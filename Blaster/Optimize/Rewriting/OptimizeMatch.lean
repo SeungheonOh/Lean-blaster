@@ -184,12 +184,12 @@ partial def isPatternMatch (lhs : Expr) (rhs : Expr) : TranslateEnvT MatchResult
 
              | Expr.const ``Int.negSucc _, Expr.const ``Int.neg _ =>
                   match a2 with
-                  | Expr.app (Expr.const ``Int.ofNat _) n2 => isPatternMatch a1 n2
+                  | Expr.app (Expr.const ``Int.ofNat _) n2 => isPatternMatch (← mkNatSuccExpr a1) n2
                   | _ => return .PotentialMatch -- case when rhs is an expression
 
              | Expr.const ``Int.neg _, Expr.const ``Int.negSucc _ =>
                   match a1 with
-                  | Expr.app (Expr.const ``Int.ofNat _) n1 => isPatternMatch n1 a2
+                  | Expr.app (Expr.const ``Int.ofNat _) n1 => isPatternMatch n1 (← mkNatSuccExpr a2)
                   | _ => return .NoMatch -- unreachable
              | _, _=>
                 if exprEq f1 f2 then isPatternMatch a1 a2
@@ -637,7 +637,7 @@ partial def unifyAndUpdateEqMap (lhs : Expr) (rhs : Expr) (nextCtxId : CtxId) (u
 
               | Expr.const ``Int.negSucc _, Expr.const ``Int.neg _ =>
                   match a2 with
-                  | Expr.app (Expr.const ``Int.ofNat _) n2 => visit a1 n2 stk updatedCtx
+                  | Expr.app (Expr.const ``Int.ofNat _) n2 => visit (← mkNatSuccExpr a1) n2 stk updatedCtx
                   | _ => -- case when rhs is an expression
                      updateEqualityMap rhs (← removeNamedPatternExpr lhs) nextCtxId
                      match stk with
@@ -646,7 +646,7 @@ partial def unifyAndUpdateEqMap (lhs : Expr) (rhs : Expr) (nextCtxId : CtxId) (u
 
               | Expr.const ``Int.neg _, Expr.const ``Int.negSucc _ =>
                    match a1 with
-                   | Expr.app (Expr.const ``Int.ofNat _) n1 => visit n1 a2 stk updatedCtx
+                   | Expr.app (Expr.const ``Int.ofNat _) n1 => visit n1 (← mkNatSuccExpr a2) stk updatedCtx
                    | _ => return updatedCtx -- unreachable
 
               | _, _ =>
