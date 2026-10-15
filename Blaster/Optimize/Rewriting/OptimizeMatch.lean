@@ -721,8 +721,11 @@ partial def optimizeMatchAlt
   (stack : List OptimizeStack) : TranslateEnvT (List OptimizeStack) := do
   let currIdx := (altIdx - mInfo.getFirstAltPos).toUSize
   -- NOTE: We need to consider the generic type for context reuse.
-  -- Otherwise, we might instantiate the rhs
-  let matchInst ← mkAppRangeExpr mInfo.nameExpr 0 mInfo.getFirstAltPos args
+  -- Otherwise, we might instantiate the rhs.
+  -- The reused context records the `discriminator = pattern` equalities and the disequalities
+  -- with the previous patterns: it is only valid for the same discriminators, but does not depend
+  -- on the match return type, which changes, e.g., when an application is pushed into the match rhs.
+  let matchInst ← mkAppRangeExpr (← mkAppRangeExpr mInfo.nameExpr 0 mInfo.numParams args) mInfo.getFirstDiscrPos mInfo.getFirstAltPos args
   match ← reuseContext? matchInst currIdx with
   | some reuse =>
        setAndCommitCtx reuse.scope
