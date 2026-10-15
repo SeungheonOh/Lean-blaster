@@ -529,16 +529,6 @@ def mkIntLtExpr (a : Expr) (b : Expr) : TranslateEnvT Expr := do
 def mkNatNegExpr (n : Nat) : TranslateEnvT Expr := do
   mkAppExpr (← mkIntNegSucc) (← mkNatLitExpr (n - 1))
 
-/-- `mkNatSuccExpr n` constructs and cache `1 + n`, i.e., the absolute value of `Int.negSucc n`,
-     folding the cases where `n` is a Nat literal or `k + m` with `k` a Nat literal.
--/
-def mkNatSuccExpr (n : Expr) : TranslateEnvT Expr := do
-  match n with
-  | Expr.lit (Literal.natVal k) => mkNatLitExpr (k + 1)
-  | Expr.app (Expr.app (Expr.const ``Nat.add _) (Expr.lit (Literal.natVal k))) m =>
-      mkApp2Expr (← mkNatAddOp) (← mkNatLitExpr (k + 1)) m
-  | _ => mkApp2Expr (← mkNatAddOp) (← mkNatLitExpr 1) n
-
 /- Given `e` of type `Bool`, return `b = e`.  -/
 def mkEqBool (e : Expr) (b : Bool) : TranslateEnvT Expr := do
   mkApp3Expr (← mkEqOp) (← mkBoolType) (← mkBoolLit b) e

@@ -34,4 +34,4 @@ import Tests.FixedIssues.Issue34
 import Tests.FixedIssues.Issue35
 import Tests.FixedIssues.Issue36
 import Tests.FixedIssues.Issue287
-import Tests.FixedIssues.NegSuccLiteralMatch
+import Tests.FixedIssues.Issue331
