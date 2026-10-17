@@ -45,6 +45,18 @@ def isHole? (e : Expr) : Option Nat :=
                   | _ => none
   | _ => none
 
+/-- Return a short description of the head symbol of `e` (used to label proof obligations). -/
+def headSymbol (e : Expr) : String :=
+  match e.consumeMData.getAppFn with
+  | .const n _ => n.toString
+  | .lam .. => "lambda"
+  | .forallE _ t _ _ => if t.isProp then "forall" else "forall"
+  | .fvar .. => "fvar"
+  | .proj n i _ => s!"{n}.{i}"
+  | .sort .. => "sort"
+  | .lit .. => "lit"
+  | _ => "other"
+
 /-- Create a proof obligation for `lhs = rhs`.
     Return `EqPf.defeq` when `lhs` and `rhs` are structurally equal and `EqPf.unknown` when
     the equality type cannot be constructed (e.g., ill-typed intermediate expressions).
@@ -53,6 +65,7 @@ def mkHole (lhs rhs : Expr) (kind : HoleKind) (label : String) : TranslateEnvT E
   if lhs == rhs then return .defeq
   let some eqType ← tryInLocalContext (mkEq lhs rhs) | return .unknown
   let idx := (← get).recon.holes.size
+  let label := s!"{kind}:{label}:{headSymbol lhs}"
   modify fun env => { env with recon.holes := env.recon.holes.push { kind, label } }
   let sorryExpr := mkApp2 (mkConst ``sorryAx [levelZero]) eqType (toExpr true)
   return .proof (mkMData (KVMap.empty.insert holeKey (.ofNat idx)) sorryExpr)
@@ -60,7 +73,7 @@ def mkHole (lhs rhs : Expr) (kind : HoleKind) (label : String) : TranslateEnvT E
 /-- Turn `EqPf.unknown` evidence into a proof obligation for `lhs = rhs`. -/
 @[always_inline, inline]
 def EqPf.close (pf : EqPf) (lhs rhs : Expr) (kind := HoleKind.frame) (label := "") : TranslateEnvT EqPf := do
-  match pf with
+  match pf.simplify with
   | .unknown =>
       if !(← isTracking) then return .unknown
       mkHole lhs rhs kind label
@@ -68,7 +81,7 @@ def EqPf.close (pf : EqPf) (lhs rhs : Expr) (kind := HoleKind.frame) (label := "
 
 /-- Transitivity: given `p : a = b` and `q : b = c` return evidence for `a = c`. -/
 def EqPf.trans (p q : EqPf) : TranslateEnvT EqPf := do
-  match p, q with
+  match p.simplify, q.simplify with
   | .unknown, _ | _, .unknown => return .unknown
   | .defeq, q => return q
   | p, .defeq => return p
@@ -76,6 +89,7 @@ def EqPf.trans (p q : EqPf) : TranslateEnvT EqPf := do
       match ← tryInLocalContext (mkEqTrans a b) with
       | some r => return .proof r
       | none => return .unknown
+  | _, _ => return .unknown
 
 /-- Return `true` when `pf` does not need any proof term. -/
 @[always_inline, inline]
@@ -91,7 +105,8 @@ def congrFunArgs (pf : EqPf) (args : Array Expr) : TranslateEnvT EqPf := do
       match ← tryInLocalContext (args.foldlM (init := p) fun acc a => mkCongrFun acc a) with
       | some r => return .proof r
       | none => return .unknown
-  | _ => return pf
+  | .defeq => return .defeq
+  | _ => return .unknown
 
 /-- Given an application `f a₁ ... aₙ` in which the argument at position `idx` has just been
     rewritten from `a` to `aᵢ` with evidence `pf : a = aᵢ`, return evidence for
@@ -114,7 +129,8 @@ def congrArgAt (f : Expr) (args : Array Expr) (idx : Nat) (pf : EqPf) : Translat
       match r with
       | some (some r) => return .proof r
       | _ => return .unknown
-  | _ => return pf
+  | .defeq => return .defeq
+  | _ => return .unknown
 
 /-- Given `let x : t := v; b` such that `v` has been rewritten to `v'` with evidence `pf : v = v'`,
     return evidence for `b[v/x] = b[v'/x]`.
@@ -125,7 +141,8 @@ def letValueCongr (n : Name) (t : Expr) (b : Expr) (pf : EqPf) : TranslateEnvT E
       match ← tryInLocalContext (mkCongrArg (.lam n t b .default) p) with
       | some r => return .proof r
       | none => return .unknown
-  | _ => return pf
+  | .defeq => return .defeq
+  | _ => return .unknown
 
 /-- Given a projection `s.idx` such that `s` has been rewritten to `s'` with evidence `pf : s = s'`,
     return evidence for `s.idx = s'.idx`.
@@ -139,7 +156,8 @@ def projCongr (n : Name) (idx : Nat) (s' : Expr) (pf : EqPf) : TranslateEnvT EqP
       match r with
       | some r => return .proof r
       | none => return .unknown
-  | _ => return pf
+  | .defeq => return .defeq
+  | _ => return .unknown
 
 /-- Given `x` a free variable and evidence `pf : b = b'` (in which `x` may occur), return
     evidence for `(fun x => b) = (fun x => b')`.
@@ -160,7 +178,25 @@ def funextCongr (x : Expr) (b b' : Expr) (pf : EqPf) : TranslateEnvT EqPf := do
       match r with
       | some r => return .proof r
       | none => return .unknown
-  | _ => return pf
+  | .defeq => return .defeq
+  | _ => return .unknown
+
+/-- Given a lambda `fun x : t => b` rewritten to `fun x : t' => b'` such that `t` and `t'` are not
+    definitionally equal and evidence `pf : b = b'` (with `x : t'`), return `EqPf.lamBody` evidence
+    when neither `b` nor `b'` depend on `x`. Otherwise `EqPf.unknown`.
+-/
+def lamBodyCongr (x : Expr) (b b' : Expr) (pf : EqPf) : TranslateEnvT EqPf := do
+  let xId := x.fvarId!
+  if b.containsFVar xId || b'.containsFVar xId then return .unknown
+  let r ← tryInLocalContext do
+    let p ← match pf with
+            | .defeq => some <$> mkEqRefl b
+            | .proof p => pure (some p)
+            | _ => pure none
+    p.mapM (mkLambdaFVars #[x] ·)
+  match r with
+  | some (some p) => return .lamBody p
+  | _ => return .unknown
 
 /-- Given a forall `∀ x : t, b` such that:
       - `pt : t = t'`
@@ -169,7 +205,7 @@ def funextCongr (x : Expr) (b b' : Expr) (pf : EqPf) : TranslateEnvT EqPf := do
     Assumes that `x` is a free variable of type `t'`.
 -/
 def forallCongr (x : Expr) (t t' b b' : Expr) (pt pb : EqPf) : TranslateEnvT EqPf := do
-  match pt, pb with
+  match pt.simplify, pb.simplify with
   | .unknown, _ | _, .unknown => return .unknown
   | .defeq, .defeq => return .defeq
   | .defeq, .proof p =>
@@ -208,6 +244,59 @@ def forallCongr (x : Expr) (t t' b b' : Expr) (pt pb : EqPf) : TranslateEnvT EqP
       match r with
       | some (some r) => return .proof r
       | _ => return .unknown
+  | _, _ => return .unknown
+
+/-- Given an application `f a₁ ... aₙ` such that `pf : lhs = f a₁ ... aₙ` and the argument at position
+    `idx` has been rewritten from `orig` to `a'ᵢ` with evidence `pfArg`, return evidence for
+    `lhs = f a₁ ... a'ᵢ ... aₙ` (with `args` corresponding to the arguments after the rewrite).
+    Rewrites on arguments with forward dependencies are kept pending in an `EqPf.depArgs` evidence
+    to be resolved once all arguments have been rewritten (see `resolveDepArgs`).
+-/
+def addArgEvidence
+  (f : Expr) (args : Array Expr) (idx : Nat) (orig : Expr) (pfArg : EqPf) (pf : EqPf) : TranslateEnvT EqPf := do
+  match pf with
+  | .unknown => return .unknown
+  | .depArgs pre pargs => return .depArgs pre (pargs.push (idx, orig, pfArg))
+  | _ =>
+    match pfArg with
+    | .defeq => return pf
+    | .unknown => return .unknown
+    | .proof _ =>
+        match ← congrArgAt f args idx pfArg with
+        | .unknown => return .depArgs pf #[(idx, orig, pfArg)]
+        | r => pf.trans r
+    | .lamBody _ | .depArgs .. => return .depArgs pf #[(idx, orig, pfArg)]
+
+/-- Resolve pending dependent rewrites on the arguments of `f a₁ ... aₙ` (see `addArgEvidence`).
+    The following applications are currently supported:
+      - `Blaster.dite' c t e`: via `dite'_congr` (when the condition has been rewritten).
+-/
+def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT EqPf := do
+  match pf with
+  | .depArgs pre pargs =>
+      let some r ← tryInLocalContext (resolve pargs) | return .unknown
+      match r with
+      | some p => pre.trans (.proof p)
+      | none => return .unknown
+  | _ => return pf
+
+  where
+    /-- Return the original argument at position `i` and its evidence. -/
+    argPf (pargs : Array (Nat × Expr × EqPf)) (i : Nat) : Expr × EqPf :=
+      pargs.foldl (fun acc (j, a, p) => if i == j then (a, p) else acc) (args[i]!, .defeq)
+
+    resolve (pargs : Array (Nat × Expr × EqPf)) : MetaM (Option Expr) := do
+      match f with
+      | .const ``Blaster.dite' us =>
+          if args.size != 4 then return none
+          let (c, .proof hc) := argPf pargs 1 | return none
+          let (t, pt) := argPf pargs 2
+          let (e, pe) := argPf pargs 3
+          let .lamBody ht := pt | return none
+          let .lamBody he := pe | return none
+          return some (mkAppN (mkConst ``Blaster.Reconstruct.dite'_congr us)
+                        #[args[0]!, c, args[1]!, t, e, args[2]!, args[3]!, hc, ht, he])
+      | _ => return none
 
 /-! ## Rule steps
 
@@ -278,8 +367,8 @@ def defEqStep : TranslateEnvT EqPf := do
 def cacheProof (a b : Expr) (pf : EqPf) : TranslateEnvT Unit := do
   if !(← isTracking) then return
   match pf with
-  | .unknown => return
-  | _ => modify fun env => { env with recon.proofCache := env.recon.proofCache.insert a (b, pf) }
+  | .defeq | .proof _ => modify fun env => { env with recon.proofCache := env.recon.proofCache.insert a (b, pf) }
+  | _ => return
 
 /-- Return `true` if all the free variables in `e` are declared in the optimizer's local context. -/
 private def fvarsInScope (e : Expr) : TranslateEnvT Bool := do

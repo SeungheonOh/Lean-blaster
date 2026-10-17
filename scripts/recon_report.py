@@ -42,6 +42,16 @@ def main(path):
             else:
                 reasons[f[:60]] += 1
     print("failure reasons:", dict(reasons))
+    labels = defaultdict(Counter)
+    for r in rows:
+        for l, ms in r.get("labels", {}).items():
+            for m, n in ms.items():
+                labels[l][m] += n
+    if labels:
+        print("\nproof obligations per rewrite site (top 40):")
+        top = sorted(labels.items(), key=lambda kv: -sum(kv[1].values()))[:40]
+        for l, ms in top:
+            print(f"  {sum(ms.values()):>6}  {l:<70} {dict(ms)}")
     per_file = defaultdict(lambda: [0, 0])
     for r in rows:
         per_file[r["file"]][0] += 1

@@ -118,6 +118,8 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
 
   | .AppOptimizeExplicitArgs f args idx stopIdx pInfo mInfo pf :: xs =>
        if idx ≥ stopIdx then
+         -- resolve pending congruence on dependent arguments (if any)
+         let pf ← withLocalContext $ resolveDepArgs f args pf
          clearSteps
          -- normalizing ite/match function application
          if let some re ← normChoiceApplication? f args then
@@ -234,14 +236,21 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
     @[always_inline, inline]
     optimizeLambda
       (n : Name) (t : Expr) (b : Expr) (bi : BinderInfo)
-      (xs : List OptimizeStack) (inDite := false) : List OptimizeStack :=
-        .InitOptimizeExpr t :: .LambdaWaitForType n bi b inDite :: xs
+      (xs : List OptimizeStack) (inDite := false) (declType : Option Expr := none) : List OptimizeStack :=
+        .InitOptimizeExpr t :: .LambdaWaitForType n bi b inDite t declType :: xs
 
+    /-- Optimize `Blaster.dite'` branch `e` with `branchType` the expected binder type,
+        i.e., `c` (resp. `¬ c`) for the then (resp. else) branch, with `c` the optimized condition.
+        NOTE: `branchType` is only considered when tracking proof terms (see `LambdaWaitForType`).
+    -/
     @[always_inline, inline]
-    optimizeDiteArg (e : Expr) (stack : List OptimizeStack) : List OptimizeStack :=
+    optimizeDiteArg (e : Expr) (branchType : TranslateEnvT Expr) (stack : List OptimizeStack) :
+      TranslateEnvT (List OptimizeStack) := do
       match e with
-      | Expr.lam n t b bi => optimizeLambda n t b bi stack (inDite := true)
-      | _ => .InitOptimizeExpr e :: stack
+      | Expr.lam n t b bi =>
+          let declType ← if (← isTracking) then some <$> branchType else pure none
+          return optimizeLambda n t b bi stack (inDite := true) (declType := declType)
+      | _ => return .InitOptimizeExpr e :: stack
 
     @[always_inline, inline]
     optimizeExplicitArgs
@@ -252,8 +261,8 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
         if idx == 1 then
          -- skipping optimization for Blaster.dite' cond as already performed by choice reduction on dite
          return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: nxtStack)
-        else if idx == 2 || idx == 3
-        then return optimizeDiteArg args[idx]! stack
+        else if idx == 2 then optimizeDiteArg args[idx]! (pure args[1]!) stack
+        else if idx == 3 then optimizeDiteArg args[idx]! (mkExpr (mkApp (← mkPropNotOp) args[1]!)) stack
         else return (.InitOptimizeExpr args[idx]! :: stack)
       else if let some argInfo := mInfo then
          if idx >= argInfo.getFirstDiscrPos && idx < argInfo.getFirstAltPos then

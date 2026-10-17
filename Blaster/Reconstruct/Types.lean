@@ -23,7 +23,29 @@ inductive EqPf where
   /-- No evidence has been tracked. An `unknown` evidence is turned into a proof
       obligation (a *hole*) as soon as both ends of the rewrite are known. -/
   | unknown
+  /-- Evidence for a lambda `fun x : t => b` rewritten to `fun x : t' => b'` such that the binder
+      type has changed (i.e., `t` and `t'` are not definitionally equal) and neither `b` nor `b'`
+      depend on `x`. `p : ∀ x : t', b = b'`.
+      This evidence can only be consumed by a congruence lemma over the enclosing application
+      (e.g., `Blaster.Reconstruct.dite'_congr`), i.e., it is considered `unknown` otherwise.
+  -/
+  | lamBody (p : Expr)
+  /-- Evidence for an application `f a₁ ... aₙ` in which some arguments with forward dependencies
+      have been rewritten, i.e.:
+        - `pre : lhs = f a₁ ... aₙ`
+        - `args : #[(i, aᵢ, pfᵢ)]` with `pfᵢ` the evidence for the rewrite of argument `aᵢ`.
+      This evidence is resolved via a dedicated congruence lemma once all the arguments have
+      been optimized (see `resolveDepArgs`). It is considered `unknown` otherwise.
+      Each entry `(i, aᵢ, pfᵢ)` keeps the argument `aᵢ` before rewriting.
+  -/
+  | depArgs (pre : EqPf) (args : Array (Nat × Expr × EqPf))
 deriving Inhabited, Repr
+
+/-- Consider evidence that can only be consumed by dedicated congruence lemmas as `unknown`. -/
+@[always_inline, inline]
+def EqPf.simplify : EqPf → EqPf
+  | .lamBody _ | .depArgs .. => .unknown
+  | pf => pf
 
 /-- Key used to tag a proof obligation (i.e., hole) in a proof term.
     A hole is represented as `mdata {blaster.hole := id} (sorryAx (lhs = rhs) true)`.

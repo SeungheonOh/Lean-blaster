@@ -23,10 +23,15 @@ structure DischargeStats where
   byMethod : Std.HashMap String Nat := {}
   /-- Pretty printed proof obligations that could not be discharged. -/
   failures : Array MessageData := #[]
+  /-- Proof obligations per label (see `HoleInfo`), i.e., `label := (method ↦ count)`
+      with method `failed` for undischarged obligations. -/
+  byLabel : Std.HashMap String (Std.HashMap String Nat) := {}
 deriving Inhabited
 
-def DischargeStats.record (s : DischargeStats) (method : String) : DischargeStats :=
-  { s with byMethod := s.byMethod.insert method (s.byMethod.getD method 0 + 1) }
+def DischargeStats.record (s : DischargeStats) (method : String) (label : String) : DischargeStats :=
+  let m := s.byLabel.getD label {}
+  { s with byMethod := s.byMethod.insert method (s.byMethod.getD method 0 + 1),
+           byLabel := s.byLabel.insert label (m.insert method (m.getD method 0 + 1)) }
 
 def DischargeStats.summary (s : DischargeStats) : String :=
   let entries := s.byMethod.toList.toArray.qsort (fun a b => a.1 < b.1)
@@ -45,7 +50,10 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
   let s ← saveState
   try
     let mvar ← mkFreshExprMVar type
-    let gs ← withHeartbeatBudget budget <| withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
+    -- NOTE: asynchronous elaboration is disabled such that kernel errors on auxiliary declarations
+    -- created by tactics are reported as exceptions instead of messages.
+    let gs ← withOptions (fun o => Elab.async.set o false) <|
+               withHeartbeatBudget budget <| withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
     let prf ← instantiateMVars mvar
     if !gs.isEmpty || prf.hasMVar || prf.hasSorry then
       s.restore
@@ -64,12 +72,19 @@ def proveByDefEq (type : Expr) (budget := dischargeHeartbeats) : MetaM (Option E
     return none
   catch _ => return none
 
+/-- Return `true` if `type` is type correct. -/
+def isTypeCorrectObligation (type : Expr) : MetaM Bool := do
+  try
+    withHeartbeatBudget dischargeHeartbeats <| Meta.check type
+    return true
+  catch _ => return false
+
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
-    ("simp", ← `(tactic| ((try simp only [Blaster.Reconstruct.dite'_eq_dite, Blaster.Reconstruct.decide'_eq_decide] at *) <;> simp [*] <;> done))),
-    ("omega", ← `(tactic| ((try apply propext) <;> (try simp only [Blaster.Reconstruct.dite'_eq_dite, Blaster.Reconstruct.decide'_eq_decide] at *) <;> omega))),
-    ("grind", ← `(tactic| ((try simp only [Blaster.Reconstruct.dite'_eq_dite, Blaster.Reconstruct.decide'_eq_decide] at *) <;> grind)))
+    ("simp", ← `(tactic| (blaster_denorm <;> simp [*] <;> done))),
+    ("omega", ← `(tactic| ((try apply propext) <;> blaster_denorm <;> omega))),
+    ("grind", ← `(tactic| (blaster_denorm <;> grind)))
   ]
 
 /-- Try to discharge proof obligation `type` (expected to be an equality) and return
@@ -77,6 +92,8 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
 -/
 def dischargeOne (type : Expr) : TermElabM (Option (Expr × String)) := do
   let type ← instantiateMVars type
+  -- ill-typed proof obligations (e.g., due to ill-typed optimized expressions) can't be discharged
+  if !(← isTypeCorrectObligation type) then return none
   if let some prf ← proveByDefEq type then return some (prf, "rfl")
   for (name, tac) in (← dischargeTactics) do
     if let some prf ← proveWithTactic type tac then return some (prf, name)
@@ -97,18 +114,22 @@ def hasHoles (e : Expr) : Bool :=
     Return the updated proof term and the discharge statistics. Proof obligations that cannot be
     discharged are left unchanged in the returned proof term.
 -/
-def dischargeHoles (p : Expr) : TermElabM (Expr × DischargeStats) := do
+def dischargeHoles (p : Expr) (holes : Array HoleInfo := #[]) : TermElabM (Expr × DischargeStats) := do
   let stats ← IO.mkRef ({} : DischargeStats)
   let p' ← Meta.transform p (pre := fun e => do
     match holeType? e with
     | none => return .continue
     | some type =>
+        let label := match isHole? e with
+                     | some idx => if h : idx < holes.size then holes[idx].label else "top"
+                     | none => "top"
         stats.modify fun s => { s with total := s.total + 1 }
         match ← dischargeOne type with
         | some (prf, method) =>
-            stats.modify (·.record method)
+            stats.modify (·.record method label)
             return .done prf
         | none =>
+            stats.modify (·.record "failed" label)
             let lctx ← getLCtx
             let dangling := (type.find? fun s => s.isFVar && !lctx.contains s.fvarId!).isSome
             let msg ← addMessageContext (if dangling then m!"{type} (out of scope variables)" else m!"{type}")
@@ -120,11 +141,12 @@ def dischargeHoles (p : Expr) : TermElabM (Expr × DischargeStats) := do
     backend SMT solver) using decision procedures available in Lean.
 -/
 def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
+  if !(← isTypeCorrectObligation e) then return none
   let tacs : Array (String × TSyntax `tactic) := #[
     ("decide", ← `(tactic| decide)),
-    ("simp", ← `(tactic| ((try simp only [Blaster.Reconstruct.dite'_eq_dite, Blaster.Reconstruct.decide'_eq_decide]) <;> simp <;> done))),
-    ("omega", ← `(tactic| (intros <;> (try simp only [Blaster.Reconstruct.dite'_eq_dite, Blaster.Reconstruct.decide'_eq_decide] at *) <;> omega))),
-    ("grind", ← `(tactic| ((try simp only [Blaster.Reconstruct.dite'_eq_dite, Blaster.Reconstruct.decide'_eq_decide]) <;> grind)))
+    ("simp", ← `(tactic| (blaster_denorm <;> simp <;> done))),
+    ("omega", ← `(tactic| (intros <;> blaster_denorm <;> omega))),
+    ("grind", ← `(tactic| (blaster_denorm <;> grind)))
   ]
   for (name, tac) in tacs do
     if let some prf ← proveWithTactic e tac (budget := 4 * dischargeHeartbeats) then

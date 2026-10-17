@@ -61,8 +61,9 @@ inductive OptimizeStack where
  | MatchChoiceOptimizeDiscrs (f : Expr) (args : Array Expr) (pInfo : FunEnvInfo)
                              (startArgIdx : Nat) (idx : Nat) (mInfo : MatchInfo) (pf : EqPf)
  | LambdaWaitForType (n : Name) (bi : BinderInfo) (body : Expr) (inDite : Bool)
+                     (origT : Expr) (declType : Option Expr)
  | LambdaWaitForBody (x : Expr) (lctx : LocalDeclContext) (hctx : Option HypsStackContext)
-                     (pt : EqPf) (origBody : Expr)
+                     (pt : EqPf) (origBody : Expr) (origT : Expr)
  | MatchRhsLambdaWaitForType (n : Name) (bi : BinderInfo) (body : Expr)
  | MatchRhsLambdaNext (e : Expr)
  | MatchRhsLambdaWaitForBody (x : Expr) (lctx : LocalDeclContext)
@@ -237,8 +238,9 @@ def stackContinuity
   | .AppOptimizeExplicitArgs f args idx stopIdx pInfo mInfo apf :: xs =>
        -- optExpr corresponds to the optimized explicit argument referenced by idx.
        -- continuity with optimizing the next explicit argument.
+       let orig := args[idx]!
        let args := args.set! idx optExpr
-       let apf ← apf.trans (← congrArgAt f args idx pf)
+       let apf ← addArgEvidence f args idx orig pf apf
        return Sum.inl (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo apf :: xs)
 
   | .DiteChoiceWaitForCond f args pInfo startArgIdx apf :: xs =>
@@ -248,8 +250,9 @@ def stackContinuity
        -- Otherwise
        --  - continuity with optimizing remaining explicit parameters before reduction
        -- NOTE: keep matchInfo to avoid unnecessary query and to avoid optimizing discriminators again
+       let orig := args[1]!
        let args := args.set! 1 optExpr
-       let apf ← apf.trans (← congrArgAt f args 1 pf)
+       let apf ← addArgEvidence f args 1 orig pf apf
        clearSteps
        if let some r ← optimizeDITEChoice f args then
            let step ← ruleStep (mkAppN f args) r "optimizeDITEChoice"
@@ -265,25 +268,32 @@ def stackContinuity
        let apf ← apf.trans (← congrArgAt f args idx pf)
        return Sum.inl (.MatchChoiceOptimizeDiscrs f args pInfo startArgIdx (idx + 1) mInfo apf :: xs)
 
-  | .LambdaWaitForType n bi body inDite :: xs =>
+  | .LambdaWaitForType n bi body inDite origT declType :: xs =>
        -- optExpr corresponds to optimized lambda type
+       -- NOTE: When `declType` is provided (i.e., only when tracking proof terms), the lambda binder is
+       -- declared with `declType` instead of `optExpr`. This is used to preserve type correctness of
+       -- `Blaster.dite'` branches, whose binder types must respectively be `c` and `¬ c`, with `c` the
+       -- optimized condition. The optimized type `optExpr` is still used as hypothesis.
        withLocalContext $ do
-         withLocalDecl' n bi optExpr fun x => do
+         withLocalDecl' n bi (declType.getD optExpr) fun x => do
            let body' := instantiate1' body x
            let bodyOpt := .InitOptimizeExpr body'
            let lctx ← mkLocalDeclStackContext (← mkLocalContext)
            if inDite then
              let hyps ← addHypotheses optExpr x
              let hypsCtx ← mkHypStackContext hyps
-             return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx (some hypsCtx) pf body' :: xs)
-           else return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx none pf body' :: xs)
+             return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx (some hypsCtx) pf body' origT :: xs)
+           else return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx none pf body' origT :: xs)
 
-  | .LambdaWaitForBody x lctx hctx pt origBody :: xs =>
+  | .LambdaWaitForBody x lctx hctx pt origBody origT :: xs =>
        -- optExpr corresponds to optimized lambda body
        -- continuity with optimizing next expression
        if let some h := hctx then resetHypContext h
        let (e, pf) ← withLocalContext $ do
-          let pf ← if pt.isDefEq then funextCongr x origBody optExpr pf else pure .unknown
+          let pf ←
+            if !(← isTracking) then pure .unknown
+            else if pt.isDefEq || (← x.fvarId!.getType) == origT then funextCongr x origBody optExpr pf
+            else lamBodyCongr x origBody optExpr pf
           mkExprPf (← mkLambdaFVar x optExpr) pf
        resetLocalDeclContext lctx
        stackContinuity xs e pf

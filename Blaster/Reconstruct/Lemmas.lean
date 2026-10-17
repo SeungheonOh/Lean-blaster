@@ -59,3 +59,51 @@ theorem decide'_eq_decide (c : Prop) :
   simp only [Blaster.decide'_equiv]
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Primitive operators
+
+The optimizer keeps primitive operators (e.g., `Nat.add`) instead of their notation counterparts
+(e.g., `HAdd.hAdd`). The following lemmas rewrite them back to notation such that Lean
+decision procedures (e.g., `simp`, `omega`) can reason about them.
+-/
+
+theorem nat_add_eq (a b : Nat) : Nat.add a b = a + b := rfl
+theorem nat_sub_eq (a b : Nat) : Nat.sub a b = a - b := rfl
+theorem nat_mul_eq (a b : Nat) : Nat.mul a b = a * b := rfl
+theorem nat_div_eq (a b : Nat) : Nat.div a b = a / b := rfl
+theorem nat_mod_eq (a b : Nat) : Nat.mod a b = a % b := rfl
+theorem nat_pow_eq (a b : Nat) : Nat.pow a b = a ^ b := rfl
+theorem int_add_eq (a b : Int) : Int.add a b = a + b := rfl
+theorem int_mul_eq (a b : Int) : Int.mul a b = a * b := rfl
+theorem int_neg_eq (a : Int) : Int.neg a = -a := rfl
+theorem int_ediv_eq (a b : Int) : Int.ediv a b = a / b := rfl
+theorem int_emod_eq (a b : Int) : Int.emod a b = a % b := rfl
+theorem int_pow_eq (a : Int) (b : Nat) : Int.pow a b = a ^ b := rfl
+
+end Blaster.Reconstruct
+
+/-- Rewrite Blaster's internal representation back to standard Lean notation in all hypotheses and the goal. -/
+macro "blaster_denorm" : tactic =>
+  `(tactic| (try simp only [Blaster.Reconstruct.dite'_eq_dite, Blaster.Reconstruct.decide'_eq_decide,
+              Blaster.Reconstruct.nat_add_eq, Blaster.Reconstruct.nat_sub_eq, Blaster.Reconstruct.nat_mul_eq,
+              Blaster.Reconstruct.nat_div_eq, Blaster.Reconstruct.nat_mod_eq, Blaster.Reconstruct.nat_pow_eq,
+              Blaster.Reconstruct.int_add_eq, Blaster.Reconstruct.int_mul_eq, Blaster.Reconstruct.int_neg_eq,
+              Blaster.Reconstruct.int_ediv_eq, Blaster.Reconstruct.int_emod_eq, Blaster.Reconstruct.int_pow_eq,
+              Int.ofNat_eq_coe] at *))
+
+namespace Blaster.Reconstruct
+
+/-! ## Congruence lemmas -/
+
+/-- Congruence for `Blaster.dite'` when the condition is rewritten. -/
+theorem dite'_congr {α : Sort u} {c c' : Prop} {t : c → α} {e : ¬ c → α} {t' : c' → α} {e' : ¬ c' → α}
+    (hc : c = c') (ht : ∀ h : c', t (hc.mpr h) = t' h) (he : ∀ h : ¬ c', e (fun h0 => h (hc.mp h0)) = e' h) :
+    Blaster.dite' c t e = Blaster.dite' c' t' e' := by
+  subst hc
+  have h1 : t = t' := funext ht
+  have h2 : e = e' := funext he
+  rw [h1, h2]
+
+end Blaster.Reconstruct

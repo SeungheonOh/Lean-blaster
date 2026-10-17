@@ -63,17 +63,19 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
     catch ex => return some ex.toMessageData
   let lvls := (collectLevelParams {} goal).params.toList
   let name ← mkFreshUserName `_blaster_reconstructed
-  withoutModifyingEnv do
-    try
-      addDecl (Declaration.thmDecl { name, levelParams := lvls, type := goal, value := proof })
-      return none
-    catch ex => return some m!"kernel rejected the reconstructed proof: {ex.toMessageData}"
+  let decl := Declaration.thmDecl { name, levelParams := lvls, type := goal, value := proof }
+  -- NOTE: `addDecl` may perform kernel checking asynchronously, i.e., errors are reported
+  -- as messages instead of exceptions. We here call the kernel synchronously.
+  match Lean.Kernel.Environment.addDecl (← getEnv).toKernelEnv (← getOptions) decl with
+  | .ok _ => return none
+  | .error ex => return some m!"kernel rejected the reconstructed proof: {ex.toMessageData (← getOptions)}"
 
 /-- Discharge the proof obligations in `proof` and check it against `goal` with the Lean kernel. -/
-def finishProof (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) : TermElabM ReconOutcome := do
+def finishProof
+  (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) (holes : Array HoleInfo) : TermElabM ReconOutcome := do
   let finish (o : ReconOutcome) : TermElabM ReconOutcome := do
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
-  let (proof, stats) ← dischargeHoles proof
+  let (proof, stats) ← dischargeHoles proof holes
   let out := { out with stats }
   if !stats.failures.isEmpty || hasHoles proof then
     let shown := stats.failures.extract 0 3
@@ -91,8 +93,8 @@ def reconstructRewrite (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermE
   let proof ← match pf with
     | .defeq => mkEqRefl e
     | .proof p => pure p
-    | .unknown => mkTopHole e optExpr
-  finishProof out goal proof startTime
+    | _ => mkTopHole e optExpr
+  finishProof out goal proof startTime recon.holes
 
 /-- Try to reconstruct a proof for `task` given the reconstruction environment `recon`
     obtained after optimization.
@@ -105,7 +107,7 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let optPf? ← match task.optPf with
     | .defeq => pure none
     | .proof p => pure (some p)
-    | .unknown => some <$> mkTopHole task.fullGoal task.optExpr
+    | _ => some <$> mkTopHole task.fullGoal task.optExpr
   -- Proof of the residual goal
   let (residual, residualMethod) ← match task.optExpr with
     | .const ``True _ => pure (some (Lean.mkConst ``True.intro), "optimizer")
@@ -126,7 +128,7 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let axioms ← task.axioms.reverse.mapM fun n => do
     let info ← getConstInfo n
     return Lean.mkConst n (info.levelParams.map mkLevelParam)
-  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime
+  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes
 
 where
   finish (startTime : Nat) (o : ReconOutcome) : TermElabM ReconOutcome := do
@@ -150,6 +152,8 @@ def dumpStats (o : ReconOutcome) (label : String) : TermElabM Unit := do
     ("holes", toJson o.stats.total),
     ("unresolved", toJson o.stats.failures.size),
     ("methods", methods),
+    ("labels", Json.mkObj (o.stats.byLabel.toList.map fun (l, m) =>
+                  (l, Json.mkObj (m.toList.map fun (k, n) => (k, toJson n))))),
     ("ms", toJson o.elapsedMs),
     ("failure", toJson ((← o.failure.toString).take 400))
   ]
