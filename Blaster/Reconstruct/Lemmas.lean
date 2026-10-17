@@ -60,10 +60,10 @@ theorem int_negSucc_eq : Int.negSucc = fun n => Int.neg (Int.ofNat (Nat.add 1 n)
   rw [Nat.add_comm]; rfl
 
 /-- Denormalization of `Int.negSucc` (see `int_negSucc_eq`), e.g., to reduce `match` expressions. -/
-theorem neg_natCast_add_eq_negSucc (k m : Nat) (h : 0 < k) : -((k + m : Nat) : Int) = Int.negSucc (k - 1 + m) := by
+theorem neg_natCast_add_eq_negSucc (k m : Nat) (h : 0 < k) : -((k + m : Nat) : Int) = Int.negSucc (m + (k - 1)) := by
   cases k with
   | zero => contradiction
-  | succ k => simp only [Nat.add_sub_cancel]; rw [Nat.succ_add]; rfl
+  | succ k => simp only [Nat.add_sub_cancel]; rw [Nat.add_comm]; rfl
 
 end Blaster.Reconstruct
 

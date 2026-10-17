@@ -59,24 +59,26 @@ solver is trusted.
 
 ## Real-world examples: PlutusCoreBlaster
 
-[PlutusCoreBlaster](https://github.com/input-output-hk/PlutusCoreBlaster) (commit `c9dc0eb`) was built
-against this branch. The modules using Blaster's internals (`#prep_uplc`) were left out, since they
-target another Blaster branch.
+[PlutusCoreBlaster](https://github.com/input-output-hk/PlutusCoreBlaster) (commit `c9dc0eb`) pins the
+`beta-lambda-cache-optimization` branch of Blaster. It was built against this port of proof
+reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as required by the branch).
 
+- **CBOR encoding.** All 31 `encode_example_i` goals of `PlutusCore/Cbor/Tests.lean` become
+  kernel-checked theorems with `blaster_theorem` (see
+  [`docs/examples/PlutusCoreCbor.lean`](examples/PlutusCoreCbor.lean)). They only depend on `propext`,
+  `Classical.choice` and `Quot.sound`; upstream checks them with `native_decide` or with an unchecked
+  `#blaster`. Running `PlutusCore/Cbor/Tests.lean` unchanged with `BLASTER_RECONSTRUCT=1` also
+  reconstructs a kernel-checked proof for each of its 33 `#blaster` commands and `blaster` tactics
+  (the 3 expected counterexamples need no proof). The examples splitting long strings evaluate the
+  well-founded recursion `splitToChunksLoop` by unfolding its equation lemmas (`blaster_wf_eval`),
+  since the kernel can't reduce well-founded recursion efficiently.
 - **Lemmas.** 17 statements from `PlutusCore/{Integer,List,Bitwise,Cbor}` were restated with
   `blaster_theorem` (see [`docs/examples/PlutusCoreBlaster.lean`](examples/PlutusCoreBlaster.lean)).
-  14 became kernel-checked theorems that depend only on `propext`, `Classical.choice` and
-  `Quot.sound`. They include `divide_add_mod`, `quotient_add_remainder`, the error cases of
-  `integerToByteString` and `replicateByte_zero_l`. The other 3 (`integerToByteString_w_bounds_err`,
-  `integerToByteString_neg_n`, `integerToByteString_n_bounds_err`) fail before reconstruction: Blaster's
-  SMT translation rejects the structural recursion of `Nat.log2` (`translateApp: unexpected
-  application`), with or without reconstruction.
-- **CBOR encoding.** The 31 `encode_example_i` goals of `PlutusCore/Cbor/Tests.lean` were run with
-  `#blaster (only-optimize: 1) (gen-proof: 1)`. Blaster proves 24 of them; 2 are `Undetermined` and 5
-  exceed 10 minutes, with or without reconstruction. 21 of the 24 come with a kernel-checked proof.
-  The remaining 3 require evaluating a well-founded recursion (`splitToChunksLoop`) on 64-character
-  strings under a dependent `match`. The kernel cannot reduce such definitions efficiently, and
-  `native_decide` is excluded on purpose.
+  14 become kernel-checked theorems, including `divide_add_mod`, `quotient_add_remainder`, the error
+  cases of `integerToByteString` and `replicateByte_zero_l`. The other 3
+  (`integerToByteString_w_bounds_err`, `integerToByteString_neg_n`,
+  `integerToByteString_n_bounds_err`) fail before reconstruction: Blaster's SMT translation rejects
+  `Nat.log2`, which core defines directly with `Nat.rec` (`translateApp: unexpected application`).
 
 ## How it works
 

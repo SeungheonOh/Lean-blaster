@@ -860,7 +860,7 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
                 (exfalso; simp_all; done)))),
     -- case analysis on `Int.negSucc` patterns (symbolic `Int.negSucc` is normalized by the optimizer)
     ("split", ← `(tactic| (blaster_denorm <;>
-        simp (disch := decide) only [Blaster.Reconstruct.neg_natCast_add_eq_negSucc, Nat.reduceSub, Nat.zero_add] at * <;>
+        simp (disch := decide) only [Blaster.Reconstruct.neg_natCast_add_eq_negSucc, Nat.reduceSub, Nat.add_zero] at * <;>
         (repeat' split) <;> first | omega | (simp_all; done) | grind))),
     -- case analysis on conditions applied to additional arguments
     ("split", ← `(tactic| (blaster_denorm <;> blaster_by_cases <;> (try simp_all [Int.sub_eq_add_neg]) <;>
