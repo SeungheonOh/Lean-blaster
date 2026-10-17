@@ -40,6 +40,10 @@ structure IndTypeDeclaration where
         will both generate the same predicate qualifier name.
       - E.g., `f1 : Term (List α) → Nat` and `f2 : Term (List β) → Nat`
         will both generate the same predicate qualifier name.
+
+     NOTE: The above sharing does not apply to sort variables universally quantified at the top level
+     of the goal, which have their own membership predicate (see `declareSortMembership`).
+      - E.g., Given `∀ (α β : Type), ...`, `List α` and `List β` have distinct predicate qualifiers.
  -/
  instName : SmtSymbol
  /-- Corresponding Smt instantiated sort for the inductive datatype instance,
@@ -49,6 +53,12 @@ structure IndTypeDeclaration where
 
  /-- unique @apply function generated for each HOF/quantified function or lambda term. -/
  applyInstName : Option SmtSymbol
+
+ /-- Flag set to `true` only for function instances referring to sort variables with a membership
+     predicate (see `generateFunInstDeclAux`). The predicate qualifier `instName` is then a membership
+     predicate that is not implied by the co-domain constraint and has to be asserted for lambda terms.
+ -/
+ isMembership : Bool := false
 
 deriving Inhabited
 
@@ -388,6 +398,13 @@ structure SmtEnv where
   -/
   funInstCache : Std.HashMap Lean.Expr SmtQualifiedIdent
 
+  /-- Cache keeping track of the `@apply` function declared for each function type instance,
+      with all polymorphic arguments abstracted (see `generateFunInstDeclAux`).
+      Function type instances that only differ in their sort variables share the same `@apply`
+      function, while each of them has its own predicate qualifier in `indTypeInstCache`.
+  -/
+  funApplyCache : Std.HashMap Lean.Expr SmtSymbol
+
   /-- Cache keeping track of sort that have already been declared. -/
   sortCache : Std.HashMap FVarId SmtSymbol
 
@@ -442,6 +459,7 @@ instance : Inhabited SmtEnv where
      indTypeVisited := Std.HashSet.emptyWithCapacity,
      indTypeInstCache := Std.HashMap.emptyWithCapacity,
      funInstCache := Std.HashMap.emptyWithCapacity,
+     funApplyCache := Std.HashMap.emptyWithCapacity,
      sortCache := Std.HashMap.emptyWithCapacity,
      fvarsCache := Std.HashMap.emptyWithCapacity,
      quantifiedFVars := Std.HashMap.emptyWithCapacity,
@@ -1163,15 +1181,6 @@ def synthDecidableWithNotFound! (e : Expr) : TranslateEnvT Expr := do
       updateSynthCache cstr cstr
       return cstr
   | some d => return d
-
-/-- Return `true` only when an instance for `[Inhabited n]` can be found.
-    Assume that `n` is a name expression for an inductive datatype.
--/
-@[always_inline, inline]
-def hasInhabitedInstance (n : Expr) : TranslateEnvT Bool := do
-  let inhCstr ← mkExpr (mkApp (← mkInhabitedConst) n)
-  return (← trySynthConstraintInstance? inhCstr).isSome
-
 
 /-- Return `true` only when an instance for `[LawfulBEq t beqInst]` can be found. -/
 @[always_inline, inline]
