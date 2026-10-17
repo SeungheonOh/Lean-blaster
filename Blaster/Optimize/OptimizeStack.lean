@@ -68,6 +68,7 @@ inductive OptimizeStack where
  | MatchRhsLambdaNext (e : Expr)
  | MatchRhsLambdaWaitForBody (x : Expr) (lctx : LocalDeclContext)
  | MatchAltWaitForExpr (params : Array Expr) (lctx : LocalDeclContext) (mctx : MatchStackContext)
+                       (origBody : Expr) (hyps : Array Expr) (substs : Array (Expr × Expr))
  | LetWaitForValue (n : Name) (t : Expr) (body : Expr)
  | MDataRecCallWaitForExpr (data : MData)
  | ProjWaitForExpr (n : Name) (idx : Nat)
@@ -379,14 +380,19 @@ def stackContinuity
         -- NOTE: evidence for the generic match instance is not needed
         stackContinuity xs e .unknown
 
-  | .MatchAltWaitForExpr params lctx mctx :: xs =>
+  | .MatchAltWaitForExpr params lctx mctx origBody hyps substs :: xs =>
        -- optExpr corresponds to the optimized match rhs
        -- continuity with optimizing next expression
-       -- TODO: proof reconstruction for match alternatives optimized w.r.t. a match context.
-       let e ← withLocalContext $ do mkExpr (← mkLambdaFVars' params optExpr)
+       -- NOTE: `hyps` are the equalities between the discriminants and the patterns of the alternative
+       -- (only when tracking proof terms), such that the evidence for the alternative can be consumed by
+       -- the congruence over the enclosing match application (see `resolveDepArgs`).
+       let (e, pf) ← withLocalContext $ do
+         let e ← mkExpr (← mkLambdaFVars' params optExpr)
+         if hyps.isEmpty || !(← isTracking) then return (e, EqPf.unknown)
+         return (e, ← matchAltCongr params hyps substs origBody optExpr pf)
        resetMatchContext mctx
        resetLocalDeclContext lctx
-       stackContinuity xs e .unknown
+       stackContinuity xs e pf
 
   | .LetWaitForValue n t body :: xs =>
        -- optExpr corresponds to the optimized let value

@@ -2,6 +2,7 @@ import Lean
 import Blaster.Optimize.Telescope
 import Blaster.Reconstruct.Types
 import Blaster.Reconstruct.Lemmas
+import Blaster.Reconstruct.Match
 
 open Lean Meta Blaster.Optimize
 
@@ -44,6 +45,20 @@ def isHole? (e : Expr) : Option Nat :=
                   | some (.ofNat n) => some n
                   | _ => none
   | _ => none
+
+/-- Return `true` if `e` is a fallback region (see `fallbackKey`). -/
+def isFallback (e : Expr) : Bool :=
+  match e with
+  | .mdata d _ => d.getBool fallbackKey
+  | _ => false
+
+/-- Return `true` if `e` contains at least one proof obligation. -/
+def hasHoles (e : Expr) : Bool :=
+  (e.find? fun s => (isHole? s).isSome).isSome
+
+/-- Mark `p` as a fallback region when it contains proof obligations (see `fallbackKey`). -/
+def mkFallback (p : Expr) : Expr :=
+  if hasHoles p then mkMData (KVMap.empty.insert fallbackKey (.ofBool true)) p else p
 
 /-- Return a short description of the head symbol of `e` (used to label proof obligations). -/
 def headSymbol (e : Expr) : String :=
@@ -304,11 +319,13 @@ def addArgEvidence
         match ← congrArgAt f args idx pfArg with
         | .unknown => return .depArgs pf #[(idx, orig, pfArg)]
         | r => pf.trans r
-    | .lamBody _ | .depArgs .. => return .depArgs pf #[(idx, orig, pfArg)]
+    | .lamBody _ | .depArgs .. | .matchAlt _ => return .depArgs pf #[(idx, orig, pfArg)]
 
 /-- Resolve pending dependent rewrites on the arguments of `f a₁ ... aₙ` (see `addArgEvidence`).
     The following applications are currently supported:
       - `Blaster.dite' c t e`: via `dite'_congr` (when the condition has been rewritten).
+      - `match` and `casesOn` applications: via the matcher's splitter, when alternatives have been
+        rewritten under the match context (see `mkMatchCongr`).
 -/
 def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT EqPf := do
   match pf with
@@ -338,6 +355,22 @@ def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT Eq
           let p := mkAppN (mkConst ``Blaster.Reconstruct.dite'_congr us)
                      #[args[0]!, c, args[1]!, t, e, args[2]!, args[3]!, hc, ht, he]
           some <$> (args.extract 4 args.size).foldlM (init := p) fun acc a => mkCongrFun acc a
+      | .const _ _ =>
+          let lhs := mkAppN f (pargs.foldl (fun acc (i, a, _) => acc.set! i a) args)
+          let some app ← matchMatcherApp? lhs (alsoCasesOn := true) | return none
+          let firstAlt := app.params.size + 1 + app.discrs.size
+          let mut altPfs := #[]
+          -- only alternatives are expected to be rewritten
+          for (i, _, p) in pargs do
+            if (i < firstAlt || i ≥ firstAlt + app.alts.size) && !p.isDefEq then return none
+          for i in [firstAlt : firstAlt + app.alts.size] do
+            match (argPf pargs i).2 with
+            | .defeq => altPfs := altPfs.push none
+            | .matchAlt p => altPfs := altPfs.push (some p)
+            | _ => return none
+          -- NOTE: the congruence is a fallback region, i.e., it is replaced with the coarse proof
+          -- obligation `lhs = f args` when one of the obligations of the alternatives is not discharged.
+          return some (mkFallback (← mkMatchCongr lhs (args.extract firstAlt (firstAlt + app.alts.size)) altPfs))
       | _ => return none
 
     /-- Return a proof of `∀ h : τ, b (_ : orig) = b' h` for a dite' branch rewritten to `b'`.
@@ -539,6 +572,51 @@ def mkApplyDiteProof
   let v ← getLevel retType
   return mkAppN (mkConst ``Blaster.Reconstruct.apply_dite' [u, v]) #[sort, retType, g, c, t, e]
 
+/-! ## Match alternatives -/
+
+/-- Given a match alternative `fun params => origBody` optimized to `fun params => optExpr` such that:
+      - `hyps` are the equalities `dⱼ = pⱼ` between the discriminants and the patterns of the alternative;
+      - `substs` are the pairs `(x, h)` such that pattern variable `x` has been substituted by
+        discriminant `d` in `origBody` before optimization, with `h : d = x`;
+      - `pf : origBody[d/x] = optExpr`;
+    return `EqPf.matchAlt p` with `p : ∀ params hyps, origBody = optExpr`.
+    The proof obligations in `pf` (if any) are generated in the local context of the alternative,
+    i.e., with `params` and `hyps` available.
+-/
+def matchAltCongr
+  (params hyps : Array Expr) (substs : Array (Expr × Expr)) (origBody optExpr : Expr) (pf : EqPf) :
+  TranslateEnvT EqPf := do
+  if hyps.any (fun h => optExpr.containsFVar h.fvarId!) then return .unknown
+  -- evidence for `origBody = origBody[d/x]`
+  let some (substPf, body) ← tryInLocalContext (substsPf origBody) | return .unknown
+  let pf ← pf.close body optExpr .frame "matchAlt"
+  let pf ← substPf.trans pf
+  let r ← tryInLocalContext do
+    let p ← match pf with
+            | .defeq => mkEqRefl origBody
+            | .proof p => pure p
+            | _ => throwError "matchAltCongr: unexpected evidence"
+    mkLambdaFVars (params ++ hyps) p
+  match r with
+  | some p => return .matchAlt p
+  | none => return .unknown
+
+  where
+    substsPf (b : Expr) : MetaM (EqPf × Expr) := do
+      let mut cur := b
+      let mut pf := EqPf.defeq
+      for (x, h) in substs do
+        let some (_, d, _) := (← inferType h).eq? | throwError "matchAltCongr: equality expected"
+        let next := cur.replaceFVar x d
+        if next == cur then continue
+        let motive := mkLambda `z .default (← inferType x) (cur.abstract #[x])
+        let step ← mkCongrArg motive (← mkEqSymm h)
+        match pf with
+        | .proof p => pf := .proof (← mkEqTrans p step)
+        | _ => pf := .proof step
+        cur := next
+      return (pf, cur)
+
 /-! ## Rule steps
 
 Rewriting rules may record a justification for the rewrites they perform via `recordStep`.
@@ -567,6 +645,19 @@ def recordStepM (lhs rhs : Expr) (p : TranslateEnvT Expr) : TranslateEnvT Unit :
   if lhs == rhs then return
   let some p ← tryInLocalContext p | return
   modify fun env => { env with recon.stepLog := env.recon.stepLog.push (lhs, rhs, .proof p) }
+
+/-- Record that `lhs` has been rewritten to `rhs` with `p : lhs' = rhs'` such that `lhs'` (resp. `rhs'`) is
+    definitionally equal to `lhs` (resp. `rhs`) with default transparency (e.g., up to matcher reduction).
+    The proof is computed lazily and nothing is recorded when the check fails.
+-/
+@[always_inline, inline]
+def recordDefEqHint (lhs rhs : Expr) (p : MetaM Expr) : TranslateEnvT Unit :=
+  recordStepM lhs rhs do
+    let p ← p
+    let eq ← mkEq lhs rhs
+    unless ← withTransparency .default (isDefEq (← inferType p) eq) do
+      throwError "recordDefEqHint: type mismatch"
+    mkExpectedTypeHint p eq
 
 /-- Record that `lhs` has been rewritten to `rhs` with `thm args : lhs = rhs` and return `rhs`.
     This is the main helper used by rewriting rules to justify the rewrites they perform.

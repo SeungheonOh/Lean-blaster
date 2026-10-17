@@ -2,6 +2,7 @@ import Lean
 import Blaster.Reconstruct.Types
 import Blaster.Reconstruct.Proof
 import Blaster.Reconstruct.Lemmas
+import Blaster.Reconstruct.Match
 
 open Lean Meta Elab Term Tactic
 
@@ -32,6 +33,12 @@ def DischargeStats.record (s : DischargeStats) (method : String) (label : String
   let m := s.byLabel.getD label {}
   { s with byMethod := s.byMethod.insert method (s.byMethod.getD method 0 + 1),
            byLabel := s.byLabel.insert label (m.insert method (m.getD method 0 + 1)) }
+
+def DischargeStats.merge (s t : DischargeStats) : DischargeStats :=
+  let byMethod := t.byMethod.fold (init := s.byMethod) fun acc m n => acc.insert m (acc.getD m 0 + n)
+  let byLabel := t.byLabel.fold (init := s.byLabel) fun acc l ms =>
+    acc.insert l (ms.fold (init := acc.getD l {}) fun acc' m n => acc'.insert m (acc'.getD m 0 + n))
+  { total := s.total + t.total, byMethod, failures := s.failures ++ t.failures, byLabel }
 
 def DischargeStats.summary (s : DischargeStats) : String :=
   let entries := s.byMethod.toList.toArray.qsort (fun a b => a.1 < b.1)
@@ -78,15 +85,20 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
   -- would process the info trees).
   let infoState ← getInfoState
   let msgs ← Core.getMessageLog
-  let r ← attempt budget do
-    let mvar ← mkFreshExprMVar type
-    -- NOTE: asynchronous elaboration is disabled such that kernel errors on auxiliary declarations
-    -- created by tactics are reported as exceptions instead of messages.
-    let gs ← withOptions (fun o => Elab.async.set o false) <|
-               withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
-    let prf ← instantiateMVars mvar
-    if !gs.isEmpty || prf.hasMVar || prf.hasSorry then return none
-    return some prf
+  -- NOTE: Diagnostics reported asynchronously during an attempt (e.g., failures when generating the
+  -- equations of a matcher via `realizeConst`) are discarded, as they don't affect the resulting proof.
+  let tasks := (← getThe Core.State).snapshotTasks
+  let r ← try
+      attempt budget do
+        let mvar ← mkFreshExprMVar type
+        -- NOTE: asynchronous elaboration is disabled such that kernel errors on auxiliary declarations
+        -- created by tactics are reported as exceptions instead of messages.
+        let gs ← withOptions (fun o => Elab.async.set o false) <|
+                   withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
+        let prf ← instantiateMVars mvar
+        if !gs.isEmpty || prf.hasMVar || prf.hasSorry then return none
+        return some prf
+    finally modifyThe Core.State fun st => { st with snapshotTasks := tasks }
   if r.isNone then s.restore
   setInfoState infoState
   Core.setMessageLog msgs
@@ -756,10 +768,138 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("induction", ← `(tactic| blaster_funind))
   ]
 
+/-! ## Case analysis driven by stuck `match` applications
+
+The splitter of a matcher with many overlapping patterns may not be generated within Lean's
+heartbeat budget (see `getEquationsFor?`), i.e., `split` cannot be used. Instead, `blaster_match_cases`
+performs case analysis on the variables `match` applications are stuck on, until they reduce by iota.
+-/
+
+/-- Maximum number of goals produced by `blaster_match_cases`. -/
+def maxMatchCaseGoals : Nat := 1024
+
+/-- Return the free variable `e` is stuck on (after weak head normalization), if any.
+    NOTE: stuck `match` applications are reduced to their `casesOn` decision tree. -/
+partial def stuckFVar? (e : Expr) (fuel : Nat := 16) : MetaM (Option FVarId) := do
+  if fuel == 0 then return none
+  let e ← whnf e
+  match e.getAppFn with
+  | .fvar fv => return if e.isFVar then some fv else none
+  | .proj _ _ s => stuckFVar? s (fuel - 1)
+  | .const n _ =>
+      let args := e.getAppArgs
+      if let some r ← stuckMatch? n e then return r
+      if let some projInfo ← getProjectionFnInfo? n then
+        if h : projInfo.numParams < args.size then return ← stuckFVar? args[projInfo.numParams] (fuel - 1)
+        return none
+      match ← getConstInfo n with
+      | .recInfo recVal =>
+          if h : recVal.getMajorIdx < args.size then stuckFVar? args[recVal.getMajorIdx] (fuel - 1)
+          else return none
+      | _ =>
+          if let some e' ← unfoldDefinition? e then return ← stuckFVar? e' (fuel - 1)
+          -- e.g., `Nat.beq n 0` (decidable equality of literal patterns): case analysis on an argument
+          for a in args do
+            let a ← whnf a
+            if let .fvar fv := a then
+              let t ← whnfR (← fv.getType)
+              if let .const tn _ := t.getAppFn then
+                if (← getEnv).isConstructor tn then continue
+                if let .inductInfo _ ← getConstInfo tn then return some fv
+          return none
+  | _ => return none
+where
+  /-- Same as `reduceMatcher?` but the stuck term is examined within the scope of the alternatives. -/
+  stuckMatch? (n : Name) (e : Expr) : MetaM (Option (Option FVarId)) := do
+    let some info ← getMatcherInfo? n | return none
+    let args := e.getAppArgs
+    let prefixSz := info.numParams + 1 + info.numDiscrs
+    if args.size < prefixSz + info.numAlts then return none
+    let .const _ us := e.getAppFn | return none
+    let f ← instantiateValueLevelParams (← getConstInfo n) us
+    let auxApp := mkAppN f (args.extract 0 prefixSz)
+    forallBoundedTelescope (← inferType auxApp) info.numAlts fun hs _ => do
+      let aux ← whnf (mkAppN auxApp hs)
+      if hs.contains aux.getAppFn then return some none
+      return some (← stuckFVar? aux (fuel - 1))
+
+/-- Return the `match` applications of `e` without loose bound variables. -/
+partial def collectMatchApps (env : Environment) (e : Expr) (acc : Array Expr := #[]) : Array Expr :=
+  let acc := if !e.hasLooseBVars && e.isApp && (e.getAppFn.constName?.map (Meta.isMatcherCore env)).getD false
+             then acc.push e else acc
+  match e with
+  | .app f a => collectMatchApps env a (collectMatchApps env f acc)
+  | .mdata _ b | .proj _ _ b => collectMatchApps env b acc
+  | .forallE _ t b _ | .lam _ t b _ => collectMatchApps env b (collectMatchApps env t acc)
+  | .letE _ t v b _ => collectMatchApps env b (collectMatchApps env v (collectMatchApps env t acc))
+  | _ => acc
+
+/-- Return the first free variable a `match` application of `e` is stuck on. -/
+def findMatchStuckFVar? (e : Expr) : MetaM (Option FVarId) := do
+  let lctx ← getLCtx
+  for m in collectMatchApps (← getEnv) e do
+    if let some fv ← observing? (stuckFVar? m) then
+      if let some fv := fv then
+        if lctx.contains fv && !(← fv.isLetVar) then return some fv
+  return none
+
+syntax (name := blasterMatchCases) "blaster_match_cases" : tactic
+
+/-- Perform case analysis on the variables `match` applications (in the goal or hypotheses) are stuck on
+    (bounded by `maxMatchCaseGoals`). -/
+@[tactic blasterMatchCases] def evalBlasterMatchCases : Tactic := fun _ => do
+  let mut todo := [← getMainGoal]
+  let mut done := #[]
+  while !todo.isEmpty do
+    let g :: rest := todo | break
+    todo := rest
+    let fv? ← g.withContext do
+      if let some fv ← findMatchStuckFVar? (← instantiateMVars (← g.getType)) then return some fv
+      for d in ← getLCtx do
+        if d.isImplementationDetail then continue
+        if let some fv ← findMatchStuckFVar? (← instantiateMVars d.type) then return some fv
+      return none
+    match fv? with
+    | none => done := done.push g
+    | some fv =>
+        let subgoals ← g.cases fv
+        todo := subgoals.toList.map (·.mvarId) ++ todo
+    if done.size + todo.length > maxMatchCaseGoals then throwError "blaster_match_cases: too many goals"
+  replaceMainGoal done.toList
+
+/-- Case analysis on the variables stuck `match` applications depend on (`blaster_match_cases`), then
+    reduction by iota and arithmetic. -/
+def matchCasesTactic : TermElabM (TSyntax `tactic) :=
+  `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> blaster_match_cases <;>
+              (try dsimp only at *) <;>
+              first | rfl | omega | (simp_all; done) | decide
+                    | (simp only [Int.ofNat_eq_coe, Int.toNat_natCast, Nat.succ_eq_add_one,
+                                  Nat.zero_add, Nat.add_sub_cancel] at * <;>
+                       first | omega | grind)
+                    | grind))
+
+/-- Maximum number of nested case splits over `match` alternatives (see `proveByMatchCases`). -/
+def matchCasesDepth : Nat := 2
+
+/-- Maximum number of alternatives considered for a case split over a `match` (see `proveByMatchCases`). -/
+def matchCasesMaxAlts : Nat := 32
+
+/-- Given a `match` application `m` with discriminants `ds` and `rhs`, return `rhs` with the occurrences
+    of the discriminants abstracted, i.e., `rhsFn xs := rhs[xs/ds]`.
+-/
+def abstractDiscrs (ds : Array Expr) (rhs : Expr) : MetaM Expr := do
+  let types ← ds.mapM inferType
+  withLocalDeclsDND (types.map (`x, ·)) fun ys => do
+    let mut r := rhs
+    for d in ds, y in ys do
+      r := (← kabstract r d).instantiate1 y
+    return r.abstract ys
+
+mutual
 /-- Try to discharge proof obligation `type` (expected to be an equality) and return
     the proof together with the method used.
 -/
-def dischargeOne (type : Expr) : TermElabM (Option (Expr × String)) := do
+partial def dischargeOne (type : Expr) (depth := matchCasesDepth) : TermElabM (Option (Expr × String)) := do
   let type ← instantiateMVars type
   -- ill-typed proof obligations (e.g., due to ill-typed optimized expressions) can't be discharged
   if !(← isTypeCorrectObligation type) then
@@ -783,7 +923,51 @@ def dischargeOne (type : Expr) : TermElabM (Option (Expr × String)) := do
   if !large then
     if let some prf ← proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats) then
       return some (prf, "cases")
+  if let some prf ← proveByMatchCases type depth then return some (prf, "match cases")
+  -- case analysis on the variables stuck `match` applications depend on (no splitter needed)
+  if depth == matchCasesDepth then
+    if (collectMatchApps (← getEnv) type).size > 0 then
+      if let some prf ← proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats) then
+        return some (prf, "match cases")
   return none
+
+/-- Try to discharge `m = rhs` (or `rhs = m`) with `m` a `match` application by a case split over the
+    alternatives of `m` via its splitter (see `mkMatchCasesProof`). The obligation for each alternative,
+    i.e., `altᵢ args = rhs[pᵢ/ds]`, is discharged in a local context with the equalities between the
+    discriminants and the patterns, as well as the overlap hypotheses of the splitter.
+-/
+partial def proveByMatchCases (type : Expr) (depth : Nat) : TermElabM (Option Expr) := do
+  if depth == 0 then return none
+  let some (_, lhs, rhs) := type.eq? | return none
+  let (m, other, symm) ←
+    if ← isMatchCasesApp lhs then pure (lhs, rhs, false)
+    else if ← isMatchCasesApp rhs then pure (rhs, lhs, true)
+    else return none
+  let some app ← matchMatcherApp? m (alsoCasesOn := true) | return none
+  if app.alts.size > matchCasesMaxAlts then return none
+  let altPf (_ : Nat) (_ : Array Expr) (_ : Array Expr) (alt rhsᵢ : Expr) : TermElabM Expr := do
+    let goal ← mkEq alt rhsᵢ
+    match ← dischargeOne goal (depth - 1) with
+    | some (p, _) => return p
+    | none => throwError "proveByMatchCases: alternative not discharged"
+  let attemptWith (rhsFn : Array Expr → MetaM Expr) : TermElabM (Option Expr) := do
+    let s ← saveState
+    let r ← attempt dischargeHeartbeats do
+      try
+        let p ← mkMatchCasesProof m (fun xs => rhsFn xs) altPf
+        let p ← if symm then mkEqSymm p else pure p
+        if ← isDefEq (← inferType p) type then return some p
+        return none
+      catch _ => return none
+    if r.isNone then s.restore
+    return r
+  -- substitute the patterns for the discriminants in `rhs` first
+  let abst? ← try some <$> abstractDiscrs app.discrs other catch _ => pure none
+  if let some abst := abst? then
+    if abst.hasLooseBVars then
+      if let some p ← attemptWith (fun xs => pure (abst.instantiateRev xs)) then return some p
+  attemptWith (fun _ => pure other)
+end
 
 /-- Return the type of a hole, i.e., `t` in `mdata {blaster.hole := _} (sorryAx t _)`. -/
 def holeType? (e : Expr) : Option Expr := do
@@ -791,10 +975,6 @@ def holeType? (e : Expr) : Option Expr := do
   match e.consumeMData with
   | .app (.app (.const ``sorryAx _) t) _ => some t
   | _ => none
-
-/-- Return `true` if `e` contains at least one proof obligation. -/
-def hasHoles (e : Expr) : Bool :=
-  (e.find? fun s => (isHole? s).isSome).isSome
 
 /-- Generalize a discharged equation `prf : type` over the free variables it depends on, i.e., return
     `(∀ xs, type, fun xs => prf)`. Used to reuse equivalences of recursive functions as lemmas.
@@ -833,13 +1013,48 @@ def proveEquivalences (equivs : Array (Expr × Expr)) : TermElabM (Array (Expr �
     if let some fact := r then facts := facts.push fact
   return facts
 
+/-- Traverse `e` and replace each subterm `s` such that `f s = some r` with `r`.
+    NOTE: Unlike `Meta.transform`, results are only shared within the same binder scope. Proof obligations
+    are closed terms, but their proofs may depend on the hypotheses of the local context (e.g., `simp [*]`).
+    Hence, the same obligation occurring under different binders must be discharged in each context.
+-/
+partial def transformScoped (e : Expr) (f : Expr → TermElabM (Option Expr)) : TermElabM Expr := do
+  go (← IO.mkRef {}) e
+where
+  go (cache : IO.Ref (Std.HashMap ExprStructEq Expr)) (e : Expr) : TermElabM Expr := do
+    if let some r := (← cache.get).get? e then return r
+    let r ← match ← f e with
+      | some r => pure r
+      | none => visit cache e
+    cache.modify (·.insert e r)
+    return r
+
+  visit (cache : IO.Ref (Std.HashMap ExprStructEq Expr)) (e : Expr) : TermElabM Expr := do
+    match e with
+    | .app fn a => return e.updateApp! (← go cache fn) (← go cache a)
+    | .mdata _ b => return e.updateMData! (← go cache b)
+    | .proj _ _ b => return e.updateProj! (← go cache b)
+    | .lam n t b bi =>
+        let t ← go cache t
+        withLocalDecl n bi t fun x => do mkLambdaFVars #[x] (← go (← IO.mkRef {}) (b.instantiate1 x))
+    | .forallE n t b bi =>
+        let t ← go cache t
+        withLocalDecl n bi t fun x => do mkForallFVars #[x] (← go (← IO.mkRef {}) (b.instantiate1 x))
+    | .letE n t v b _ =>
+        let t ← go cache t
+        let v ← go cache v
+        withLetDecl n t v fun x => do mkLetFVars #[x] (← go (← IO.mkRef {}) (b.instantiate1 x))
+    | _ => return e
+
 /-- Discharge all the proof obligations in `p`.
     Return the updated proof term and the discharge statistics. Proof obligations that cannot be
     discharged are left unchanged in the returned proof term.
     NOTE: A second pass is performed on the remaining obligations, using the equivalences between
     recursive functions proved during the first pass as hypotheses (nested equivalences).
+    NOTE: A fallback region `r : lhs = rhs` (see `fallbackKey`) is replaced with a proof of `lhs = rhs`
+    discharged as a whole when one of its proof obligations cannot be discharged.
 -/
-def dischargeHoles
+partial def dischargeHoles
   (p : Expr) (holes : Array HoleInfo := #[]) (equivs : Array (Expr × Expr) := #[]) :
   TermElabM (Expr × DischargeStats) := do
   let stats ← IO.mkRef ({} : DischargeStats)
@@ -849,9 +1064,9 @@ def dischargeHoles
     | some idx => if h : idx < holes.size then holes[idx].label else "top"
     | none => "top"
   -- first pass
-  let p' ← Meta.transform p (pre := fun e => do
+  let p' ← transformScoped p fun e => do
     match holeType? e with
-    | none => return .continue
+    | none => return none
     | some type =>
         let label := labelOf e
         stats.modify fun s => { s with total := s.total + 1 }
@@ -860,30 +1075,55 @@ def dischargeHoles
             stats.modify (·.record method label)
             if label.startsWith "rule:recFunEquiv" then
               if let some f ← generalizeFact type prf then facts.modify (·.push f)
-            return .done prf
-        | none => return .done e)
-  -- second pass (with proved equivalences as hypotheses) and failure reporting
-  let facts ← facts.get
-  let p' ← Meta.transform p' (pre := fun e => do
-    match holeType? e with
-    | none => return .continue
-    | some type =>
-        let label := labelOf e
-        if let some prf ← dischargeWithFacts type facts then
-          stats.modify (·.record "induction+facts" label)
-          return .done prf
-        -- NOTE: unsound eliminations of unused binders are reported separately
-        let unsound ← try isUnsoundBinderElim type catch _ => pure false
-        stats.modify (·.record (if unsound then "refused:unsound" else "failed") label)
-        if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then
-          let g ← mkFreshExprMVar type
-          logInfo m!"[{label}] unresolved proof obligation:\n{← Meta.ppGoal g.mvarId!}"
-        let lctx ← getLCtx
-        let dangling := (type.find? fun s => s.isFVar && !lctx.contains s.fvarId!).isSome
-        let msg ← addMessageContext (if dangling then m!"{type} (out of scope variables)" else m!"{type}")
-        stats.modify fun s => { s with failures := s.failures.push msg }
-        return .done e)
-  return (p', ← stats.get)
+            return some prf
+        | none => return some e
+  -- second pass (with proved equivalences as hypotheses), fallback regions and failure reporting
+  let (p', st) ← secondPass (← facts.get) labelOf p'
+  return (p', (← stats.get).merge st)
+
+  where
+    secondPass (facts : Array (Expr × Expr)) (labelOf : Expr → String) (p : Expr) :
+      TermElabM (Expr × DischargeStats) := do
+      let stats ← IO.mkRef ({} : DischargeStats)
+      let p' ← transformScoped p fun e => do
+        if isFallback e then
+          let inner := e.consumeMData
+          let (inner', st) ← secondPass facts labelOf inner
+          if st.failures.isEmpty && !hasHoles inner' then
+            stats.modify (·.merge st)
+            return some inner'
+          -- discharge the region as a whole
+          if let some type ← observing? (do instantiateMVars (← inferType inner)) then
+            let label := s!"fallback:{headSymbol (type.eq?.map (·.2.1) |>.getD type)}"
+            stats.modify fun s => { s with total := s.total + 1 }
+            if let some (prf, method) ← dischargeOne type then
+              stats.modify (·.record method label)
+              return some prf
+            if let some prf ← dischargeWithFacts type facts then
+              stats.modify (·.record "induction+facts" label)
+              return some prf
+            stats.modify (·.record "failed" label)
+          stats.modify (·.merge st)
+          return some inner'
+        match holeType? e with
+        | none => return none
+        | some type =>
+            let label := labelOf e
+            if let some prf ← dischargeWithFacts type facts then
+              stats.modify (·.record "induction+facts" label)
+              return some prf
+            -- NOTE: unsound eliminations of unused binders are reported separately
+            let unsound ← try isUnsoundBinderElim type catch _ => pure false
+            stats.modify (·.record (if unsound then "refused:unsound" else "failed") label)
+            if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then
+              let g ← mkFreshExprMVar type
+              logInfo m!"[{label}] unresolved proof obligation:\n{← Meta.ppGoal g.mvarId!}"
+            let lctx ← getLCtx
+            let dangling := (type.find? fun s => s.isFVar && !lctx.contains s.fvarId!).isSome
+            let msg ← addMessageContext (if dangling then m!"{type} (out of scope variables)" else m!"{type}")
+            stats.modify fun s => { s with failures := s.failures.push msg }
+            return some e
+      return (p', ← stats.get)
 
 /-! ## Seeded quantifier instantiation
 
@@ -1028,6 +1268,8 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("split", ← `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> (repeat' split) <;>
                           (try simp_all) <;> first | done | omega | grind))),
     -- existential goals: witness search
+    -- case analysis on the variables `match` applications are stuck on
+    ("match cases", ← matchCasesTactic),
     ("exists", ← `(tactic| (intros <;> blaster_denorm <;> blaster_exists))),
     -- recursive functions: unfolding equation lemmas (e.g., `f (n + 1) = ...`)
     ("unfold", ← `(tactic| (intros <;> blaster_denorm <;>
