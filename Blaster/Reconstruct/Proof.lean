@@ -331,6 +331,38 @@ def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT Eq
             mkLambdaFVars #[h] (← mkEqRefl (mkApp b' h))
       | _ => return none
 
+/-- Return `true` if `e` contains a proof obligation (see `mkHole`). -/
+def containsHole (e : Expr) : Bool :=
+  (e.find? fun s => (isHole? s).isSome).isSome
+
+/-- Given `c` a proposition rewritten to `True` (resp. `False`) with evidence `pf`, return a proof of
+    `c` (resp. `¬ c`) that can be used inside expressions, i.e., without proof obligations.
+-/
+def constCondProof (c : Expr) (pf : EqPf) (isTrue : Bool) : TranslateEnvT (Option Expr) := do
+  match pf with
+  | .defeq =>
+      return some (if isTrue then mkConst ``True.intro else mkConst ``not_false)
+  | .proof p =>
+      if !containsHole p then
+        return some (mkApp2 (mkConst (if isTrue then ``of_eq_true else ``of_eq_false)) c p)
+      decideProof
+  | _ => decideProof
+  where
+    /-- Proof by evaluation when `c` is closed and decidable. -/
+    decideProof : TranslateEnvT (Option Expr) := do
+      if c.hasFVar || c.hasMVar then return none
+      let r ← tryInLocalContext do
+        let .some inst ← trySynthInstance (mkApp (mkConst ``Decidable) c) | return none
+        let b := toExpr isTrue
+        let ok ← tryCatchRuntimeEx
+          (withCurrHeartbeats <| withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 20000 * 1000 }) <|
+             withTransparency .default <| isDefEq (mkApp2 (mkConst ``Decidable.decide) c inst) b)
+          (fun _ => return false)
+        if !ok then return none
+        let refl := mkApp2 (mkConst ``Eq.refl [levelOne]) (mkConst ``Bool) b
+        return some (mkApp3 (mkConst (if isTrue then ``of_decide_eq_true else ``of_decide_eq_false)) c inst refl)
+      return r.join
+
 /-! ## Proof builders for function propagation over `Blaster.dite'` -/
 
 /-- Return a proof of `dite' c t e x₁ ... xₙ = dite' c (fun h => t h x₁ ... xₙ) (fun h => e h x₁ ... xₙ)`

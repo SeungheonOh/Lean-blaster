@@ -254,8 +254,14 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
 def dischargeOne (type : Expr) : TermElabM (Option (Expr × String)) := do
   let type ← instantiateMVars type
   -- ill-typed proof obligations (e.g., due to ill-typed optimized expressions) can't be discharged
-  if !(← isTypeCorrectObligation type) then return none
+  if !(← isTypeCorrectObligation type) then
+    if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then
+      try Meta.check type catch ex => logInfo m!"ill-typed proof obligation: {ex.toMessageData}"
+    return none
   if let some prf ← proveByDefEq type then return some (prf, "rfl")
+  -- closed obligations (e.g., concrete computations) are decided by kernel evaluation
+  if !type.hasFVar && !type.hasMVar then
+    if let some prf ← proveWithTactic type (← `(tactic| decide +kernel)) then return some (prf, "decide")
   for (name, tac) in (← dischargeTactics) do
     if let some prf ← proveWithTactic type tac then return some (prf, name)
   return none

@@ -368,3 +368,15 @@ theorem apply_dite' {α : Sort u} {β : Sort v} (g : α → β) (c : Prop) (t : 
   by_cases h : c <;> simp [h]
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## `Blaster.dite'` with a constant condition (see `optimizeDITEChoice`) -/
+
+theorem dite'_pos {α : Sort u} (c : Prop) (t : c → α) (e : ¬ c → α) (h : c) : Blaster.dite' c t e = t h := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; simp [h]
+
+theorem dite'_neg {α : Sort u} (c : Prop) (t : c → α) (e : ¬ c → α) (h : ¬ c) : Blaster.dite' c t e = e h := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; simp [h]
+
+end Blaster.Reconstruct

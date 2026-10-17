@@ -252,6 +252,11 @@ def stackContinuity
        -- NOTE: keep matchInfo to avoid unnecessary query and to avoid optimizing discriminators again
        let orig := args[1]!
        let args := args.set! 1 optExpr
+       -- NOTE: when tracking proof terms, a dite' with a condition reduced to `True`/`False` is
+       -- reduced with a proof of the original condition (instead of `True.intro`), such that the
+       -- resulting expression is well-typed.
+       if let some (r, rpf) ← constDiteChoice? orig pf apf then
+         return Sum.inl (← pushTrans r rpf xs)
        let apf ← addArgEvidence f args 1 orig pf apf
        clearSteps
        if let some r ← optimizeDITEChoice f args then
@@ -354,6 +359,25 @@ def stackContinuity
   | _ => throwEnvError "stackContinuity: unexpected optimize stack continuity {reprStr stack} !!!"
 
   where
+    /-- When tracking proof terms and the condition of `dite' c t e x₁ ... xₙ` has been rewritten to
+        `True` (resp. `False`), return `t h x₁ ... xₙ` (resp. `e h x₁ ... xₙ`) with `h` a proof of `c`
+        (resp. `¬ c`), together with the evidence of the rewrite.
+    -/
+    constDiteChoice? (orig : Expr) (pf : EqPf) (apf : EqPf) : TranslateEnvT (Option (Expr × EqPf)) := do
+      let .DiteChoiceWaitForCond f args _ _ _ :: _ := stack | return none
+      if !(← isTracking) || args.size < 4 then return none
+      let isTrue := optExpr.isConstOf ``True
+      if !isTrue && !optExpr.isConstOf ``False then return none
+      let some h ← withLocalContext (constCondProof orig pf isTrue) | return none
+      let branch := if isTrue then args[2]! else args[3]!
+      let extraArgs := args.extract 4 args.size
+      let r := mkAppN (betaLambda branch #[h]) extraArgs
+      let lemma := mkAppN (mkConst (if isTrue then ``Blaster.Reconstruct.dite'_pos else ``Blaster.Reconstruct.dite'_neg)
+                    f.constLevels!) #[args[0]!, orig, args[2]!, args[3]!, h]
+      let some p ← tryInLocalContext (extraArgs.foldlM (init := lemma) fun acc a => mkCongrFun acc a)
+        | return none
+      return some (r, ← apf.trans (.proof p))
+
     /-- Given a function `f := Expr const n l` perform the following:
          - When `n := mInfo ∈ isMatcherCache` (i.e., match info already optimized)
              - return `none`

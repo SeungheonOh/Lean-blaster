@@ -111,7 +111,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
          else optimizeExprAux (.AppOptimizeExplicitArgs f args startIdx args.size pInfo none pf :: xs)
 
        else if idx < pInfo.paramsInfo.size -- handle case when HOF is the returned type
-            then if !pInfo.paramsInfo[idx]!.isExplicit
+            then if !pInfo.paramsInfo[idx]!.isExplicit && !(← skipProofArg pInfo idx)
                  then optimizeExprAux (.InitOptimizeExpr args[idx]! :: stack)
                  else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo pf :: xs)
             else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo pf :: xs)
@@ -183,6 +183,17 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
   | _ => throwEnvError "optimizeExprAux: unexpected optimize stack continuity {reprStr stack} !!!"
 
   where
+
+    /-- Return `true` when the argument at position `idx` is a proof that must not be optimized, i.e.,
+        only when tracking proof terms. Rewriting inside proofs is useless (proof irrelevance) and may
+        produce ill-typed proofs (e.g., when a proposition in an implicit argument is rewritten
+        but not the instances depending on it).
+    -/
+    @[always_inline, inline]
+    skipProofArg (pInfo : FunEnvInfo) (idx : Nat) : TranslateEnvT Bool := do
+      if h : idx < pInfo.paramsInfo.size then
+        if pInfo.paramsInfo[idx].isProp then return (← isTracking)
+      return false
 
     /-- Given `pf : lhs = f x₁ ... xₙ` and `r` the result of applying a rewriting rule on
         `f x₁ ... xₙ`, push `r` on the stack to be optimized while keeping track of the evidence for `lhs = r`.
@@ -257,6 +268,8 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
       (f : Expr) (args : Array Expr) (idx : Nat) (stopIdx : Nat)
       (pInfo : FunEnvInfo) (mInfo : Option MatchInfo) (pf : EqPf) (stack : List OptimizeStack)
       (nxtStack : List OptimizeStack) : TranslateEnvT (List OptimizeStack) := withLocalContext $ do
+      if ← skipProofArg pInfo idx then
+        return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: nxtStack)
       if isBlasterDiteConst f then
         if idx == 1 then
          -- skipping optimization for Blaster.dite' cond as already performed by choice reduction on dite
