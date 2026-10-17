@@ -48,7 +48,7 @@ def optimizeProjection? (n : Name) (idx : Nat) (s : Expr) : TranslateEnvT (Optio
       let retType ← inferTypeEnv (mkProj n idx s)
       let e1' ← updateDIteExprWithProj typeName idx pcond e1
       let e2' ← updateDIteExprWithProj typeName idx (mkApp (← mkPropNotOp) pcond) e2
-      return mkApp4 (← mkBlasterDIteOp) retType pcond e1' e2'
+      return (← mkBlasterDIteApp retType pcond e1' e2')
 
     updateRhsWithProj (typeName : Name) (idx : Nat) (lhs : Array Expr) (rhs : Expr) : TranslateEnvT Expr := do
       let altArgsRes ← retrieveAltsArgs lhs

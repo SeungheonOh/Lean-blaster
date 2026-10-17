@@ -34,6 +34,16 @@ theorem nat_beq_eq : Nat.beq = fun x y => x == y := by
   . have h1 := Nat.eq_of_beq_eq_true h
     simp [h1]
 
+theorem nat_beq_denorm (x y : Nat) : Nat.beq x y = decide (x = y) := by
+  cases h : Nat.beq x y
+  . exact (decide_eq_false (Nat.ne_of_beq_eq_false h)).symm
+  . exact (decide_eq_true (Nat.eq_of_beq_eq_true h)).symm
+
+theorem nat_ble_denorm (x y : Nat) : Nat.ble x y = decide (x ≤ y) := by
+  cases h : Nat.ble x y
+  . exact (decide_eq_false (fun h2 => by have := Nat.ble_eq_true_of_le h2; rw [h] at this; contradiction)).symm
+  . exact (decide_eq_true (Nat.le_of_ble_eq_true h)).symm
+
 theorem int_negSucc_eq : Int.negSucc = fun n => Int.neg (Int.ofNat (Nat.add 1 n)) := by
   funext n
   show Int.negSucc n = Int.neg (Int.ofNat (1 + n))
@@ -75,6 +85,12 @@ theorem nat_mul_eq (a b : Nat) : Nat.mul a b = a * b := rfl
 theorem nat_div_eq (a b : Nat) : Nat.div a b = a / b := rfl
 theorem nat_mod_eq (a b : Nat) : Nat.mod a b = a % b := rfl
 theorem nat_pow_eq (a b : Nat) : Nat.pow a b = a ^ b := rfl
+theorem string_append_eq (a b : String) : String.append a b = a ++ b := rfl
+theorem list_append_eq {α : Type u} (a b : List α) : List.append a b = a ++ b := rfl
+/-- Move numerals to the right of additions, i.e., the form expected by equation lemmas (`n + 1`). -/
+theorem nat_lit_add_comm (k : Nat) (n : Nat) :
+    @OfNat.ofNat Nat k (instOfNatNat k) + n = n + @OfNat.ofNat Nat k (instOfNatNat k) :=
+  Nat.add_comm _ _
 theorem int_add_eq (a b : Int) : Int.add a b = a + b := rfl
 theorem int_mul_eq (a b : Int) : Int.mul a b = a * b := rfl
 theorem int_neg_eq (a : Int) : Int.neg a = -a := rfl
@@ -91,6 +107,8 @@ macro "blaster_denorm" : tactic =>
               Blaster.Reconstruct.nat_div_eq, Blaster.Reconstruct.nat_mod_eq, Blaster.Reconstruct.nat_pow_eq,
               Blaster.Reconstruct.int_add_eq, Blaster.Reconstruct.int_mul_eq, Blaster.Reconstruct.int_neg_eq,
               Blaster.Reconstruct.int_ediv_eq, Blaster.Reconstruct.int_emod_eq, Blaster.Reconstruct.int_pow_eq,
+              Blaster.Reconstruct.nat_beq_denorm, Blaster.Reconstruct.nat_ble_denorm,
+              Blaster.Reconstruct.string_append_eq, Blaster.Reconstruct.list_append_eq,
               Int.ofNat_eq_coe] at *))
 
 namespace Blaster.Reconstruct
@@ -311,6 +329,22 @@ theorem int_mul_cancel_rl {x : Int} (y z : Int) (h : ¬ (0 = x)) : (Int.mul y x 
 theorem int_mul_cancel_rr {x : Int} (y z : Int) (h : ¬ (0 = x)) : (Int.mul y x = Int.mul z x) = (y = z) := by
   rw [show Int.mul y x = Int.mul x y from Int.mul_comm y x, show Int.mul z x = Int.mul x z from Int.mul_comm z x]
   exact int_mul_cancel_ll y z h
+/-- Cancellation lemmas in standard notation (used by `blaster_mul_cancel`). -/
+theorem nat_mul_cancel_ll' {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (x * y = x * z) = (y = z) := nat_mul_cancel_ll y z h
+theorem nat_mul_cancel_lr' {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (x * y = z * x) = (y = z) := nat_mul_cancel_lr y z h
+theorem nat_mul_cancel_rl' {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (y * x = x * z) = (y = z) := nat_mul_cancel_rl y z h
+theorem nat_mul_cancel_rr' {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (y * x = z * x) = (y = z) := nat_mul_cancel_rr y z h
+theorem int_mul_cancel_ll' {x : Int} (y z : Int) (h : ¬ (0 = x)) : (x * y = x * z) = (y = z) := int_mul_cancel_ll y z h
+theorem int_mul_cancel_lr' {x : Int} (y z : Int) (h : ¬ (0 = x)) : (x * y = z * x) = (y = z) := int_mul_cancel_lr y z h
+theorem int_mul_cancel_rl' {x : Int} (y z : Int) (h : ¬ (0 = x)) : (y * x = x * z) = (y = z) := int_mul_cancel_rl y z h
+theorem int_mul_cancel_rr' {x : Int} (y z : Int) (h : ¬ (0 = x)) : (y * x = z * x) = (y = z) := int_mul_cancel_rr y z h
+
+macro "blaster_mul_cancel" : tactic =>
+  `(tactic| simp (disch := omega) only [Blaster.Reconstruct.nat_mul_cancel_ll', Blaster.Reconstruct.nat_mul_cancel_lr',
+      Blaster.Reconstruct.nat_mul_cancel_rl', Blaster.Reconstruct.nat_mul_cancel_rr',
+      Blaster.Reconstruct.int_mul_cancel_ll', Blaster.Reconstruct.int_mul_cancel_lr',
+      Blaster.Reconstruct.int_mul_cancel_rl', Blaster.Reconstruct.int_mul_cancel_rr'] at *)
+
 theorem nat_zero_eq_mul {x y : Nat} (hx : ¬ (0 = x)) (hy : ¬ (0 = y)) : (0 = Nat.mul x y) = False :=
   propext ⟨fun h => by
     have := Nat.mul_eq_zero.mp h.symm

@@ -184,7 +184,7 @@ def funPropagation? (cf : Expr) (cargs : Array Expr) (skipPropCheck := false) (r
         let e1' ← pushFunInDIteExpr f args idxArg pcond e1
         let e2' ← pushFunInDIteExpr f args idxArg (mkApp (← mkPropNotOp) pcond) e2
         -- NOTE: we also need to set the sort type for the pulled dite' to meet the function's return type
-        let r := mkApp4 (← mkBlasterDIteOp) retType pcond e1' e2'
+        let r := (← mkBlasterDIteApp retType pcond e1' e2')
         Blaster.Reconstruct.withProofM (mkAppN f args) r
           (Blaster.Reconstruct.mkApplyDiteProof f args idxArg _psort pcond e1 e2 retType)
       else return none

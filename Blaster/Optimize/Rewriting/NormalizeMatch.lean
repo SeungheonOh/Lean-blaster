@@ -561,7 +561,7 @@ def normMatchExprAux?
      let lam1 := mkLambda hName BinderInfo.default condTerm thenExpr
      let notCond := mkApp (← mkPropNotOp) condTerm
      let lam2 := mkLambda hName BinderInfo.default notCond elseExpr
-     return (mkApp4 (← mkBlasterDIteOp) (getLambdaBody matchType) condTerm lam1 lam2)
+     return ((← mkBlasterDIteApp (getLambdaBody matchType) condTerm lam1 lam2))
 
 
 /-- A generic match expression rewriter that given a `MatchInfo` instance representing a match application,

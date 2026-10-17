@@ -52,7 +52,11 @@ def blasterTacticImp : Tactic := fun stx =>
        match task? with
        | some task =>
           if sOpts.reconstruct > 0 then
-            let outcome ← Reconstruct.reconstructSafe task task.recon
+            -- NOTE: reconstruction is not subject to the heartbeat limit of the enclosing declaration
+            let heartbeats ← IO.getNumHeartbeats
+            let outcome ← withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $
+              Reconstruct.reconstructSafe task task.recon
+            IO.setNumHeartbeats heartbeats
             Reconstruct.dumpStats outcome "tactic"
             Reconstruct.reportOutcome sOpts outcome
             match outcome.proof? with

@@ -236,7 +236,7 @@ def constMatchPropagation?
         let retType := getLambdaBody margs[mInfo.getFirstDiscrPos - 1]!
         let e1' ← pushMatchInDIteExpr cm margs idx e1
         let e2' ← pushMatchInDIteExpr cm margs idx e2
-        let diteExpr := mkApp4 (← mkBlasterDIteOp) retType pcond e1' e2'
+        let diteExpr := (← mkBlasterDIteApp retType pcond e1' e2')
         if extra_args.isEmpty
         then return diteExpr
         else return mkAppN diteExpr extra_args

@@ -54,16 +54,28 @@ def dischargeMaxRecDepth : Nat := 8192
 -/
 def attempt [Monad m] [MonadBacktrack s m] [MonadExcept Exception m] [MonadRuntimeException m]
   [MonadWithReaderOf Core.Context m] [MonadLiftT BaseIO m] [MonadControlT CoreM m]
+  [MonadStateOf Core.State m]
   (budget : Nat) (x : m (Option α)) : m (Option α) := do
   let st ← saveState
+  -- NOTE: asynchronous subtasks spawned by a failed attempt (e.g., the on-demand generation of
+  -- auxiliary lemmas) are discarded, such that their errors are not reported.
+  let tasks := (← getThe Core.State).snapshotTasks
+  let failed : m (Option α) := do
+    restoreState st
+    modifyThe Core.State fun s => { s with snapshotTasks := tasks }
+    return none
   tryCatchRuntimeEx
-    (withHeartbeatBudget budget <|
-       withTheReader Core.Context (fun ctx => { ctx with maxRecDepth := dischargeMaxRecDepth }) x)
-    (fun _ => do restoreState st; return none)
+    (do
+      let r ← withHeartbeatBudget budget <|
+        withTheReader Core.Context (fun ctx => { ctx with maxRecDepth := dischargeMaxRecDepth }) x
+      if r.isNone then failed else return r)
+    (fun _ => failed)
 
 /-- Try to close goal `type` with tactic `tac`. The elaboration state is restored on failure. -/
 def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHeartbeats) : TermElabM (Option Expr) := do
   let s ← saveState
+  -- NOTE: info trees produced by internal tactic runs are discarded (e.g., linters would process them).
+  let infoState ← getInfoState
   let r ← attempt budget do
     let mvar ← mkFreshExprMVar type
     -- NOTE: asynchronous elaboration is disabled such that kernel errors on auxiliary declarations
@@ -74,6 +86,7 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
     if !gs.isEmpty || prf.hasMVar || prf.hasSorry then return none
     return some prf
   if r.isNone then s.restore
+  setInfoState infoState
   return r
 
 /-- Try to prove `lhs = rhs` by definitional unfolding. -/
@@ -108,10 +121,10 @@ def isUserDefinition (env : Environment) (n : Name) : Bool := Id.run do
 
 syntax (name := blasterUnfoldUser) "blaster_unfold_user" : tactic
 
-/-- Unfold (up to 3 rounds) the user definitions occurring in the main goal and its hypotheses. -/
+/-- Unfold (up to 5 rounds) the user definitions occurring in the main goal and its hypotheses. -/
 @[tactic blasterUnfoldUser] def evalBlasterUnfoldUser : Tactic := fun _ => do
   let env ← getEnv
-  for _ in [0:3] do
+  for _ in [0:5] do
     if (← getGoals).isEmpty then return
     let g ← getMainGoal
     let mut t ← instantiateMVars (← g.getType)
@@ -119,42 +132,90 @@ syntax (name := blasterUnfoldUser) "blaster_unfold_user" : tactic
       if !d.isImplementationDetail then t := mkApp t (← instantiateMVars d.type)
     let consts := t.getUsedConstants.filter (isUserDefinition env)
     if consts.isEmpty then return
-    let lemmas ← consts.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
-    try evalTactic (← `(tactic| simp only [$lemmas,*] at *)) catch _ => return
+    -- NOTE: `simp` does not rewrite instance arguments, user instances (e.g., derived `BEq`
+    -- instances) are unfolded with `delta` instead.
+    let mut insts := #[]
+    let mut defs := #[]
+    for n in consts do
+      if ← isInstance n then insts := insts.push n else defs := defs.push n
+    let mut progress := false
+    if !insts.isEmpty then
+      let ids := insts.map mkIdent
+      try
+        evalTactic (← `(tactic| delta $ids* at *))
+        progress := true
+      catch _ => pure ()
+    if !defs.isEmpty then
+      let lemmas ← defs.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+      try
+        evalTactic (← `(tactic| simp only [$lemmas,*] at *))
+        progress := true
+      catch _ => pure ()
+    if !progress then return
 
 /-- Maximum number of goals produced by `blaster_cases_vars`. -/
 def maxCaseGoals : Nat := 128
 
-syntax (name := blasterCasesVars) "blaster_cases_vars" : tactic
+syntax (name := blasterCasesVars) "blaster_cases_vars" (num)? : tactic
+/-- Same as `blaster_cases_vars` but only for variables of non-recursive types (e.g., structures, enumerations). -/
+syntax (name := blasterCasesNonRec) "blaster_cases_nonrec" (num)? : tactic
 
-/-- Perform case analysis on the variables of inductive types (bounded by `maxCaseGoals`). -/
-@[tactic blasterCasesVars] def evalBlasterCasesVars : Tactic := fun _ => do
-  let g ← getMainGoal
-  let vars ← g.withContext do
-    let mut vars := #[]
-    for d in ← getLCtx do
-      if d.isImplementationDetail then continue
-      let t ← whnfR d.type
-      let .const n _ := t.getAppFn | continue
-      let .inductInfo info ← getConstInfo n | continue
-      if info.numIndices != 0 || (← isProp d.type) then continue
-      vars := vars.push (d.fvarId, info.ctors.length)
-    return vars
-  let mut goals := [g]
-  let mut nbGoals := 1
-  for (v, nbCtors) in vars do
-    if nbGoals * nbCtors > maxCaseGoals then break
+/-- Return the variables of (non-indexed) inductive types in the local context of `g`, together
+    with their number of constructors.
+-/
+def inductiveVars (g : MVarId) (nonRec := false) : MetaM (Array (FVarId × Nat)) := g.withContext do
+  let mut vars := #[]
+  for d in ← getLCtx do
+    if d.isImplementationDetail then continue
+    let t ← whnfR d.type
+    let .const n _ := t.getAppFn | continue
+    let .inductInfo info ← getConstInfo n | continue
+    if info.numIndices != 0 || (← isProp d.type) then continue
+    -- NOTE: integers are handled by arithmetic decision procedures instead
+    if nonRec && (info.isRec || n == ``Int) then continue
+    vars := vars.push (d.fvarId, info.ctors.length)
+  return vars
+
+/-- Perform case analysis on the variables of inductive types (bounded by `maxCaseGoals`). The fields
+    of the constructors are themselves case-analyzed (up to four rounds), e.g., for structures.
+-/
+def casesVars (maxCaseGoals : Nat) (nonRecOnly : Bool) : TacticM Unit := do
+  let mut goals := [← getMainGoal]
+  let mut done : Std.HashSet FVarId := {}
+  for round in [0:4] do
+    let mut progress := false
     let mut newGoals := []
+    -- NOTE: goals share the free variables of their common ancestor
+    let doneBefore := done
     for g in goals do
-      -- the variable may have been substituted in some goals
-      if !(← g.withContext (return (← getLCtx).contains v)) then
-        newGoals := newGoals ++ [g]
-        continue
-      let subgoals ← g.cases v
-      newGoals := newGoals ++ subgoals.toList.map (·.mvarId)
+      -- NOTE: only fields of non-recursive types are case-analyzed (e.g., not `Nat` fields)
+      let vars := (← inductiveVars g (nonRec := nonRecOnly || round > 0)).filter (!doneBefore.contains ·.1)
+      let mut gs := [g]
+      for (v, nbCtors) in vars do
+        if (goals.length + newGoals.length + gs.length) * nbCtors > maxCaseGoals then break
+        let mut gs' := []
+        for g' in gs do
+          -- the variable may have been substituted in some goals
+          if !(← g'.withContext (return (← getLCtx).contains v)) then
+            gs' := gs' ++ [g']
+            continue
+          let subgoals ← g'.cases v
+          gs' := gs' ++ subgoals.toList.map (·.mvarId)
+        gs := gs'
+        done := done.insert v
+        progress := true
+      newGoals := newGoals ++ gs
     goals := newGoals
-    nbGoals := goals.length
+    if !progress then
+      if round == 0 && nonRecOnly then throwError "blaster_cases_nonrec: no variable"
+      break
   replaceMainGoal goals
+
+@[tactic blasterCasesVars] def evalBlasterCasesVars : Tactic := fun stx =>
+  casesVars (if stx[1].isNone then maxCaseGoals else stx[1][0].toNat) false
+
+@[tactic blasterCasesNonRec] def evalBlasterCasesNonRec : Tactic := fun stx =>
+  casesVars (if stx[1].isNone then maxCaseGoals else stx[1][0].toNat) true
 
 syntax (name := introFacts) "intro_facts" : tactic
 
@@ -173,6 +234,82 @@ syntax (name := introFacts) "intro_facts" : tactic
 The SMT solver proves `∃ x, P x` without providing a witness. For `Nat`/`Int` existentials, a few
 candidate witnesses built from the variables in context are tried, the remaining goal being closed by `omega`.
 -/
+
+syntax (name := blasterDivModFacts) "blaster_divmod_facts" : tactic
+
+/-- Add the basic facts on each `a / b` and `a % b` (over `Nat`) occurring in the main goal, i.e.,
+    `b * (a / b) + a % b = a`, `a / b ≤ a`, and, when `0 < b` holds by `omega`, `a % b < b` and
+    `a < b * (a / b + 1)`.
+-/
+@[tactic blasterDivModFacts] def evalBlasterDivModFacts : Tactic := fun _ => do
+  let g ← getMainGoal
+  let pairs ← g.withContext do
+    let mut ts := #[← instantiateMVars (← g.getType)]
+    for d in ← getLCtx do
+      if !d.isImplementationDetail then ts := ts.push (← instantiateMVars d.type)
+    let mut pairs : Array (Expr × Expr) := #[]
+    for t in ts do
+      for s in collect t #[] do
+        if !pairs.contains s then pairs := pairs.push s
+    return pairs
+  for (a, b) in pairs.extract 0 8 do
+    withMainContext do
+      let a ← Term.exprToSyntax a
+      let b ← Term.exprToSyntax b
+      evalTactic (← `(tactic| (have := Nat.div_add_mod $a $b; have := Nat.div_le_self $a $b;
+                               (try have := Nat.mod_lt $a (show 0 < $b by omega));
+                               (try have := Nat.lt_mul_div_succ $a (show 0 < $b by omega)))))
+where
+  collect (e : Expr) (acc : Array (Expr × Expr)) : Array (Expr × Expr) :=
+    let acc := match e.getAppFn, e.getAppArgs with
+      | .const n _, args =>
+          if (n == ``HDiv.hDiv || n == ``HMod.hMod) && args.size == 6 && args[0]!.isConstOf ``Nat
+             && !e.hasLooseBVars then
+            acc.push (args[4]!, args[5]!)
+          else acc
+      | _, _ => acc
+    match e with
+    | .app f a => collect a (collect f acc)
+    | .lam _ t b _ | .forallE _ t b _ => collect b (collect t acc)
+    | .letE _ t v b _ => collect b (collect v (collect t acc))
+    | .mdata _ e | .proj _ _ e => collect e acc
+    | _ => acc
+
+syntax (name := blasterLitAdd) "blaster_lit_add" : tactic
+
+/-- Rewrite `k + n` into `n + k` (over `Nat`), for every numeral `k` and non-numeral `n`, i.e.,
+    the form expected by equation lemmas of recursive functions (e.g., `f (n + 1) = ...`).
+-/
+@[tactic blasterLitAdd] def evalBlasterLitAdd : Tactic := fun _ => withMainContext do
+  let g ← getMainGoal
+  let mut ts := #[← instantiateMVars (← g.getType)]
+  for d in ← getLCtx do
+    if !d.isImplementationDetail then ts := ts.push (← instantiateMVars d.type)
+  let mut pairs : Array (Expr × Expr) := #[]
+  for t in ts do
+    for s in collect t #[] do
+      if !pairs.contains s then pairs := pairs.push s
+  if pairs.isEmpty then throwError "blaster_lit_add: no numeral addition"
+  let mut lemmas := #[]
+  for (k, n) in pairs.extract 0 8 do
+    lemmas := lemmas.push (← `(Lean.Parser.Tactic.simpLemma|
+      Nat.add_comm $(← Term.exprToSyntax k) $(← Term.exprToSyntax n)))
+  evalTactic (← `(tactic| simp only [$lemmas,*] at *))
+where
+  collect (e : Expr) (acc : Array (Expr × Expr)) : Array (Expr × Expr) :=
+    let acc := match e.getAppFn, e.getAppArgs with
+      | .const n _, args =>
+          if n == ``HAdd.hAdd && args.size == 6 && args[0]!.isConstOf ``Nat && !e.hasLooseBVars
+             && (args[4]!.nat?).isSome && (args[5]!.nat?).isNone then
+            acc.push (args[4]!, args[5]!)
+          else acc
+      | _, _ => acc
+    match e with
+    | .app f a => collect a (collect f acc)
+    | .lam _ t b _ | .forallE _ t b _ => collect b (collect t acc)
+    | .letE _ t v b _ => collect b (collect v (collect t acc))
+    | .mdata _ e | .proj _ _ e => collect e acc
+    | _ => acc
 
 syntax (name := blasterExists) "blaster_exists" : tactic
 
@@ -251,6 +388,58 @@ The optimizer replaces a recursive function with a structurally equivalent one (
 e.g., a user-defined `power` with `Nat.pow`. Such rewrites are justified by induction.
 -/
 
+/-- Return `true` if `f` is defined by structural or well-founded recursion.
+    NOTE: functional induction principles are generated on demand and their generation is costly,
+    e.g., for non-recursive functions with large `match` expressions.
+-/
+def isRecursiveDef (env : Environment) (f : Name) : Bool := Id.run do
+  if env.contains (f ++ `_unary) then return true
+  let some info := env.find? f | return false
+  let some v := info.value? | return false
+  return v.getUsedConstants.any fun n =>
+    n == f || n == ``WellFounded.fix || (n.isStr && n.getString! == "brecOn")
+
+/-- Return the applications of recursive user functions in the main goal, i.e., the candidates for
+    functional induction (at most 4).
+-/
+partial def funInductionCandidates : TacticM (Array Expr) := do
+  let g ← getMainGoal
+  g.withContext do
+    let env ← getEnv
+    let target ← instantiateMVars (← g.getType)
+    let mut res := #[]
+    for app in collectApps target #[] do
+      let .const f _ := app.getAppFn | continue
+      if !isUserDefinition env f || !(isRecursiveDef env f) then continue
+      if res.any (·.getAppFn == app.getAppFn) || res.size ≥ 4 then continue
+      res := res.push app
+    return res
+where
+  collectApps (e : Expr) (acc : Array Expr) : Array Expr :=
+    match e with
+    | .app .. =>
+        let acc := if e.getAppFn.isConst && !e.hasLooseBVars then acc.push e else acc
+        e.getAppArgs.foldl (fun acc a => collectApps a acc) acc
+    | .lam _ t b _ | .forallE _ t b _ => collectApps b (collectApps t acc)
+    | .letE _ t v b _ => collectApps b (collectApps v (collectApps t acc))
+    | .mdata _ e | .proj _ _ e => collectApps e acc
+    | _ => acc
+
+/-- Return the head functions of both sides of the main goal `lhs = rhs` that can be unfolded. -/
+def eqHeads : TacticM (Array Name) := do
+  let g ← getMainGoal
+  g.withContext do
+    let some (_, lhs, rhs) := (← instantiateMVars (← g.getType)).eq? | return #[]
+    let env ← getEnv
+    let mut res := #[]
+    for side in [lhs, rhs] do
+      let .const f _ := side.getAppFn | continue
+      let some info := env.find? f | continue
+      if !info.isDefinition || isMatcherCore env f || isAuxRecursor env f then continue
+      if (← isInstance f) then continue
+      res := res.push f
+    return res
+
 syntax (name := blasterFunInd) "blaster_funind" : tactic
 
 /-- Prove `f = g` (or `f a₁ ... aₙ = g a₁ ... aₙ`) by function extensionality and induction on
@@ -295,8 +484,19 @@ syntax (name := blasterFunInd) "blaster_funind" : tactic
   replaceMainGoal [g]
   let finish ← `(tactic| (blaster_unfold_user <;> blaster_denorm <;>
                            (try simp_all [Nat.pow_succ, Int.pow_succ]) <;> grind))
-  -- try induction on each variable (last one first), then with the other variables generalized
   let mut alts : Array (TSyntax `tactic) := #[]
+  -- functional induction following the recursion of a user function occurring in the equation
+  let heads ← eqHeads
+  for app in ← funInductionCandidates do
+    let t ← Term.exprToSyntax app
+    -- NOTE: the function inducted on is already unfolded by `fun_induction` (unfolding it again may loop)
+    let heads := heads.filter (· != app.getAppFn.constName!)
+    let lemmas ← heads.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+    alts := alts.push (← `(tactic| (fun_induction $t:term <;> blaster_denorm <;>
+                                     (try simp_all [$lemmas,*]) <;> grind)))
+    alts := alts.push (← `(tactic| (fun_induction $t:term <;> $finish)))
+    alts := alts.push (← `(tactic| (fun_induction $t:term <;> (try cases ‹Nat›) <;> $finish)))
+  -- try induction on each variable (last one first), then with the other variables generalized
   for x in vars.reverse do
     alts := alts.push (← `(tactic| (induction $x:ident <;> $finish)))
   for x in vars do
@@ -313,6 +513,32 @@ syntax (name := blasterFunInd) "blaster_funind" : tactic
     catch _ => s.restore
   throwError "blaster_funind: failed"
 
+/-- Maximum number of alternatives of a `match` expression for case analysis strategies. -/
+def maxMatchAlts : Nat := 8
+
+/-- Return `true` if `e` contains a matcher with more than `maxMatchAlts` alternatives, possibly
+    within the body of a (non-recursive) user definition occurring in `e`.
+-/
+def involvesLargeMatch (e : Expr) : MetaM Bool := do
+  let env ← getEnv
+  let isLarge (n : Name) : MetaM Bool := do
+    let some info ← getMatcherInfo? n | return false
+    return info.numAlts > maxMatchAlts
+  for n in e.getUsedConstants do
+    if ← isLarge n then return true
+    if isUserDefinition env n then
+      let some v := (env.find? n).bind (·.value?) | continue
+      for m in v.getUsedConstants do
+        if ← isLarge m then return true
+  return false
+
+/-- Case analysis on variables of non-recursive inductive types, producing up to 1024 goals, then unfolding of user definitions. -/
+def deepCases : TermElabM (TSyntax `tactic) :=
+  `(tactic| (intros <;> blaster_denorm <;> blaster_cases_nonrec 1024 <;> blaster_unfold_user <;>
+             (try simp_all) <;> (try blaster_unfold_user) <;>
+             (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
+             (try decide) <;> done))
+
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
@@ -321,6 +547,14 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
     -- case analysis (e.g., `match` expressions normalized to `Blaster.dite'`)
     ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind))),
+    -- case analysis with cancellation of non-zero factors
+    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> (try simp_all) <;> (try blaster_mul_cancel) <;>
+                          first | (simp_all; done) | omega | grind))),
+    -- case analysis on inductive variables (e.g., derived `BEq` instances)
+    ("cases", ← `(tactic| (blaster_denorm <;> blaster_cases_vars <;> blaster_unfold_user <;>
+                          (try simp_all) <;> (try blaster_unfold_user) <;>
+                          (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
+                          (try decide) <;> done))),
     -- equivalence of recursive functions
     ("induction", ← `(tactic| blaster_funind))
   ]
@@ -339,8 +573,16 @@ def dischargeOne (type : Expr) : TermElabM (Option (Expr × String)) := do
   -- closed obligations (e.g., concrete computations) are decided by kernel evaluation
   if !type.hasFVar && !type.hasMVar then
     if let some prf ← proveWithTactic type (← `(tactic| decide +kernel)) then return some (prf, "decide")
+  -- NOTE: case analysis on (or unfolding of) large `match` expressions requires the generation of
+  -- costly auxiliary lemmas (e.g., splitters), which are not subject to the discharge budget.
+  let large ← involvesLargeMatch type
   for (name, tac) in (← dischargeTactics) do
+    if large && name ∈ ["split", "cases", "induction"] then continue
     if let some prf ← proveWithTactic type tac then return some (prf, name)
+  -- deeper case analysis with a larger budget (e.g., equality of nested structures)
+  if !large then
+    if let some prf ← proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats) then
+      return some (prf, "cases")
   return none
 
 /-- Return the type of a hole, i.e., `t` in `mdata {blaster.hole := _} (sorryAx t _)`. -/
@@ -504,9 +746,24 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
                                            first | omega | grind))),
     -- user definitions (e.g., derived `BEq` instances) with case analysis on inductive variables
     ("unfold + cases", ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;> blaster_unfold_user <;>
-                                     (try simp_all) <;> (try decide) <;> done))),
+                                     (try simp_all) <;> (try blaster_unfold_user) <;>
+                                     (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
+                                     (try decide) <;> done))),
+    -- `match` expressions over arithmetic: case analysis on the discriminants
+    ("split", ← `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> (repeat' split) <;>
+                          (try simp_all) <;> first | done | omega | grind))),
     -- existential goals: witness search
     ("exists", ← `(tactic| (intros <;> blaster_denorm <;> blaster_exists))),
+    -- recursive functions: unfolding equation lemmas (e.g., `f (n + 1) = ...`)
+    ("unfold", ← `(tactic| (intros <;> blaster_denorm <;>
+        (try blaster_lit_add) <;>
+        blaster_unfold_user <;> (try simp_all) <;> done))),
+    -- division/modulo facts
+    ("div/mod facts", ← `(tactic| (intros <;> blaster_denorm <;> blaster_divmod_facts <;> first
+      | omega
+      | (symm; apply Nat.div_eq_of_lt_le <;> grind)
+      | (apply Nat.div_eq_of_lt_le <;> grind)
+      | grind))),
     -- non-linear arithmetic with core lemmas
     ("nonlinear", ← `(tactic| (intros <;> blaster_denorm <;> first
       | (grind [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mul_le_mul, Nat.eq_of_mul_eq_mul_left,
@@ -530,9 +787,14 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
                      Int.ediv_add_emod, Nat.pos_iff_ne_zero]; done)
         | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega))))
   ]
+  let large ← involvesLargeMatch e
   for (name, tac) in tacs do
+    if large && name ∈ ["unfold + cases", "unfold", "split"] then continue
     if let some prf ← proveWithTactic e tac (budget := 4 * dischargeHeartbeats) then
       return some (prf, name)
+  if !large then
+    if let some prf ← proveWithTactic e (← deepCases) (budget := 8 * dischargeHeartbeats) then
+      return some (prf, "unfold + cases")
   return none
 
 end Blaster.Reconstruct

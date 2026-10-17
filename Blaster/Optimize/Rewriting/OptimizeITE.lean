@@ -132,7 +132,7 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
             let hName ← Term.mkFreshBinderName
             let lam1 := mkLambda hName BinderInfo.default or_e t1
             let lam2 := mkLambda hName BinderInfo.default (mkApp (← mkPropNotOp) or_e) e1
-            return mkApp4 (← mkBlasterDIteOp) sort1 or_e lam1 lam2
+            return (← mkBlasterDIteApp sort1 or_e lam1 lam2)
           else return none
       if exprEq c1 c2 then
         if exprEq t1 t2 then
@@ -144,8 +144,8 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
                   withLocalDecl' x1 bi1' tc1 fun x1' => do
                     let lam1 ← mkLambdaFVar n1' (instantiate1' e1' x1')
                     let lam2 ← mkLambdaFVar n2' (instantiate1' e2' x1')
-                    let dite ← mkLambdaFVar x1' (mkApp4 (← mkBlasterDIteOp) sort1 a lam1 lam2)
-                    return mkApp4 (← mkBlasterDIteOp) sort1 c1 t1 dite
+                    let dite ← mkLambdaFVar x1' ((← mkBlasterDIteApp sort1 a lam1 lam2))
+                    return (← mkBlasterDIteApp sort1 c1 t1 dite)
               |_, _ => return none
         else if exprEq e1 e2 then
            withLocalDecl' n1 bi1 dc1 fun n1' => do
@@ -156,8 +156,8 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
                   withLocalDecl' x1 bi1' tc1 fun x1' => do
                     let lam1 ← mkLambdaFVar n1' (instantiate1' t1' x1')
                     let lam2 ← mkLambdaFVar n2' (instantiate1' t2' x1')
-                    let dite ← mkLambdaFVar x1' (mkApp4 (← mkBlasterDIteOp) sort1 a lam1 lam2)
-                    return mkApp4 (← mkBlasterDIteOp) sort1 c1 dite e1
+                    let dite ← mkLambdaFVar x1' ((← mkBlasterDIteApp sort1 a lam1 lam2))
+                    return (← mkBlasterDIteApp sort1 c1 dite e1)
               |_, _ => return none
         else if exprEq t1 e2 && exprEq t2 e1 then
           setRestart
@@ -165,7 +165,7 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
           let hName ← Term.mkFreshBinderName
           let lam1 := mkLambda hName BinderInfo.default eq_cond t1
           let lam2 := mkLambda hName BinderInfo.default (mkApp (← mkPropNotOp) eq_cond) e1
-          return mkApp4 (← mkBlasterDIteOp) sort1 eq_cond lam1 lam2
+          return (← mkBlasterDIteApp sort1 eq_cond lam1 lam2)
         else return none
       else return none
   | _, _ => return none

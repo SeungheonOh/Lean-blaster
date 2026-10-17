@@ -186,13 +186,13 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
             let thenExpr ← mkExpr $ mkLambda hName BinderInfo.default xs[1]! xs[3]!
             let notCond ← mkExpr $ mkApp (← mkPropNotOp) xs[1]!
             let elseExpr ← mkExpr $ mkLambda hName BinderInfo.default notCond xs[4]!
-            let appExpr ← mkExpr $ mkApp4 (← mkBlasterDIteOp) xs[0]! xs[1]! thenExpr elseExpr
+            let appExpr ← mkExpr $ (← mkBlasterDIteApp xs[0]! xs[1]! thenExpr elseExpr)
             let lam ← mkLambdaFVars xs appExpr
             constContinuity (← mkExpr lam) "ite" (some (mkConst ``Blaster.ite_to_dite'_equiv e.constLevels!))
 
      | ``dite =>
          forallTelescope (← inferTypeEnv e) fun xs _ => do
-           let appExpr ← mkExpr $ mkApp4 (← mkBlasterDIteOp) xs[0]! xs[1]! xs[3]! xs[4]!
+           let appExpr ← mkExpr $ (← mkBlasterDIteApp xs[0]! xs[1]! xs[3]! xs[4]!)
            let lam ← mkLambdaFVars xs appExpr
            constContinuity (← mkExpr lam) "dite" (some (mkConst ``Blaster.dite_equiv e.constLevels!))
 

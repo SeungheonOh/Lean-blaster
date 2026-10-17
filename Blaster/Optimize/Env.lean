@@ -814,6 +814,18 @@ def mkDIteOp : TranslateEnvT Expr := mkExpr (mkConst ``dite [levelOne])
 /-- Return `Blaster.dite'` operator and cache result. -/
 def mkBlasterDIteOp : TranslateEnvT Expr := mkExpr (mkConst ``Blaster.dite' [levelOne])
 
+/-- Return `Blaster.dite' α c t e`. The universe level of `Blaster.dite'` is `1` (i.e., universe levels
+    are normalized), except when tracking proof terms, where it is the actual universe level of `α`.
+-/
+def mkBlasterDIteApp (α c t e : Expr) : TranslateEnvT Expr := do
+  if (← get).recon.tracking && !α.hasLooseBVars then
+    try
+      let u ← instantiateLevelMVars (← getLevel α)
+      if u.normalize != levelOne then
+        return mkApp4 (mkConst ``Blaster.dite' [u.normalize]) α c t e
+    catch _ => pure ()
+  return mkApp4 (← mkBlasterDIteOp) α c t e
+
 /-- Return `LE.le` operator and cache result. -/
 def mkLeOp : TranslateEnvT Expr := mkExpr (mkConst ``LE.le [levelZero])
 

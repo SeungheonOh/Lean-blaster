@@ -20,6 +20,11 @@ def callOptimize (sOpts : BlasterOptions) (stx : Syntax) : TermElabM Expr :=
 -/
 def auditReconstruction (sOpts : BlasterOptions) (stx : Syntax) (name : String) : TermElabM Unit := do
   if (← IO.getEnv "BLASTER_RECON_STATS").isNone then return
+  -- NOTE: the heartbeats consumed by the audit are not counted for the test itself
+  let heartbeats ← IO.getNumHeartbeats
+  try auditCore finally IO.setNumHeartbeats heartbeats
+where
+ auditCore : TermElabM Unit :=
   withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0, maxRecDepth := 100000 }) $ do
     let s ← saveState
     let outcome ← tryCatchRuntimeEx (do
