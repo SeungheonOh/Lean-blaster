@@ -176,22 +176,70 @@ candidate witnesses built from the variables in context are tried, the remaining
 
 syntax (name := blasterExists) "blaster_exists" : tactic
 
+/-- Return the natural number literals occurring in `e` (and their neighbours). -/
+def literalSeeds (e : Expr) : Array Nat := Id.run do
+  let mut ns : Std.HashSet Nat := {0, 1}
+  let rec collect (e : Expr) (acc : Std.HashSet Nat) : Std.HashSet Nat :=
+    match e with
+    | .lit (.natVal n) => (acc.insert n).insert (n + 1) |>.insert (n - 1)
+    | .app f a => collect a (collect f acc)
+    | .lam _ t b _ | .forallE _ t b _ => collect b (collect t acc)
+    | .mdata _ b => collect b acc
+    | .letE _ t v b _ => collect b (collect v (collect t acc))
+    | _ => acc
+  ns := collect e ns
+  return ns.toArray.qsort (· < ·)
+
+/-- Candidate witnesses (as terms) of type `t` up to `depth` nested constructors. -/
+partial def witnessCandidates (t : Expr) (seeds : Array Nat) (vars : Array Ident) (depth : Nat) :
+    MetaM (Array Term) := do
+  let t ← whnfR t
+  if t.isConstOf ``Nat || t.isConstOf ``Int then
+    let mut cs : Array Term := #[]
+    for n in seeds do cs := cs.push (← `($(Syntax.mkNumLit (toString n))))
+    for x in vars do cs := cs ++ #[← `($x), ← `($x - 1), ← `($x + 1)]
+    return cs
+  let .const n _ := t.getAppFn | return #[]
+  let .inductInfo info ← getConstInfo n | return #[]
+  if info.numIndices != 0 then return #[]
+  let mut cs : Array Term := #[]
+  for ctor in info.ctors do
+    let cinfo ← getConstInfo ctor
+    let fieldsOk ← forallTelescopeReducing cinfo.type fun xs _ => do
+      let fields := xs.extract info.numParams xs.size
+      let mut args : Array (Array Term) := #[#[]]
+      for x in fields do
+        let xt ← inferType x
+        let opts ← if (← isProp xt) then pure #[← `(?_)]
+          else if depth == 0 && (xt.getAppFn.constName? == some n) then pure #[]
+          else witnessCandidates xt seeds #[] (if xt.getAppFn.constName? == some n then depth - 1 else depth)
+        if opts.isEmpty then return none
+        let mut next := #[]
+        for a in args do
+          for o in opts.extract 0 6 do
+            if next.size < 64 then next := next.push (a.push o)
+        args := next
+      return some args
+    let some argss := fieldsOk | continue
+    for args in argss do
+      cs := cs.push (← `($(mkIdent ctor) $args*))
+  return cs.extract 0 64
+
 @[tactic blasterExists] def evalBlasterExists : Tactic := fun _ => do
   let g ← getMainGoal
-  let some (_, .lam _ t _ _) := (← whnfR (← instantiateMVars (← g.getType))).app2? ``Exists
+  let target ← instantiateMVars (← g.getType)
+  let some (_, .lam _ t _ _) := (← whnfR target).app2? ``Exists
     | throwError "blaster_exists: existential expected"
-  let isNat := t.isConstOf ``Nat
-  if !isNat && !t.isConstOf ``Int then throwError "blaster_exists: Nat/Int existential expected"
-  let mut candidates : Array Term := #[← `(0), ← `(1)]
+  let mut vars : Array Ident := #[]
   for d in ← g.withContext getLCtx do
     if d.isImplementationDetail || d.userName.isInaccessibleUserName then continue
-    if ← g.withContext (isDefEq d.type t) then
-      let x := mkIdent d.userName
-      candidates := candidates ++ #[← `($x), ← `($x - 1), ← `($x + 1)]
+    if ← g.withContext (isDefEq d.type t) then vars := vars.push (mkIdent d.userName)
+  let candidates ← g.withContext (witnessCandidates t (literalSeeds target) vars 2)
   let s ← saveState
   for c in candidates do
     try
-      evalTactic (← `(tactic| (refine ⟨$c, ?_⟩ <;> omega)))
+      evalTactic (← `(tactic| (refine ⟨$c, ?_⟩ <;>
+        (try blaster_unfold_user) <;> first | omega | decide | (simp_all; done) | (simp_all <;> omega))))
       if (← getUnsolvedGoals).isEmpty then return
       s.restore
     catch _ => s.restore
