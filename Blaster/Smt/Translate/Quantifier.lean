@@ -180,6 +180,13 @@ def defineSortAndCache (v : FVarId) : TranslateEnvT SmtSymbol := do
       return s
   | some s => return s
 
+/-- Return `true` when a membership predicate has been declared for sort variable `e`
+    (see `declareSortMembership`).
+-/
+def hasSortMembership (e : Expr) : TranslateEnvT Bool := do
+  if !e.isFVar then return false
+  return (← get).smtEnv.indTypeInstCache.contains e
+
 /-- Add an inductive datatype name to the visited inductive datatype cache. -/
 def cacheIndName (indName : Name) : TranslateEnvT Unit := do
   modify (fun env => { env with smtEnv.indTypeVisited := env.smtEnv.indTypeVisited.insert indName})
@@ -212,6 +219,25 @@ def updateIndInstCacheAux
 /-- Same as `updateIndInstCacheAux` but return value is discarded. -/
 def updateIndInstCache (d : Expr) (n : SmtSymbol) (instSort : SortExpr) : TranslateEnvT Unit :=
   discard (updateIndInstCacheAux d n instSort)
+
+/-- Given `v` a quantified sort variable (e.g., `α : Type`) and `s` its corresponding smt sort
+    (see `defineSortAndCache`), perform the following only when no entry exists for `α` in `indTypeInstCache`:
+      - add entry `α := {@is{s}, s}` to `indTypeInstCache`
+      - declare membership predicate `(declare-fun @is{s} (s) Bool)`
+
+    All sort variables are mapped to the universal sort `@@Type`, which can never be empty at the smt level.
+    The (uninterpreted) membership predicate characterizes the subset of `@@Type` denoted by `α`.
+    It is used as predicate qualifier for any term of type `α` (see `getPredicateDeclaration`) such that
+    the backend solver does not assume that `α` is inhabited nor that distinct sort variables
+    have the same cardinality.
+-/
+def declareSortMembership (v : FVarId) (s : SmtSymbol) : TranslateEnvT Unit := do
+  let t := mkFVar v
+  unless ((← get).smtEnv.indTypeInstCache.get? t).isSome do
+    let instName := mkNormalSymbol s!"@is@{← v.getUserName}{v.name}"
+    let decl := ({instName, instSort := .SymbolSort s, applyInstName := none} : IndTypeDeclaration)
+    modify (fun env => {env with smtEnv.indTypeInstCache := env.smtEnv.indTypeInstCache.insert t decl})
+    definePredQualifier decl.instName decl.instSort none
 
 /-- Return `true` if `v` is tagged as a top level free variable. -/
 def isTopLevelFVar (v : FVarId) : TranslateEnvT Bool := do
@@ -293,16 +319,22 @@ def generateInstType
 /-- Given arguments `x₀ ... xₙ` perform the following:
       let A := [x₀, ..., xₙ]
       let V := {α | i ∈ [0..n] ∧ α ∈ getFVarsInExpr A[i] ∧ isGenericParam A[i]}
-      return `[α | α ∈ V]`
+      - When `abstractAll` is set to `true`:
+          - return `[α | α ∈ V]`
+      - Otherwise:
+          - return `[α | α ∈ V ∧ ¬ hasSortMembership α]`
+    Sort variables with a membership predicate are kept in instances so that, e.g.,
+    `List α` and `List β` have distinct predicate qualifiers.
 -/
-def retrieveGenericArgs (args : Array Expr) : TranslateEnvT (Array Expr) := do
+def retrieveGenericArgs (args : Array Expr) (abstractAll := false) : TranslateEnvT (Array Expr) := do
   let mut genericArgs := #[]
   let mut knownGenParams := (.emptyWithCapacity : Std.HashSet Expr)
   for h : i in [:args.size] do
     let e := args[i]
     if (← isGenericParam e) then
       (genericArgs, knownGenParams) ← updateGenericArgs e genericArgs knownGenParams
-  return genericArgs
+  if abstractAll then return genericArgs
+  genericArgs.filterM (fun a => return !(← hasSortMembership a))
 
 /-- Given an inductive datatype instance `t x₀ ... xₙ`, perform the following:
      - When `∀ i ∈ [0..n], ¬ isGenericParam xᵢ`,
@@ -401,8 +433,8 @@ def generateIndInstDecl
           - return `λ b₀ → .. → bₘ → ∀ α'₀ → α'₁ → ... → α'ₚ → αₙ`
     Assumes that `t` does not have any implicit types (i.e., removeClassConstraintsInFunType called)
 -/
-def getFunInstDeclAux (t : Expr) : TranslateEnvT Expr := do
-  let genericArgs ← retrieveGenericArgs (retrieveArrowTypes t)
+def getFunInstDeclAux (t : Expr) (abstractAll := false) : TranslateEnvT Expr := do
+  let genericArgs ← retrieveGenericArgs (retrieveArrowTypes t) abstractAll
   mkLambdaFVars' genericArgs t
 
 /-- Same as `getFunInstDeclAux` but calls `removeClassConstraintsInFunType on `t` first. -/
@@ -430,9 +462,13 @@ def withInstantiatedImplicitArgs (t : Expr) (k : Expr → TranslateEnvT α) : Tr
 
 /-- Return `decl.instName` when `t := decl` exists in `indTypeInstCache`.
     Otherwise `none`.
+    The membership predicate is returned when `t` is a sort variable for which
+    a membership predicate has been declared (see `declareSortMembership`).
     TODO: UPDATE
 -/
 def getPredicateDeclaration (t : Expr) : TranslateEnvT (Option IndTypeDeclaration) := do
+  if t.isFVar then
+    if let some decl := (← get).smtEnv.indTypeInstCache.get? t then return decl
   let t' ← getType t
   let typeInst ← getInst t'
   return (← get).smtEnv.indTypeInstCache.get? typeInst
@@ -483,6 +519,24 @@ def createPredQualifierAppAux (st : SmtTerm) (t : Expr) : TranslateEnvT SmtTerm 
 def createPredQualifierApp (smtSym : SmtSymbol) (t : Expr) : TranslateEnvT SmtTerm :=
   createPredQualifierAppAux (smtSimpleVarId smtSym) t
 
+/-- Given `xs := [x₀, ..., xₙ]` smt terms and `ts := [t₀, ..., tₙ]` their corresponding types,
+    and `cstr` a co-domain constraint, return `(=> (@isType₀ x₀) ... (=> (@isTypeₙ xₙ) cstr))`.
+    Guarding the co-domain constraint with the domain predicate qualifiers is necessary as
+    the domain of a function may be empty (e.g., `α → β` with `α` and `β` both instantiated with `Empty`).
+    No predicate qualifier is generated for `tᵢ` when:
+      - `tᵢ` is a dependent type (i.e., has loose bound variables); or
+      - `tᵢ` is a proposition; or
+      - no predicate qualifier has been declared for `tᵢ`.
+-/
+def guardWithDomainQualifiers (xs : Array SmtTerm) (ts : Array Expr) (cstr : SmtTerm) : TranslateEnvT SmtTerm := do
+  let mut guards := #[]
+  for h : i in [:ts.size] do
+    let t := ts[i]
+    if t.hasLooseBVars || (← isPropEnv t) then continue
+    if let some decl ← getPredicateDeclaration t then
+      guards := guards.push (mkSimpleSmtAppN decl.instName #[xs[i]!])
+  return guards.foldr (fun g acc => impliesSmt g acc) cstr
+
 
 /-- Given `t := α₁ → α₂ ... → αₙ` and `st` its corresponding smt representation (i.e., ArrowTN sα₁ sα₂ sαₙ),
     perform the following action:
@@ -519,12 +573,34 @@ def createPredQualifierApp (smtSym : SmtSymbol) (t : Expr) : TranslateEnvT SmtTe
                     :qid @apply{n}_ext_fun)))`
 
             - `(assert (forall ((@f (ArrowTN sα₁ sα₂ ... αₙ)))
-                (! (= (forall ((@x₁ sα₁) ... (@xₙ₋₁ sαₙ₋₁)) (@isTypeₙ (@apply{n} @f @x₁ ... @xₙ₋₁)))
+                (! (= (forall ((@x₁ sα₁) ... (@xₙ₋₁ sαₙ₋₁))
+                        (=> (@isType₁ @x₁) ... (=> (@isTypeₙ₋₁ @xₙ₋₁) (@isTypeₙ (@apply{n} @f @x₁ ... @xₙ₋₁)))))
                       (@is{instName} @f) )
                    :pattern ( (@is{instName} @f)) :qid @isFun{v}_cstr)))`
 
             - with ∀ i ∈ [1..n] = s
          - return `{@is{instName}, st}`
+    The `@apply{n}` function (and its congruence and extensionality assertions) is shared by all
+    function instances that only differ in their sort variables (see `funApplyCache`),
+    while each instance has its own predicate qualifier `@is{instName}`.
+    When the instance refers to sort variables with a membership predicate (e.g., `α → β`),
+    `@is{instName}` is a membership predicate (i.e., `isMembership` set to `true`) and the following
+    assertions are generated instead of the co-domain constraint above:
+      - `(assert (forall ((@f (ArrowTN sα₁ sα₂ ... αₙ)))
+           (! (=> (@is{instName} @f)
+                  (forall ((@x₁ sα₁) ... (@xₙ₋₁ sαₙ₋₁))
+                     (=> (@isType₁ @x₁) ... (=> (@isTypeₙ₋₁ @xₙ₋₁) (@isTypeₙ (@apply{n} @f @x₁ ... @xₙ₋₁))))))
+              :pattern ( (@is{instName} @f)) :qid @isFun{v}_cstr)))`
+      - `(assert (forall ((@f (ArrowTN sα₁ sα₂ sαₙ)) (@g (ArrowTN sα₁ sα₂ sαₙ)))
+           (! (=> (@is{instName} @f) (=> (@is{instName} @g)
+                  (=> (forall ((@x₁ sα₁) ... (@xₙ₋₁ sαₙ₋₁))
+                         (=> (@isType₁ @x₁) ... (=> (@isTypeₙ₋₁ @xₙ₋₁)
+                            (= (@apply{n} @f @x₁ ... @xₙ₋₁) (@apply{n} @g @x₁ ... @xₙ₋₁)))))
+                      (= @f @g))))
+              :qid @isFun{v}_ext_fun)))`
+    Indeed, functions of distinct instances share the same smt sort and the co-domain constraint is
+    trivially satisfied by any function when the domain is empty. The membership predicate is then
+    asserted for each lambda term (see `translateLambda`).
 -/
 def generateFunInstDeclAux (t : Expr) (st : SortExpr) : TranslateEnvT IndTypeDeclaration := do
   let t' ← removeClassConstraintsInFunType t
@@ -534,10 +610,20 @@ def generateFunInstDeclAux (t : Expr) (st : SortExpr) : TranslateEnvT IndTypeDec
    | none =>
        let v ← mkFreshId
        let instName := mkReservedSymbol s!"Fun{v}"
-       let applyName := mkReservedSymbol s!"@apply{v}"
-       let decl ← updateIndInstCacheAux funInst instName st (applyInstName := some applyName)
+       let applyInst ← getFunInstDeclAux t' (abstractAll := true)
+       let (applyName, newApply) ←
+         match (← get).smtEnv.funApplyCache.get? applyInst with
+         | some n => pure (n, false)
+         | none =>
+             let n := mkReservedSymbol s!"@apply{v}"
+             modify (fun env => {env with smtEnv.funApplyCache := env.smtEnv.funApplyCache.insert applyInst n})
+             pure (n, true)
+       -- membership predicate when instance refers to sort variables with a membership predicate
+       let isMembership := funInst != applyInst
+       let decl := ({instName, instSort := st, applyInstName := some applyName, isMembership} : IndTypeDeclaration)
+       modify (fun env => {env with smtEnv.indTypeInstCache := env.smtEnv.indTypeInstCache.insert funInst decl})
        definePredQualifier decl.instName decl.instSort none
-       generateApplyFunAndAssertions t' decl.instName applyName
+       generateApplyFunAndAssertions t' decl.instName applyName newApply isMembership
        return decl
 
   where
@@ -545,13 +631,15 @@ def generateFunInstDeclAux (t : Expr) (st : SortExpr) : TranslateEnvT IndTypeDec
      | Expr.app (Expr.const ``outParam _) e => e
      | e => e
 
-    generateApplyFunAndAssertions (t : Expr) (instName : SmtSymbol) (applyName : SmtSymbol) : TranslateEnvT Unit := do
+    generateApplyFunAndAssertions
+      (t : Expr) (instName : SmtSymbol) (applyName : SmtSymbol)
+      (newApply : Bool) (isMembership : Bool) : TranslateEnvT Unit := do
      let funTypes := retrieveArrowTypes t
      let .ParamSort _ smtTypes := st | throwEnvError "defineFunAssertions: ParamSort expected but got {st}"
      let nbTypes := funTypes.size - 1
      -- declare apply function `(declare-fun @apply{n} (st sα₁ ... sαₙ₋₁) sαₙ)`
      let declArgs := Array.foldl (λ acc s => acc.push s) #[st] smtTypes (stop := smtTypes.size - 1)
-     declareFun applyName declArgs smtTypes[nbTypes]!
+     if newApply then declareFun applyName declArgs smtTypes[nbTypes]!
      let fsym := mkReservedSymbol "@f"
      let fId := smtSimpleVarId fsym
      let gsym := mkReservedSymbol "@g"
@@ -577,12 +665,30 @@ def generateFunInstDeclAux (t : Expr) (st : SortExpr) : TranslateEnvT IndTypeDec
      -- isFun constraint
      -- Need to remove outParam on return type (if necessary) (see, translateLambda)
      let coDomainCstr ← createPredQualifierAppAux f_applyTerm1 (removeOutParam funTypes[nbTypes]!)
+     let domainTypes := funTypes.extract 0 nbTypes
+     let coDomainCstr ← guardWithDomainQualifiers xIds domainTypes coDomainCstr
      let forallCoDomain := mkForallTerm none co_quantifiers coDomainCstr none
      let f_funPredApp := mkSimpleSmtAppN instName #[fId]
-     let forallFunBody := eqSmt forallCoDomain f_funPredApp
      let qidName := appendSymbol instName "cstr"
      let fun_annotations := some #[mkPattern #[f_funPredApp], mkQid qidName]
-     assertTerm (mkForallTerm none #[(fsym, st)] forallFunBody fun_annotations)
+     if isMembership then
+       -- Functions of distinct instances share the same smt sort and `@apply` function.
+       -- The co-domain constraint therefore cannot characterize the functions of this instance,
+       -- e.g., any function satisfies the co-domain constraint when the domain is empty.
+       let forallFunBody := impliesSmt f_funPredApp forallCoDomain
+       assertTerm (mkForallTerm none #[(fsym, st)] forallFunBody fun_annotations)
+       -- extensionality restricted to the functions and domain of this instance
+       let g_funPredApp := mkSimpleSmtAppN instName #[gId]
+       let eqAppFun ← guardWithDomainQualifiers xIds domainTypes (eqSmt f_applyTerm1 g_applyTerm)
+       let innerForall := mkForallTerm none co_quantifiers eqAppFun none
+       let forallExtBody := impliesSmt f_funPredApp (impliesSmt g_funPredApp (impliesSmt innerForall (eqSmt fId gId)))
+       let qidName := appendSymbol instName "ext_fun"
+       let fg_quantifiers : SortedVars := #[(fsym, st), (gsym, st)]
+       assertTerm (mkForallTerm none fg_quantifiers forallExtBody (some #[mkQid qidName]))
+     else
+       let forallFunBody := eqSmt forallCoDomain f_funPredApp
+       assertTerm (mkForallTerm none #[(fsym, st)] forallFunBody fun_annotations)
+     unless newApply do return -- congruence and extensionality already asserted for shared `@apply`
      -- congruence on fun
      let qidName := appendSymbol applyName "congr_fun"
      let quantifiers_fun := (co_quantifiers.push (fsym, st)).push (gsym, st)
@@ -1243,7 +1349,11 @@ def translateQuantifier
  -- define sort if t is a sort type
  if t.isType then
    generateSortInstDecl t
-   discard $ defineSortAndCache v
+   let s ← defineSortAndCache v
+   -- NOTE: Sort variables universally quantified at the top level of the goal can be instantiated
+   -- with any type (including empty ones) and therefore have their own membership predicate.
+   -- Other sort quantifiers (e.g., `∀ α` in a hypothesis) are instantiated with the universal sort `@@Type`.
+   if (← get).topLevel then declareSortMembership v s
  else
    -- No more required to resolve type at this stage.
    let smtType ← translateTypeAux termTranslator t
@@ -1266,18 +1376,52 @@ def translateQuantifier
 def translateForAll
   (e : Expr) (termTranslator : Expr → TranslateEnvT SmtTerm) : QuantifierEnvT SmtTerm := do
  Optimize.forallTelescope e fun fvars b => do
+   let topLevel := (← get).topLevel
+   let mut topLevelPremises := #[]
+   let mut sortVars := #[]
    for h : i in [:fvars.size] do
      let v := fvars[i]
      let decl ← getFVarLocalDecl v
      if (← isPropEnv decl.type) then
-       updatePremises (← termTranslator decl.type)
+       -- top level premises are translated once all top level sort variables are known
+       if topLevel then topLevelPremises := topLevelPremises.push decl.type
+       else updatePremises (← termTranslator decl.type)
      -- need to filter out class constraints
      else if !(← isClassConstraintExpr decl.type) then
        translateQuantifier v decl.type termTranslator
+       if decl.type.isType then sortVars := sortVars.push v
+   for h : i in [:topLevelPremises.size] do
+     let p := topLevelPremises[i]
+     let mut pTerm ← termTranslator p
+     for pInst in (← instantiateSortHyp p sortVars) do
+       pTerm := andSmt pTerm (← termTranslator pInst)
+     updatePremises pTerm
    let fbody ← termTranslator b
    genForAllTerm fbody
 
  where
+   /-- Given `p := ∀ (β₁ : t₁) ... (βₙ : tₙ), e` a top level premise with `β₁ ... βₙ` sort variables
+       and `sortVars` the sort variables universally quantified at the top level, return the
+       instances `e[β₁/α₁] ... [βₙ/αₙ]` for all `αᵢ ∈ sortVars` such that `Type(αᵢ) = tᵢ` (at most `maxInsts`).
+       Sort quantifiers in premises are otherwise instantiated with the universal sort `@@Type`
+       (see `translateQuantifier`), which does not satisfy the membership predicate of top level
+       sort variables. Instantiating premises is sound as they are hypotheses.
+   -/
+   instantiateSortHyp (p : Expr) (sortVars : Array Expr) (maxInsts := 8) : TranslateEnvT (Array Expr) := do
+     let mut todo := #[p]
+     let mut res := #[]
+     while !todo.isEmpty && res.size < maxInsts do
+       let e := todo.back!
+       todo := todo.pop
+       match e with
+       | Expr.forallE _ t body _ =>
+           if t.isType then
+             for α in sortVars do
+               if (← inferTypeEnv α) == t then todo := todo.push (body.instantiate1 α)
+           else if e != p then res := res.push e
+       | _ => if e != p then res := res.push e
+     return res
+
    genForAllTerm (fbody : SmtTerm) : QuantifierEnvT SmtTerm := do
     let env ← get
     let mut forallTerm := fbody
