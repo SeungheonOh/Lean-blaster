@@ -99,6 +99,11 @@ structure ReconEnv where
   /-- Proof obligations generated so far. -/
   holes : Array HoleInfo := #[]
 
+  /-- Equivalences between recursive functions established by the optimizer (see `storeRecFunDef`),
+      in the order they have been established, i.e., `(f, g)` with `f` replaced by `g`.
+  -/
+  recFunEquivs : Array (Expr × Expr) := #[]
+
   /-- Number of rewrite steps justified by an explicit proof term. -/
   nbExplicit : Nat := 0
 

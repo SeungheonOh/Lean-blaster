@@ -156,6 +156,18 @@ syntax (name := blasterCasesVars) "blaster_cases_vars" : tactic
     nbGoals := goals.length
   replaceMainGoal goals
 
+syntax (name := introFacts) "intro_facts" : tactic
+
+/-- Introduce the leading `blaster_fact` hypotheses (see `dischargeWithFacts`). -/
+@[tactic introFacts] def evalIntroFacts : Tactic := fun _ => do
+  let mut g ← getMainGoal
+  repeat
+    let .forallE n _ _ _ := (← whnfR (← g.getType)) | break
+    if n != `blaster_fact then break
+    let (_, g') ← g.intro (← mkFreshUserName `blaster_fact)
+    g := g'
+  replaceMainGoal [g]
+
 /-! ## Equivalence of recursive functions
 
 The optimizer replaces a recursive function with a structurally equivalent one (see `storeRecFunDef`),
@@ -191,6 +203,19 @@ syntax (name := blasterFunInd) "blaster_funind" : tactic
       vars := vars.push (mkIdent n)
     replaceMainGoal [g]
   if vars.isEmpty then throwError "blaster_funind: no variable"
+  -- clear the hypotheses not related to the equation (they only hinder the induction)
+  let g ← getMainGoal
+  let g ← g.withContext do
+    let target ← instantiateMVars (← g.getType)
+    let mut g := g
+    for d in (← getLCtx).decls.toArray.reverse do
+      let some d := d | continue
+      if d.isImplementationDetail || target.containsFVar d.fvarId then continue
+      -- keep the facts introduced by `intro_facts`
+      if d.userName.toString.startsWith "blaster_fact" then continue
+      try g ← g.clear d.fvarId catch _ => pure ()
+    return g
+  replaceMainGoal [g]
   let finish ← `(tactic| (blaster_unfold_user <;> blaster_denorm <;>
                            (try simp_all [Nat.pow_succ, Int.pow_succ]) <;> grind))
   -- try induction on each variable (last one first), then with the other variables generalized
@@ -246,31 +271,91 @@ def holeType? (e : Expr) : Option Expr := do
 def hasHoles (e : Expr) : Bool :=
   (e.find? fun s => (isHole? s).isSome).isSome
 
+/-- Generalize a discharged equation `prf : type` over the free variables it depends on, i.e., return
+    `(∀ xs, type, fun xs => prf)`. Used to reuse equivalences of recursive functions as lemmas.
+-/
+def generalizeFact (type prf : Expr) : MetaM (Option (Expr × Expr)) := do
+  let lctx ← getLCtx
+  let fvars := (collectFVars {} (← instantiateMVars type)).fvarIds
+  let fvars := fvars.filter lctx.contains
+  let fvars := (lctx.getFVarIds.filter fvars.contains).map mkFVar
+  let t ← mkForallFVars fvars type
+  let p ← mkLambdaFVars fvars prf
+  if t.hasFVar || p.hasFVar || t.hasMVar || p.hasMVar then return none
+  return some (t, p)
+
+/-- Try to discharge `type` with the induction strategy given the previously proved `facts`
+    (i.e., closed equations between recursive functions) as additional hypotheses.
+-/
+def dischargeWithFacts (type : Expr) (facts : Array (Expr × Expr)) : TermElabM (Option Expr) := do
+  if facts.isEmpty then return none
+  let type' := facts.foldr (fun (t, _) acc => mkForall `blaster_fact .default t acc) type
+  let tac ← `(tactic| (intro_facts; blaster_funind))
+  let some prf ← proveWithTactic type' tac | return none
+  return some (mkAppN prf (facts.map Prod.snd))
+
+/-- Prove the equivalences `f = g` between recursive functions established by the optimizer (in order),
+    each one using the previously proved ones as hypotheses. Return the proved equations.
+-/
+def proveEquivalences (equivs : Array (Expr × Expr)) : TermElabM (Array (Expr × Expr)) := do
+  let mut facts := #[]
+  for (f, g) in equivs do
+    let r ← attempt (4 * dischargeHeartbeats) do
+      let type ← mkEq f g
+      if let some prf ← dischargeWithFacts type facts then return some (type, prf)
+      if let some prf ← proveWithTactic type (← `(tactic| blaster_funind)) then return some (type, prf)
+      return none
+    if let some fact := r then facts := facts.push fact
+  return facts
+
 /-- Discharge all the proof obligations in `p`.
     Return the updated proof term and the discharge statistics. Proof obligations that cannot be
     discharged are left unchanged in the returned proof term.
+    NOTE: A second pass is performed on the remaining obligations, using the equivalences between
+    recursive functions proved during the first pass as hypotheses (nested equivalences).
 -/
-def dischargeHoles (p : Expr) (holes : Array HoleInfo := #[]) : TermElabM (Expr × DischargeStats) := do
+def dischargeHoles
+  (p : Expr) (holes : Array HoleInfo := #[]) (equivs : Array (Expr × Expr) := #[]) :
+  TermElabM (Expr × DischargeStats) := do
   let stats ← IO.mkRef ({} : DischargeStats)
+  let facts ← IO.mkRef (← proveEquivalences equivs)
+  let labelOf (e : Expr) : String :=
+    match isHole? e with
+    | some idx => if h : idx < holes.size then holes[idx].label else "top"
+    | none => "top"
+  -- first pass
   let p' ← Meta.transform p (pre := fun e => do
     match holeType? e with
     | none => return .continue
     | some type =>
-        let label := match isHole? e with
-                     | some idx => if h : idx < holes.size then holes[idx].label else "top"
-                     | none => "top"
+        let label := labelOf e
         stats.modify fun s => { s with total := s.total + 1 }
         match ← dischargeOne type with
         | some (prf, method) =>
             stats.modify (·.record method label)
+            if label.startsWith "rule:recFunEquiv" then
+              if let some f ← generalizeFact type prf then facts.modify (·.push f)
             return .done prf
-        | none =>
-            stats.modify (·.record "failed" label)
-            let lctx ← getLCtx
-            let dangling := (type.find? fun s => s.isFVar && !lctx.contains s.fvarId!).isSome
-            let msg ← addMessageContext (if dangling then m!"{type} (out of scope variables)" else m!"{type}")
-            stats.modify fun s => { s with failures := s.failures.push msg }
-            return .done e)
+        | none => return .done e)
+  -- second pass (with proved equivalences as hypotheses) and failure reporting
+  let facts ← facts.get
+  let p' ← Meta.transform p' (pre := fun e => do
+    match holeType? e with
+    | none => return .continue
+    | some type =>
+        let label := labelOf e
+        if let some prf ← dischargeWithFacts type facts then
+          stats.modify (·.record "induction+facts" label)
+          return .done prf
+        stats.modify (·.record "failed" label)
+        if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then
+          let g ← mkFreshExprMVar type
+          logInfo m!"[{label}] unresolved proof obligation:\n{← Meta.ppGoal g.mvarId!}"
+        let lctx ← getLCtx
+        let dangling := (type.find? fun s => s.isFVar && !lctx.contains s.fvarId!).isSome
+        let msg ← addMessageContext (if dangling then m!"{type} (out of scope variables)" else m!"{type}")
+        stats.modify fun s => { s with failures := s.failures.push msg }
+        return .done e)
   return (p', ← stats.get)
 
 /-! ## Seeded quantifier instantiation

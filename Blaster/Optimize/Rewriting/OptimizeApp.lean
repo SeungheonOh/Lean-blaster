@@ -213,6 +213,9 @@ def normOpaqueAndRecFun (s : OptimizeStack) (xs : List OptimizeStack) :
         uncacheFunName instApp
         -- trace[Optimize.recFun] "optimized rec body for {reprStr subsInst} got {reprStr optDef}"
         let fn' ← storeRecFunDef subsInst params optDef
+        -- keep track of the established equivalence for proof reconstruction
+        if (← isTracking) && !(exprEq fn' subsInst) && !fn'.hasFVar && !subsInst.hasFVar then
+          modify fun env => { env with recon.recFunEquivs := env.recon.recFunEquivs.push (subsInst, fn') }
         -- trace[Optimize.recFun] "rec function instance {reprStr subsInst} is equivalent to {reprStr fn'}"
         optimizeRecApp subsInst fn' uargs params xs pf (mkAppN uf uargs)
 

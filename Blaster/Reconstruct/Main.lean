@@ -72,10 +72,11 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
 
 /-- Discharge the proof obligations in `proof` and check it against `goal` with the Lean kernel. -/
 def finishProof
-  (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) (holes : Array HoleInfo) : TermElabM ReconOutcome := do
+  (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) (holes : Array HoleInfo)
+  (equivs : Array (Expr × Expr) := #[]) : TermElabM ReconOutcome := do
   let finish (o : ReconOutcome) : TermElabM ReconOutcome := do
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
-  let (proof, stats) ← dischargeHoles proof holes
+  let (proof, stats) ← dischargeHoles proof holes equivs
   let out := { out with stats }
   if !stats.failures.isEmpty || hasHoles proof then
     let shown := stats.failures.extract 0 3
@@ -94,7 +95,7 @@ def reconstructRewrite (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermE
     | .defeq => mkEqRefl e
     | .proof p => pure p
     | _ => mkTopHole e optExpr
-  finishProof out goal proof startTime recon.holes
+  finishProof out goal proof startTime recon.holes recon.recFunEquivs
 
 /-- Try to reconstruct a proof for `task` given the reconstruction environment `recon`
     obtained after optimization.
@@ -130,7 +131,7 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let axioms ← task.axioms.reverse.mapM fun n => do
     let info ← getConstInfo n
     return Lean.mkConst n (info.levelParams.map mkLevelParam)
-  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes
+  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes recon.recFunEquivs
 
 where
   finish (startTime : Nat) (o : ReconOutcome) : TermElabM ReconOutcome := do

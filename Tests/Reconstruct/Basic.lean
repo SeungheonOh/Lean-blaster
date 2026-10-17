@@ -53,6 +53,19 @@ def addNat (a : Nat) (b : Nat) : Nat :=
 
 #blaster (reconstruct: 2) [∀ (x y : Nat), addNat x y = x + y]
 
+-- nested equivalences: `powerNat ≡ Nat.pow` relies on `mulNat ≡ Nat.mul`, which relies on `addNat ≡ Nat.add`
+def mulNat (x : Nat) (y : Nat) : Nat :=
+  match x, y with
+  | _, Nat.zero => 0
+  | _, Nat.succ b => addNat x (mulNat x b)
+
+def powerNat (a : Nat) (n : Nat) : Nat :=
+  match n with
+  | Nat.zero => 1
+  | Nat.succ n' => mulNat a (powerNat a n')
+
+#blaster (reconstruct: 2) (only-optimize: 1) [∀ (x y : Nat), powerNat x y = Nat.pow x y]
+
 /-! ## Residual goals with user definitions (unfolding + case analysis) -/
 
 inductive Color where
