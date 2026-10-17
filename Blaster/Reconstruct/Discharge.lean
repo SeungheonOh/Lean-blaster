@@ -78,6 +78,16 @@ def attempt [Monad m] [MonadBacktrack s m] [MonadExcept Exception m] [MonadRunti
       if r.isNone then failed else return r)
     (fun _ => failed)
 
+/-- Return `true` if `prf` depends on `sorryAx` through an auxiliary declaration of the current
+    module (e.g., a matcher created by `nomatch` after an elaboration error).
+-/
+def dependsOnSorry (prf : Expr) : MetaM Bool := do
+  let env ← getEnv
+  for c in prf.getUsedConstants do
+    if (env.getModuleIdxFor? c).isSome then continue
+    if (← collectAxioms c).contains ``sorryAx then return true
+  return false
+
 /-- Try to close goal `type` with tactic `tac`. The elaboration state is restored on failure. -/
 def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHeartbeats) : TermElabM (Option Expr) := do
   let s ← saveState
@@ -88,6 +98,8 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
   -- NOTE: Diagnostics reported asynchronously during an attempt (e.g., failures when generating the
   -- equations of a matcher via `realizeConst`) are discarded, as they don't affect the resulting proof.
   let tasks := (← getThe Core.State).snapshotTasks
+  -- NOTE: an attempt logging an error (e.g., an elaboration error recovered with `sorry`) is rejected
+  Core.setMessageLog {}
   let r ← try
       attempt budget do
         let mvar ← mkFreshExprMVar type
@@ -97,6 +109,8 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
                    withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
         let prf ← instantiateMVars mvar
         if !gs.isEmpty || prf.hasMVar || prf.hasSorry then return none
+        if ← dependsOnSorry prf then return none
+        if (← Core.getMessageLog).hasErrors then return none
         return some prf
     finally modifyThe Core.State fun st => { st with snapshotTasks := tasks }
   if r.isNone then s.restore

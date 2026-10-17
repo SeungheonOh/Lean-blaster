@@ -82,6 +82,10 @@ def finishProof
     let shown := stats.failures.extract 0 3
     let msgs := shown.foldl (fun acc m => acc ++ m!"\n  • {m}") m!""
     return ← finish { out with failure := m!"{stats.failures.size} unresolved proof obligation(s) out of {stats.total}:{msgs}" }
+  -- NOTE: `sorryAx` may occur in auxiliary declarations created by tactics (e.g., after an
+  -- elaboration error), which the kernel accepts.
+  if proof.hasSorry || (← dependsOnSorry proof) then
+    return ← finish { out with failure := m!"the reconstructed proof depends on sorryAx" }
   match ← kernelCheck goal proof with
   | some msg => finish { out with failure := msg }
   | none => finish { out with proof? := some proof }
