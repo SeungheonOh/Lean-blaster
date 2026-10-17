@@ -270,6 +270,28 @@ Over the same milestones, the number of rewrite steps justified by an explicit l
 to 16.6k. Proof obligations left to tactics dropped from 13.2k to 4.0k, of which only 127 remain
 unresolved (down from 796).
 
+### Port to `beta-lambda-cache-optimization`
+
+The reconstruction was ported onto Blaster's `beta-lambda-cache-optimization` branch (hash-consing,
+context reuse, equality maps and metavariable-based beta reduction). When tracking proofs, the proof run
+disables context reuse, equality-map lookups and shared beta reduction, and hash-conses its input in a
+fresh environment. On that branch's test suite (3865 attempts, run with a nightly Z3):
+
+| `#testOptimize` certificates | goals closed by optimizer | goals closed by SMT | all |
+|------------------------------|---------------------------|---------------------|-----|
+| 99.7% (3121 / 3130)          | 100% (399 / 399)          | 98.8% (332 / 336)   | **99.7%** (3852 / 3865) |
+
+Three of the SMT failures are goals that are *false* (`Tests/Smt/SmtUninhabited.lean`, e.g.
+`∀ (α : Type), (α → Empty) → False`). The beta branch reports them `Valid`, as it doesn't include the
+soundness fix for type variables that may be empty. Reconstruction correctly refuses them. The
+remaining failures are 9 `match` normalizations over `Int` patterns or dependent discriminants
+(`MatchToITE_9/10/15/20/21`, `MatchOverFun_3`, `MatchOverMatch_5`, `MatchReduceUnchanged_6`,
+`NegLitSymOffset`) and one SMT residual (`Issue287`).
+
+Reconstruction refuses a proof that depends on `sorryAx`, including through auxiliary declarations
+created by tactics. For example, `nomatch` reports missing cases as an error message and still produces
+a matcher whose body is `sorry`, which the kernel accepts.
+
 ## Current limitations / next steps
 
 - The remaining failures (14 of 3267 attempts, excluding refused unsound eliminations) fall into a few classes:
