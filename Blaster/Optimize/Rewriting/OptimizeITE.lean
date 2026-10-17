@@ -427,6 +427,13 @@ def optimizeDITEChoice (f : Expr) (args : Array Expr) : TranslateEnvT (Option Ex
    diteReduce? (cond : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr) := do
      if let some p ← inHypMap cond
      then
+       -- NOTE: when tracking proof terms, the hypothesis must be a proof of the binder type
+       -- (i.e., the resulting expression must be well-typed).
+       let p ← if ← Blaster.Reconstruct.isTracking then
+           let key := match t with | Expr.lam _ c _ _ => c | _ => cond
+           Blaster.Reconstruct.hypProof? key p
+         else pure (some p)
+       let some p := p | return none
        freeRewriteCacheReuse t 0
        freeRewriteCacheReuse e 0
        mkAppExpr t p

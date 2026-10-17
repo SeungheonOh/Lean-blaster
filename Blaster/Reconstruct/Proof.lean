@@ -267,7 +267,8 @@ def forallCongr (x : Expr) (t t' b b' : Expr) (pt pb : EqPf) : TranslateEnvT EqP
         let h ← mkLambdaFVars #[x] pb
         if b'.containsFVar xId then
           let q₂ ← mkLambdaFVars #[x] b'
-          return some (mkApp6 (mkConst ``implies_dep_congr_ctx) t t' b q₂ p h)
+          -- NOTE: `implies_dep_congr_ctx {p₁ p₂ q₁} (h₁ : p₁ = p₂) {q₂ : p₂ → Prop} (h₂ : ∀ h, q₁ = q₂ h)`
+          return some (mkApp6 (mkConst ``implies_dep_congr_ctx) t t' b p q₂ h)
         else
           return some (mkApp6 (mkConst ``implies_congr_ctx) t t' b b' p h)
       match r with
