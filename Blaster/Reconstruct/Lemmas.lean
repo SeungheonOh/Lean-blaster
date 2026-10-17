@@ -380,3 +380,13 @@ theorem dite'_neg {α : Sort u} (c : Prop) (t : c → α) (e : ¬ c → α) (h :
   simp only [Blaster.Reconstruct.dite'_eq_dite]; simp [h]
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-- Cast a proof along an equality of propositions. Used to keep expressions well-typed when a
+    hypothesis is declared with a rewritten type (see `LambdaWaitForType`, `ForallWaitForType`).
+    NOTE: Stated as a theorem such that the SMT translation interprets it by its statement.
+-/
+theorem castProof {P Q : Prop} (h : P = Q) (p : P) : Q := h ▸ p
+
+end Blaster.Reconstruct

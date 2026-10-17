@@ -198,9 +198,10 @@ def sameDomain (t t' : Expr) : TranslateEnvT Bool := do
     definitionally equal and evidence `pf : b = b'` (with `x : t'`), return `EqPf.lamBody` evidence
     when neither `b` nor `b'` depend on `x`. Otherwise `EqPf.unknown`.
 -/
-def lamBodyCongr (x : Expr) (b b' : Expr) (pf : EqPf) : TranslateEnvT EqPf := do
+def lamBodyCongr (x : Expr) (b b' : Expr) (pf : EqPf) (allowDep := false) : TranslateEnvT EqPf := do
   let xId := x.fvarId!
-  if b.containsFVar xId || b'.containsFVar xId then return .unknown
+  -- NOTE: dependency is allowed when the body has been instantiated with a cast (see `LambdaWaitForType`)
+  if !allowDep && (b.containsFVar xId || b'.containsFVar xId) then return .unknown
   let r ← tryInLocalContext do
     let p ← match pf with
             | .defeq => some <$> mkEqRefl b
@@ -258,6 +259,29 @@ def forallCongr (x : Expr) (t t' b b' : Expr) (pt pb : EqPf) : TranslateEnvT EqP
       | some (some r) => return .proof r
       | _ => return .unknown
   | _, _ => return .unknown
+
+/-- Given a forall `∀ x : t, b` such that:
+      - `pt : t = t'` (with `t` and `t'` propositions)
+      - the body `b` (with `rawBody` the body with a loose bound variable) has been instantiated with a
+        cast of `x : t'` to `t` and rewritten to `b'` with evidence `pb`
+    return evidence for `(∀ x : t, b) = (∀ x : t', b')` via `forall_prop_domain_congr`.
+-/
+def castForallCongr (x : Expr) (t t' rawBody b' : Expr) (pt pb : EqPf) : TranslateEnvT EqPf := do
+  let .proof p := pt | return .unknown
+  let r ← tryInLocalContext do
+    let decl ← x.fvarId!.getDecl
+    let q₁ := Expr.lam decl.userName t rawBody .default
+    let q₂ ← mkLambdaFVars #[x] b'
+    let body := rawBody.instantiate1 (mkApp4 (mkConst ``Blaster.Reconstruct.castProof) t' t (← mkEqSymm p) x)
+    let pbody ← match pb with
+      | .defeq => mkEqRefl body
+      | .proof q => pure q
+      | _ => throwError "castForallCongr: unknown evidence"
+    let h₂ ← mkLambdaFVars #[x] pbody
+    return mkAppN (mkConst ``forall_prop_domain_congr) #[t, t', q₁, q₂, p, h₂]
+  match r with
+  | some r => return .proof r
+  | none => return .unknown
 
 /-- Given an application `f a₁ ... aₙ` such that `pf : lhs = f a₁ ... aₙ` and the argument at position
     `idx` has been rewritten from `orig` to `a'ᵢ` with evidence `pfArg`, return evidence for

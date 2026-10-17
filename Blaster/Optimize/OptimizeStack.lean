@@ -49,7 +49,7 @@ inductive OptimizeStack where
                     (subsInts : Expr) (params : ImplicitParameters) (optBody : Expr) (f : Expr) (pf : EqPf)
  | ForallWaitForType (n : Name) (bi : BinderInfo) (t : Expr) (body : Expr)
  | ForallWaitForBody (x : Expr) (t : Expr) (hctx : HypsStackContext) (lctx : LocalDeclContext)
-                     (origT : Expr) (pt : EqPf) (origBody : Expr)
+                     (origT : Expr) (pt : EqPf) (origBody : Expr) (rawBody : Option Expr)
  | AppWaitForConst (args : Array Expr)
  | OptimizeMatchInfoWaitForInst (f : Expr) (args : Array Expr)
                                 (startArgIdx : Nat) (pInfo : FunEnvInfo) (mInfo : MatcherRecInfo) (pf : EqPf)
@@ -61,9 +61,9 @@ inductive OptimizeStack where
  | MatchChoiceOptimizeDiscrs (f : Expr) (args : Array Expr) (pInfo : FunEnvInfo)
                              (startArgIdx : Nat) (idx : Nat) (mInfo : MatchInfo) (pf : EqPf)
  | LambdaWaitForType (n : Name) (bi : BinderInfo) (body : Expr) (inDite : Bool)
-                     (origT : Expr) (declType : Option Expr)
+                     (origT : Expr) (declType : Option (Expr × Option Expr))
  | LambdaWaitForBody (x : Expr) (lctx : LocalDeclContext) (hctx : Option HypsStackContext)
-                     (pt : EqPf) (origBody : Expr) (origT : Expr)
+                     (pt : EqPf) (origBody : Expr) (origT : Expr) (casted : Bool)
  | MatchRhsLambdaWaitForType (n : Name) (bi : BinderInfo) (body : Expr)
  | MatchRhsLambdaNext (e : Expr)
  | MatchRhsLambdaWaitForBody (x : Expr) (lctx : LocalDeclContext)
@@ -155,23 +155,34 @@ def stackContinuity
   | .ForallWaitForType n bi t body :: xs =>
        -- optExpr corresponds to optimized forall binder type
        -- continuity with optimizing forall body
+       -- NOTE: When tracking proof terms, the following actions are performed to preserve type correctness:
+       --  - binders that are not hypotheses (e.g., functions over proofs) keep their original type
+       --    when the rewrite of their type is not definitional;
+       --  - for hypotheses used in the body, the body is instantiated with a cast from the rewritten type
+       --    to the original one (only when the evidence of the rewrite has no proof obligation).
        withLocalContext $ do
-         withLocalDecl' n bi optExpr fun x => do
-           let body' := instantiate1' body x
+         let (declT, pt, castEq?) ← forallBinderType t optExpr pf body
+         withLocalDecl' n bi declT fun x => do
+           let body' := match castEq? with
+             | some h => body.instantiate1 (mkApp4 (mkConst ``Blaster.Reconstruct.castProof) declT t h x)
+             | none => instantiate1' body x
            let isNotPropBody := !(← isPropEnv body')
-           let hyps ← addHypotheses optExpr x isNotPropBody
+           let hyps ← addHypotheses declT x isNotPropBody
            let hctx ← mkHypStackContext hyps
            let lctx ← mkLocalDeclStackContext (← mkLocalContext)
-           return Sum.inl ( .InitOptimizeExpr body' :: .ForallWaitForBody x optExpr hctx lctx t pf body' :: xs)
+           let rawBody := castEq?.map fun _ => body
+           return Sum.inl ( .InitOptimizeExpr body' :: .ForallWaitForBody x declT hctx lctx t pt body' rawBody :: xs)
 
-  | .ForallWaitForBody x t hctx lctx origT pt origBody :: xs =>
+  | .ForallWaitForBody x t hctx lctx origT pt origBody rawBody :: xs =>
        -- optExpr corresponds to optimized forall body
        -- continiuity with applying forall normalization rules
        resetHypContext hctx
        let (e, pf) ← withLocalContext $ do
           if !(← isTracking) then
             return (← optimizeForall x t hctx.newHCtx.2.1 optExpr, EqPf.unknown)
-          let congrPf ← forallCongr x origT t origBody optExpr pt pf
+          let congrPf ← match rawBody with
+            | some b0 => castForallCongr x origT t b0 optExpr pt pf
+            | none => forallCongr x origT t origBody optExpr pt pf
           let lhs ← mkForallFVar x optExpr
           clearSteps
           let e ← optimizeForall x t hctx.newHCtx.2.1 optExpr
@@ -273,24 +284,33 @@ def stackContinuity
        let apf ← apf.trans (← congrArgAt f args idx pf)
        return Sum.inl (.MatchChoiceOptimizeDiscrs f args pInfo startArgIdx (idx + 1) mInfo apf :: xs)
 
-  | .LambdaWaitForType n bi body inDite origT declType :: xs =>
+  | .LambdaWaitForType n bi body inDite origT declInfo :: xs =>
        -- optExpr corresponds to optimized lambda type
        -- NOTE: When `declType` is provided (i.e., only when tracking proof terms), the lambda binder is
        -- declared with `declType` instead of `optExpr`. This is used to preserve type correctness of
        -- `Blaster.dite'` branches, whose binder types must respectively be `c` and `¬ c`, with `c` the
        -- optimized condition. The optimized type `optExpr` is still used as hypothesis.
+       -- NOTE: When a cast `h : declType = origT` is provided, the body is instantiated with a proof of `origT`
+       -- obtained from the binder, such that the body remains well-typed.
        withLocalContext $ do
+         let declType := declInfo.map Prod.fst
+         let castEq? := declInfo.bind Prod.snd
          withLocalDecl' n bi (declType.getD optExpr) fun x => do
-           let body' := instantiate1' body x
+           let (body', casted) := match declType, castEq? with
+             | some τ, some h =>
+                 if body.hasLooseBVars
+                 then (body.instantiate1 (mkApp4 (mkConst ``Blaster.Reconstruct.castProof) τ origT h x), true)
+                 else (body, false)
+             | _, _ => (instantiate1' body x, false)
            let bodyOpt := .InitOptimizeExpr body'
            let lctx ← mkLocalDeclStackContext (← mkLocalContext)
            if inDite then
              let hyps ← addHypotheses optExpr x
              let hypsCtx ← mkHypStackContext hyps
-             return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx (some hypsCtx) pf body' origT :: xs)
-           else return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx none pf body' origT :: xs)
+             return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx (some hypsCtx) pf body' origT casted :: xs)
+           else return Sum.inl (bodyOpt :: .LambdaWaitForBody x lctx none pf body' origT casted :: xs)
 
-  | .LambdaWaitForBody x lctx hctx pt origBody origT :: xs =>
+  | .LambdaWaitForBody x lctx hctx pt origBody origT casted :: xs =>
        -- optExpr corresponds to optimized lambda body
        -- continuity with optimizing next expression
        if let some h := hctx then resetHypContext h
@@ -298,7 +318,7 @@ def stackContinuity
           let pf ←
             if !(← isTracking) then pure .unknown
             else if pt.isDefEq || (← sameDomain (← x.fvarId!.getType) origT) then funextCongr x origBody optExpr pf
-            else lamBodyCongr x origBody optExpr pf
+            else lamBodyCongr x origBody optExpr pf (allowDep := casted)
           mkExprPf (← mkLambdaFVar x optExpr) pf
        resetLocalDeclContext lctx
        stackContinuity xs e pf
@@ -359,6 +379,22 @@ def stackContinuity
   | _ => throwEnvError "stackContinuity: unexpected optimize stack continuity {reprStr stack} !!!"
 
   where
+    /-- Return the type with which a forall binder of type `t` (optimized to `t'` with evidence `pf`) must be
+        declared, the evidence for the binder type and the (optional) cast `t' = t` for the body
+        (see `ForallWaitForType`).
+    -/
+    forallBinderType (t t' : Expr) (pf : EqPf) (body : Expr) : TranslateEnvT (Expr × EqPf × Option Expr) := do
+      if !(← isTracking) || t == t' then return (t', pf, none)
+      if !(← isPropEnv t) then
+        if ← sameDomain t' t then return (t', pf, none)
+        -- keep the original type (e.g., functions over proofs)
+        return (t, .defeq, none)
+      if !body.hasLooseBVars then return (t', pf, none)
+      let .proof p := pf | return (t', pf, none)
+      if containsHole p then return (t', pf, none)
+      let some h ← tryInLocalContext (mkEqSymm p) | return (t', pf, none)
+      return (t', pf, some h)
+
     /-- When tracking proof terms and the condition of `dite' c t e x₁ ... xₙ` has been rewritten to
         `True` (resp. `False`), return `t h x₁ ... xₙ` (resp. `e h x₁ ... xₙ`) with `h` a proof of `c`
         (resp. `¬ c`), together with the evidence of the rewrite.
