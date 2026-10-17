@@ -405,3 +405,64 @@ theorem dite'_swap_dep {α : Sort u} {c₀ c : Prop} (pc : c₀ = ¬ c) (t : c�
   . simp [h]
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## `BEq` and `decide'` bridges (see `optimizeBEq` and `optimizeDecideEq`) -/
+
+theorem bool_false_beq (e : Bool) : (false == e) = !e := by cases e <;> rfl
+theorem bool_true_beq (e : Bool) : (true == e) = e := by cases e <;> rfl
+theorem bool_beq_not_self (e : Bool) : (e == !e) = false := by cases e <;> rfl
+theorem bool_not_beq_not (a b : Bool) : ((!a) == !b) = (a == b) := by cases a <;> cases b <;> rfl
+theorem beq_self' {α : Type u} [BEq α] [LawfulBEq α] (a : α) : (a == a) = true := beq_self_eq_true a
+theorem true_eq_beq {α : Type u} [BEq α] [LawfulBEq α] (a b : α) : (true = (a == b)) = (a = b) := by
+  apply propext; constructor
+  . intro h; exact eq_of_beq h.symm
+  . intro h; subst h; exact (beq_self_eq_true a).symm
+theorem false_eq_beq {α : Type u} [BEq α] [LawfulBEq α] (a b : α) : (false = (a == b)) = ¬ (a = b) := by
+  apply propext; constructor
+  . intro h h'; subst h'; rw [beq_self_eq_true] at h; contradiction
+  . intro h; cases h' : a == b
+    . rfl
+    . exact (h (eq_of_beq h')).elim
+theorem bool_eq_beq {α : Type u} [BEq α] [LawfulBEq α] (c : Bool) (a b : α) :
+    (c = (a == b)) = ((true = c) = (a = b)) := by
+  cases c
+  . rw [false_eq_beq]; apply propext; constructor
+    . intro h; apply propext; constructor
+      . intro h'; exact Bool.noConfusion h'
+      . intro h'; exact (h h').elim
+    . intro h h'; exact Bool.noConfusion (h.mpr h')
+  . rw [true_eq_beq]; simp
+theorem beq_eq_bool {α : Type u} [BEq α] [LawfulBEq α] (c : Bool) (a b : α) :
+    ((a == b) = c) = ((true = c) = (a = b)) := by
+  rw [← bool_eq_beq]; exact propext ⟨Eq.symm, Eq.symm⟩
+theorem bool_eq_bool_eq_tt (a b : Bool) : ((true = a) = (true = b)) = (a = b) := by
+  cases a <;> cases b <;> simp
+theorem bool_eq_bool_eq_tf (a b : Bool) : ((true = a) = (false = b)) = (a = !b) := by
+  cases a <;> cases b <;> simp
+theorem bool_eq_bool_eq_ft (a b : Bool) : ((false = a) = (true = b)) = ((!a) = b) := by
+  cases a <;> cases b <;> simp
+theorem bool_eq_bool_eq_ff (a b : Bool) : ((false = a) = (false = b)) = ((!a) = !b) := by
+  cases a <;> cases b <;> simp
+theorem true_eq_decide' (e : Prop) : (true = Blaster.decide' e) = e := by
+  apply propext; constructor
+  . intro h; exact (Blaster.decide'_true e).mp h.symm
+  . intro h; exact ((Blaster.decide'_true e).mpr h).symm
+theorem false_eq_decide' (e : Prop) : (false = Blaster.decide' e) = ¬ e := by
+  apply propext; constructor
+  . intro h; exact (Blaster.decide'_false e).mp h.symm
+  . intro h; exact ((Blaster.decide'_false e).mpr h).symm
+theorem decide'_eq_decide' (e1 e2 : Prop) : (Blaster.decide' e1 = Blaster.decide' e2) = (e1 = e2) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]
+  apply propext; constructor
+  . intro h; apply propext; constructor <;> intro h' <;> by_cases h1 : e1 <;> by_cases h2 : e2 <;> simp_all
+  . intro h; subst h; rfl
+theorem decide'_eq_bool (e : Prop) (b : Bool) : (Blaster.decide' e = b) = (e = (true = b)) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]
+  cases b <;> by_cases h : e <;> simp [h]
+theorem bool_eq_decide' (e : Prop) (b : Bool) : (b = Blaster.decide' e) = (e = (true = b)) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]
+  cases b <;> by_cases h : e <;> simp [h]
+
+end Blaster.Reconstruct
