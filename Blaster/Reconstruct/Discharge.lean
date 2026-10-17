@@ -195,6 +195,74 @@ syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
 @[tactic blasterInstHyps] def evalBlasterInstHyps : Tactic := fun _ =>
   liftMetaTactic fun g => return [← instHypsWithSeeds g]
 
+/-! ## Unfolding user definitions
+
+The SMT solver receives the definitions of the (recursive) functions occurring in the residual
+goal. Lean decision procedures do not unfold them automatically. The following tactics unfold
+definitions that are not part of the Lean/Blaster libraries and perform a bounded case analysis
+on variables of inductive types.
+-/
+
+/-- Return `true` if `n` is a user definition, i.e., a definition not defined in Lean's core libraries. -/
+def isUserDefinition (env : Environment) (n : Name) : Bool := Id.run do
+  let some info := env.find? n | return false
+  if !info.isDefinition || isAuxRecursor env n || isMatcherCore env n then return false
+  match env.getModuleIdxFor? n with
+  | none => return true
+  | some idx =>
+      let mod := env.header.moduleNames[idx.toNat]!
+      return !(mod.getRoot ∈ [`Init, `Lean, `Std, `Lake, `Blaster])
+
+syntax (name := blasterUnfoldUser) "blaster_unfold_user" : tactic
+
+/-- Unfold (up to 3 rounds) the user definitions occurring in the main goal and its hypotheses. -/
+@[tactic blasterUnfoldUser] def evalBlasterUnfoldUser : Tactic := fun _ => do
+  let env ← getEnv
+  for _ in [0:3] do
+    if (← getGoals).isEmpty then return
+    let g ← getMainGoal
+    let mut t ← instantiateMVars (← g.getType)
+    for d in ← g.withContext getLCtx do
+      if !d.isImplementationDetail then t := mkApp t (← instantiateMVars d.type)
+    let consts := t.getUsedConstants.filter (isUserDefinition env)
+    if consts.isEmpty then return
+    let lemmas ← consts.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+    try evalTactic (← `(tactic| simp only [$lemmas,*] at *)) catch _ => return
+
+/-- Maximum number of goals produced by `blaster_cases_vars`. -/
+def maxCaseGoals : Nat := 128
+
+syntax (name := blasterCasesVars) "blaster_cases_vars" : tactic
+
+/-- Perform case analysis on the variables of inductive types (bounded by `maxCaseGoals`). -/
+@[tactic blasterCasesVars] def evalBlasterCasesVars : Tactic := fun _ => do
+  let g ← getMainGoal
+  let vars ← g.withContext do
+    let mut vars := #[]
+    for d in ← getLCtx do
+      if d.isImplementationDetail then continue
+      let t ← whnfR d.type
+      let .const n _ := t.getAppFn | continue
+      let .inductInfo info ← getConstInfo n | continue
+      if info.numIndices != 0 || (← isProp d.type) then continue
+      vars := vars.push (d.fvarId, info.ctors.length)
+    return vars
+  let mut goals := [g]
+  let mut nbGoals := 1
+  for (v, nbCtors) in vars do
+    if nbGoals * nbCtors > maxCaseGoals then break
+    let mut newGoals := []
+    for g in goals do
+      -- the variable may have been substituted in some goals
+      if !(← g.withContext (return (← getLCtx).contains v)) then
+        newGoals := newGoals ++ [g]
+        continue
+      let subgoals ← g.cases v
+      newGoals := newGoals ++ subgoals.toList.map (·.mvarId)
+    goals := newGoals
+    nbGoals := goals.length
+  replaceMainGoal goals
+
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
 -/
@@ -207,6 +275,9 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
     ("seeded instantiation", ← `(tactic| (intros <;> blaster_inst_hyps <;> blaster_denorm <;>
                                            first | omega | grind))),
+    -- user definitions (e.g., derived `BEq` instances) with case analysis on inductive variables
+    ("unfold + cases", ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;> blaster_unfold_user <;>
+                                     (try simp_all) <;> (try decide) <;> done))),
     -- non-linear division/modulo identities
     ("arith simp", ← `(tactic| (intros <;> blaster_denorm <;>
         simp_all [Nat.mod_add_div, Nat.div_add_mod, Nat.mul_div_mul_left, Nat.mul_div_cancel_left,
