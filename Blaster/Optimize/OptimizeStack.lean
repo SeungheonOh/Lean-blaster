@@ -163,6 +163,11 @@ def stackContinuity
        withLocalContext $ do
          let (declT, pt, castEq?) ← forallBinderType t optExpr pf body
          withLocalDecl' n bi declT fun x => do
+           -- NOTE: casts are only used for propositional bodies (see `castForallCongr`), e.g., not for
+           -- the alternative types of a matcher.
+           let castEq? ← match castEq? with
+             | some h => do if (← isPropEnv (instantiate1' body x)) then pure (some h) else pure none
+             | none => pure none
            let body' := match castEq? with
              | some h => body.instantiate1 (mkApp4 (mkConst ``Blaster.Reconstruct.castProof) declT t h x)
              | none => instantiate1' body x
@@ -386,14 +391,22 @@ def stackContinuity
     forallBinderType (t t' : Expr) (pf : EqPf) (body : Expr) : TranslateEnvT (Expr × EqPf × Option Expr) := do
       if !(← isTracking) || t == t' then return (t', pf, none)
       if !(← isPropEnv t) then
+        -- keep the original type only for functions over proofs (i.e., with a proposition as domain),
+        -- whose domain rewrite would otherwise make their applications ill-typed
+        if !(← isFunOverProof t) then return (t', pf, none)
         if ← sameDomain t' t then return (t', pf, none)
-        -- keep the original type (e.g., functions over proofs)
         return (t, .defeq, none)
       if !body.hasLooseBVars then return (t', pf, none)
       let .proof p := pf | return (t', pf, none)
       if containsHole p then return (t', pf, none)
       let some h ← tryInLocalContext (mkEqSymm p) | return (t', pf, none)
       return (t', pf, some h)
+
+    /-- Return `true` if `t := (h : P) → β` with `P` a proposition. -/
+    isFunOverProof (t : Expr) : TranslateEnvT Bool := do
+      let .forallE _ d _ _ := t | return false
+      let some r ← tryInLocalContext (isProp d) | return false
+      return r
 
     /-- When tracking proof terms and the condition of `dite' c t e x₁ ... xₙ` has been rewritten to
         `True` (resp. `False`), return `t h x₁ ... xₙ` (resp. `e h x₁ ... xₙ`) with `h` a proof of `c`

@@ -387,6 +387,54 @@ def constCondProof (c : Expr) (pf : EqPf) (isTrue : Bool) : TranslateEnvT (Optio
         return some (mkApp3 (mkConst (if isTrue then ``of_decide_eq_true else ``of_decide_eq_false)) c inst refl)
       return r.join
 
+/-! ## Casting proof arguments
+
+Proof arguments are not rewritten when tracking proof terms (see `skipProofArg`). However, the data they
+refer to may have been rewritten (e.g., `Fin.mk v p` with `v` rewritten to `v'`), in which case the proof
+no longer has the expected type. Such proofs are cast using the evidence of the rewrites of the data.
+-/
+
+/-- Return the pairs of maximal subterms `(a, b)` that differ between `e` and `e'` (up to `n` pairs),
+    or `none` when `e` and `e'` do not have the same structure.
+-/
+partial def diffSubterms (e e' : Expr) (n := 8) : Option (Array (Expr × Expr)) := do
+  let rec go (e e' : Expr) (acc : Array (Expr × Expr)) : Option (Array (Expr × Expr)) := do
+    if e == e' then return acc
+    if acc.size ≥ n then none
+    match e, e' with
+    | .app f a, .app f' a' =>
+        if f.getAppNumArgs == f'.getAppNumArgs && f.getAppFn == f'.getAppFn then go a a' (← go f f' acc)
+        else return acc.push (e, e')
+    | _, _ => return acc.push (e, e')
+  go e e' #[]
+
+/-- Return a proof of `t = t'` built from the cached evidence of the rewrites of the differing
+    subterms of `t` and `t'` (only when no proof obligation is involved).
+-/
+def cachedEqProof (t t' : Expr) : TranslateEnvT (Option Expr) := do
+  let some diffs := diffSubterms t t' | return none
+  let cache := (← get).recon.proofCache
+  let mut cur := t
+  let mut proof? : Option Expr := none
+  for (a, b) in diffs do
+    let some (b', pf) := cache.get? a | return none
+    if b' != b then return none
+    match pf with
+    | .defeq => continue
+    | .proof p =>
+        if containsHole p then return none
+        let some step ← tryInLocalContext do
+            let aType ← inferType a
+            let motive ← withLocalDeclD `z aType fun z => mkLambdaFVars #[z] (cur.replace fun s => if s == a then some z else none)
+            mkCongrArg motive p
+          | return none
+        cur := cur.replace fun s => if s == a then some b else none
+        proof? ← match proof? with
+          | none => pure (some step)
+          | some q => tryInLocalContext (mkEqTrans q step)
+    | _ => return none
+  return proof?
+
 /-! ## Proof builders for function propagation over `Blaster.dite'` -/
 
 /-- Return a proof of `dite' c t e x₁ ... xₙ = dite' c (fun h => t h x₁ ... xₙ) (fun h => e h x₁ ... xₙ)`

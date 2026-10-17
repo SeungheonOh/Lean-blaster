@@ -111,7 +111,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
          else optimizeExprAux (.AppOptimizeExplicitArgs f args startIdx args.size pInfo none pf :: xs)
 
        else if idx < pInfo.paramsInfo.size -- handle case when HOF is the returned type
-            then if !pInfo.paramsInfo[idx]!.isExplicit && !(← skipProofArg pInfo idx)
+            then if !pInfo.paramsInfo[idx]!.isExplicit && !(← skipProofArg f pInfo idx)
                  then optimizeExprAux (.InitOptimizeExpr args[idx]! :: stack)
                  else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo pf :: xs)
             else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo pf :: xs)
@@ -120,6 +120,8 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
        if idx ≥ stopIdx then
          -- resolve pending congruence on dependent arguments (if any)
          let pf ← withLocalContext $ resolveDepArgs f args pf
+         -- cast proof arguments whose type is no longer the expected one (only when tracking proofs)
+         let args ← castProofArgs f args pInfo
          clearSteps
          -- normalizing ite/match function application
          if let some re ← normChoiceApplication? f args then
@@ -190,10 +192,37 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
         but not the instances depending on it).
     -/
     @[always_inline, inline]
-    skipProofArg (pInfo : FunEnvInfo) (idx : Nat) : TranslateEnvT Bool := do
+    skipProofArg (f : Expr) (pInfo : FunEnvInfo) (idx : Nat) : TranslateEnvT Bool := do
       if h : idx < pInfo.paramsInfo.size then
-        if pInfo.paramsInfo[idx].isProp then return (← isTracking)
+        if pInfo.paramsInfo[idx].isProp then
+          if !(← isTracking) then return false
+          -- NOTE: match/casesOn arguments are handled by the match normalization rules
+          if (← isMatcher? f).isSome then return false
+          if let .const n _ := f then
+            if isCasesOnRecursor (← getEnv) n || (← isMatchExpr f) then return false
+          return true
       return false
+
+    /-- When tracking proof terms, cast each proof argument of `f x₁ ... xₙ` whose type is not the expected
+        one (i.e., because the data it refers to has been rewritten), using `Blaster.Reconstruct.castProof`.
+        NOTE: By proof irrelevance, the evidence for the application is not affected.
+    -/
+    castProofArgs (f : Expr) (args : Array Expr) (pInfo : FunEnvInfo) : TranslateEnvT (Array Expr) := do
+      if !(← isTracking) then return args
+      let mut args := args
+      for h : j in [:min args.size pInfo.paramsInfo.size] do
+        if !pInfo.paramsInfo[j]!.isProp then continue
+        -- NOTE: proof variables are left unchanged (e.g., pattern variables in match alternatives)
+        if args[j]!.isFVar then continue
+        let some (actual, expected) ← tryInLocalContext (do
+            let .forallE _ d _ _ ← whnfD (← inferType (mkAppN f (args.extract 0 j))) | throwError "unexpected"
+            return (← instantiateMVars (← inferType args[j]!), d))
+          | continue
+        if actual == expected then continue
+        if (← sameDomain actual expected) then continue
+        let some hEq ← withLocalContext (cachedEqProof actual expected) | continue
+        args := args.set! j (mkApp4 (mkConst ``Blaster.Reconstruct.castProof) actual expected hEq args[j]!)
+      return args
 
     /-- Given `pf : lhs = f x₁ ... xₙ` and `r` the result of applying a rewriting rule on
         `f x₁ ... xₙ`, push `r` on the stack to be optimized while keeping track of the evidence for `lhs = r`.
@@ -281,7 +310,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
       (f : Expr) (args : Array Expr) (idx : Nat) (stopIdx : Nat)
       (pInfo : FunEnvInfo) (mInfo : Option MatchInfo) (pf : EqPf) (stack : List OptimizeStack)
       (nxtStack : List OptimizeStack) : TranslateEnvT (List OptimizeStack) := withLocalContext $ do
-      if ← skipProofArg pInfo idx then
+      if ← skipProofArg f pInfo idx then
         return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: nxtStack)
       if isBlasterDiteConst f then
         if idx == 1 then
