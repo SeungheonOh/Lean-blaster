@@ -44,6 +44,26 @@ namespace Tests.Reconstruct
 #blaster (reconstruct: 2) [∀ (x : Int), (if x < 0 then -x else x) ≥ 0]
 #blaster (reconstruct: 2) [∀ (x : Nat) (xs : List Nat), !(List.isEmpty xs) → List.head! (List.map (Nat.add x) xs) ≥ x]
 
+/-! ## Equivalence of recursive functions (justified by induction) -/
+
+def addNat (a : Nat) (b : Nat) : Nat :=
+  match a, b with
+  | _, Nat.zero => a
+  | _, Nat.succ b => Nat.succ (addNat a b)
+
+#blaster (reconstruct: 2) [∀ (x y : Nat), addNat x y = x + y]
+
+/-! ## Residual goals with user definitions (unfolding + case analysis) -/
+
+inductive Color where
+  | red : Color → Color
+  | transparent : Color
+  | blue : Color → Color
+  | black : Color
+  deriving BEq
+
+#blaster (reconstruct: 2) [∀ (x y : Color), x == y → x == Color.transparent → y == Color.transparent]
+
 /-! ## Tactic: the goal is closed with a kernel-checked proof instead of `admit` -/
 
 theorem and_left_rec : ∀ (a b : Prop), a ∧ b → a := by blaster (reconstruct: 2)

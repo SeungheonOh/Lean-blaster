@@ -88,6 +88,129 @@ def proveByDefEq (type : Expr) (budget := dischargeHeartbeats) : MetaM (Option E
 def isTypeCorrectObligation (type : Expr) : MetaM Bool := do
   return (← attempt dischargeHeartbeats (do Meta.check type; return some ())).isSome
 
+/-! ## Unfolding user definitions
+
+The SMT solver receives the definitions of the (recursive) functions occurring in the residual
+goal. Lean decision procedures do not unfold them automatically. The following tactics unfold
+definitions that are not part of the Lean/Blaster libraries and perform a bounded case analysis
+on variables of inductive types.
+-/
+
+/-- Return `true` if `n` is a user definition, i.e., a definition not defined in Lean's core libraries. -/
+def isUserDefinition (env : Environment) (n : Name) : Bool := Id.run do
+  let some info := env.find? n | return false
+  if !info.isDefinition || isAuxRecursor env n || isMatcherCore env n then return false
+  match env.getModuleIdxFor? n with
+  | none => return true
+  | some idx =>
+      let mod := env.header.moduleNames[idx.toNat]!
+      return !(mod.getRoot ∈ [`Init, `Lean, `Std, `Lake, `Blaster])
+
+syntax (name := blasterUnfoldUser) "blaster_unfold_user" : tactic
+
+/-- Unfold (up to 3 rounds) the user definitions occurring in the main goal and its hypotheses. -/
+@[tactic blasterUnfoldUser] def evalBlasterUnfoldUser : Tactic := fun _ => do
+  let env ← getEnv
+  for _ in [0:3] do
+    if (← getGoals).isEmpty then return
+    let g ← getMainGoal
+    let mut t ← instantiateMVars (← g.getType)
+    for d in ← g.withContext getLCtx do
+      if !d.isImplementationDetail then t := mkApp t (← instantiateMVars d.type)
+    let consts := t.getUsedConstants.filter (isUserDefinition env)
+    if consts.isEmpty then return
+    let lemmas ← consts.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+    try evalTactic (← `(tactic| simp only [$lemmas,*] at *)) catch _ => return
+
+/-- Maximum number of goals produced by `blaster_cases_vars`. -/
+def maxCaseGoals : Nat := 128
+
+syntax (name := blasterCasesVars) "blaster_cases_vars" : tactic
+
+/-- Perform case analysis on the variables of inductive types (bounded by `maxCaseGoals`). -/
+@[tactic blasterCasesVars] def evalBlasterCasesVars : Tactic := fun _ => do
+  let g ← getMainGoal
+  let vars ← g.withContext do
+    let mut vars := #[]
+    for d in ← getLCtx do
+      if d.isImplementationDetail then continue
+      let t ← whnfR d.type
+      let .const n _ := t.getAppFn | continue
+      let .inductInfo info ← getConstInfo n | continue
+      if info.numIndices != 0 || (← isProp d.type) then continue
+      vars := vars.push (d.fvarId, info.ctors.length)
+    return vars
+  let mut goals := [g]
+  let mut nbGoals := 1
+  for (v, nbCtors) in vars do
+    if nbGoals * nbCtors > maxCaseGoals then break
+    let mut newGoals := []
+    for g in goals do
+      -- the variable may have been substituted in some goals
+      if !(← g.withContext (return (← getLCtx).contains v)) then
+        newGoals := newGoals ++ [g]
+        continue
+      let subgoals ← g.cases v
+      newGoals := newGoals ++ subgoals.toList.map (·.mvarId)
+    goals := newGoals
+    nbGoals := goals.length
+  replaceMainGoal goals
+
+/-! ## Equivalence of recursive functions
+
+The optimizer replaces a recursive function with a structurally equivalent one (see `storeRecFunDef`),
+e.g., a user-defined `power` with `Nat.pow`. Such rewrites are justified by induction.
+-/
+
+syntax (name := blasterFunInd) "blaster_funind" : tactic
+
+/-- Prove `f = g` (or `f a₁ ... aₙ = g a₁ ... aₙ`) by function extensionality and induction on
+    one of the arguments, unfolding user definitions in each case.
+-/
+@[tactic blasterFunInd] def evalBlasterFunInd : Tactic := fun _ => do
+  -- function extensionality
+  let mut vars : Array Ident := #[]
+  for i in [0:8] do
+    let g ← getMainGoal
+    let some (t, _, _) := (← whnfR (← instantiateMVars (← g.getType))).eq? | break
+    if !(← whnfR t).isForall then break
+    let x := mkIdent (Name.mkSimple s!"x_{i}")
+    evalTactic (← `(tactic| (apply funext; intro $x:ident)))
+    vars := vars.push x
+  -- variables of the goal (when not a function equality): give them accessible names
+  if vars.isEmpty then
+    evalTactic (← `(tactic| intros))
+    let g ← getMainGoal
+    let target ← instantiateMVars (← g.getType)
+    let mut g := g
+    for d in ← g.withContext getLCtx do
+      if d.isImplementationDetail || !target.containsFVar d.fvarId then continue
+      if (← g.withContext (isProp d.type)) then continue
+      let n := Name.mkSimple s!"y_{vars.size}"
+      g ← g.rename d.fvarId n
+      vars := vars.push (mkIdent n)
+    replaceMainGoal [g]
+  if vars.isEmpty then throwError "blaster_funind: no variable"
+  let finish ← `(tactic| (blaster_unfold_user <;> blaster_denorm <;>
+                           (try simp_all [Nat.pow_succ, Int.pow_succ]) <;> grind))
+  -- try induction on each variable (last one first), then with the other variables generalized
+  let mut alts : Array (TSyntax `tactic) := #[]
+  for x in vars.reverse do
+    alts := alts.push (← `(tactic| (induction $x:ident <;> $finish)))
+  for x in vars do
+    let others := vars.filter (· != x)
+    if others.isEmpty then continue
+    alts := alts.push (← `(tactic| (induction $x:ident generalizing $others* <;>
+                                     (try (cases $(others[0]!):ident)) <;> $finish)))
+  let s ← saveState
+  for tac in alts do
+    try
+      evalTactic tac
+      if (← getUnsolvedGoals).isEmpty then return
+      s.restore
+    catch _ => s.restore
+  throwError "blaster_funind: failed"
+
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
@@ -95,7 +218,9 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("omega", ← `(tactic| ((try apply propext) <;> blaster_denorm <;> omega))),
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
     -- case analysis (e.g., `match` expressions normalized to `Blaster.dite'`)
-    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind)))
+    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind))),
+    -- equivalence of recursive functions
+    ("induction", ← `(tactic| blaster_funind))
   ]
 
 /-- Try to discharge proof obligation `type` (expected to be an equality) and return
@@ -194,74 +319,6 @@ syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
 
 @[tactic blasterInstHyps] def evalBlasterInstHyps : Tactic := fun _ =>
   liftMetaTactic fun g => return [← instHypsWithSeeds g]
-
-/-! ## Unfolding user definitions
-
-The SMT solver receives the definitions of the (recursive) functions occurring in the residual
-goal. Lean decision procedures do not unfold them automatically. The following tactics unfold
-definitions that are not part of the Lean/Blaster libraries and perform a bounded case analysis
-on variables of inductive types.
--/
-
-/-- Return `true` if `n` is a user definition, i.e., a definition not defined in Lean's core libraries. -/
-def isUserDefinition (env : Environment) (n : Name) : Bool := Id.run do
-  let some info := env.find? n | return false
-  if !info.isDefinition || isAuxRecursor env n || isMatcherCore env n then return false
-  match env.getModuleIdxFor? n with
-  | none => return true
-  | some idx =>
-      let mod := env.header.moduleNames[idx.toNat]!
-      return !(mod.getRoot ∈ [`Init, `Lean, `Std, `Lake, `Blaster])
-
-syntax (name := blasterUnfoldUser) "blaster_unfold_user" : tactic
-
-/-- Unfold (up to 3 rounds) the user definitions occurring in the main goal and its hypotheses. -/
-@[tactic blasterUnfoldUser] def evalBlasterUnfoldUser : Tactic := fun _ => do
-  let env ← getEnv
-  for _ in [0:3] do
-    if (← getGoals).isEmpty then return
-    let g ← getMainGoal
-    let mut t ← instantiateMVars (← g.getType)
-    for d in ← g.withContext getLCtx do
-      if !d.isImplementationDetail then t := mkApp t (← instantiateMVars d.type)
-    let consts := t.getUsedConstants.filter (isUserDefinition env)
-    if consts.isEmpty then return
-    let lemmas ← consts.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
-    try evalTactic (← `(tactic| simp only [$lemmas,*] at *)) catch _ => return
-
-/-- Maximum number of goals produced by `blaster_cases_vars`. -/
-def maxCaseGoals : Nat := 128
-
-syntax (name := blasterCasesVars) "blaster_cases_vars" : tactic
-
-/-- Perform case analysis on the variables of inductive types (bounded by `maxCaseGoals`). -/
-@[tactic blasterCasesVars] def evalBlasterCasesVars : Tactic := fun _ => do
-  let g ← getMainGoal
-  let vars ← g.withContext do
-    let mut vars := #[]
-    for d in ← getLCtx do
-      if d.isImplementationDetail then continue
-      let t ← whnfR d.type
-      let .const n _ := t.getAppFn | continue
-      let .inductInfo info ← getConstInfo n | continue
-      if info.numIndices != 0 || (← isProp d.type) then continue
-      vars := vars.push (d.fvarId, info.ctors.length)
-    return vars
-  let mut goals := [g]
-  let mut nbGoals := 1
-  for (v, nbCtors) in vars do
-    if nbGoals * nbCtors > maxCaseGoals then break
-    let mut newGoals := []
-    for g in goals do
-      -- the variable may have been substituted in some goals
-      if !(← g.withContext (return (← getLCtx).contains v)) then
-        newGoals := newGoals ++ [g]
-        continue
-      let subgoals ← g.cases v
-      newGoals := newGoals ++ subgoals.toList.map (·.mvarId)
-    goals := newGoals
-    nbGoals := goals.length
-  replaceMainGoal goals
 
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
