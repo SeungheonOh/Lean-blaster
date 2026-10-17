@@ -123,6 +123,18 @@ def optimizeNatPow (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
  | some n1, some n2 => evalBinNatOp Nat.pow n1 n2
  | _, _ => mkApp2Expr f op1 op2
 
+/-- Apply the following simplification/normalization rules on `Nat.log2` :
+     - Nat.log2 N ==> "Nat.log2 N"
+   Assume that f = Expr.const ``Nat.log2.
+   An error is triggered when args.size ≠ 1 (i.e., only fully applied `Nat.log2` expected at this stage)
+-/
+def optimizeNatLog2 (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
+ if args.size != 1 then throwEnvError "optimizeNatLog2: exactly one argument expected"
+ let op := args[0]!
+ match isNatValue? op with
+ | some n => mkNatLitExpr (Nat.log2 n)
+ | none => mkAppExpr f op
+
 /-- Apply the following simplification/normalization rules on `Nat.mul` :
      - 0 * n ==> 0
      - 1 * n ==> n
@@ -347,6 +359,7 @@ def optimizeNat? (f : Expr) (args : Array Expr) : TranslateEnvT (Option Expr) :=
   | ``Nat.beq => optimizeNatBeq f args
   | ``Nat.ble => optimizeNatble f args
   | ``Nat.pow => optimizeNatPow f args
+  | ``Nat.log2 => optimizeNatLog2 f args
   | _=> return none
 
 end Blaster.Optimize

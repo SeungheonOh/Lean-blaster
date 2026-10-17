@@ -218,6 +218,10 @@ private def withLocalDeclAux (name : Name) (bi : BinderInfo) (type : Expr) (k : 
 def withLocalDecl' (name : Name) (bi : BinderInfo) (type : Expr) (k : Expr → n α) : n α :=
   mapTranslateEnvT (fun k => withLocalDeclAux name bi type k) k
 
+/-- Remove `@&` annotations from `t` (e.g., `Nat.log2 : (n : @& Nat) → Nat`). -/
+partial def removeBorrowedAnnotations (t : Expr) : Expr :=
+  t.replace fun e => if isMarkedBorrowed e then some (removeBorrowedAnnotations e.mdataExpr!) else none
+
 /--
   Eta expand the given expression.
   Example:
@@ -225,10 +229,12 @@ def withLocalDecl' (name : Name) (bi : BinderInfo) (type : Expr) (k : Expr → n
   etaExpand (mkConst ``Nat.add)
   ```
   produces `fun x y => Nat.add x y`
+  NOTE: `@&` annotations are removed from the binder types to avoid generating
+  a distinct Smt arrow type instance for the eta-expanded function.
 -/
 @[always_inline, inline]
 def etaExpand (e : Expr) : TranslateEnvT Expr := do
-  forallTelescope (← inferTypeEnv e) fun xs _ => do mkLambdaFVarsExpr xs (← mkAppNExpr e xs)
+  forallTelescope (removeBorrowedAnnotations (← inferTypeEnv e)) fun xs _ => do mkLambdaFVarsExpr xs (← mkAppNExpr e xs)
 
 private def binderCntLtMaxBinders (n : Nat) (maxBinders? : Option Nat) : Bool :=
   match maxBinders? with

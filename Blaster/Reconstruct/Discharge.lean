@@ -1471,6 +1471,8 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
                      Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_mul_ediv,
                      Int.mul_ediv_add_emod, Int.fmod_add_mul_fdiv, Int.tmod_add_mul_tdiv, Nat.pos_iff_ne_zero]; done)
         | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega)))),
+    -- `Nat.log2` (opaque for the solver, defined with `Nat.rec` in core): one unfolding step
+    ("unfold", ← `(tactic| (intros <;> blaster_denorm <;> rw [Nat.log2_def] <;> split <;> first | omega | grind))),
     -- existential goals over types (e.g., `∃ (α : Type) (x : α), α = Nat`)
     ("exists", ← `(tactic| (intros <;> first | exact ⟨_, rfl⟩ | exact ⟨_, default, rfl⟩ | exact ⟨_, _, rfl⟩))),
     -- goals valid due to an empty type (e.g., `g : Nat → E` with `E` empty)
