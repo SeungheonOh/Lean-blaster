@@ -105,10 +105,12 @@ def optimizeAppAux (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
 -/
 def finalizeRecApp
      (uf rf : Expr) (uargs : Array Expr)
-     (params : ImplicitParameters) (xs : List OptimizeStack) : TranslateEnvT OptimizeContinuity := do
-     -- NOTE: when tracking proof terms, the replacement of `uf uargs` with an equivalent application
-     -- is justified by the equivalence of the corresponding recursive functions (see `recFunEquivs`).
-     let lhs ← mkAppNExpr uf uargs
+     (params : ImplicitParameters) (xs : List OptimizeStack) (lhs? : Option Expr := none) :
+     TranslateEnvT OptimizeContinuity := do
+     -- NOTE: when tracking proof terms, the replacement of `uf uargs` (or of the original application
+     -- `lhs?` when provided) with an equivalent application is justified by the equivalence of the
+     -- corresponding recursive functions (see `recFunEquivs`).
+     let lhs ← match lhs? with | some e => pure e | none => mkAppNExpr uf uargs
      if params.isEmpty then
        return ← recContinuity lhs rf xs
      if exprEq uf rf then
@@ -204,7 +206,7 @@ def normRecFun (uf : Expr) (uargs : Array Expr) (appExpr : Expr) (xs : List Opti
      -- optimize recursive fun definition and store
      -- NOTE: keeping track of next ctxId to generate for clean-up
      let nextCtxId := (← get).optEnv.options.nextCtxId
-     return Sum.inl (.InitOptimizeExpr fdef :: .RecFunDefWaitForStorage uargs instApp subsInst params nextCtxId :: xs)
+     return Sum.inl (.InitOptimizeExpr fdef :: .RecFunDefWaitForStorage uargs instApp subsInst params nextCtxId appExpr :: xs)
  else stackContinuity xs appExpr -- proceed with continuity
 
  where

@@ -101,7 +101,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
       | Sum.inr (Sum.inr e') => return e'
       | Sum.inr (Sum.inl stack') => optimizeExprAux stack'
 
-  | .RecFunDefStorage uargs instApp subsInst params optDef startCtxId :: xs =>
+  | .RecFunDefStorage uargs instApp subsInst params optDef startCtxId appExpr :: xs =>
         uncacheFunName instApp
         -- clean-up rewrite cache
         freeRewriteCacheRange startCtxId (← get).optEnv.options.nextCtxId
@@ -111,7 +111,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
         if (← isTracking) && !(exprEq fn' subsInst) && !fn'.hasFVar && !subsInst.hasFVar then
           modify fun env => { env with recon.recFunEquivs := env.recon.recFunEquivs.push (subsInst, fn') }
         -- trace[Optimize.recFun] "rec function instance {reprStr subsInst} is equivalent to {reprStr fn'}"
-        match (← finalizeRecApp subsInst fn' uargs params xs) with
+        match (← finalizeRecApp subsInst fn' uargs params xs (lhs? := some appExpr)) with
         | Sum.inr e => return e
         | Sum.inl stack' => optimizeExprAux stack'
 

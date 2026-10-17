@@ -24,9 +24,10 @@ inductive OptimizeStack where
  | TransWith (pf : EqPf) (lhs : Expr) (forceHole : Bool)
  | RecFunDefWaitForStorage (args : Array Expr) (instApp : Expr)
                            (subsInts : Expr) (params : ImplicitParameters) (startCtxId : CtxId)
+                           (appExpr : Expr)
  | RecFunDefStorage (args : Array Expr) (instApp : Expr)
                     (subsInts : Expr) (params : ImplicitParameters) (optBody : Expr)
-                    (startCtxId : CtxId)
+                    (startCtxId : CtxId) (appExpr : Expr)
  | ForallWaitForType (n : Name) (bi : BinderInfo) (body : Expr) (t : Expr)
  | ForallWaitForBody (x : Expr) (t : Expr) (hctx : HypsStackContext) (isProp : Bool)
                      (origT : Expr) (pt : EqPf) (origBody : Expr) (rawBody : Option Expr)
@@ -153,11 +154,16 @@ def boolNegCast? (τ origT : Expr) : TranslateEnvT (Option Expr) := do
   let some lemma := lemma? | return none
   tryInLocalContext (mkEqSymm (mkApp (mkConst lemma) e))
 
-/-- Return `true` if `t := (h : P) → β` with `P` a proposition. -/
+/-- Return `true` if one of the binders of the forall telescope `t` is a proof. -/
+def anyProofBinder (t : Expr) : MetaM Bool :=
+  Meta.forallTelescope t fun xs _ => xs.anyM fun x => do Meta.isProp (← Meta.inferType x)
+
+/-- Return `true` if `t := (x₁ : α₁) → ... → (h : P) → β` with `P` a proposition. -/
 def isFunOverProof (t : Expr) : TranslateEnvT Bool := do
-  let .forallE _ d _ _ := t | return false
-  let some r ← tryInLocalContext (isProp d) | return false
-  return r
+  if !t.isForall then return false
+  -- NOTE: any binder of the telescope may be a proof (e.g., `(y : Nat) → y = 0 → Nat`)
+  try withLocalContext (show TranslateEnvT Bool from anyProofBinder t)
+  catch _ => return false
 
 /-- Return the type with which a forall binder of type `t` (optimized to `t'` with evidence `pf`) must be
     declared, the evidence for the binder type and the (optional) cast `t' = t` for the body
@@ -212,11 +218,11 @@ def stackContinuity
          else pure pf
        stackContinuity xs optExpr (← p.trans pf) skipCache
 
-  | .RecFunDefWaitForStorage args instApp subsInst params startCtxId :: xs =>
+  | .RecFunDefWaitForStorage args instApp subsInst params startCtxId appExpr :: xs =>
        -- optExpr corresponds to optimized rec fun body
        -- continuity with normOpaqueAndRecFun
        -- NOTE: evidence for the optimized body is not needed to reconstruct the proof of the goal.
-       return Sum.inl (.RecFunDefStorage args instApp subsInst params optExpr startCtxId :: xs)
+       return Sum.inl (.RecFunDefStorage args instApp subsInst params optExpr startCtxId appExpr :: xs)
 
   | .ForallWaitForType n bi body t :: xs =>
        -- optExpr corresponds to optimized forall binder type
