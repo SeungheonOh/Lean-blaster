@@ -70,10 +70,31 @@ def extractDependentITEExpr (e : Expr) : TranslateEnvT Expr := do
 def isITESwap? (f : Expr) (args : Array Expr) : TranslateEnvT (Option Expr) := do
  let c := args[1]!
  if let Expr.app (Expr.const ``Not _) ne := c then
-    return mkAppN f ((args.set! 1 ne).swapIfInBounds 2 3)
+    let r := mkAppN f ((args.set! 1 ne).swapIfInBounds 2 3)
+    return ← swapWithProof r ne ``Blaster.Reconstruct.dite'_not_swap ne
  if let some c' ← (isITEBoolSwap? c) then
-    return mkAppN f ((args.set! 1 c').swapIfInBounds 2 3)
+    let r := mkAppN f ((args.set! 1 c').swapIfInBounds 2 3)
+    let some (_, _, b) := eq? c | return r
+    return ← swapWithProof r c' ``Blaster.Reconstruct.dite'_false_swap b
  return none
+
+ where
+   /-- When tracking proof terms and both branches do not depend on their hypothesis, return the
+       swapped `dite'` with well-typed branch binders (i.e., `c'` and `¬ c'`) together with the
+       justification `thm`. Otherwise return `r`.
+       NOTE: swapping branches without updating the binder types yields an ill-typed `dite'`.
+   -/
+   swapWithProof (r : Expr) (c' : Expr) (thm : Name) (thmArg : Expr) : TranslateEnvT Expr := do
+     if !(← Blaster.Reconstruct.isTracking) || args.size < 4 then return r
+     let (Expr.lam n1 _ a bi1, Expr.lam n2 _ b bi2) := (args[2]!, args[3]!) | return r
+     if a.hasLooseBVars || b.hasLooseBVars then return r
+     let thenBranch := Expr.lam n2 c' b bi2
+     let elseBranch := Expr.lam n1 (mkApp (← mkPropNotOp) c') a bi1
+     let extraArgs := args.extract 4 args.size
+     let r' := mkAppN f (#[args[0]!, c', thenBranch, elseBranch] ++ extraArgs)
+     Blaster.Reconstruct.withProofM (mkAppN f args) r' do
+       let p := mkApp4 (mkConst thm f.constLevels!) args[0]! thmArg a b
+       extraArgs.foldlM (init := p) fun acc x => mkCongrFun acc x
 
 /-- Given `a`, 't` and `e` the condition, then and else expressions for
     a Blaster.dite' expression,

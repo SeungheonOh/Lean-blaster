@@ -48,12 +48,18 @@ def reduceApp? (f : Expr) (args: Array Expr) : TranslateEnvT (Option Expr) := wi
      return (betaLambda fbody auxFun.getAppArgs)
 
    isFunRecReduction? (f : Expr) (args : Array Expr) : TranslateEnvT (Option Expr) := do
-     let Expr.const n _ := f | return none
+     let Expr.const n l := f | return none
      if !(← isRecursiveFun n) then return none
      if !(← allExplicitParamsAreCtor f args) then return none
      let some fbody ← getFunBody f
        | throwEnvError "reduceApp?: recursive function body expected for {reprStr f}"
-     return (betaLambda fbody args)
+     let r := betaLambda fbody args
+     -- justification: the unfolding equation theorem of `f` (see `getFunBody`)
+     withProofM (mkAppN f args) r do
+       let some eqThm ← getUnfoldEqnFor? n | throwError "unfolding equation expected for {n}"
+       let nbParams := (← getConstEnvInfo eqThm).type.getForallBinderNames.length
+       let p := mkAppN (mkConst eqThm l) (args.extract 0 nbParams)
+       (args.extract nbParams args.size).foldlM (init := p) fun acc a => mkCongrFun acc a
 
 /-- Perform constant propagation and apply simplification and normalization rules
     on application expressions.

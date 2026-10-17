@@ -350,17 +350,49 @@ def optimizeEq (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
  if let some r ← zeroEqNegReduce? op1 op2 eqType then return r
  if let some (e1, e2) ← intNegEqReduce? op1 op2 then
    return ← withThm lhs (mkApp3 f eqType e1 e2) ``int_neg_eq_neg #[e1, e2]
- if let some r ← natZeroEqMulReduce? op1 op2 then return r
- if let some r ← intZeroEqMulReduce? op1 op2 then return r
+ if let some r ← natZeroEqMulReduce? op1 op2 then
+   if let some (x, y) := natMul? op2 then
+     if let (some hx, some hy) := (← nonZeroNatProof? x, ← nonZeroNatProof? y) then
+       return ← withThm lhs r ``nat_zero_eq_mul #[x, y, hx, hy]
+   return r
+ if let some r ← intZeroEqMulReduce? op1 op2 then
+   if let some (x, y) := intMul? op2 then
+     if let (some hx, some hy) := (← nonZeroIntProof? x, ← nonZeroIntProof? y) then
+       return ← withThm lhs r ``int_zero_eq_mul #[x, y, hx, hy]
+   return r
  if let some r ← arithEq? op1 op2 then return r
  if let some (e1, e2) ← natAddEqReduce? op1 op2 then return mkApp3 f eqType e1 e2
  if let some (e1, e2) ← intAddEqReduce? op1 op2 then return mkApp3 f eqType e1 e2
- if let some (e1, e2) ← natMulEqReduce? op1 op2 then return mkApp3 f eqType e1 e2
- if let some (e1, e2) ← intMulEqReduce? op1 op2 then return mkApp3 f eqType e1 e2
+ if let some (e1, e2) ← natMulEqReduce? op1 op2 then
+   let r := mkApp3 f eqType e1 e2
+   if !(← isTracking) then return r
+   return ← withMulCancel lhs r (natMul? op1) (natMul? op2) nonZeroNatProof?
+            #[``nat_mul_cancel_ll, ``nat_mul_cancel_lr, ``nat_mul_cancel_rl, ``nat_mul_cancel_rr]
+ if let some (e1, e2) ← intMulEqReduce? op1 op2 then
+   let r := mkApp3 f eqType e1 e2
+   if !(← isTracking) then return r
+   return ← withMulCancel lhs r (intMul? op1) (intMul? op2) nonZeroIntProof?
+            #[``int_mul_cancel_ll, ``int_mul_cancel_lr, ``int_mul_cancel_rl, ``int_mul_cancel_rr]
  -- no caching at this level as optimizeEq is called by optimizeDecideEq
  return mkApp3 f eqType op1 op2
 
  where
+   /-- Record the justification of the multiplicative cancellation `lhs ⟶ r` (see `natMulEqReduce?`),
+       with `thms` the cancellation lemmas for each operand configuration (in the order applied by the rule).
+   -/
+   withMulCancel
+     (lhs r : Expr) (m1 m2 : Option (Expr × Expr)) (nonZero : Expr → TranslateEnvT (Option Expr))
+     (thms : Array Name) : TranslateEnvT Expr := do
+     let (some (e1, e2), some (e3, e4)) := (m1, m2) | return r
+     let cases := #[(e1, e3, e2, e4), (e1, e4, e2, e3), (e2, e3, e1, e4), (e2, e4, e1, e3)]
+     for h : i in [:cases.size] do
+       let (x, x', y, z) := cases[i]
+       if exprEq x x' then
+         -- NOTE: stop at the first matching configuration (i.e., the one applied by the rule)
+         let some hx ← nonZero x | return r
+         return ← withThm lhs r thms[i]! #[x, y, z, hx]
+     return r
+
    /- Given `op1` and `op2` corresponding to the operands for `Eq`,
        - When `op1 := -x` ∧ `op2 := -y ∧ Type(x) = Int`:
           - return `some (x, y)`

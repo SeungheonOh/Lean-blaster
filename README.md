@@ -101,6 +101,8 @@ require «Blaster» from git
   - `gen-cex`: generate counterexample for falsified theorems (default: 1)
   - `solve-result`: specify the expected result from the #blaster command, i.e.,
                     0 for 'Valid', 1 for 'Falsified' and 2 for 'Undetermined'. (default: 0)
+  - `reconstruct`: produce a proof checked by the Lean kernel for 'Valid' results, i.e.,
+                   0 for no reconstruction, 1 for best effort and 2 for required (default: 0)
 
 ### Call to the solver
 
@@ -136,8 +138,10 @@ theorem length_set {as : List α} {i : Nat} {a : α} : (as.set i a).length = as.
 ```
 
 > [!NOTE]
-> The tool does not perform proof reconstruction right now.
-> - When the solver declares a goal as `Valid`, the tactic currently concludes the proof with an `admit`.
+> Proof reconstruction is available as an opt-in feature (see [docs/ProofReconstruction.md](docs/ProofReconstruction.md)).
+> - When the solver declares a goal as `Valid`, the tactic concludes the proof with an `admit` by default.
+>   With option `(reconstruct: 1)` (best effort) or `(reconstruct: 2)` (required), the goal is instead
+>   closed with a proof term checked by the Lean kernel whenever reconstruction succeeds.
 > - When the solver declares a goal as `Falsified`, the tactic fails and a counterexample is provided as witness.
 > No counterexample is provided when a goal is reduced to `False` at the optimization phase.
 > - When the solver returns `Undetermined` (i.e., the back-end solver was not able to prove/refute the goal),

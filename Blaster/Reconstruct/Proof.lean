@@ -373,6 +373,18 @@ def clearSteps : TranslateEnvT Unit := do
   if !(← isTracking) then return
   modify fun env => { env with recon.stepLog := #[] }
 
+/-- Return `true` if `p` is a valid justification for rewriting `a` to `b`. -/
+def validStep (a b : Expr) (p : EqPf) : TranslateEnvT Bool := do
+  match p with
+  | .defeq => return true
+  | .proof p =>
+      let r ← tryInLocalContext do
+        let some (_, a', b') := (← instantiateMVars (← inferType p)).eq? | return false
+        if a' == a && b' == b then return true
+        withTransparency .instances <| isDefEq a' a <&&> isDefEq b' b
+      return r.getD false
+  | _ => return false
+
 /-- Return evidence that `lhs = rhs` for a rewrite performed by a rule, using the steps
     recorded since the last call to `clearSteps`. Proof obligations are generated for
     any gap in the recorded chain of rewrites.
@@ -387,6 +399,9 @@ def ruleStep (lhs rhs : Expr) (label : String) : TranslateEnvT EqPf := do
   for (a, b, p) in log do
     if cur == rhs then break
     if a == cur then
+      -- NOTE: recorded proofs are validated such that a wrong justification only results in a
+      -- proof obligation (and not in a kernel rejection of the whole proof).
+      if !(← validStep a b p) then continue
       pf ← pf.trans p
       incExplicit
       cur := b

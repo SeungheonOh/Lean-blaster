@@ -18,5 +18,5 @@ lake build Tests.Utils Tests.Smt.Benchmarks.ValidatorsExamples.PlutusLedgerAPI.V
 FILES=$(grep -rlE "#blaster|#testOptimize|by blaster" "$FILTER" --include=*.lean \
           | grep -v "^Tests/Utils.lean" | grep -v "^Tests/StateMachine" | sort)
 echo "$FILES" | xargs -P "$JOBS" -I{} sh -c \
-  'BLASTER_RECONSTRUCT=1 BLASTER_RECON_STATS="$0" timeout 1800 lake env lean "$1" >/dev/null 2>&1 || echo "failed: $1"' "$OUT" {}
+  'BLASTER_RECONSTRUCT=1 BLASTER_RECON_STATS="$0" timeout 900 lake env lean "$1" >/dev/null 2>&1 || echo "failed: $1"' "$OUT" {}
 python3 "$(dirname "$0")/recon_report.py" "$OUT"

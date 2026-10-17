@@ -280,3 +280,64 @@ theorem not_eq_not_prop (a b : Prop) : ((¬ a) = (¬ b)) = (a = b) := by
 theorem int_neg_eq_neg (a b : Int) : (Int.neg a = Int.neg b) = (a = b) := propext Int.neg_inj
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Arithmetic cancellation under non-zero hypotheses (see `optimizeEq`) -/
+
+theorem nat_ne_zero_of_pos {x : Nat} (h : 0 < x) : ¬ (0 = x) := fun h' => by omega
+theorem nat_ne_zero_of_lit {x : Nat} (h : Nat.beq x 0 = false) : ¬ (0 = x) :=
+  fun h' => by subst h'; contradiction
+theorem int_ne_zero_of_pos {x : Int} (h : 0 < x) : ¬ (0 = x) := fun h' => by omega
+theorem int_ne_zero_of_neg {x : Int} (h : x < 0) : ¬ (0 = x) := fun h' => by omega
+theorem int_ne_zero_of_lit {x : Int} (h : (x == 0) = false) : ¬ (0 = x) :=
+  fun h' => by subst h'; contradiction
+
+theorem nat_mul_cancel_ll {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (Nat.mul x y = Nat.mul x z) = (y = z) :=
+  propext ⟨Nat.eq_of_mul_eq_mul_left (by omega), fun h => h ▸ rfl⟩
+theorem nat_mul_cancel_lr {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (Nat.mul x y = Nat.mul z x) = (y = z) := by
+  rw [show Nat.mul z x = Nat.mul x z from Nat.mul_comm z x]; exact nat_mul_cancel_ll y z h
+theorem nat_mul_cancel_rl {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (Nat.mul y x = Nat.mul x z) = (y = z) := by
+  rw [show Nat.mul y x = Nat.mul x y from Nat.mul_comm y x]; exact nat_mul_cancel_ll y z h
+theorem nat_mul_cancel_rr {x : Nat} (y z : Nat) (h : ¬ (0 = x)) : (Nat.mul y x = Nat.mul z x) = (y = z) := by
+  rw [show Nat.mul y x = Nat.mul x y from Nat.mul_comm y x, show Nat.mul z x = Nat.mul x z from Nat.mul_comm z x]
+  exact nat_mul_cancel_ll y z h
+theorem int_mul_cancel_ll {x : Int} (y z : Int) (h : ¬ (0 = x)) : (Int.mul x y = Int.mul x z) = (y = z) :=
+  propext ⟨Int.eq_of_mul_eq_mul_left (fun h' => h h'.symm), fun h => h ▸ rfl⟩
+theorem int_mul_cancel_lr {x : Int} (y z : Int) (h : ¬ (0 = x)) : (Int.mul x y = Int.mul z x) = (y = z) := by
+  rw [show Int.mul z x = Int.mul x z from Int.mul_comm z x]; exact int_mul_cancel_ll y z h
+theorem int_mul_cancel_rl {x : Int} (y z : Int) (h : ¬ (0 = x)) : (Int.mul y x = Int.mul x z) = (y = z) := by
+  rw [show Int.mul y x = Int.mul x y from Int.mul_comm y x]; exact int_mul_cancel_ll y z h
+theorem int_mul_cancel_rr {x : Int} (y z : Int) (h : ¬ (0 = x)) : (Int.mul y x = Int.mul z x) = (y = z) := by
+  rw [show Int.mul y x = Int.mul x y from Int.mul_comm y x, show Int.mul z x = Int.mul x z from Int.mul_comm z x]
+  exact int_mul_cancel_ll y z h
+theorem nat_zero_eq_mul {x y : Nat} (hx : ¬ (0 = x)) (hy : ¬ (0 = y)) : (0 = Nat.mul x y) = False :=
+  propext ⟨fun h => by
+    have := Nat.mul_eq_zero.mp h.symm
+    cases this <;> omega, False.elim⟩
+theorem int_zero_eq_mul {x y : Int} (hx : ¬ (0 = x)) (hy : ¬ (0 = y)) : (0 = Int.mul x y) = False :=
+  propext ⟨fun h => by
+    have := Int.mul_eq_zero.mp h.symm
+    cases this <;> omega, False.elim⟩
+
+/-! ## Inhabited types (see `optimizeForall`) -/
+
+theorem nonempty_of_inhabited (α : Sort u) [Inhabited α] : Nonempty α := ⟨default⟩
+
+end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## `Blaster.dite'` normalization (see `optimizeDITEChoice`) -/
+
+theorem dite'_not_swap {α : Sort u} (c : Prop) (a b : α) :
+    Blaster.dite' (¬ c) (fun _ => a) (fun _ => b) = Blaster.dite' c (fun _ => b) (fun _ => a) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]
+  by_cases h : c <;> simp [h]
+
+theorem dite'_false_swap {α : Sort u} (c : Bool) (a b : α) :
+    Blaster.dite' (false = c) (fun _ => a) (fun _ => b) = Blaster.dite' (true = c) (fun _ => b) (fun _ => a) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]
+  cases c <;> simp
+
+end Blaster.Reconstruct

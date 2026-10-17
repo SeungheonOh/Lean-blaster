@@ -143,6 +143,23 @@ def optimizeForallCore (n : Expr) (t : Expr) (h : HypothesisMap) (b : Expr) : Tr
   if (← (isSortOrInhabited t) <&&> (isPropEnv b) <&&> (pure !fVarInExpr n.fvarId! b)) then return b
   mkForallFVar n b
 
+/-- Return a proof of `Nonempty t` (used for proof reconstruction).
+    An error is triggered when no such proof can be found.
+-/
+def nonemptyProof (t : Expr) : MetaM Expr := do
+  let u ← getLevel t
+  if let .some inst ← trySynthInstance (mkApp (mkConst ``Nonempty [u]) t) then return inst
+  if let .some inst ← trySynthInstance (mkApp (mkConst ``Inhabited [u]) t) then
+    return mkApp2 (mkConst ``Blaster.Reconstruct.nonempty_of_inhabited [u]) t inst
+  -- inductive type with a nullary constructor
+  let .const n us := t.getAppFn | throwError "nonemptyProof: no proof for {t}"
+  let .inductInfo info ← getConstInfo n | throwError "nonemptyProof: no proof for {t}"
+  for ctor in info.ctors do
+    let .ctorInfo cinfo ← getConstInfo ctor | continue
+    if cinfo.numFields == 0 && t.getAppNumArgs == cinfo.numParams then
+      return mkApp2 (mkConst ``Nonempty.intro [u]) t (mkAppN (mkConst ctor us) t.getAppArgs)
+  throwError "nonemptyProof: no proof for {t}"
+
 /-- Same as `optimizeForallCore` but also records the justification of the applied rule
     when tracking proof terms (see `Blaster.Reconstruct`).
 -/
@@ -169,7 +186,9 @@ def optimizeForall (n : Expr) (t : Expr) (h : HypothesisMap) (b : Expr) : Transl
   if !isArrow || !isPropBody || !(← isPropEnv t) then
     -- `∀ (n : t), e ===> e` (when t is inhabited)
     if isArrow && isPropBody && exprEq r b then
-      return ← withProofM lhs r (mkAppOptM ``forall_const' #[t, none, b])
+      return ← withProofM lhs r (do
+        let u ← getLevel t
+        return mkApp3 (mkConst ``forall_const' [u]) t (← nonemptyProof t) b)
     return r
   -- non-dependent implication `t → b` between propositions
   if exprEq t b then return ← withThm lhs r ``imp_self_eq #[t]
