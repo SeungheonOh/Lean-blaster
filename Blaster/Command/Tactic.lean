@@ -27,6 +27,9 @@ Options:
   - `reconstruct`: close 'Valid' goals with a proof checked by the Lean kernel instead of `admit`, i.e.,
                    0 for no reconstruction, 1 for best effort (falls back to `admit` with a warning)
                    and 2 for required (error on failure). (default: 0)
+  - `gen-proof`: require a kernel-checked proof that only depends on Lean's standard axioms
+                 (`propext`, `Classical.choice`, `Quot.sound`) and on the local axioms used as
+                 hypotheses, i.e., never `sorryAx`. Implies `(reconstruct: 2)`. (default: 0)
 Example: `blaster (timeout: 10) (verbose: 1)`
 -/
 syntax (name := blasterTactic) "blaster" (solveOption)* : tactic
@@ -53,8 +56,17 @@ def blasterTacticImp : Tactic := fun stx =>
             Reconstruct.dumpStats outcome "tactic"
             Reconstruct.reportOutcome sOpts outcome
             match outcome.proof? with
-            | some p => goal.assign p
-            | none => goal.admit
+            | some p =>
+                if sOpts.genProof then
+                  match ← Reconstruct.checkProofAxioms p task.axioms with
+                  | .error msg => throwTacticEx `blaster goal msg
+                  | .ok axs => logInfo m!"📜 Proof generated (axioms: {axs.toList})"
+                goal.assign p
+            | none =>
+                -- NOTE: no `admit` when a kernel-checked proof is required
+                if sOpts.reconstruct ≥ 2 then
+                  throwTacticEx `blaster goal "proof reconstruction failed (see above)"
+                goal.admit
           else goal.admit
        | none => goal.admit
    | .Falsified cex => throwTacticEx `blaster goal "Goal was falsified (see counterexample above)"

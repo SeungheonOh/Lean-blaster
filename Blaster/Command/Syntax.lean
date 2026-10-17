@@ -23,6 +23,8 @@ Options:
                     0 for 'Valid', 1 for 'Falsified' and 2 for 'Undetermined'. (default: 0)
   - `reconstruct`: produce a proof checked by the Lean kernel for 'Valid' results, i.e.,
                    0 for no reconstruction, 1 for best effort and 2 for required. (default: 0)
+  - `gen-proof`: require a kernel-checked proof depending only on Lean's standard axioms
+                 (no `sorryAx`); implies `(reconstruct: 2)`. (default: 0)
 
 Examples:
    - #blaster [∀ x y : Nat, x + y ≥ x]
@@ -42,6 +44,7 @@ syntax "(solve-result:" num ")" : solveOption
 syntax "(max-depth:" num ")" : solveOption
 syntax "(random-seed:" num ")" : solveOption
 syntax "(reconstruct:" num ")" : solveOption
+syntax "(gen-proof:" num ")" : solveOption
 
 -- NOTE: Limited to one term for the time being
 syntax solveTerm := "[" term "]"
@@ -122,6 +125,14 @@ def parseReconstruct (sOpts : BlasterOptions) : TSyntax `solveOption → m Blast
       | _ => throwUnsupportedSyntax
   | _ => return sOpts
 
+def parseGenProof (sOpts : BlasterOptions) : TSyntax `solveOption → m BlasterOptions
+  | `(solveOption| (gen-proof: $n:num)) =>
+      match n.getNat with
+      | 0 => return { sOpts with genProof := false }
+      | 1 => return { sOpts with genProof := true, reconstruct := 2 }
+      | _ => throwUnsupportedSyntax
+  | _ => return sOpts
+
 /-! ### Generic Parser for All Options -/
 def parseSolveOption (sOpts : BlasterOptions) (opt : TSyntax `solveOption) : m BlasterOptions := do
   let sOpts ← parseUnfoldDepth sOpts opt
@@ -135,6 +146,7 @@ def parseSolveOption (sOpts : BlasterOptions) (opt : TSyntax `solveOption) : m B
   let sOpts ← parseMaxDepth sOpts opt
   let sOpts ← parseRandomSeed sOpts opt
   let sOpts ← parseReconstruct sOpts opt
+  let sOpts ← parseGenProof sOpts opt
   return sOpts
 
 /-! ### Process Multiple Options -/

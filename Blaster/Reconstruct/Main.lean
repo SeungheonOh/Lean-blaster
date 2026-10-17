@@ -162,6 +162,25 @@ def reconstructRewriteSafe (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : T
     s.restore
     return { failure := m!"exception: {ex.toMessageData}" }
 
+/-- Lean's standard axioms. -/
+def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
+
+/-- Return the axioms the expression `e` (transitively) depends on. -/
+def exprAxioms (e : Expr) : CoreM (Array Name) := do
+  let env ← getEnv
+  let consts := e.getUsedConstants
+  let (_, s) := ((consts.forM fun c => Lean.CollectAxioms.collect c).run env).run {}
+  return s.axioms.qsort Name.lt
+
+/-- Check that a proof term only depends on the standard axioms and on `allowed` (e.g., the local
+    axioms used as hypotheses). Return the axioms used, or an error message.
+-/
+def checkProofAxioms (proof : Expr) (allowed : List Name := []) : CoreM (Except MessageData (Array Name)) := do
+  let axs ← exprAxioms proof
+  let bad := axs.filter fun a => !(standardAxioms.contains a || allowed.contains a)
+  if bad.isEmpty then return .ok axs
+  return .error m!"the reconstructed proof depends on non-standard axioms: {bad.toList}"
+
 /-- Append a JSON summary of `o` to the file referred by environment variable `BLASTER_RECON_STATS` (if set). -/
 def dumpStats (o : ReconOutcome) (label : String) : TermElabM Unit := do
   let some path ← IO.getEnv "BLASTER_RECON_STATS" | return
@@ -213,5 +232,10 @@ def command (sOpts: BlasterOptions) (stx : Syntax) : TermElabM Unit := do
        let outcome ← reconstructSafe task env'.recon
        dumpStats outcome "command"
        reportOutcome sOpts outcome
+       if sOpts.genProof then
+         if let some p := outcome.proof? then
+           match ← checkProofAxioms p task.axioms with
+           | .error msg => logError m!"❌ {msg}"
+           | .ok axs => logInfo m!"📜 Proof generated (axioms: {axs.toList})"
 
 end Blaster.Reconstruct

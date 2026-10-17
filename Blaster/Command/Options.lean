@@ -81,6 +81,12 @@ structure BlasterOptions where
       It is set to 0 by default.
   -/
   reconstruct : Nat := 0
+
+  /-- When set to `true`, a `Valid` result must come with a kernel-checked proof that only depends on
+      Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`) and on the local axioms
+      used as hypotheses (i.e., no `sorryAx`). Implies `reconstruct := 2`.
+  -/
+  genProof : Bool := false
  deriving Repr
 
 instance : Inhabited BlasterOptions where
