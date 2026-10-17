@@ -409,6 +409,7 @@ def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
   let wrapperLemmas ← wrappers.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
   if !wrappers.isEmpty then evalTactic (← `(tactic| try simp only [$wrapperLemmas,*] at *))
   let mut idx := 0
+  let mut evalTerms : Array Term := #[]
   let mut done : Array Expr := #[]
   for _ in [0:6] do
     if (← getGoals).isEmpty then break
@@ -439,13 +440,15 @@ def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
       let g ← getMainGoal
       let (_, g') ← (← g.assert hName eqTy prf).intro1P
       replaceMainGoal [g']
-      evalTactic (← `(tactic| try simp only [$(mkIdent hName):ident] at *))
+      -- NOTE: the equation is used as a term, as `simp ... at *` also rewrites the hypothesis to `True`
+      let eqTerm ← Term.exprToSyntax prf
+      evalTerms := evalTerms.push eqTerm
+      evalTactic (← `(tactic| try simp only [$eqTerm:term] at *))
   if idx == 0 then throwError "blaster_wf_eval: no evaluation"
   if (← getGoals).isEmpty then return
   -- the evaluation equations are applied again after case analysis (e.g., on a `match` whose
   -- discriminant is an evaluated application, which can't be rewritten before the case split)
-  let evalLemmas ← (List.range idx).toArray.mapM fun i =>
-    `(Lean.Parser.Tactic.simpLemma| $(mkIdent (Name.mkSimple s!"blaster_eval_{i}")):ident)
+  let evalLemmas ← evalTerms.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
   evalTactic (← `(tactic| first
     | rfl
     | decide +kernel +revert

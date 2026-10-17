@@ -317,12 +317,13 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
       (.InitOptimizeExpr v :: .LetWaitForValue body :: stack)
 
     /-- Return a proof of `c' = c` (resp. `¬ c' = ¬ c`) for the then (resp. else) branch of a `dite'` whose
-        condition `c` has been rewritten to `c'` (only when the evidence has no proof obligation).
+        condition `c` has been rewritten to `c'`.
+        NOTE: the evidence may contain proof obligations (e.g., a rewrite justified by a hypothesis),
+        which are discharged with the other ones. Otherwise, the branch body would be ill-typed.
     -/
     branchCast? (isThen : Bool) (pf : EqPf) : TranslateEnvT (Option Expr) := do
       let .depArgs _ pargs := pf | return none
       let some (_, _, .proof pc) := pargs.find? (·.1 == 1) | return none
-      if containsHole pc then return none
       tryInLocalContext do
         let h ← mkEqSymm pc
         if isThen then return h else mkCongrArg (mkConst ``Not) h
@@ -351,6 +352,8 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
                -- cast from the new binder type `t'` to the original one `t` (when tracking proof terms)
                let castEq? ← do
                  if !(← isTracking) || exprEq t t' || !b.hasLooseBVars then pure none
+                 -- NOTE: no cast needed when the binder types are definitionally equal
+                 else if ← sameDomain t' t then pure none
                  else if let some h ← branchCast? isThen pf then pure (some h)
                  else boolNegCast? t' t
                withLocalDecl' n bi t' fun x => do
