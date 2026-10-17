@@ -115,7 +115,12 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | e =>
         match ← proveResidual e with
         | some (p, m) => pure (some p, s!"smt residual by {m}")
-        | none => pure (none, "none")
+        | none =>
+            -- equivalences between recursive functions established by the optimizer as hypotheses
+            let facts ← if recon.recFunEquivs.isEmpty then pure #[] else proveEquivalences recon.recFunEquivs
+            match ← dischargeWithFacts e facts with
+            | some p => pure (some p, "smt residual by induction+facts")
+            | none => pure (none, "none")
   let out := { out with residual := residualMethod }
   let some residual := residual
     | finish { out with failure := m!"could not reconstruct a proof for the residual goal proved by the SMT solver{indentExpr task.optExpr}" }
