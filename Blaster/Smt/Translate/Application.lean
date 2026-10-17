@@ -618,17 +618,17 @@ partial def inferUndeclFunType (t : Expr) (params : ImplicitParameters) : Expr :
     `params` its corresponding implicit/explicit parameters and `s` its corresponding smt symbol,
      perform the following:
        - Let `∀ α₀ → ∀ α₁ ... → αₙ` := inferUndecFunType (← getFunEnvInfo f).type params
-       - declare smt function `declare-fun s ((st₀) .. (stₙ₋₁)) stₙ)`
+       - declare smt function `declare-fun s ((st₀) .. (stₙ₋₁)) stₙ)` (only when `declare` is set to `true`)
        - assert the following proposition to constraint the codomain value:
           - `(assert (forall ((@x₀ st₀) ... (@xₙ₋₁ stₙ₋₁))
-              (! (@isTypeₙ (s @x₁ ... @xₙ₋₁))
+              (! (=> (@isType₀ @x₀) ... (=> (@isTypeₙ₋₁ @xₙ₋₁) (@isTypeₙ (s @x₁ ... @xₙ₋₁))))
                  :pattern ((s @x₁ ... @xₙ₋₁))) :qid s_cstr)`
 
      where ∀ i ∈ [0..n], αᵢ translates to Smt type stᵢ
 -/
 def generateUndeclaredFun
   (f : Expr) (s : SmtSymbol) (params : ImplicitParameters)
-  (termTranslator : Expr → TranslateEnvT SmtTerm) : TranslateEnvT Unit := do
+  (termTranslator : Expr → TranslateEnvT SmtTerm) (declare := true) : TranslateEnvT Unit := do
   let pInfo ← getFunEnvInfo f
   -- infer fun type and removing implicit arguments (i.e., even class constraints)
   let funType := inferUndeclFunType pInfo.type params
@@ -636,19 +636,23 @@ def generateUndeclaredFun
     let xsyms := Array.ofFn (λ f : Fin fvars.size => mkReservedSymbol s!"@x{f.val}")
     let mut pargs := (#[] : Array SortExpr)
     let mut co_quantifiers := (#[] : SortedVars)
+    let mut argTypes := #[]
     for h : i in [:fvars.size] do
       let decl ← getFVarLocalDecl fvars[i]
       let st ← translateFunLambdaParamType decl.type termTranslator
       pargs := pargs.push st
       co_quantifiers := co_quantifiers.push (xsyms[i]!, st)
+      argTypes := argTypes.push decl.type
     let ret ← translateFunLambdaParamType retType termTranslator
-    declareFun s pargs ret
+    if declare then declareFun s pargs ret
     -- assert codomain constraint
     if fvars.size > 0 then
       let xIds := Array.map (λ v => smtSimpleVarId v) xsyms
       let f_applyTerm := mkSimpleSmtAppN s xIds
       let forallBody ← createPredQualifierAppAux f_applyTerm retType
-      let qidName := mkQid $ appendSymbol s "cstr"
+      let forallBody ← guardWithDomainQualifiers xIds argTypes forallBody
+      let qidSuffix ← if declare then pure "cstr" else pure s!"cstr{← mkFreshId}"
+      let qidName := mkQid $ appendSymbol s qidSuffix
       let pattern := some #[mkPattern #[f_applyTerm], qidName]
       assertTerm (mkForallTerm none co_quantifiers forallBody pattern)
     else
@@ -934,6 +938,17 @@ def translateApp
       let genericArgs ← retrieveGenericFVars params
       mkLambdaFVars genericArgs instAux (usedOnly := true)
 
+    /-- Undeclared function instances only differing in their sort variables share the same smt function.
+        However, the codomain constraint of such a function has to be asserted for each instantiation
+        of sort variables with a membership predicate (see `declareSortMembership`), e.g.,
+        `(forall ((@x @@Type)) (=> (@isα @x) (@isNat (s @x))))` and
+        `(forall ((@x @@Type)) (=> (@isβ @x) (@isNat (s @x))))` for instances `α → Nat` and `β → Nat`.
+        Return `instApp α₁ ... αₖ` with `α₁ ... αₖ` the generic parameters having a membership predicate.
+    -/
+    getUndeclFunCstrInst (instApp : Expr) (params : ImplicitParameters) : TranslateEnvT Expr := do
+      let sortVars ← (← retrieveGenericFVars params).filterM hasSortMembership
+      return mkAppN instApp sortVars
+
 
     isOpaqueAxiomOrUndeclFun (f : Expr) (n : Name) (args : Array Expr) : TranslateEnvT Bool := do
       match ← getFunBody f with
@@ -954,14 +969,22 @@ def translateApp
       -- get instance application
       let params ← getImplicitParameters f args
       let instApp ← getUndeclFunAppInst f params
+      let cstrInst ← getUndeclFunCstrInst instApp params
       match (← get).smtEnv.funInstCache.get? instApp with
       | none =>
          let smtId ← generateFunInst f params
          let .SimpleIdent s := smtId
            | throwEnvError "translateUndeclaredFun?: SimpleIdent expected but got {smtId}"
          generateUndeclaredFun f s params termTranslator
+         updateFunInstCacheBase cstrInst smtId
          createAppN f (Sum.inl smtId) args termTranslator
       | some smtId =>
+          unless (← get).smtEnv.funInstCache.contains cstrInst do
+            -- assert codomain constraint for each sort variable instantiation
+            let .SimpleIdent s := smtId
+              | throwEnvError "translateUndeclaredFun?: SimpleIdent expected but got {smtId}"
+            generateUndeclaredFun f s params termTranslator (declare := false)
+            updateFunInstCacheBase cstrInst smtId
           createAppN f (Sum.inl smtId) args termTranslator
 
     translateFullyApplied? (f : Expr) (n : Name) (args : Array Expr) : TranslateEnvT (Option SmtTerm) := do
@@ -1051,6 +1074,8 @@ def translateLambda
      let applyTerm := mkSimpleSmtAppN applyName applyArgs
      let forallBody := eqSmt applyTerm sb
      assertTerm (mkForallTerm none svars forallBody (some #[mkPattern #[applyTerm], mkQid qidName]))
+     -- lambda term is a member of its function type (see `generateFunInstDeclAux`)
+     if decl.isMembership then assertTerm (mkSimpleSmtAppN decl.instName #[lamId])
      return lamId
    else
     let mut gvars := (#[] : SortedVars)
