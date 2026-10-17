@@ -78,6 +78,16 @@ def attempt [Monad m] [MonadBacktrack s m] [MonadExcept Exception m] [MonadRunti
       if r.isNone then failed else return r)
     (fun _ => failed)
 
+/-- Return `true` if `prf` depends on `sorryAx` through an auxiliary declaration of the current
+    module (e.g., a matcher created by `nomatch` after an elaboration error).
+-/
+def dependsOnSorry (prf : Expr) : MetaM Bool := do
+  let env ← getEnv
+  for c in prf.getUsedConstants do
+    if (env.getModuleIdxFor? c).isSome then continue
+    if (← collectAxioms c).contains ``sorryAx then return true
+  return false
+
 /-- Try to close goal `type` with tactic `tac`. The elaboration state is restored on failure. -/
 def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHeartbeats) : TermElabM (Option Expr) := do
   let s ← saveState
@@ -88,6 +98,8 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
   -- NOTE: Diagnostics reported asynchronously during an attempt (e.g., failures when generating the
   -- equations of a matcher via `realizeConst`) are discarded, as they don't affect the resulting proof.
   let tasks := (← getThe Core.State).snapshotTasks
+  -- NOTE: an attempt logging an error (e.g., an elaboration error recovered with `sorry`) is rejected
+  Core.setMessageLog {}
   let r ← try
       attempt budget do
         let mvar ← mkFreshExprMVar type
@@ -97,6 +109,8 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
                    withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
         let prf ← instantiateMVars mvar
         if !gs.isEmpty || prf.hasMVar || prf.hasSorry then return none
+        if ← dependsOnSorry prf then return none
+        if (← Core.getMessageLog).hasErrors then return none
         return some prf
     finally modifyThe Core.State fun st => { st with snapshotTasks := tasks }
   if r.isNone then s.restore
@@ -778,7 +792,8 @@ syntax (name := blasterGenDiscrs) "blaster_gen_discrs" : tactic
     let t ← instantiateMVars (← g.getType)
     let some m ← findMatcher t
       | throwError "blaster_gen_discrs: no match expression"
-    let ds := m.discrs.filter fun d => !d.isFVar && !d.hasLooseBVars && !d.isLit && !d.isAppOfArity ``OfNat.ofNat 3
+    -- NOTE: closed discriminants (e.g., `Int.ofNat 10`) are kept such that the `match` can be reduced
+    let ds := m.discrs.filter fun d => !d.isFVar && !d.hasLooseBVars && d.hasFVar
     if ds.isEmpty then throwError "blaster_gen_discrs: no discriminant to generalize"
     let (_, g) ← g.generalize (ds.map fun d => { expr := d, xName? := `d : GeneralizeArg })
     return [g]
@@ -1369,14 +1384,21 @@ syntax (name := blasterNoMatch) "blaster_nomatch" : tactic
   let s ← saveState
   for c in cands.extract 0 16 do
     let arity ← forallTelescopeReducing (← inferType c) fun xs _ => pure xs.size
-    let t ← Term.exprToSyntax c
     for k in [0:min arity 3 + 1] do
+      -- NOTE: created for each attempt, as the state is restored after a failed attempt
+      let t ← Term.exprToSyntax c
       let args := Array.replicate k (← `(default))
+      -- NOTE: `nomatch` reports missing cases as an error message (with a `sorry` proof)
+      let msgs ← Core.getMessageLog
+      Core.setMessageLog {}
       try
         evalTactic (← `(tactic| exact nomatch ($t $args*)))
-        if (← getGoals).isEmpty then return
+        if (← getGoals).isEmpty && !(← Core.getMessageLog).hasErrors then
+          Core.setMessageLog msgs
+          return
       catch _ => pure ()
       s.restore
+      Core.setMessageLog msgs
   throwError "blaster_nomatch: no element of an empty type"
 
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
@@ -1410,10 +1432,6 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     -- case analysis on the variables `match` applications are stuck on
     ("match cases", ← matchCasesTactic),
     ("exists", ← `(tactic| (intros <;> blaster_denorm <;> blaster_exists))),
-    -- existential goals over types (e.g., `∃ (α : Type) (x : α), α = Nat`)
-    ("exists", ← `(tactic| (intros <;> first | exact ⟨_, rfl⟩ | exact ⟨_, default, rfl⟩ | exact ⟨_, _, rfl⟩))),
-    -- goals valid due to an empty type (e.g., `g : Nat → E` with `E` empty)
-    ("empty", ← `(tactic| (intros <;> blaster_nomatch))),
     -- recursive functions: unfolding equation lemmas (e.g., `f (n + 1) = ...`)
     ("unfold", ← `(tactic| (intros <;> blaster_denorm <;>
         (try blaster_lit_add) <;>
@@ -1449,7 +1467,11 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
                      Nat.le_div_iff_mul_le, Nat.div_lt_self, Nat.mod_def, Nat.mul_div_le, Nat.not_lt,
                      Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_mul_ediv,
                      Int.mul_ediv_add_emod, Int.fmod_add_mul_fdiv, Int.tmod_add_mul_tdiv, Nat.pos_iff_ne_zero]; done)
-        | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega))))
+        | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega)))),
+    -- existential goals over types (e.g., `∃ (α : Type) (x : α), α = Nat`)
+    ("exists", ← `(tactic| (intros <;> first | exact ⟨_, rfl⟩ | exact ⟨_, default, rfl⟩ | exact ⟨_, _, rfl⟩))),
+    -- goals valid due to an empty type (e.g., `g : Nat → E` with `E` empty)
+    ("empty", ← `(tactic| (intros <;> blaster_nomatch))),
   ]
   let large ← involvesLargeMatch e
   for (name, tac) in tacs do
