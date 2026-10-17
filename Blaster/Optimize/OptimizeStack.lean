@@ -273,9 +273,13 @@ def stackContinuity
        -- resulting expression is well-typed.
        if let some (r, rpf) ← constDiteChoice? orig pf apf then
          return Sum.inl (← pushTrans r rpf xs)
+       let preApf := apf
        let apf ← addArgEvidence f args 1 orig pf apf
        clearSteps
        if let some r ← optimizeDITEChoice f args then
+           -- swapping dependent branches requires casts to keep the result well-typed
+           if let some (r', rpf) ← dependentSwap? orig pf preApf r then
+             return Sum.inl (← pushTrans r' rpf xs)
            let step ← ruleStep (mkAppN f args) r "optimizeDITEChoice"
            return Sum.inl (← pushTrans r (← apf.trans step) xs)
        else
@@ -401,6 +405,49 @@ def stackContinuity
       if containsHole p then return (t', pf, none)
       let some h ← tryInLocalContext (mkEqSymm p) | return (t', pf, none)
       return (t', pf, some h)
+
+    /-- When tracking proof terms and `r` is the swapped form (see `isITESwap?`) of `dite' c₀ t e x₁ ... xₙ`
+        with dependent branches, i.e., `dite' c e t` with `c₀` rewritten to `¬ c` (or `false = b` with
+        `c := true = b`), return the well-typed swapped `dite'` (see `dite'_swap_dep`) and its evidence.
+    -/
+    dependentSwap? (orig : Expr) (pf : EqPf) (apf : EqPf) (r : Expr) : TranslateEnvT (Option (Expr × EqPf)) := do
+      let .DiteChoiceWaitForCond f args _ _ _ :: _ := stack | return none
+      if !(← isTracking) || args.size < 4 then return none
+      let t := args[2]!
+      let e := args[3]!
+      let (.lam _ _ tb _, .lam _ _ eb _) := (t, e) | return none
+      if !tb.hasLooseBVars && !eb.hasLooseBVars then return none
+      -- new condition `c` with `orig = ¬ c`
+      let res ← tryInLocalContext do
+        let pc₀ ← match pf with
+          | .defeq => Meta.mkEqRefl orig
+          | .proof p => if containsHole p then throwError "obligation" else pure p
+          | _ => throwError "unknown"
+        let (c, pc) ← match optExpr with
+          | .app (.const ``Not _) c => pure (c, pc₀)
+          | _ =>
+            let some (_, .const ``false _, b) := optExpr.eq? | throwError "no swap"
+            let c := mkApp3 (mkConst ``Eq [levelOne]) (mkConst ``Bool) (mkConst ``true) b
+            pure (c, ← mkEqTrans pc₀ (← mkEqSymm (mkApp (mkConst ``Blaster.Reconstruct.not_true_eq_bool) b)))
+        -- check that `r` is indeed the swapped form
+        let extraArgs := args.extract 4 args.size
+        let swapped := mkAppN f (#[args[0]!, c, e, t] ++ extraArgs)
+        if !(r == swapped) then throwError "not a swap"
+        let notC := mkApp (mkConst ``Not) c
+        let thenB ← withLocalDeclD `h c fun h => do
+          let h₀proof := Expr.lam `h₀ orig
+            (mkApp (mkApp4 (mkConst ``Blaster.Reconstruct.castProof) orig notC pc (.bvar 0)) h) .default
+          mkLambdaFVars #[h] (eb.instantiate1 h₀proof)
+        let elseB ← withLocalDeclD `h notC fun h => do
+          let cast := mkApp4 (mkConst ``Blaster.Reconstruct.castProof) notC orig (← mkEqSymm pc) h
+          mkLambdaFVars #[h] (tb.instantiate1 cast)
+        let r' := mkAppN f (#[args[0]!, c, thenB, elseB] ++ extraArgs)
+        let lemma := mkAppN (mkConst ``Blaster.Reconstruct.dite'_swap_dep f.constLevels!)
+                       #[args[0]!, orig, c, pc, t, e]
+        let p ← extraArgs.foldlM (init := lemma) fun acc a => mkCongrFun acc a
+        return (r', p)
+      let some (r', p) := res | return none
+      return some (r', ← apf.trans (.proof p))
 
     /-- Return `true` if `t := (h : P) → β` with `P` a proposition. -/
     isFunOverProof (t : Expr) : TranslateEnvT Bool := do

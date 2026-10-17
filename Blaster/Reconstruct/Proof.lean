@@ -387,6 +387,49 @@ def constCondProof (c : Expr) (pf : EqPf) (isTrue : Bool) : TranslateEnvT (Optio
         return some (mkApp3 (mkConst (if isTrue then ``of_decide_eq_true else ``of_decide_eq_false)) c inst refl)
       return r.join
 
+/-- Return a proof of `Nonempty t` (used to justify the elimination of unused binders).
+    An error is triggered when no such proof can be found.
+-/
+partial def nonemptyProof (t : Expr) : MetaM Expr := do
+  let u ← getLevel t
+  if let .some inst ← trySynthInstance (mkApp (mkConst ``Nonempty [u]) t) then return inst
+  if let .some inst ← trySynthInstance (mkApp (mkConst ``Inhabited [u]) t) then
+    return mkApp2 (mkConst ``Blaster.Reconstruct.nonempty_of_inhabited [u]) t inst
+  match ← whnfR t with
+  | .forallE n d b bi =>
+      -- function type: constant function returning an element of the (non-dependent) codomain
+      if b.hasLooseBVars then throwError "nonemptyProof: dependent function type {t}"
+      let nb ← nonemptyProof b
+      let v ← getLevel b
+      let elem := mkApp2 (mkConst ``Classical.choice [v]) b nb
+      return mkApp2 (mkConst ``Nonempty.intro [u]) t (.lam n d elem bi)
+  | t' =>
+    -- inductive type with a nullary constructor
+    let .const n us := t'.getAppFn | throwError "nonemptyProof: no proof for {t}"
+    let .inductInfo info ← getConstInfo n | throwError "nonemptyProof: no proof for {t}"
+    for ctor in info.ctors do
+      let .ctorInfo cinfo ← getConstInfo ctor | continue
+      if cinfo.numFields == 0 && t'.getAppNumArgs == cinfo.numParams then
+        return mkApp2 (mkConst ``Nonempty.intro [u]) t (mkAppN (mkConst ctor us) t'.getAppArgs)
+    throwError "nonemptyProof: no proof for {t}"
+
+/-- Return `true` if `type := (∀ x : T, b) = b'` or `(∃ x : T, b) = b'` with `x` unused in `b` and
+    `Nonempty T` not provable, i.e., an elimination of an unused binder over a possibly empty type.
+    Such rewrites are unsound and are reported separately from reconstruction gaps.
+-/
+def isUnsoundBinderElim (type : Expr) : MetaM Bool := do
+  let some (_, lhs, _) := type.eq? | return false
+  let binderType? : Option Expr := match lhs with
+    | .forallE _ d b _ => if b.hasLooseBVars then none else some d
+    | .app (.app (.const ``Exists _) d) (.lam _ _ b _) => if b.hasLooseBVars then none else some d
+    | _ => none
+  let some d := binderType? | return false
+  if ← isProp d then return false
+  try
+    discard <| nonemptyProof d
+    return false
+  catch _ => return true
+
 /-! ## Casting proof arguments
 
 Proof arguments are not rewritten when tracking proof terms (see `skipProofArg`). However, the data they

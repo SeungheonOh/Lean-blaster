@@ -20,6 +20,17 @@ def main(path):
     total = len(rows)
     ok = sum(1 for r in rows if r["success"])
     print(f"{'all':<22} {total:>6} {ok:>15} {100.0 * ok / max(1, total):>6.1f}%")
+    # attempts whose only unresolved obligations are unsound rewrites (correctly refused)
+    def unsound_only(r):
+        if r["success"]:
+            return False
+        ms = [m for l, m in r.get("labels", {}).items()]
+        refused = sum(m.get("refused:unsound", 0) for m in ms)
+        failed = sum(m.get("failed", 0) for m in ms)
+        return refused > 0 and failed == 0
+    refused = sum(1 for r in rows if unsound_only(r))
+    print(f"{'refused (unsound)':<22} {refused:>6}")
+    print(f"{'all except refused':<22} {total - refused:>6} {ok:>15} {100.0 * ok / max(1, total - refused):>6.1f}%")
     methods = Counter()
     for r in rows:
         for m, n in r["methods"].items():

@@ -390,3 +390,18 @@ namespace Blaster.Reconstruct
 theorem castProof {P Q : Prop} (h : P = Q) (p : P) : Q := h ▸ p
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-- Swap the branches of a `dite'` whose condition `c₀` is equal to `¬ c` (dependent branches). -/
+theorem dite'_swap_dep {α : Sort u} {c₀ c : Prop} (pc : c₀ = ¬ c) (t : c₀ → α) (e : ¬ c₀ → α) :
+    Blaster.dite' c₀ t e =
+      Blaster.dite' c (fun h => e (fun h₀ => (castProof pc h₀) h)) (fun h => t (castProof pc.symm h)) := by
+  subst pc
+  simp only [Blaster.Reconstruct.dite'_eq_dite]
+  by_cases h : c
+  . have : ¬ ¬ c := fun h' => h' h
+    simp [h]
+  . simp [h]
+
+end Blaster.Reconstruct

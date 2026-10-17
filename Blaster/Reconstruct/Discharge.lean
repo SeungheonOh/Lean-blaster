@@ -353,7 +353,9 @@ def dischargeHoles
         if let some prf ← dischargeWithFacts type facts then
           stats.modify (·.record "induction+facts" label)
           return .done prf
-        stats.modify (·.record "failed" label)
+        -- NOTE: unsound eliminations of unused binders are reported separately
+        let unsound ← try isUnsoundBinderElim type catch _ => pure false
+        stats.modify (·.record (if unsound then "refused:unsound" else "failed") label)
         if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then
           let g ← mkFreshExprMVar type
           logInfo m!"[{label}] unresolved proof obligation:\n{← Meta.ppGoal g.mvarId!}"
