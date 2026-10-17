@@ -610,6 +610,116 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("induction", ← `(tactic| blaster_funind))
   ]
 
+/-! ## Case analysis driven by stuck `match` applications
+
+The splitter of a matcher with many overlapping patterns may not be generated within Lean's
+heartbeat budget (see `getEquationsFor?`), i.e., `split` cannot be used. Instead, `blaster_match_cases`
+performs case analysis on the variables `match` applications are stuck on, until they reduce by iota.
+-/
+
+/-- Maximum number of goals produced by `blaster_match_cases`. -/
+def maxMatchCaseGoals : Nat := 1024
+
+/-- Return the free variable `e` is stuck on (after weak head normalization), if any.
+    NOTE: stuck `match` applications are reduced to their `casesOn` decision tree. -/
+partial def stuckFVar? (e : Expr) (fuel : Nat := 16) : MetaM (Option FVarId) := do
+  if fuel == 0 then return none
+  let e ← whnf e
+  match e.getAppFn with
+  | .fvar fv => return if e.isFVar then some fv else none
+  | .proj _ _ s => stuckFVar? s (fuel - 1)
+  | .const n _ =>
+      let args := e.getAppArgs
+      if let some r ← stuckMatch? n e then return r
+      if let some projInfo ← getProjectionFnInfo? n then
+        if h : projInfo.numParams < args.size then return ← stuckFVar? args[projInfo.numParams] (fuel - 1)
+        return none
+      match ← getConstInfo n with
+      | .recInfo recVal =>
+          if h : recVal.getMajorIdx < args.size then stuckFVar? args[recVal.getMajorIdx] (fuel - 1)
+          else return none
+      | _ =>
+          if let some e' ← unfoldDefinition? e then return ← stuckFVar? e' (fuel - 1)
+          -- e.g., `Nat.beq n 0` (decidable equality of literal patterns): case analysis on an argument
+          for a in args do
+            let a ← whnf a
+            if let .fvar fv := a then
+              let t ← whnfR (← fv.getType)
+              if let .const tn _ := t.getAppFn then
+                if (← getEnv).isConstructor tn then continue
+                if let .inductInfo _ ← getConstInfo tn then return some fv
+          return none
+  | _ => return none
+where
+  /-- Same as `reduceMatcher?` but the stuck term is examined within the scope of the alternatives. -/
+  stuckMatch? (n : Name) (e : Expr) : MetaM (Option (Option FVarId)) := do
+    let some info ← getMatcherInfo? n | return none
+    let args := e.getAppArgs
+    let prefixSz := info.numParams + 1 + info.numDiscrs
+    if args.size < prefixSz + info.numAlts then return none
+    let .const _ us := e.getAppFn | return none
+    let f ← instantiateValueLevelParams (← getConstInfo n) us
+    let auxApp := mkAppN f (args.extract 0 prefixSz)
+    forallBoundedTelescope (← inferType auxApp) info.numAlts fun hs _ => do
+      let aux ← whnf (mkAppN auxApp hs)
+      if hs.contains aux.getAppFn then return some none
+      return some (← stuckFVar? aux (fuel - 1))
+
+/-- Return the `match` applications of `e` without loose bound variables. -/
+partial def collectMatchApps (env : Environment) (e : Expr) (acc : Array Expr := #[]) : Array Expr :=
+  let acc := if !e.hasLooseBVars && e.isApp && (e.getAppFn.constName?.map (Meta.isMatcherCore env)).getD false
+             then acc.push e else acc
+  match e with
+  | .app f a => collectMatchApps env a (collectMatchApps env f acc)
+  | .mdata _ b | .proj _ _ b => collectMatchApps env b acc
+  | .forallE _ t b _ | .lam _ t b _ => collectMatchApps env b (collectMatchApps env t acc)
+  | .letE _ t v b _ => collectMatchApps env b (collectMatchApps env v (collectMatchApps env t acc))
+  | _ => acc
+
+/-- Return the first free variable a `match` application of `e` is stuck on. -/
+def findMatchStuckFVar? (e : Expr) : MetaM (Option FVarId) := do
+  let lctx ← getLCtx
+  for m in collectMatchApps (← getEnv) e do
+    if let some fv ← observing? (stuckFVar? m) then
+      if let some fv := fv then
+        if lctx.contains fv && !(← fv.isLetVar) then return some fv
+  return none
+
+syntax (name := blasterMatchCases) "blaster_match_cases" : tactic
+
+/-- Perform case analysis on the variables `match` applications (in the goal or hypotheses) are stuck on
+    (bounded by `maxMatchCaseGoals`). -/
+@[tactic blasterMatchCases] def evalBlasterMatchCases : Tactic := fun _ => do
+  let mut todo := [← getMainGoal]
+  let mut done := #[]
+  while !todo.isEmpty do
+    let g :: rest := todo | break
+    todo := rest
+    let fv? ← g.withContext do
+      if let some fv ← findMatchStuckFVar? (← instantiateMVars (← g.getType)) then return some fv
+      for d in ← getLCtx do
+        if d.isImplementationDetail then continue
+        if let some fv ← findMatchStuckFVar? (← instantiateMVars d.type) then return some fv
+      return none
+    match fv? with
+    | none => done := done.push g
+    | some fv =>
+        let subgoals ← g.cases fv
+        todo := subgoals.toList.map (·.mvarId) ++ todo
+    if done.size + todo.length > maxMatchCaseGoals then throwError "blaster_match_cases: too many goals"
+  replaceMainGoal done.toList
+
+/-- Case analysis on the variables stuck `match` applications depend on (`blaster_match_cases`), then
+    reduction by iota and arithmetic. -/
+def matchCasesTactic : TermElabM (TSyntax `tactic) :=
+  `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> blaster_match_cases <;>
+              (try dsimp only at *) <;>
+              first | rfl | omega | (simp_all; done) | decide
+                    | (simp only [Int.ofNat_eq_coe, Int.toNat_natCast, Nat.succ_eq_add_one,
+                                  Nat.zero_add, Nat.add_sub_cancel] at * <;>
+                       first | omega | grind)
+                    | grind))
+
 /-- Maximum number of nested case splits over `match` alternatives (see `proveByMatchCases`). -/
 def matchCasesDepth : Nat := 2
 
@@ -653,6 +763,11 @@ partial def dischargeOne (type : Expr) (depth := matchCasesDepth) : TermElabM (O
     if let some prf ← proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats) then
       return some (prf, "cases")
   if let some prf ← proveByMatchCases type depth then return some (prf, "match cases")
+  -- case analysis on the variables stuck `match` applications depend on (no splitter needed)
+  if depth == matchCasesDepth then
+    if (collectMatchApps (← getEnv) type).size > 0 then
+      if let some prf ← proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats) then
+        return some (prf, "match cases")
   return none
 
 /-- Try to discharge `m = rhs` (or `rhs = m`) with `m` a `match` application by a case split over the
@@ -917,6 +1032,8 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("split", ← `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> (repeat' split) <;>
                           (try simp_all) <;> first | done | omega | grind))),
     -- existential goals: witness search
+    -- case analysis on the variables `match` applications are stuck on
+    ("match cases", ← matchCasesTactic),
     ("exists", ← `(tactic| (intros <;> blaster_denorm <;> blaster_exists))),
     -- recursive functions: unfolding equation lemmas (e.g., `f (n + 1) = ...`)
     ("unfold", ← `(tactic| (intros <;> blaster_denorm <;>
