@@ -23,7 +23,8 @@ def auditReconstruction (sOpts : BlasterOptions) (stx : Syntax) (name : String) 
   withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0, maxRecDepth := 100000 }) $ do
     let s ← saveState
     let outcome ← tryCatchRuntimeEx (do
-        let e ← parseTerm stx
+        -- NOTE: universe level metavariables must be instantiated (see `normLevel`)
+        let e ← instantiateMVars (← parseTerm stx)
         let ((optExpr, pf), env) ← Blaster.Optimize.commandPf { sOpts with reconstruct := 1 } e
         Blaster.Reconstruct.reconstructRewriteSafe e optExpr pf env.recon)
       (fun ex => do s.restore; pure { failure := m!"exception: {ex.toMessageData}" })

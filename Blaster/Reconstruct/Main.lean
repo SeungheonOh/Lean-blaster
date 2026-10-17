@@ -122,7 +122,9 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let pFull ← match optPf? with
     | none => mkExpectedTypeHint residual task.fullGoal
     | some p =>
-        try mkEqMPR p residual
+        -- NOTE: `Eq.mpr` is built with explicit arguments (`mkEqMPR` unifies the inferred type of `p`
+        -- with `task.optExpr`, which may trigger expensive unfolding).
+        try pure (mkApp4 (Lean.mkConst ``Eq.mpr [levelZero]) task.fullGoal task.optExpr p residual)
         catch ex => return ← finish { out with failure := m!"ill-formed optimization proof: {ex.toMessageData}" }
   -- Instantiate local axioms
   let axioms ← task.axioms.reverse.mapM fun n => do
@@ -134,19 +136,28 @@ where
   finish (startTime : Nat) (o : ReconOutcome) : TermElabM ReconOutcome := do
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
 
+/-- Maximum recursion depth used during reconstruction.
+    NOTE: `#blaster` sets `maxRecDepth` to `0`, which is not interpreted as "unlimited" by all
+    the procedures used during reconstruction (e.g., tactics).
+-/
+def reconMaxRecDepth : Nat := 100000
+
+@[inline] def withReconRecDepth (x : TermElabM α) : TermElabM α :=
+  withTheReader Core.Context (fun ctx => { ctx with maxRecDepth := reconMaxRecDepth }) x
+
 /-- Same as `reconstruct` but any exception (including runtime exceptions such as maximum recursion
     depth or heartbeats) is reported as a reconstruction failure.
 -/
 def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome := do
   let s ← saveState
-  tryCatchRuntimeEx (reconstruct task recon) fun ex => do
+  tryCatchRuntimeEx (withReconRecDepth (reconstruct task recon)) fun ex => do
     s.restore
     return { failure := m!"exception: {ex.toMessageData}" }
 
 /-- Same as `reconstructRewrite` but any exception is reported as a reconstruction failure. -/
 def reconstructRewriteSafe (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermElabM ReconOutcome := do
   let s ← saveState
-  tryCatchRuntimeEx (reconstructRewrite e optExpr pf recon) fun ex => do
+  tryCatchRuntimeEx (withReconRecDepth (reconstructRewrite e optExpr pf recon)) fun ex => do
     s.restore
     return { failure := m!"exception: {ex.toMessageData}" }
 

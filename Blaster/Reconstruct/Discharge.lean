@@ -45,46 +45,57 @@ def dischargeHeartbeats : Nat := 50000
   [MonadControlT CoreM m] (n : Nat) (x : m α) : m α :=
   withCurrHeartbeats <| withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := n * 1000 }) x
 
+/-- Maximum recursion depth allowed for each discharge attempt. -/
+def dischargeMaxRecDepth : Nat := 8192
+
+/-- Execute `x` within a bounded resource budget (heartbeats and recursion depth) and return `none`
+    on any exception, including runtime exceptions (e.g., heartbeats or maximum recursion depth).
+    The state is restored on failure.
+-/
+def attempt [Monad m] [MonadBacktrack s m] [MonadExcept Exception m] [MonadRuntimeException m]
+  [MonadWithReaderOf Core.Context m] [MonadLiftT BaseIO m] [MonadControlT CoreM m]
+  (budget : Nat) (x : m (Option α)) : m (Option α) := do
+  let st ← saveState
+  tryCatchRuntimeEx
+    (withHeartbeatBudget budget <|
+       withTheReader Core.Context (fun ctx => { ctx with maxRecDepth := dischargeMaxRecDepth }) x)
+    (fun _ => do restoreState st; return none)
+
 /-- Try to close goal `type` with tactic `tac`. The elaboration state is restored on failure. -/
 def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHeartbeats) : TermElabM (Option Expr) := do
   let s ← saveState
-  try
+  let r ← attempt budget do
     let mvar ← mkFreshExprMVar type
     -- NOTE: asynchronous elaboration is disabled such that kernel errors on auxiliary declarations
     -- created by tactics are reported as exceptions instead of messages.
     let gs ← withOptions (fun o => Elab.async.set o false) <|
-               withHeartbeatBudget budget <| withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
+               withoutErrToSorry <| Tactic.run mvar.mvarId! (evalTactic tac)
     let prf ← instantiateMVars mvar
-    if !gs.isEmpty || prf.hasMVar || prf.hasSorry then
-      s.restore
-      return none
+    if !gs.isEmpty || prf.hasMVar || prf.hasSorry then return none
     return some prf
-  catch _ =>
-    s.restore
-    return none
+  if r.isNone then s.restore
+  return r
 
 /-- Try to prove `lhs = rhs` by definitional unfolding. -/
 def proveByDefEq (type : Expr) (budget := dischargeHeartbeats) : MetaM (Option Expr) := do
   let some (_, lhs, rhs) := type.eq? | return none
-  try
-    if ← withHeartbeatBudget budget <| withTransparency .default <| isDefEq lhs rhs then
+  attempt budget do
+    if ← withTransparency .default <| isDefEq lhs rhs then
       return some (← mkExpectedTypeHint (← mkEqRefl lhs) type)
     return none
-  catch _ => return none
 
 /-- Return `true` if `type` is type correct. -/
 def isTypeCorrectObligation (type : Expr) : MetaM Bool := do
-  try
-    withHeartbeatBudget dischargeHeartbeats <| Meta.check type
-    return true
-  catch _ => return false
+  return (← attempt dischargeHeartbeats (do Meta.check type; return some ())).isSome
 
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
     ("simp", ← `(tactic| (blaster_denorm <;> simp [*] <;> done))),
     ("omega", ← `(tactic| ((try apply propext) <;> blaster_denorm <;> omega))),
-    ("grind", ← `(tactic| (blaster_denorm <;> grind)))
+    ("grind", ← `(tactic| (blaster_denorm <;> grind))),
+    -- case analysis (e.g., `match` expressions normalized to `Blaster.dite'`)
+    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind)))
   ]
 
 /-- Try to discharge proof obligation `type` (expected to be an equality) and return

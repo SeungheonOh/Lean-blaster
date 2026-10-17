@@ -330,7 +330,16 @@ def optimizeLE (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
    let op1 := args[2]!
    let op2 := args[3]!
    setRestart
-   mkNotLtExpr le_type op2 op1
+   let r ← mkNotLtExpr le_type op2 op1
+   let thm? := match le_type with
+     | Expr.const ``Nat _ => some ``Blaster.Reconstruct.nat_le_eq_not_lt
+     | Expr.const ``Int _ => some ``Blaster.Reconstruct.int_le_eq_not_lt
+     | Expr.const ``Bool _ => some ``Blaster.Reconstruct.bool_le_eq_not_lt
+     | Expr.const ``String _ => some ``Blaster.Reconstruct.string_le_eq_not_lt
+     | _ => none
+   match thm? with
+   | some thm => Blaster.Reconstruct.withThm (mkAppN f args) r thm #[op1, op2]
+   | none => return r
  else if args.size == 2 then
    setRestart
    -- we need to return a lambda term here, i.e.,

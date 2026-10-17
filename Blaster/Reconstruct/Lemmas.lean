@@ -341,3 +341,14 @@ theorem dite'_false_swap {α : Sort u} (c : Bool) (a b : α) :
   cases c <;> simp
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Relational operators (see `optimizeLE`) -/
+
+theorem nat_le_eq_not_lt (a b : Nat) : (a ≤ b) = ¬ (b < a) := propext Nat.not_lt.symm
+theorem int_le_eq_not_lt (a b : Int) : (a ≤ b) = ¬ (b < a) := propext Int.not_lt.symm
+theorem bool_le_eq_not_lt (a b : Bool) : (a ≤ b) = ¬ (b < a) := by cases a <;> cases b <;> decide
+theorem string_le_eq_not_lt (a b : String) : (a ≤ b) = ¬ (b < a) := rfl
+
+end Blaster.Reconstruct
