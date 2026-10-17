@@ -278,6 +278,48 @@ where
     | .mdata _ e | .proj _ _ e => collect e acc
     | _ => acc
 
+syntax (name := blasterNlDiv) "blaster_nl_div" : tactic
+
+/-- Non-linear `Nat` division goals: for each `a / b` in the main goal, add `0 < b`, the division
+    facts, and for each hypothesis `a < b * c` (or `a < c * b`) the bound `a / b < c` multiplied by `b`.
+    Then the goal (or the two bounds of `Nat.div_eq_of_lt_le` for `_ / b = _`) are closed by `omega`
+    after distributing the multiplications.
+-/
+@[tactic blasterNlDiv] def evalBlasterNlDiv : Tactic := fun _ => withMainContext do
+  let g ← getMainGoal
+  let pairs := evalBlasterDivModFacts.collect (← instantiateMVars (← g.getType)) #[]
+  if pairs.isEmpty then throwError "blaster_nl_div: no division"
+  let hyps ← g.withContext do
+    let mut hs := #[]
+    for d in ← getLCtx do
+      if d.isImplementationDetail then continue
+      let t ← instantiateMVars d.type
+      -- `a < p` with `p` a product
+      if let some (_, _, a, p) := t.app4? ``LT.lt then
+        if p.isAppOfArity ``HMul.hMul 6 then hs := hs.push (d.toExpr, a, p.getArg! 4, p.getArg! 5)
+    return hs
+  for (a, b) in pairs.extract 0 4 do
+    withMainContext do
+      let aS ← Term.exprToSyntax a
+      let bS ← Term.exprToSyntax b
+      evalTactic (← `(tactic| have blaster_pos : 0 < $bS := by
+        first | omega | (apply Nat.pos_of_ne_zero; intro h0; simp_all)))
+      evalTactic (← `(tactic| (have := Nat.div_add_mod $aS $bS; have := Nat.mod_lt $aS blaster_pos)))
+      for (h, a', l, r) in hyps do
+        if !(← isDefEq a a') then continue
+        let c ← if ← isDefEq l b then pure r else if ← isDefEq r b then pure l else continue
+        let hS ← Term.exprToSyntax h
+        let cS ← Term.exprToSyntax c
+        evalTactic (← `(tactic| try (
+          have blaster_q : $aS / $bS + 1 ≤ $cS :=
+            Nat.succ_le_of_lt ((Nat.div_lt_iff_lt_mul blaster_pos).2 (by rw [Nat.mul_comm]; first | exact $hS | omega))
+          have := Nat.mul_le_mul_left $bS blaster_q)))
+  evalTactic (← `(tactic| first
+    | omega
+    | (apply Nat.div_eq_of_lt_le <;>
+        simp only [Nat.sub_mul, Nat.add_mul, Nat.mul_add, Nat.one_mul, Nat.mul_one] at * <;>
+        simp only [Nat.mul_comm] at * <;> omega)))
+
 syntax (name := blasterLitAdd) "blaster_lit_add" : tactic
 
 /-- Rewrite `k + n` into `n + k` (over `Nat`), for every numeral `k` and non-numeral `n`, i.e.,
@@ -384,14 +426,15 @@ partial def witnessCandidates (t : Expr) (seeds : Array Nat) (vars : Array Ident
         if opts.isEmpty then return none
         let mut next := #[]
         for a in args do
-          for o in opts.extract 0 6 do
-            if next.size < 64 then next := next.push (a.push o)
+          -- NOTE: single fields (e.g., `next (n : T)`) range over all the candidates of their type
+          for o in opts.extract 0 (if fields.size == 1 then 256 else 8) do
+            if next.size < 256 then next := next.push (a.push o)
         args := next
       return some args
     let some argss := fieldsOk | continue
     for args in argss do
       cs := cs.push (← `($(mkIdent ctor) $args*))
-  return cs.extract 0 64
+  return cs.extract 0 512
 
 @[tactic blasterExists] def evalBlasterExists : Tactic := fun _ => do
   let g ← getMainGoal
@@ -753,18 +796,86 @@ partial def specializeWithSeeds (p ty : Expr) (depth : Nat) : MetaM (Array (Expr
     res := res ++ (← specializeWithSeeds p' ty' (depth - 1))
   return res
 
-/-- Add the seeded specializations of all propositional hypotheses of `g` to its local context. -/
+/-- Maximum number of specializations of a hypothesis w.r.t. local variables. -/
+def maxLocalSpecializations : Nat := 64
+
+/-- Return the specializations of `p : ty` w.r.t. the (non-propositional) local variables `vars`,
+    i.e., all the instantiations of the leading quantifiers of `ty` with variables of the
+    expected type (e.g., `(∀ β (x : T β), P β x) → ∀ α (y : T α), Q` needs `β := α` and `x := y`).
+    Only fully instantiated specializations are returned (up to `maxLocalSpecializations`).
+-/
+partial def specializeWithLocals (vars : Array Expr) (p ty : Expr) : MetaM (Array (Expr × Expr)) := do
+  let res ← IO.mkRef #[]
+  let rec go (p ty : Expr) (depth : Nat) : MetaM Unit := do
+    if (← res.get).size ≥ maxLocalSpecializations then return
+    let ty ← whnfR ty
+    let .forallE _ d b bi := ty | if depth > 0 then res.modify (·.push (p, ty)) else pure ()
+    if bi.isInstImplicit then
+      -- instance arguments are synthesized
+      match ← trySynthInstance d with
+      | .some inst => go (mkApp p inst) (b.instantiate1 inst) (depth + 1)
+      | _ =>
+        for v in vars do
+          if ← isDefEq (← inferType v) d then go (mkApp p v) (b.instantiate1 v) (depth + 1)
+      return
+    if (← isProp d) then
+      -- stop at the first hypothesis
+      if depth > 0 then res.modify (·.push (p, ty))
+      return
+    for v in vars do
+      if ← isDefEq (← inferType v) d then go (mkApp p v) (b.instantiate1 v) (depth + 1)
+  go p ty 0
+  return ← res.get
+
+/-- Add the seeded specializations of all propositional hypotheses of `g` to its local context,
+    including their specializations w.r.t. the local variables.
+-/
 def instHypsWithSeeds (g : MVarId) : MetaM MVarId := g.withContext do
   let mut hs := #[]
+  let mut vars := #[]
+  for decl in ← getLCtx do
+    if decl.isImplementationDetail then continue
+    if !(← isProp decl.type) then vars := vars.push decl.toExpr
   for decl in ← getLCtx do
     if decl.isImplementationDetail then continue
     let ty ← instantiateMVars decl.type
     if !(← isProp ty) then continue
     for (p, pty) in ← specializeWithSeeds decl.toExpr ty 2 do
       hs := hs.push { userName := `h_seed, type := pty, value := p : Hypothesis }
+    let locals ← try withNewMCtxDepth (specializeWithLocals vars decl.toExpr ty) catch _ => pure #[]
+    for (p, pty) in locals do
+      let p ← instantiateMVars p
+      let pty ← instantiateMVars pty
+      if p.hasMVar || pty.hasMVar then continue
+      hs := hs.push { userName := `h_inst, type := pty, value := p : Hypothesis }
   if hs.isEmpty then return g
   let (_, g) ← g.assertHypotheses hs
   return g
+
+syntax (name := blasterStructFacts) "blaster_struct_facts" : tactic
+
+/-- Add the propositional fields of the local variables of structure types (e.g., invariants
+    `s.inv : ∀ x y, x < y → s.f x < s.f y`) as hypotheses.
+-/
+@[tactic blasterStructFacts] def evalBlasterStructFacts : Tactic := fun _ =>
+  liftMetaTactic fun g => g.withContext do
+    let env ← getEnv
+    let mut hs := #[]
+    for decl in ← getLCtx do
+      if decl.isImplementationDetail || (← isProp decl.type) then continue
+      let t ← whnfR decl.type
+      let .const n _ := t.getAppFn | continue
+      let some info := getStructureInfo? env n | continue
+      for fld in info.fieldNames do
+        let some proj := env.getProjectionFnInfo? (n ++ fld) |>.map (fun _ => n ++ fld) | continue
+        try
+          let p ← mkAppM proj #[decl.toExpr]
+          let pty ← inferType p
+          if ← isProp pty then hs := hs.push { userName := fld, type := pty, value := p : Hypothesis }
+        catch _ => pure ()
+    if hs.isEmpty then throwError "blaster_struct_facts: no fact"
+    let (_, g) ← g.assertHypotheses hs
+    return [g]
 
 syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
 
@@ -783,6 +894,13 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
     ("seeded instantiation", ← `(tactic| (intros <;> blaster_inst_hyps <;> blaster_denorm <;>
                                            first | omega | grind))),
+    -- invariants of structures (e.g., `s.inv`) and instantiation with local variables
+    ("instantiation", ← `(tactic| (intros <;> (try blaster_struct_facts) <;> blaster_inst_hyps <;>
+                                    blaster_denorm <;> first | omega | (solve_by_elim (maxDepth := 8)) | grind |
+                                    (simp_all; done)))),
+    -- case analysis with unfolding of list accessors
+    ("cases", ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;>
+                          simp_all [List.head!, List.head?, List.headD, List.getLast!, List.tail!] <;> done))),
     -- user definitions (e.g., derived `BEq` instances) with case analysis on inductive variables
     ("unfold + cases", ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;> blaster_unfold_user <;>
                                      (try simp_all) <;> (try blaster_unfold_user) <;>
@@ -803,6 +921,8 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
       | (symm; apply Nat.div_eq_of_lt_le <;> grind)
       | (apply Nat.div_eq_of_lt_le <;> grind)
       | grind))),
+    -- non-linear division
+    ("nonlinear", ← `(tactic| (intros <;> blaster_denorm <;> blaster_nl_div))),
     -- non-linear arithmetic with core lemmas
     ("nonlinear", ← `(tactic| (intros <;> blaster_denorm <;> first
       | (grind [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mul_le_mul, Nat.eq_of_mul_eq_mul_left,

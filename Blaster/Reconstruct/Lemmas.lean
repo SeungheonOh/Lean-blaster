@@ -156,8 +156,8 @@ namespace Blaster.Reconstruct
 theorem not_false_eq' : (¬ False) = True := propext ⟨fun _ => trivial, fun _ h => h⟩
 theorem not_true_eq' : (¬ True) = False := propext ⟨fun h => h trivial, fun h => h.elim⟩
 theorem not_not_eq' (p : Prop) : (¬ ¬ p) = p := propext Classical.not_not
-theorem not_false_eq_bool (e : Bool) : (¬ (false = e)) = (true = e) := by cases e <;> simp
 theorem not_true_eq_bool (e : Bool) : (¬ (true = e)) = (false = e) := by cases e <;> simp
+theorem not_false_eq_bool (e : Bool) : (¬ (false = e)) = (true = e) := by cases e <;> simp
 theorem nat_not_zero_lt (e : Nat) : (¬ (0 < e)) = (0 = e) := by
   apply propext; constructor <;> intro h <;> omega
 theorem not_and_not_eq (a b : Prop) : (¬ (¬ a ∧ ¬ b)) = (a ∨ b) := by

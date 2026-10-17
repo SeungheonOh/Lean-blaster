@@ -158,7 +158,7 @@ def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutco
   -- fallback: prove the original goal directly with Lean's decision procedures
   let startTime ← IO.monoMsNow
   let s ← saveState
-  let direct ← tryCatchRuntimeEx (withReconRecDepth (proveDirect task.goal)) fun _ => do
+  let direct ← tryCatchRuntimeEx (withReconRecDepth (proveDirect task.goal task.axioms)) fun _ => do
     s.restore
     return none
   match direct with
@@ -166,12 +166,22 @@ def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutco
                                      elapsedMs := out.elapsedMs + ((← IO.monoMsNow) - startTime) }
   | none => return out
 where
-  proveDirect (goal : Expr) : TermElabM (Option (Expr × String)) := do
+  proveDirect (goal : Expr) (axioms : List Name) : TermElabM (Option (Expr × String)) := do
     let goal ← instantiateMVars goal
     if goal.hasMVar || goal.hasFVar then return none
     let r ← (do
       if let some p ← proveByDefEq goal then return some (p, "rfl")
       if let some p ← proveWithTactic goal (← `(tactic| decide +kernel)) then return some (p, "decide")
+      -- local axioms (e.g., universe polymorphic ones) as lemmas
+      if !axioms.isEmpty then
+        let lemmas ← axioms.toArray.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+        let tacs := #[
+          ← `(tactic| (intros <;> blaster_denorm <;> simp_all [$lemmas,*] <;> done)),
+          ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;>
+                       simp_all [$lemmas,*, List.head!, List.head?, List.headD] <;> done))]
+        for tac in tacs do
+          if let some p ← proveWithTactic goal tac (budget := 4 * dischargeHeartbeats) then
+            return some (p, "local axioms")
       proveResidual goal : TermElabM _)
     let some (p, m) := r | return none
     if (← kernelCheck goal p).isSome then return none

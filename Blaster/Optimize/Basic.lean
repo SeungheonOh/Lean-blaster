@@ -66,7 +66,12 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
 
           | Expr.lam n t b bi => optimizeExprAux (optimizeLambda n t b bi i_stack)
 
-          | Expr.letE n t v b _ => optimizeExprAux (inlineLet n t v b i_stack) -- inline let expression
+          | Expr.letE n t v b _ =>
+              -- NOTE: when tracking proof terms, let expressions are zeta-reduced with their original value,
+              -- i.e., substituting the optimized value may yield ill-typed terms (e.g., `Decidable` instances
+              -- of the original value).
+              if (← isTracking) then optimizeExprAux (.InitOptimizeExpr (b.instantiate1 v) :: i_stack)
+              else optimizeExprAux (inlineLet n t v b i_stack) -- inline let expression
 
           | Expr.mdata d me =>
               if (isTaggedRecursiveCall e) then
@@ -319,7 +324,11 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
          -- skipping optimization for Blaster.dite' cond as already performed by choice reduction on dite
          return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: nxtStack)
         else if idx == 2 then optimizeDiteArg args[idx]! (pure args[1]!) true pf stack
-        else if idx == 3 then optimizeDiteArg args[idx]! (mkExpr (mkApp (← mkPropNotOp) args[1]!)) false pf stack
+        -- NOTE: the else branch binder type must be exactly `¬ c` when tracking proof terms, i.e., not
+        -- rewritten with the global rewriting cache (see `mkExpr`).
+        else if idx == 3 then
+          let notCond := mkApp (← mkPropNotOp) args[1]!
+          optimizeDiteArg args[idx]! (if (← isTracking) then pure notCond else mkExpr notCond) false pf stack
         else return (.InitOptimizeExpr args[idx]! :: stack)
       else if let some argInfo := mInfo then
          if idx >= argInfo.getFirstDiscrPos && idx < argInfo.getFirstAltPos then

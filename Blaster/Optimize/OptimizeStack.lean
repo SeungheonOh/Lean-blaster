@@ -118,6 +118,21 @@ def mkLocalDeclStackContext (newCtx : LocalDeclContext) : TranslateEnvT LocalDec
 def resetLocalDeclContext (oldCtx : LocalDeclContext) : TranslateEnvT Unit :=
   updateLocalContext oldCtx
 
+/-- Return a proof of `τ = origT` when `τ` and `origT` are Boolean negations of each other, i.e.,
+    `(false = e) = ¬ (true = e)` or `(true = e) = ¬ (false = e)`. Otherwise `none`.
+-/
+def boolNegCast? (τ origT : Expr) : TranslateEnvT (Option Expr) := do
+  let some arg := origT.not? | return none
+  let some (_, l, e) := arg.eq? | return none
+  let some (_, l', e') := τ.eq? | return none
+  if !(exprEq e e') then return none
+  let lemma? :=
+    if l.isConstOf ``true && l'.isConstOf ``false then some ``Blaster.Reconstruct.not_true_eq_bool
+    else if l.isConstOf ``false && l'.isConstOf ``true then some ``Blaster.Reconstruct.not_false_eq_bool
+    else none
+  let some lemma := lemma? | return none
+  tryInLocalContext (mkEqSymm (mkApp (mkConst lemma) e))
+
 /-- Same as `mkExpr` but also returns the evidence for the possible rewrite performed
     via the global rewriting cache, i.e., given `pf : lhs = e`, return `(e', pf')` with `pf' : lhs = e'`.
 -/
@@ -303,7 +318,20 @@ def stackContinuity
        -- obtained from the binder, such that the body remains well-typed.
        withLocalContext $ do
          let declType := declInfo.map Prod.fst
+         -- NOTE: when tracking proof terms, a lambda over a proposition whose body depends on the
+         -- binder keeps its original binder type (the body may expect a proof of the original type).
+         let declType ←
+           if declType.isNone && body.hasLooseBVars && !(exprEq optExpr origT) && (← isTracking)
+              && (← isPropEnv origT) then pure (some origT)
+           else pure declType
          let castEq? := declInfo.bind Prod.snd
+         -- NOTE: a branch binder type that differs from the original one without a cast (e.g., after
+         -- swapping the branches of a `dite'`) is casted with a Boolean negation lemma when possible.
+         let castEq? ← match declType, castEq? with
+           | some τ, none =>
+               if body.hasLooseBVars && !(exprEq τ origT) && (← isTracking) then boolNegCast? τ origT
+               else pure none
+           | _, c => pure c
          withLocalDecl' n bi (declType.getD optExpr) fun x => do
            let (body', casted) := match declType, castEq? with
              | some τ, some h =>
