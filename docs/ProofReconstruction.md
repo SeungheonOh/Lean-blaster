@@ -252,8 +252,11 @@ because of the unsound rewrite above (18 attempts).
 | + functional induction, case analysis of nested structures, `div`/`mod` facts | 99.0%  | 97.9%                     | 89.6%               | 98.2% | 98.8%              |
 | + existential elimination lemma, applied `dite` case analysis, direct fallback | 99.1% | 99.5%                     | 93.9%               | 98.7% | **99.3%**          |
 | + `match` alternatives (splitter congruence, `match cases`, fallback regions, stuck-match case analysis) | 99.2%² | 99.5% | 96.4%        | 99.0% | **99.6%**          |
+| + soundness fix merged, WF evaluation, residual induction, `sorryAx` checks on auxiliary declarations³ | 99.9% | 100% | 100%      | **99.9%** |                |
 
 ¹ more tests were measured in this run, as earlier runs aborted some test files.
+³ 3306 of 3309 attempts; the unsound rewrite was fixed (no refused goals). The 3 failures are
+`MatchToITE_9`, `_10` and `_15`.
 ² measured against `deaf200` with the same harness. The row includes the match tests of
 `Tests/Reconstruct/Basic.lean` and `Tests/Reconstruct/MatchEdge.lean`. Excluding them, the rates go from
 99.1% / 99.4% / 93.8% / 98.7% / 99.3% to 99.2% / 99.4% / 96.0% / 99.0% / 99.6% (3188 to 3197 of 3229 attempts),
