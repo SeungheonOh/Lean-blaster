@@ -14,6 +14,20 @@ def callOptimize (sOpts : BlasterOptions) (stx : Syntax) : TermElabM Expr :=
     let optRes ← (Blaster.Optimize.command sOpts (← parseTerm stx))
     pure optRes.1
 
+/-- When environment variable `BLASTER_RECON_STATS` is set, try to reconstruct a kernel-checked proof
+    that the given term is equal to its optimized form and dump statistics (see `Blaster.Reconstruct.dumpStats`).
+    This is used to measure the coverage of proof reconstruction on the optimizer's test suite.
+-/
+def auditReconstruction (sOpts : BlasterOptions) (stx : Syntax) (name : String) : TermElabM Unit := do
+  if (← IO.getEnv "BLASTER_RECON_STATS").isNone then return
+  withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0, maxRecDepth := 0 }) $ do
+    let outcome ← try
+        let e ← parseTerm stx
+        let ((optExpr, pf), env) ← Blaster.Optimize.commandPf { sOpts with reconstruct := 1 } e
+        Blaster.Reconstruct.reconstructRewrite e optExpr pf env.recon
+      catch ex => pure { failure := m!"exception: {ex.toMessageData}" }
+    Blaster.Reconstruct.dumpStats outcome s!"testOptimize:{name}"
+
 /-! ## Definition of #testOptimize command to write unit test for Blaster.optimize
     The #testOptimize usage is as follows:
      #testOptimize [ "TestName" ] (verbose: num)? (norm-result: num)? TermToOptimize ==> OptimizedTerm
@@ -154,6 +168,7 @@ def testOptimizeImp : CommandElab := fun stx => do
    let m ← getMainModule
    withDeclName (m ++ name.toName) $ do
      let actual ← callOptimize sOpts t1
+     auditReconstruction sOpts t1 name
      let expected' := removeAnnotations (← parseTerm t2)
      -- keep the current name generator and restore it afterwards
      let ngen ← getNGen

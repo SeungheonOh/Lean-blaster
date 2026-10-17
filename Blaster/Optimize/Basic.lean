@@ -317,6 +317,18 @@ def Optimize.main (e : Expr) : TranslateEnvT Expr :=
   Prod.fst <$> Optimize.mainPf e
 
 
+/-- Same as `command` but also returns the evidence that `e` is equal to the optimized expression
+    (see option `reconstruct`).
+-/
+def commandPf (sOpts: BlasterOptions) (e : Expr) : MetaM ((Expr × EqPf) × TranslateEnv) := do
+  -- keep the current name generator and restore it afterwards
+  let ngen ← getNGen
+  let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
+  let res ← Optimize.mainPf e|>.run env
+  -- restore name generator
+  setNGen ngen
+  return res
+
 /-- Optimize an expression using the given solver options.
     ### Parameters
       - `sOpts`: The solver options to use for optimization.
@@ -326,13 +338,8 @@ def Optimize.main (e : Expr) : TranslateEnvT Expr :=
     NOTE: This function is to be used only by callOptimize in package Test.
 -/
 def command (sOpts: BlasterOptions) (e : Expr) : MetaM (Expr × TranslateEnv) := do
-  -- keep the current name generator and restore it afterwards
-  let ngen ← getNGen
-  let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-  let res ← Optimize.main e|>.run env
-  -- restore name generator
-  setNGen ngen
-  return res
+  let ((optExpr, _), env) ← commandPf sOpts e
+  return (optExpr, env)
 
 
 initialize

@@ -69,14 +69,38 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
       return none
     catch ex => return some m!"kernel rejected the reconstructed proof: {ex.toMessageData}"
 
+/-- Discharge the proof obligations in `proof` and check it against `goal` with the Lean kernel. -/
+def finishProof (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) : TermElabM ReconOutcome := do
+  let finish (o : ReconOutcome) : TermElabM ReconOutcome := do
+    return { o with elapsedMs := (← IO.monoMsNow) - startTime }
+  let (proof, stats) ← dischargeHoles proof
+  let out := { out with stats }
+  if !stats.failures.isEmpty || hasHoles proof then
+    let shown := stats.failures.extract 0 3
+    let msgs := shown.foldl (fun acc m => acc ++ m!"\n  • {m}") m!""
+    return ← finish { out with failure := m!"{stats.failures.size} unresolved proof obligation(s) out of {stats.total}:{msgs}" }
+  match ← kernelCheck goal proof with
+  | some msg => finish { out with failure := msg }
+  | none => finish { out with proof? := some proof }
+
+/-- Try to reconstruct a proof for `e = optExpr` given the evidence `pf` obtained by the optimizer. -/
+def reconstructRewrite (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermElabM ReconOutcome := do
+  let startTime ← IO.monoMsNow
+  let out : ReconOutcome := { nbExplicit := recon.nbExplicit, nbDefEq := recon.nbDefEq, residual := "n/a" }
+  let goal ← mkEq e optExpr
+  let proof ← match pf with
+    | .defeq => mkEqRefl e
+    | .proof p => pure p
+    | .unknown => mkTopHole e optExpr
+  finishProof out goal proof startTime
+
 /-- Try to reconstruct a proof for `task` given the reconstruction environment `recon`
     obtained after optimization.
 -/
 def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome := do
   let startTime ← IO.monoMsNow
   let out : ReconOutcome := { nbExplicit := recon.nbExplicit, nbDefEq := recon.nbDefEq }
-  let finish (o : ReconOutcome) : TermElabM ReconOutcome := do
-    return { o with elapsedMs := (← IO.monoMsNow) - startTime }
+  let finish := reconstruct.finish startTime
   -- Evidence for `fullGoal = optExpr`
   let optPf? ← match task.optPf with
     | .defeq => pure none
@@ -98,21 +122,15 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | some p =>
         try mkEqMPR p residual
         catch ex => return ← finish { out with failure := m!"ill-formed optimization proof: {ex.toMessageData}" }
-  -- Discharge proof obligations
-  let (pFull, stats) ← dischargeHoles pFull
-  let out := { out with stats }
-  if !stats.failures.isEmpty || hasHoles pFull then
-    let shown := stats.failures.extract 0 3
-    let msgs := shown.foldl (fun acc m => acc ++ m!"\n  • {m}") m!""
-    return ← finish { out with failure := m!"{stats.failures.size} unresolved proof obligation(s) out of {stats.total}:{msgs}" }
   -- Instantiate local axioms
   let axioms ← task.axioms.reverse.mapM fun n => do
     let info ← getConstInfo n
     return Lean.mkConst n (info.levelParams.map mkLevelParam)
-  let proof := mkAppN pFull axioms.toArray
-  match ← kernelCheck task.goal proof with
-  | some msg => finish { out with failure := msg }
-  | none => finish { out with proof? := some proof }
+  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime
+
+where
+  finish (startTime : Nat) (o : ReconOutcome) : TermElabM ReconOutcome := do
+    return { o with elapsedMs := (← IO.monoMsNow) - startTime }
 
 /-- Append a JSON summary of `o` to the file referred by environment variable `BLASTER_RECON_STATS` (if set). -/
 def dumpStats (o : ReconOutcome) (label : String) : TermElabM Unit := do
@@ -133,7 +151,7 @@ def dumpStats (o : ReconOutcome) (label : String) : TermElabM Unit := do
     ("unresolved", toJson o.stats.failures.size),
     ("methods", methods),
     ("ms", toJson o.elapsedMs),
-    ("failure", toJson (← o.failure.toString))
+    ("failure", toJson ((← o.failure.toString).take 400))
   ]
   let h ← IO.FS.Handle.mk path .append
   h.putStrLn json.compress

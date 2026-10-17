@@ -86,4 +86,14 @@ structure BlasterOptions where
 instance : Inhabited BlasterOptions where
   default := {}
 
+/-- Return the default options, possibly overridden by the following environment variables:
+     - `BLASTER_RECONSTRUCT`: default proof reconstruction level (see `reconstruct`).
+    NOTE: Options explicitly provided to `#blaster` or `blaster` take precedence.
+-/
+def BlasterOptions.fromEnv : IO BlasterOptions := do
+  let mut opts : BlasterOptions := default
+  if let some v ← IO.getEnv "BLASTER_RECONSTRUCT" then
+    if let some n := v.toNat? then opts := { opts with reconstruct := n }
+  return opts
+
 end Blaster.Options

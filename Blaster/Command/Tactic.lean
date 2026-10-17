@@ -37,7 +37,7 @@ def blasterTacticImp : Tactic := fun stx =>
   withMainContext $ do
    -- Parse options in any order
    let opts := stx[1].getArgs
-   let sOpts ← parseSolveOptions opts default
+   let sOpts ← parseSolveOptions opts (← BlasterOptions.fromEnv)
    let (goal, nbQuantifiers) ← revertHypotheses (← getMainGoal)
    let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
    let ((result, optExpr, task?), env') ←
