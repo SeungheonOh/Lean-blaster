@@ -216,17 +216,17 @@ because of the unsound rewrite above (18 attempts).
 | + existential witnesses, non-linear residual strategies | 98.4%                        | 93.8%                     | 78.5%               | 96.7% | 97.3%              |
 | + separate proof run (universe levels kept)           | 98.4%                        | 93.2%                     | 80.4%               | 96.8% | 97.3%              |
 | + functional induction, case analysis of nested structures, `div`/`mod` facts | 99.0%  | 97.9%                     | 89.6%               | 98.2% | 98.8%              |
-| + existential elimination lemma, applied `dite` case analysis, direct fallback | 99.0% | 99.5%                     | 93.9%               | 98.7% | **99.3%**          |
+| + existential elimination lemma, applied `dite` case analysis, direct fallback | 99.1% | 99.5%                     | 93.9%               | 98.7% | **99.3%**          |
 
 ¹ more tests were measured in this run, as earlier runs aborted some test files.
 
 Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
-to 16.6k. Proof obligations left to tactics dropped from 13.2k to 4.0k, of which only 128 remain
+to 16.6k. Proof obligations left to tactics dropped from 13.2k to 4.0k, of which only 127 remain
 unresolved (down from 796).
 
 ## Current limitations / next steps
 
-- The remaining failures (24 of 3238 attempts) fall into a few classes:
+- The remaining failures (23 of 3238 attempts) fall into a few classes:
   - `match` expressions over `Int`/`Nat` literal patterns with many alternatives (`MatchToITE`), where
     the equivalence with the `dite'` chain needs a case analysis on the matcher's splitter;
   - residual goals of the SMT solver over polymorphic or uninterpreted functions with quantified
