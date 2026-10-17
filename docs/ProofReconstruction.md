@@ -135,12 +135,13 @@ are the fraction of attempts producing a kernel-checked proof.
 | + dependent `dite'` congruence, `dite'` propagation lemmas, arithmetic residuals | 92.9% | 92.0%                | 44.2%               | 89.5% |
 | + residual: user-definition unfolding with bounded case analysis | 92.9%                  | 92.0%                     | 65.5%               | 91.0% |
 | + non-linear `div`/`mod` lemmas, induction for recursive-function equivalences | 95.1%  | 93.1%                     | 70.9%               | 93.3% |
+| + nested recursive-function equivalences (proved bottom-up and reused) | 95.4%           | 93.2%                     | 70.9%               | 93.5% |
 
 ¹ more tests were measured in this run, as earlier runs aborted some test files.
 
 Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
 to 16.0k. Proof obligations left to tactics dropped from 13.2k to 4.5k, of which only 419 remain
-unresolved (down from 796). The extended `div`/`mod`
+unresolved (down from 796; 410 after the nested-equivalence work). The extended `div`/`mod`
 lemma set then raised the `Tests/Smt/SmtNat` goals further, from 95 to 107 of 132.
 
 ## Current limitations / next steps
@@ -150,7 +151,13 @@ lemma set then raised the `Tests/Smt/SmtNat` goals further, from 95 to 107 of 13
   and equation lemmas.
 - Rewrites of recursive functions into structurally equivalent ones (`storeRecFunDef`) are justified
   by `blaster_funind`, which applies function extensionality and then induction on one argument.
-  Equivalences that need a generalized induction hypothesis or mutual induction still fail.
+  The optimizer records every equivalence it establishes, including those found while optimizing other
+  function bodies. Reconstruction proves them bottom-up, each one using the previous ones as
+  hypotheses. Equivalences that need a generalized induction hypothesis or mutual induction still fail.
+- Quantified *functions* whose domain is a proposition (e.g. `∀ f : (c = true → α), …`) block
+  reconstruction once the optimizer rewrites the domain non-definitionally. Original and optimized
+  bodies then need differently typed variables, and relating them requires casts in the optimizer.
+  This accounts for most of the remaining `frame::forall` failures.
 - Goals proved by the SMT solver rely on Lean decision procedures. The next step is to replay Z3
   proofs, or at least use unsat cores and quantifier instantiations from Z3 as hints.
 - Universe-polymorphic goals cannot be reconstructed while `normLevel` is applied.
