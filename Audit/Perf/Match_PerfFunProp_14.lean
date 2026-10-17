@@ -1,0 +1,2 @@
+import Blaster
+#blaster (only-optimize: 1) [ ∀ (b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 : Bool), List.length [(if b0 then 1 else 2), (if b1 then 1 else 2), (if b2 then 1 else 2), (if b3 then 1 else 2), (if b4 then 1 else 2), (if b5 then 1 else 2), (if b6 then 1 else 2), (if b7 then 1 else 2), (if b8 then 1 else 2), (if b9 then 1 else 2), (if b10 then 1 else 2), (if b11 then 1 else 2), (if b12 then 1 else 2), (if b13 then 1 else 2)] = 14 ]

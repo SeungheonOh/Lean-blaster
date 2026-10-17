@@ -1,0 +1,19 @@
+#!/usr/bin/env -S python3 -I
+import sys, os
+if len(sys.argv) > 1 and sys.argv[1] == "-version":
+    print("Z3 version 4.15.2"); sys.exit(0)
+buf = ""; bal = 0
+for line in sys.stdin:
+    buf += line
+    bal += line.count("(") - line.count(")")
+    if bal > 0: continue
+    cmd = buf.strip(); buf = ""; bal = 0
+    if not cmd: continue
+    if cmd.startswith("(check-sat"):
+        print(os.environ.get("FAKE_RES", "sat"), flush=True)
+    elif cmd.startswith("(get-model") or cmd.startswith("(eval"):
+        sys.exit(0)
+    elif cmd.startswith("(exit"):
+        sys.exit(0)
+    else:
+        print("success", flush=True)
