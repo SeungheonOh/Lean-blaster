@@ -245,17 +245,27 @@ def optimizeDITEChoice (f : Expr) (args : Array Expr) : TranslateEnvT (Option Ex
    diteReduce? (cond : Expr) (t : Expr) : TranslateEnvT (Option Expr) := do
      let hyps := (← get).optEnv.hypothesisContext.hypothesisMap
      match t with
-     | Expr.lam _h _c b _bi =>
+     | Expr.lam _h c b _bi =>
          if let some p ← inHypMap cond hyps then
             if !b.hasLooseBVars
             then return b
-            else return (t.beta #[p])
+            else
+              -- NOTE: when tracking proof terms, the hypothesis must be a proof of the binder type
+              -- (i.e., the resulting expression must be well-typed).
+              if ← Blaster.Reconstruct.isTracking then
+                let some p ← Blaster.Reconstruct.hypProof? c p | return none
+                return (t.beta #[p])
+              return (t.beta #[p])
          else return none
      | _ =>
         if !(← isQuantifiedFun t) then
           throwEnvError "diteReduce?: lambda/quantified function expression expected but got {reprStr t}"
         if let some p ← inHypMap cond hyps
-        then return (t.beta #[p])
+        then
+          if ← Blaster.Reconstruct.isTracking then
+            let some p ← Blaster.Reconstruct.hypProof? cond p | return none
+            return (t.beta #[p])
+          return (t.beta #[p])
         else return none
 
 /-- Apply simplification/normalization rules on `Blaster.dite'` in the given order.
