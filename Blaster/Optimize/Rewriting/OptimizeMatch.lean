@@ -4,7 +4,7 @@ import Blaster.Optimize.Rewriting.NormalizeMatch
 import Blaster.Optimize.Rewriting.OptimizeITE
 import Blaster.Optimize.Telescope
 
-open Lean Meta Elab
+open Lean Meta Blaster.Reconstruct Elab
 namespace Blaster.Optimize
 
 private partial def isCstMatchPropAux (stack : List Expr) : TranslateEnvT Bool := do
@@ -540,20 +540,28 @@ def structEqMatch
 -/
 @[always_inline, inline]
 def optimizeMatch
-  (f : Expr) (args : Array Expr) (mInfo : MatchInfo) (xs : List OptimizeStack) :
+  (f : Expr) (args : Array Expr) (mInfo : MatchInfo) (xs : List OptimizeStack) (pf : EqPf) :
   TranslateEnvT OptimizeContinuity := withLocalContext $ do
+ let lhs := mkAppN f args
  -- check for match elimination rules first
- if let some r ← elimMatch? mInfo args then return (← stackContinuity xs r)
+ clearSteps
+ if let some r ← elimMatch? mInfo args then
+   return (← stackContinuity xs r (← pf.trans (← ruleStep lhs r "elimMatch")))
  -- check for match equivalence afterwards
  let (f', args') ← structEqMatch f args mInfo
+ let pf ← pf.trans (← ruleStep lhs (mkAppN f' args') "structEqMatch")
  let some mInfo' ← isMatcher? f' |
    throwEnvError "MatchInfo expected for {reprStr f'} previous {reprStr f}!!!"
  --  normalize match expression to ite
+ clearSteps
  match (← normMatchExpr? args' mInfo') with
  | some mdef =>
     -- trace[Optimize.normMatch] "normalizing match to ite {reprStr f'} {reprStr args'} => {reprStr mdef}"
-    return Sum.inl (.InitOptimizeExpr mdef :: xs)
- | _ => return (← stackContinuity xs (← mkAppExpr f' args'))
+    let pf ← pf.trans (← ruleStep (mkAppN f' args') mdef "normMatchExpr")
+    return Sum.inl (← pushTrans mdef pf xs)
+ | _ =>
+    let (e, pf) ← mkExprPf (mkAppN f' args') pf
+    return (← stackContinuity xs e pf)
 
 
 initialize

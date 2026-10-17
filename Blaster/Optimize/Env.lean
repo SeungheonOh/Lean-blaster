@@ -4,6 +4,7 @@ import Blaster.Optimize.MatchInfo
 import Blaster.Optimize.Opaque
 import Blaster.Smt.Term
 import Blaster.Command.Options
+import Blaster.Reconstruct.Types
 
 open Lean Meta Blaster.Smt Blaster.Options
 
@@ -456,11 +457,14 @@ structure TranslateEnv where
   smtEnv : SmtEnv
   /-- Environment used when optimization a lean expression. -/
   optEnv : OptimizeEnv
+  /-- Environment used for proof reconstruction. -/
+  recon : Blaster.Reconstruct.ReconEnv
 
 instance : Inhabited TranslateEnv where
   default :=
     { smtEnv := default,
-      optEnv := default
+      optEnv := default,
+      recon := default
     }
 
 abbrev TranslateEnvT := StateRefT TranslateEnv MetaM
@@ -663,7 +667,7 @@ def mkExpr (a : Expr) (cacheResult := true) : TranslateEnvT Expr := do
 /-- Return `true` only when both hypothesisMap and matchInContext are empty and isRefHyp flag is not set -/
 @[always_inline, inline]
 def isGlobalContext : TranslateEnvT Bool := do
-  let ⟨_, ⟨_, _, _, _, _, _, _, _, hypothesisContext, matchInContext, _, _, _, _⟩⟩ ← get
+  let ⟨_, ⟨_, _, _, _, _, _, _, _, hypothesisContext, matchInContext, _, _, _, _⟩, _⟩ ← get
   return hypothesisContext.hypothesisMap.size == 0 && matchInContext.size == 0
 
 /-- Perform the following:
@@ -1712,7 +1716,7 @@ where
     An error is triggered if no corresponding entry can be found in `recFunMap`.
 -/
 def hasRecFunInst? (instApp : Expr) : TranslateEnvT (Option Expr) := do
-  let ⟨_, ⟨_, _, _, _, _,recFunInstCache,_,recFunMap, _, _, _, _, _, _⟩⟩ ← get
+  let ⟨_, ⟨_, _, _, _, _,recFunInstCache,_,recFunMap, _, _, _, _, _, _⟩, _⟩ ← get
   match recFunInstCache.get? instApp with
   | some fbody =>
      -- retrieve function application from recFunMap
@@ -1722,8 +1726,8 @@ def hasRecFunInst? (instApp : Expr) : TranslateEnvT (Option Expr) := do
   | none => return none
 
 
-/-- Returns all axioms only defined in current module. -/
-def findLocalAxioms : TranslateEnvT (List Expr) := do
+/-- Returns the name and type of all the propositional axioms only defined in current module. -/
+def findLocalAxiomDecls : TranslateEnvT (List (Name × Expr)) := do
  let env ← getEnv
  (Environment.constants env).toList.filterMapM
     (λ c : Name × ConstantInfo => do
@@ -1733,11 +1737,15 @@ def findLocalAxioms : TranslateEnvT (List Expr) := do
         | .axiomInfo info =>
             if ← isTheorem c.1 then return none
             if ← isPropEnv (info.type) then
-              return some info.type
+              return some (c.1, info.type)
             else return none
         | _ => return none
       else return none
     )
+
+/-- Returns all axioms only defined in current module. -/
+def findLocalAxioms : TranslateEnvT (List Expr) :=
+  return (← findLocalAxiomDecls).map Prod.snd
 
 initialize
   registerTraceClass `Optimize.cacheExpr

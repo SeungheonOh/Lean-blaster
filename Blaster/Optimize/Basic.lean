@@ -7,13 +7,15 @@ import Blaster.Optimize.Rewriting.OptimizeApp
 import Blaster.Optimize.Rewriting.OptimizeConst
 import Blaster.Optimize.Rewriting.OptimizeForAll
 
-open Lean Elab Command Term Meta Blaster.Options
+open Lean Elab Command Term Meta Blaster.Options Blaster.Reconstruct
 
 namespace Blaster.Optimize
 
 
 -- TODO: update formalization with inference rule style notation.
-partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr := do
+-- NOTE: Each rewrite performed by the optimizer is accompanied with evidence that the
+-- rewritten expression is equal to the original one (see `Blaster.Reconstruct`).
+partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr × EqPf) := do
   match stack with
   | .InitOptimizeExpr e :: xs =>
       match (← isInOptimizeEnvCache e xs) with
@@ -27,13 +29,16 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
 
           | Expr.sort l =>
               -- sort is used for Type u, Prop, etc
-              let s' ← mkExpr (Expr.sort (normLevel l))
-              match (← stackContinuity i_stack s') with
+              let s := Expr.sort (normLevel l)
+              clearSteps
+              let (s', pf) ← mkExprPf s (← ruleStep e s "normLevel")
+              match (← stackContinuity i_stack s' pf) with
               | Sum.inr e' => return e'
               | Sum.inl stack' => optimizeExprAux stack'
 
           | Expr.lit .. => -- number or string literal
-              match (← stackContinuity i_stack (← mkExpr e)) with
+              let (e', pf) ← mkExprPf e .defeq
+              match (← stackContinuity i_stack e' pf) with
               | Sum.inr e' => return e'
               | Sum.inl stack' => optimizeExprAux stack'
 
@@ -43,7 +48,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
               | Sum.inl stack' => optimizeExprAux stack'
 
           | Expr.forallE n t b bi =>
-              optimizeExprAux (.InitOptimizeExpr t :: .ForallWaitForType n bi b :: i_stack)
+              optimizeExprAux (.InitOptimizeExpr t :: .ForallWaitForType n bi t b :: i_stack)
 
           | Expr.app .. =>
              let (f, ras) := getAppFnWithArgs e
@@ -59,7 +64,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
 
           | Expr.lam n t b bi => optimizeExprAux (optimizeLambda n t b bi i_stack)
 
-          | Expr.letE _n _t v b _ => optimizeExprAux (inlineLet v b i_stack) -- inline let expression
+          | Expr.letE n t v b _ => optimizeExprAux (inlineLet n t v b i_stack) -- inline let expression
 
           | Expr.mdata d me =>
               if (isTaggedRecursiveCall e) then
@@ -83,79 +88,84 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
         | Sum.inr e => return e
         | Sum.inl stack' => optimizeExprAux stack'
 
-  | .AppOptimizeImplicitArgs f args idx startIdx stopIdx pInfo :: xs =>
+  | .AppOptimizeImplicitArgs f args idx startIdx stopIdx pInfo pf :: xs =>
        if idx ≥ stopIdx then
          if isBlasterDiteConst f && args.size ≥ 2 then
            -- applying choice reduction to avoid optimizing unreachable arguments in Blaster.dite'
            let condOpt := .InitOptimizeExpr args[1]!
-           optimizeExprAux (condOpt :: .DiteChoiceWaitForCond f args pInfo startIdx :: xs)
+           optimizeExprAux (condOpt :: .DiteChoiceWaitForCond f args pInfo startIdx pf :: xs)
          else if let some mInfo ← isMatcher? f then
             -- try match reduction rule first to avoid unnecessary optimization on discriminators
+            clearSteps
             if let some r ← matchReduction? f args mInfo then
-              optimizeExprAux (.InitOptimizeExpr r :: xs)
+              optimizeExprAux (← pushRuleStep f args r "matchReduction" pf xs)
             else
               -- applying choice reduction and match constant propagation to
               -- avoid optimizing unreachable rhs in match
               -- only optimizing match discriminators first
-              optimizeExprAux (.MatchChoiceOptimizeDiscrs f args pInfo startIdx mInfo.getFirstDiscrPos mInfo :: xs)
+              optimizeExprAux (.MatchChoiceOptimizeDiscrs f args pInfo startIdx mInfo.getFirstDiscrPos mInfo pf :: xs)
          -- try to apply funPropagation to avoid optimizing ite/match multiple times
-         else if let some r ← funPropagation? f args (reorderArgs := true) then
-           optimizeExprAux (.InitOptimizeExpr r :: xs)
+         else if let some r ← (do clearSteps; funPropagation? f args (reorderArgs := true)) then
+           optimizeExprAux (← pushRuleStep f args r "funPropagation" pf xs)
          -- apply optimization on remaining explicit parameters before reduction
-         else optimizeExprAux (.AppOptimizeExplicitArgs f args startIdx args.size pInfo none :: xs)
+         else optimizeExprAux (.AppOptimizeExplicitArgs f args startIdx args.size pInfo none pf :: xs)
 
        else if idx < pInfo.paramsInfo.size -- handle case when HOF is the returned type
             then if !pInfo.paramsInfo[idx]!.isExplicit
                  then optimizeExprAux (.InitOptimizeExpr args[idx]! :: stack)
-                 else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo :: xs)
-            else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo :: xs)
+                 else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo pf :: xs)
+            else optimizeExprAux (.AppOptimizeImplicitArgs f args (idx + 1) startIdx stopIdx pInfo pf :: xs)
 
-  | .AppOptimizeExplicitArgs f args idx stopIdx pInfo mInfo :: xs =>
+  | .AppOptimizeExplicitArgs f args idx stopIdx pInfo mInfo pf :: xs =>
        if idx ≥ stopIdx then
+         clearSteps
          -- normalizing ite/match function application
          if let some re ← normChoiceApplication? f args then
            -- trace[Optimize.normChoiceApp] "normalizing choice application {reprStr f} {reprStr args} => {reprStr re}"
-           optimizeExprAux (.InitOptimizeExpr re :: xs)
+           optimizeExprAux (← pushRuleStep f args re "normChoiceApplication" pf xs)
          -- apply match normalization rules
          else if let some argInfo := mInfo then
-           match (← optimizeMatch f args argInfo xs) with
+           match (← optimizeMatch f args argInfo xs pf) with
            | Sum.inr e' => return e'
            | Sum.inl stack' => optimizeExprAux stack'
          -- apply ite normalization rules only when fully applied
          else if isBlasterDiteConst f && args.size == 4 then
-           match (← optimizeIfThenElse? f args xs) with
+           match (← optimizeIfThenElse? f args xs pf) with
            | Sum.inr e' => return e'
            | Sum.inl stack' => optimizeExprAux stack'
          -- try to reduce app if all params are constructors
          else if let some re ← reduceApp? f args then
            -- trace[Optimize.reduceApp] "application reduction {reprStr f} {reprStr args} => {reprStr re}"
-           optimizeExprAux (.InitOptimizeExpr re :: xs)
+           optimizeExprAux (← pushRuleStep f args re "reduceApp" pf xs)
          -- unfold non-recursive and non-opaque functions
          -- NOTE: beta reduction performed by getUnfoldFunDef? when rf is a lambda term
          -- NOTE: we can only unfold once all parameters have been optimized.
          else if let some fdef ← getUnfoldFunDef? f args then
            -- trace[Optimize.unfoldDef] "unfolding function definition {reprStr f} {reprStr args} => {reprStr fdef}"
-           optimizeExprAux (.InitOptimizeExpr fdef :: xs)
+           -- NOTE: unfolding a non-recursive definition is a definitional step (delta + beta).
+           optimizeExprAux (← pushTrans fdef (← pf.trans (← defEqStep)) xs)
          -- normalizing partially apply function after unfolding non-opaque functions
          else if let some pe ← normPartialFun? f args then
            -- trace[Optimize.normPartial] "normalizing partial function {reprStr f} {reprStr args} => {reprStr pe}"
-           optimizeExprAux (.InitOptimizeExpr pe :: xs)
+           -- NOTE: eta expansion is a definitional step.
+           optimizeExprAux (← pushTrans pe (← pf.trans (← defEqStep)) xs)
          -- applying optimization on opaque rec function and app and proceed with fun propagation rules
-         else optimizeExprAux (.InitOpaqueRecExpr f args :: xs)
+         else optimizeExprAux (.InitOpaqueRecExpr f args pf :: xs)
        else if idx < pInfo.paramsInfo.size
             then if pInfo.paramsInfo[idx]!.isExplicit
-                 then optimizeExprAux (← optimizeExplicitArgs f args idx stopIdx pInfo mInfo stack xs)
-                 else optimizeExprAux (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo :: xs)
+                 then optimizeExprAux (← optimizeExplicitArgs f args idx stopIdx pInfo mInfo pf stack xs)
+                 else optimizeExprAux (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: xs)
             else optimizeExprAux (.InitOptimizeExpr args[idx]! :: stack)
 
-  | .MatchChoiceOptimizeDiscrs f args pInfo startArgIdx idx mInfo :: xs =>
+  | .MatchChoiceOptimizeDiscrs f args pInfo startArgIdx idx mInfo pf :: xs =>
         if idx ≥ mInfo.getFirstAltPos then
+          clearSteps
           if let some r ← matchReduction? f args mInfo then
-            optimizeExprAux (.InitOptimizeExpr r :: xs)
+            optimizeExprAux (← pushRuleStep f args r "matchReduction" pf xs)
           else
             -- apply optimization on remaining explicit parameters before reduction
             -- keep matchInfo to avoid unnecessary query and to avoid optimizing discriminators again
-            optimizeExprAux (.AppOptimizeExplicitArgs f args startArgIdx args.size pInfo mInfo :: xs)
+            optimizeExprAux (.AppOptimizeExplicitArgs f args startArgIdx args.size pInfo mInfo pf :: xs)
         else optimizeExprAux (.InitOptimizeExpr args[idx]! :: stack)
 
   | .MatchRhsLambdaNext next :: xs =>
@@ -164,13 +174,24 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
           optimizeExprAux (.InitOptimizeExpr t :: .MatchRhsLambdaWaitForType n bi b :: xs)
       | _ =>
          -- header on xs is expected to be .MatchRhsLambdaWaitForBody
-         match (← stackContinuity xs next) with
+         match (← stackContinuity xs next .unknown) with
          | Sum.inl stack' => optimizeExprAux stack'
          | _ => throwEnvError "optimizeExprAux: continuity expected for MatchRhsLambdaNext !!!"
 
   | _ => throwEnvError "optimizeExprAux: unexpected optimize stack continuity {reprStr stack} !!!"
 
   where
+
+    /-- Given `pf : lhs = f x₁ ... xₙ` and `r` the result of applying a rewriting rule on
+        `f x₁ ... xₙ`, push `r` on the stack to be optimized while keeping track of the evidence for `lhs = r`.
+    -/
+    @[always_inline, inline]
+    pushRuleStep
+      (f : Expr) (args : Array Expr) (r : Expr) (label : String)
+      (pf : EqPf) (stack : List OptimizeStack) : TranslateEnvT (List OptimizeStack) := do
+      if !(← isTracking) then return .InitOptimizeExpr r :: stack
+      let step ← withLocalContext $ ruleStep (mkAppN f args) r label
+      pushTrans r (← pf.trans step) stack
 
     /-- Given `e := Expr.fVar fv` perform the following:
          - When `some v := fv.getValue?`
@@ -182,7 +203,9 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
     normFVar (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeContinuity :=
       withLocalContext $ do
         match ← e.fvarId!.getValue? with
-        | none => stackContinuity stack (← mkExpr e)
+        | none =>
+            let (e', pf) ← mkExprPf e .defeq
+            stackContinuity stack e' pf
         | some v =>
             return Sum.inl (.InitOptimizeExpr (← instantiateMVars v) :: stack)
 
@@ -205,8 +228,8 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
       else return none
 
     @[always_inline, inline]
-    inlineLet (v : Expr) (body : Expr) (stack : List OptimizeStack) : List OptimizeStack :=
-      (.InitOptimizeExpr v :: .LetWaitForValue body :: stack)
+    inlineLet (n : Name) (t : Expr) (v : Expr) (body : Expr) (stack : List OptimizeStack) : List OptimizeStack :=
+      (.InitOptimizeExpr v :: .LetWaitForValue n t body :: stack)
 
     @[always_inline, inline]
     optimizeLambda
@@ -223,19 +246,19 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
     @[always_inline, inline]
     optimizeExplicitArgs
       (f : Expr) (args : Array Expr) (idx : Nat) (stopIdx : Nat)
-      (pInfo : FunEnvInfo) (mInfo : Option MatchInfo) (stack : List OptimizeStack)
+      (pInfo : FunEnvInfo) (mInfo : Option MatchInfo) (pf : EqPf) (stack : List OptimizeStack)
       (nxtStack : List OptimizeStack) : TranslateEnvT (List OptimizeStack) := withLocalContext $ do
       if isBlasterDiteConst f then
         if idx == 1 then
          -- skipping optimization for Blaster.dite' cond as already performed by choice reduction on dite
-         return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo :: nxtStack)
+         return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: nxtStack)
         else if idx == 2 || idx == 3
         then return optimizeDiteArg args[idx]! stack
         else return (.InitOptimizeExpr args[idx]! :: stack)
       else if let some argInfo := mInfo then
          if idx >= argInfo.getFirstDiscrPos && idx < argInfo.getFirstAltPos then
            -- skipping optimization for discriminators as already performed by choice reduction on match
-           return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo :: nxtStack)
+           return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: nxtStack)
          else if idx >= argInfo.getFirstAltPos && idx < argInfo.arity then
            optimizeMatchAlt args argInfo idx args[idx]! stack
          else return (.InitOptimizeExpr args[idx]! :: stack)
@@ -244,14 +267,14 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT Expr :=
 
 @[always_inline, inline]
 def optimizeExpr (e : Expr) : TranslateEnvT Expr :=
-  optimizeExprAux [.InitOptimizeExpr e]
+  Prod.fst <$> optimizeExprAux [.InitOptimizeExpr e]
 
 /-- Same as optimizeExpr but updates local context before optimizing expression -/
 @[always_inline, inline]
 def optimizeExpr' (e : Expr) : TranslateEnvT Expr := do
   -- set start local context
   updateLocalContext (← mkLocalContext)
-  optimizeExprAux [.InitOptimizeExpr e ]
+  Prod.fst <$> optimizeExprAux [.InitOptimizeExpr e ]
 
 /-- Populate the `recFunInstCache` with opaque recursive function definition.
     This function need to be call before performing optimization on a lean expression.
@@ -268,18 +291,30 @@ def cacheOpaqueRecFun : TranslateEnvT Unit := do
 
  where
    callOptimize (e : Expr) : TranslateEnvT Unit :=
-     discard $ optimizeExprAux [.InitOpaqueRecExpr e #[]]
+     discard $ optimizeExprAux [.InitOpaqueRecExpr e #[] .unknown]
 
 /-- Perform the following actions:
       - populate the recFunInstCache with default recursive function definitions.
       - optimize expression `e`
+    Return the optimized expression `e'` together with the evidence that `e = e'`.
+    NOTE: Proof terms are only tracked when proof reconstruction is activated
+    (see option `reconstruct`). Otherwise, `EqPf.unknown` is returned.
 -/
-def Optimize.main (e : Expr) : TranslateEnvT Expr := do
+def Optimize.mainPf (e : Expr) : TranslateEnvT (Expr × EqPf) := do
   -- set start local context
   updateLocalContext (← mkLocalContext)
   -- populate recFunInstCache with recursive function definition.
+  setTracking false
   cacheOpaqueRecFun
-  optimizeExpr e
+  -- track proof terms only for the expression to be optimized
+  setTracking ((← get).optEnv.options.solverOptions.reconstruct > 0)
+  let res ← optimizeExprAux [.InitOptimizeExpr e]
+  setTracking false
+  return res
+
+/-- Same as `Optimize.mainPf` but only returns the optimized expression. -/
+def Optimize.main (e : Expr) : TranslateEnvT Expr :=
+  Prod.fst <$> Optimize.mainPf e
 
 
 /-- Optimize an expression using the given solver options.

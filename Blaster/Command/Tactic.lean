@@ -3,6 +3,7 @@ import Blaster.Command.Syntax
 import Blaster.Smt.Translate
 import Blaster.Optimize
 import Blaster.Logging.Basic
+import Blaster.Reconstruct.Main
 
 open Lean Elab Tactic Meta
 open Blaster.Optimize Blaster.Smt Blaster.Options Blaster.Syntax
@@ -23,6 +24,9 @@ Options:
   - `random-seed`: seed for the random number generator (default: none)
   - `solve-result`: specify the expected result from the blaster tactic, i.e.,
                     0 for 'Valid', 1 for 'Falsified' and 2 for 'Undetermined'. (default: 0)
+  - `reconstruct`: close 'Valid' goals with a proof checked by the Lean kernel instead of `admit`, i.e.,
+                   0 for no reconstruction, 1 for best effort (falls back to `admit` with a warning)
+                   and 2 for required (error on failure). (default: 0)
 Example: `blaster (timeout: 10) (verbose: 1)`
 -/
 syntax (name := blasterTactic) "blaster" (solveOption)* : tactic
@@ -36,12 +40,23 @@ def blasterTacticImp : Tactic := fun stx =>
    let sOpts ← parseSolveOptions opts default
    let (goal, nbQuantifiers) ← revertHypotheses (← getMainGoal)
    let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-   let ((result, optExpr), _) ←
+   let ((result, optExpr, task?), env') ←
      withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $ do
        IO.setNumHeartbeats 0
-       Translate.main (← goal.getType >>= instantiateMVars') (logUndetermined := false) |>.run env
+       Translate.mainWithTask (← goal.getType >>= instantiateMVars') (logUndetermined := false) |>.run env
    match result with
-   | .Valid => goal.admit -- TODO: replace with proof reconstruction
+   | .Valid =>
+       match task? with
+       | some task =>
+          if sOpts.reconstruct > 0 then
+            let outcome ← Reconstruct.reconstruct task env'.recon
+            Reconstruct.dumpStats outcome "tactic"
+            Reconstruct.reportOutcome sOpts outcome
+            match outcome.proof? with
+            | some p => goal.assign p
+            | none => goal.admit
+          else goal.admit
+       | none => goal.admit
    | .Falsified cex => throwTacticEx `blaster goal "Goal was falsified (see counterexample above)"
    | .Undetermined =>
         -- Replace the goal with the optimized expression

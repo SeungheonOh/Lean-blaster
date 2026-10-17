@@ -1,6 +1,7 @@
 import Lean
 import Blaster.Command.Options
 import Blaster.Smt.Translate
+import Blaster.Reconstruct.Main
 open Lean Elab Command Term Meta Blaster.Options
 
 namespace Blaster.Syntax
@@ -20,6 +21,8 @@ Options:
   - `gen-cex`: generate counterexample for falsified theorems (default: 1)
   - `solve-result`: specify the expected result from the #blaster command, i.e.,
                     0 for 'Valid', 1 for 'Falsified' and 2 for 'Undetermined'. (default: 0)
+  - `reconstruct`: produce a proof checked by the Lean kernel for 'Valid' results, i.e.,
+                   0 for no reconstruction, 1 for best effort and 2 for required. (default: 0)
 
 Examples:
    - #blaster [∀ x y : Nat, x + y ≥ x]
@@ -38,6 +41,7 @@ syntax "(gen-cex:" num ")" : solveOption
 syntax "(solve-result:" num ")" : solveOption
 syntax "(max-depth:" num ")" : solveOption
 syntax "(random-seed:" num ")" : solveOption
+syntax "(reconstruct:" num ")" : solveOption
 
 -- NOTE: Limited to one term for the time being
 syntax solveTerm := "[" term "]"
@@ -111,6 +115,13 @@ def parseSolveResult (sOpts : BlasterOptions) : TSyntax `solveOption → m Blast
       | _ => throwUnsupportedSyntax
   | _ => return sOpts
 
+def parseReconstruct (sOpts : BlasterOptions) : TSyntax `solveOption → m BlasterOptions
+  | `(solveOption| (reconstruct: $n:num)) =>
+      match n.getNat with
+      | 0 | 1 | 2 => return { sOpts with reconstruct := n.getNat }
+      | _ => throwUnsupportedSyntax
+  | _ => return sOpts
+
 /-! ### Generic Parser for All Options -/
 def parseSolveOption (sOpts : BlasterOptions) (opt : TSyntax `solveOption) : m BlasterOptions := do
   let sOpts ← parseUnfoldDepth sOpts opt
@@ -123,6 +134,7 @@ def parseSolveOption (sOpts : BlasterOptions) (opt : TSyntax `solveOption) : m B
   let sOpts ← parseSolveResult sOpts opt
   let sOpts ← parseMaxDepth sOpts opt
   let sOpts ← parseRandomSeed sOpts opt
+  let sOpts ← parseReconstruct sOpts opt
   return sOpts
 
 /-! ### Process Multiple Options -/
@@ -161,6 +173,6 @@ def commandInvoker (f : BlasterOptions → Syntax → TermElabM Unit) : CommandE
 
 /-! ### Implementation of solve command -/
 @[command_elab solve]
-def solveImp : CommandElab := commandInvoker Blaster.Smt.command
+def solveImp : CommandElab := commandInvoker Blaster.Reconstruct.command
 
 end Blaster.Syntax
