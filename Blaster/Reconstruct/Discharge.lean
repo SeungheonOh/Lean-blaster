@@ -290,6 +290,31 @@ where
     | .mdata _ e | .proj _ _ e => collect e acc
     | _ => acc
 
+syntax (name := blasterCloseProofs) "blaster_close_proofs" : tactic
+
+/-- Replace the proofs occurring in the goal that depend on local hypotheses but whose type is a
+    closed decidable proposition (e.g., `s.length ≤ 64` for a string literal `s`) with proofs by
+    `decide`, which is a definitional change by proof irrelevance. This allows closed goals to be
+    decided by kernel evaluation after a case analysis (see `blaster_wf_eval`).
+-/
+@[tactic blasterCloseProofs] def evalBlasterCloseProofs : Tactic := fun _ =>
+  liftMetaTactic fun g => g.withContext do
+    let t ← instantiateMVars (← g.getType)
+    let changed ← IO.mkRef false
+    let t' ← Meta.transform t (pre := fun e => do
+      if !e.hasFVar || e.hasLooseBVars then return .continue
+      if !(← isProof e) then return .continue
+      let p ← instantiateMVars (← inferType e)
+      if p.hasFVar || p.hasMVar then return .continue
+      try
+        let r ← withAtLeastTransparency .default <| whnf (← mkDecide p)
+        if !r.isConstOf ``true then return .continue
+        changed.set true
+        return .done (← mkDecideProof p)
+      catch _ => return .continue)
+    if !(← changed.get) then throwError "blaster_close_proofs: no proof to close"
+    return [← g.replaceTargetDefEq t']
+
 syntax (name := blasterWfEval) "blaster_wf_eval" : tactic
 
 /-- Return `true` if `f` is defined by well-founded recursion. -/
@@ -387,7 +412,7 @@ def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
     | rfl
     | decide +kernel +revert
     | ((repeat' split) <;> (try $unfoldAtTac:tactic) <;> (try simp_all) <;> (try subst_vars) <;>
-        first | done | rfl | decide +kernel +revert)))
+        first | done | rfl | (blaster_close_proofs; decide +kernel) | decide +kernel +revert)))
 where
   arity (env : Environment) (n : Name) : Nat :=
     ((env.find? n).map fun info => info.type.getForallArity).getD 0
