@@ -392,8 +392,10 @@ def constCondProof (c : Expr) (pf : EqPf) (isTrue : Bool) : TranslateEnvT (Optio
 -/
 partial def nonemptyProof (t : Expr) : MetaM Expr := do
   let u ← getLevel t
-  if let .some inst ← trySynthInstance (mkApp (mkConst ``Nonempty [u]) t) then return inst
-  if let .some inst ← trySynthInstance (mkApp (mkConst ``Inhabited [u]) t) then
+  -- NOTE: local instances are ignored, i.e., a binder to be eliminated can't justify its own inhabitation.
+  let synth (c : Expr) : MetaM (LOption Expr) := do withLCtx (← getLCtx) #[] (trySynthInstance c)
+  if let .some inst ← synth (mkApp (mkConst ``Nonempty [u]) t) then return inst
+  if let .some inst ← synth (mkApp (mkConst ``Inhabited [u]) t) then
     return mkApp2 (mkConst ``Blaster.Reconstruct.nonempty_of_inhabited [u]) t inst
   match ← whnfR t with
   | .forallE n d b bi =>
@@ -411,7 +413,27 @@ partial def nonemptyProof (t : Expr) : MetaM Expr := do
       let .ctorInfo cinfo ← getConstInfo ctor | continue
       if cinfo.numFields == 0 && t'.getAppNumArgs == cinfo.numParams then
         return mkApp2 (mkConst ``Nonempty.intro [u]) t (mkAppN (mkConst ctor us) t'.getAppArgs)
+    -- constructor whose (non-dependent) fields are all inhabited, e.g., `BEq α` or `LT α`
+    -- NOTE: recursive types are not considered (to ensure termination).
+    if info.isRec then throwError "nonemptyProof: no proof for {t}"
+    for ctor in info.ctors do
+      let .ctorInfo cinfo ← getConstInfo ctor | continue
+      if t'.getAppNumArgs != cinfo.numParams then continue
+      let ctorApp := mkAppN (mkConst ctor us) t'.getAppArgs
+      let some elem ← (try some <$> fieldsElem ctorApp (← instantiateForall cinfo.type t'.getAppArgs)
+                       catch _ => pure none) | continue
+      return mkApp2 (mkConst ``Nonempty.intro [u]) t elem
     throwError "nonemptyProof: no proof for {t}"
+where
+  /-- Apply `f : ∀ fields, T` to an arbitrary element of each (non-dependent) field type. -/
+  fieldsElem (f fType : Expr) : MetaM Expr := do
+    match ← whnfR fType with
+    | .forallE _ d b _ =>
+        if b.hasLooseBVars then throwError "nonemptyProof: dependent field"
+        let nd ← nonemptyProof d
+        let elem := mkApp2 (mkConst ``Classical.choice [← getLevel d]) d nd
+        fieldsElem (mkApp f elem) b
+    | _ => return f
 
 /-- Return `true` if `type := (∀ x : T, b) = b'` or `(∃ x : T, b) = b'` with `x` unused in `b` and
     `Nonempty T` not provable, i.e., an elimination of an unused binder over a possibly empty type.
