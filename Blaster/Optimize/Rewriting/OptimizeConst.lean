@@ -294,11 +294,12 @@ def normPartialCtorApp? (f : Expr) (args : Array Expr) : TranslateEnvT (Option E
 -/
 def optimizeConstApp (f : Expr) (args : Array Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeContinuity := do
   if let some r ← normPartialCtorApp? f args then return Sum.inl (.InitOptimizeExpr r :: stack)
-  if let some r ← funPropagation? f args (← isAppArg) then return Sum.inl (r :: stack)
+  if let some r ← funPropagation? f args (← isAppArg) then
+    return Sum.inl (← pushRuleFrame (← mkAppNExpr f args) r "funPropagation" .defeq stack)
   let e ← applyConstAppRules f args
   if ← isRestart then
     resetRestart
-    return Sum.inl (.InitOptimizeExpr e :: stack)
+    return Sum.inl (← pushRuleFrame (← mkAppNExpr f args) (.InitOptimizeExpr e) "ctorApp" .defeq stack)
   else stackContinuity stack e
 
   where

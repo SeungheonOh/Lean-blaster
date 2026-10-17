@@ -239,7 +239,7 @@ def dumpStats (o : ReconOutcome) (label : String) : TermElabM Unit := do
     ("labels", Json.mkObj (o.stats.byLabel.toList.map fun (l, m) =>
                   (l, Json.mkObj (m.toList.map fun (k, n) => (k, toJson n))))),
     ("ms", toJson o.elapsedMs),
-    ("failure", toJson ((← o.failure.toString).take 400))
+    ("failure", toJson ((← o.failure.toString).take (if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then 20000 else 400)))
   ]
   let h ← IO.FS.Handle.mk path .append
   h.putStrLn json.compress

@@ -714,6 +714,33 @@ syntax (name := blasterFunInd) "blaster_funind" : tactic
     catch _ => s.restore
   throwError "blaster_funind: failed"
 
+syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
+
+syntax (name := blasterGenDiscrs) "blaster_gen_discrs" : tactic
+
+/-- Generalize the non-variable discriminants of the first `match` expression occurring in the goal
+    (e.g., the symbolic `Int.negSucc` normalized by the optimizer), such that case analysis on the
+    `match` expression can be performed.
+-/
+@[tactic blasterGenDiscrs] def evalBlasterGenDiscrs : Tactic := fun _ =>
+  liftMetaTactic fun g => g.withContext do
+    let t ← instantiateMVars (← g.getType)
+    let some m ← findMatcher t
+      | throwError "blaster_gen_discrs: no match expression"
+    let ds := m.discrs.filter fun d => !d.isFVar && !d.hasLooseBVars && !d.isLit && !d.isAppOfArity ``OfNat.ofNat 3
+    if ds.isEmpty then throwError "blaster_gen_discrs: no discriminant to generalize"
+    let (_, g) ← g.generalize (ds.map fun d => { expr := d, xName? := `d : GeneralizeArg })
+    return [g]
+where
+  findMatcher (t : Expr) : MetaM (Option MatcherApp) := do
+    let r ← IO.mkRef none
+    Meta.forEachExpr' t fun e => do
+      if (← r.get).isSome then return false
+      if let some m ← matchMatcherApp? e then
+        r.set (some m); return false
+      return true
+    r.get
+
 /-- Maximum number of alternatives of a `match` expression for case analysis strategies. -/
 def maxMatchAlts : Nat := 32
 
@@ -740,6 +767,12 @@ def deepCases : TermElabM (TSyntax `tactic) :=
              (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
              (try decide) <;> first | done | ((repeat' split) <;> (try simp_all) <;> omega)))
 
+/-- Case analysis on a `match` expression with generalized discriminants (see `blaster_gen_discrs`). -/
+def matchGeneralizeTactic : TermElabM (TSyntax `tactic) :=
+  `(tactic| (blaster_gen_discrs <;> blaster_denorm <;> split <;> (repeat' split) <;>
+             (try simp_all [Int.negSucc_eq]) <;> (try norm_cast at *) <;> (try simp_all) <;>
+             (try blaster_inst_hyps) <;> first | omega | (subst_vars; simp_all; done) | grind))
+
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
@@ -753,6 +786,10 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
           Int.mul_emod_left, Int.mul_emod_right, Int.ediv_self, Int.emod_self] <;> done))),
     -- case analysis (e.g., `match` expressions normalized to `Blaster.dite'`)
     ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind))),
+    -- case analysis on `Int.negSucc` patterns (symbolic `Int.negSucc` is normalized by the optimizer)
+    ("split", ← `(tactic| (blaster_denorm <;>
+        simp (disch := decide) only [Blaster.Reconstruct.neg_natCast_add_eq_negSucc, Nat.reduceSub, Nat.zero_add] at * <;>
+        (repeat' split) <;> first | omega | (simp_all; done) | grind))),
     -- case analysis on conditions applied to additional arguments
     ("split", ← `(tactic| (blaster_denorm <;> blaster_by_cases <;> (try simp_all [Int.sub_eq_add_neg]) <;>
                           first | done | omega | grind))),
@@ -924,6 +961,11 @@ partial def dischargeOne (type : Expr) (depth := matchCasesDepth) : TermElabM (O
     if let some prf ← proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats) then
       return some (prf, "cases")
   if let some prf ← proveByMatchCases type depth then return some (prf, "match cases")
+  -- case analysis on `match` expressions with generalized discriminants (e.g., symbolic `Int.negSucc`
+  -- normalized by the optimizer)
+  if !large then
+    if let some prf ← proveWithTactic type (← matchGeneralizeTactic) (budget := 4 * dischargeHeartbeats) then
+      return some (prf, "match cases")
   -- case analysis on the variables stuck `match` applications depend on (no splitter needed)
   if depth == matchCasesDepth then
     if (collectMatchApps (← getEnv) type).size > 0 then
@@ -1185,6 +1227,22 @@ partial def specializeWithLocals (vars : Array Expr) (p ty : Expr) : MetaM (Arra
   go p ty 0
   return ← res.get
 
+/-- Given a hypothesis `h : ∀ (k : Nat), ¬ a = k + c` (e.g., produced by the case analysis of a
+    `match` with pattern `k + c`), where `c` is a constant offset, return `h (a - c)`.
+-/
+def patternInstance? (h ty : Expr) : MetaM (Option (Expr × Expr)) := do
+  let .forallE _ d b _ := ty | return none
+  if !d.isConstOf ``Nat then return none
+  let some body := b.not? | return none
+  let some (_, l, r) := body.eq? | return none
+  let (a, r) := if l.hasLooseBVars then (r, l) else (l, r)
+  if a.hasLooseBVars || !r.hasLooseBVars then return none
+  let some c₀ ← evalNat (r.instantiate1 (mkNatLit 0)) |>.run | return none
+  let some c₁ ← evalNat (r.instantiate1 (mkNatLit 1)) |>.run | return none
+  if c₁ != c₀ + 1 then return none
+  let v := mkNatSub a (mkNatLit c₀)
+  return some (mkApp h v, ← instantiateForall ty #[v])
+
 /-- Add the seeded specializations of all propositional hypotheses of `g` to its local context,
     including their specializations w.r.t. the local variables.
 -/
@@ -1206,6 +1264,8 @@ def instHypsWithSeeds (g : MVarId) : MetaM MVarId := g.withContext do
       let pty ← instantiateMVars pty
       if p.hasMVar || pty.hasMVar then continue
       hs := hs.push { userName := `h_inst, type := pty, value := p : Hypothesis }
+    if let some (p, pty) ← try patternInstance? decl.toExpr ty catch _ => pure none then
+      hs := hs.push { userName := `h_pat, type := pty, value := p : Hypothesis }
   if hs.isEmpty then return g
   let (_, g) ← g.assertHypotheses hs
   return g
@@ -1235,7 +1295,6 @@ syntax (name := blasterStructFacts) "blaster_struct_facts" : tactic
     let (_, g) ← g.assertHypotheses hs
     return [g]
 
-syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
 
 @[tactic blasterInstHyps] def evalBlasterInstHyps : Tactic := fun _ =>
   liftMetaTactic fun g => return [← instHypsWithSeeds g]

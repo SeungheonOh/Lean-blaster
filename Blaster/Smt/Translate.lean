@@ -70,7 +70,9 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
       let r ← (do
         let s ← Meta.saveState
         tryCatchRuntimeEx
-          (some <$> (Optimize.mainPf e' (track := true) (applyHashCons := false)).run proofEnv)
+          -- NOTE: the proof run starts with an empty hash-consing cache, i.e., `e'` must be hash-consed
+          -- such that structural equality checks (e.g., on literals) remain valid.
+          (some <$> (Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv)
           (fun _ => do s.restore; return none) : MetaM _)
       match r with
       | some ((optExprP, optPf), envP) =>
