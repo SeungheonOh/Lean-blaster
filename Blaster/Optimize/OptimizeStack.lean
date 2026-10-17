@@ -292,7 +292,7 @@ def stackContinuity
        let (e, pf) ← withLocalContext $ do
           let pf ←
             if !(← isTracking) then pure .unknown
-            else if pt.isDefEq || (← x.fvarId!.getType) == origT then funextCongr x origBody optExpr pf
+            else if pt.isDefEq || (← sameDomain (← x.fvarId!.getType) origT) then funextCongr x origBody optExpr pf
             else lamBodyCongr x origBody optExpr pf
           mkExprPf (← mkLambdaFVar x optExpr) pf
        resetLocalDeclContext lctx

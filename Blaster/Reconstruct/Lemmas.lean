@@ -352,3 +352,19 @@ theorem bool_le_eq_not_lt (a b : Bool) : (a ≤ b) = ¬ (b < a) := by cases a <;
 theorem string_le_eq_not_lt (a b : String) : (a ≤ b) = ¬ (b < a) := rfl
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Function propagation over `Blaster.dite'` (see `normChoiceApplication?` and `funPropagation?`) -/
+
+theorem dite'_app {α : Sort u} {β : α → Sort v} (c : Prop) (t : c → (a : α) → β a) (e : ¬ c → (a : α) → β a)
+    (x : α) : Blaster.dite' c t e x = Blaster.dite' c (fun h => t h x) (fun h => e h x) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]
+  by_cases h : c <;> simp [h]
+
+theorem apply_dite' {α : Sort u} {β : Sort v} (g : α → β) (c : Prop) (t : c → α) (e : ¬ c → α) :
+    g (Blaster.dite' c t e) = Blaster.dite' c (fun h => g (t h)) (fun h => g (e h)) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]
+  by_cases h : c <;> simp [h]
+
+end Blaster.Reconstruct

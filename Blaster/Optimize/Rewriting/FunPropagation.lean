@@ -65,7 +65,9 @@ def normChoiceApplication?
       -- NOTE: We expect that the ite sort is of form ∀ α₀ → ... → αₙ to avoid type inference,
       -- which is costly.
       let dite_args := dite_args.set! 0 (args[0]!.getForallBodyMaxDepth (args.size - 4))
-      return (mkAppN f dite_args)
+      let r := mkAppN f dite_args
+      Blaster.Reconstruct.withProofM (mkAppN f args) r
+        (Blaster.Reconstruct.mkDiteAppProof args[0]! args[1]! args[2]! args[3]! f.constLevels! extra_args)
 
     mkAppInRhs (extra_args : Array Expr) (lhs : Array Expr) (rhs : Expr) : TranslateEnvT Expr := do
       let altArgsRes ← retrieveAltsArgs lhs
@@ -182,7 +184,9 @@ def funPropagation? (cf : Expr) (cargs : Array Expr) (skipPropCheck := false) (r
         let e1' ← pushFunInDIteExpr f args idxArg pcond e1
         let e2' ← pushFunInDIteExpr f args idxArg (mkApp (← mkPropNotOp) pcond) e2
         -- NOTE: we also need to set the sort type for the pulled dite' to meet the function's return type
-        return (mkApp4 (← mkBlasterDIteOp) retType pcond e1' e2')
+        let r := mkApp4 (← mkBlasterDIteOp) retType pcond e1' e2'
+        Blaster.Reconstruct.withProofM (mkAppN f args) r
+          (Blaster.Reconstruct.mkApplyDiteProof f args idxArg _psort pcond e1 e2 retType)
       else return none
 
     updateRhsWithFun

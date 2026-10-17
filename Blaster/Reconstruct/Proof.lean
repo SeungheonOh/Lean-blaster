@@ -181,6 +181,19 @@ def funextCongr (x : Expr) (b b' : Expr) (pf : EqPf) : TranslateEnvT EqPf := do
   | .defeq => return .defeq
   | _ => return .unknown
 
+/-- Return `true` when binder types `t` and `t'` are definitionally equal (bounded check).
+    NOTE: the body of a lambda whose binder type has been rewritten to a definitionally equal one
+    can be related by `funext`, as the kernel checks binder types up to definitional equality.
+-/
+def sameDomain (t t' : Expr) : TranslateEnvT Bool := do
+  if t == t' then return true
+  let r ← tryInLocalContext do
+    tryCatchRuntimeEx
+      (withCurrHeartbeats <| withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 20000 * 1000 }) <|
+        withTransparency .default <| isDefEq t t')
+      (fun _ => return false)
+  return r.getD false
+
 /-- Given a lambda `fun x : t => b` rewritten to `fun x : t' => b'` such that `t` and `t'` are not
     definitionally equal and evidence `pf : b = b'` (with `x : t'`), return `EqPf.lamBody` evidence
     when neither `b` nor `b'` depend on `x`. Otherwise `EqPf.unknown`.
@@ -256,7 +269,9 @@ def addArgEvidence
   (f : Expr) (args : Array Expr) (idx : Nat) (orig : Expr) (pfArg : EqPf) (pf : EqPf) : TranslateEnvT EqPf := do
   match pf with
   | .unknown => return .unknown
-  | .depArgs pre pargs => return .depArgs pre (pargs.push (idx, orig, pfArg))
+  | .depArgs pre pargs =>
+      if pfArg.isDefEq then return pf
+      return .depArgs pre (pargs.push (idx, orig, pfArg))
   | _ =>
     match pfArg with
     | .defeq => return pf
@@ -288,15 +303,72 @@ def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT Eq
     resolve (pargs : Array (Nat × Expr × EqPf)) : MetaM (Option Expr) := do
       match f with
       | .const ``Blaster.dite' us =>
-          if args.size != 4 then return none
+          -- extra arguments (i.e., function-valued dite') are expected to be unchanged
+          if args.size < 4 || pargs.any (fun (i, _, _) => i ≥ 4) then return none
           let (c, .proof hc) := argPf pargs 1 | return none
           let (t, pt) := argPf pargs 2
           let (e, pe) := argPf pargs 3
-          let .lamBody ht := pt | return none
-          let .lamBody he := pe | return none
-          return some (mkAppN (mkConst ``Blaster.Reconstruct.dite'_congr us)
-                        #[args[0]!, c, args[1]!, t, e, args[2]!, args[3]!, hc, ht, he])
+          let c' := args[1]!
+          let some ht ← branchPf pt args[2]! c' | return none
+          let some he ← branchPf pe args[3]! (mkNot c') | return none
+          let p := mkAppN (mkConst ``Blaster.Reconstruct.dite'_congr us)
+                     #[args[0]!, c, args[1]!, t, e, args[2]!, args[3]!, hc, ht, he]
+          some <$> (args.extract 4 args.size).foldlM (init := p) fun acc a => mkCongrFun acc a
       | _ => return none
+
+    /-- Return a proof of `∀ h : τ, b (_ : orig) = b' h` for a dite' branch rewritten to `b'`.
+        NOTE: For `EqPf.defeq` and `EqPf.proof`, the kernel only accepts the resulting proof when
+        the original and rewritten branch domains are definitionally equal (proof irrelevance).
+    -/
+    branchPf (pf : EqPf) (b' : Expr) (τ : Expr) : MetaM (Option Expr) := do
+      match pf with
+      | .lamBody p => return some p
+      | .proof p =>
+          withLocalDeclD `h τ fun h => do
+            mkLambdaFVars #[h] (← mkCongrFun p h)
+      | .defeq =>
+          withLocalDeclD `h τ fun h => do
+            mkLambdaFVars #[h] (← mkEqRefl (mkApp b' h))
+      | _ => return none
+
+/-! ## Proof builders for function propagation over `Blaster.dite'` -/
+
+/-- Return a proof of `dite' c t e x₁ ... xₙ = dite' c (fun h => t h x₁ ... xₙ) (fun h => e h x₁ ... xₙ)`
+    with `sort` the dite' sort (i.e., a function type) and `us` its universe levels.
+-/
+def mkDiteAppProof (sort c t e : Expr) (us : List Level) (xs : Array Expr) : MetaM Expr := do
+  let mut sort := sort
+  let mut t := t
+  let mut e := e
+  let mut proof? : Option Expr := none
+  for x in xs do
+    let .forallE n α b _ ← whnfD sort | throwError "mkDiteAppProof: function type expected"
+    let β := Expr.lam n α b .default
+    let u ← getLevel α
+    let resType := b.instantiate1 x
+    let v ← getLevel resType
+    let step := mkApp6 (mkConst ``Blaster.Reconstruct.dite'_app [u, v]) α β c t e x
+    proof? ← match proof? with
+             | none => pure (some step)
+             | some p => some <$> mkEqTrans (← mkCongrFun p x) step
+    t := .lam `h c (mkApp (mkApp t (.bvar 0)) x) .default
+    e := .lam `h (mkNot c) (mkApp (mkApp e (.bvar 0)) x) .default
+    sort := resType
+  let some p := proof? | throwError "mkDiteAppProof: at least one argument expected"
+  let _ := us
+  return p
+
+/-- Return a proof of
+      `f a₁ ... (dite' c t e) ... aₙ = dite' c (fun h => f a₁ ... (t h) ... aₙ) (fun h => f a₁ ... (e h) ... aₙ)`
+    with `idx` the position of the `dite'` argument, `sort` the dite' sort and `retType` the
+    type of the application.
+-/
+def mkApplyDiteProof
+  (f : Expr) (args : Array Expr) (idx : Nat) (sort c t e retType : Expr) : MetaM Expr := do
+  let g := Expr.lam `x sort (mkAppN f (args.set! idx (.bvar 0))) .default
+  let u ← getLevel sort
+  let v ← getLevel retType
+  return mkAppN (mkConst ``Blaster.Reconstruct.apply_dite' [u, v]) #[sort, retType, g, c, t, e]
 
 /-! ## Rule steps
 
