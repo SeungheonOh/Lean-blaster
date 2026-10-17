@@ -57,6 +57,27 @@ re-checked independently of Blaster (e.g., with `lean4checker`). Blaster's own d
 terms, but they are ordinary, kernel-checked definitions and theorems. Neither the optimizer nor the SMT
 solver is trusted.
 
+## Real-world examples: PlutusCoreBlaster
+
+[PlutusCoreBlaster](https://github.com/input-output-hk/PlutusCoreBlaster) (commit `c9dc0eb`) was built
+against this branch. The modules using Blaster's internals (`#prep_uplc`) were left out, since they
+target another Blaster branch.
+
+- **Lemmas.** 17 statements from `PlutusCore/{Integer,List,Bitwise,Cbor}` were restated with
+  `blaster_theorem` (see [`docs/examples/PlutusCoreBlaster.lean`](examples/PlutusCoreBlaster.lean)).
+  14 became kernel-checked theorems that depend only on `propext`, `Classical.choice` and
+  `Quot.sound`. They include `divide_add_mod`, `quotient_add_remainder`, the error cases of
+  `integerToByteString` and `replicateByte_zero_l`. The other 3 (`integerToByteString_w_bounds_err`,
+  `integerToByteString_neg_n`, `integerToByteString_n_bounds_err`) fail before reconstruction: Blaster's
+  SMT translation rejects the structural recursion of `Nat.log2` (`translateApp: unexpected
+  application`), with or without reconstruction.
+- **CBOR encoding.** The 31 `encode_example_i` goals of `PlutusCore/Cbor/Tests.lean` were run with
+  `#blaster (only-optimize: 1) (gen-proof: 1)`. Blaster proves 24 of them; 2 are `Undetermined` and 5
+  exceed 10 minutes, with or without reconstruction. 21 of the 24 come with a kernel-checked proof.
+  The remaining 3 require evaluating a well-founded recursion (`splitToChunksLoop`) on 64-character
+  strings under a dependent `match`. The kernel cannot reduce such definitions efficiently, and
+  `native_decide` is excluded on purpose.
+
 ## How it works
 
 ```
