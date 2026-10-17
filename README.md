@@ -103,6 +103,9 @@ require «Blaster» from git
                     0 for 'Valid', 1 for 'Falsified' and 2 for 'Undetermined'. (default: 0)
   - `reconstruct`: produce a proof checked by the Lean kernel for 'Valid' results, i.e.,
                    0 for no reconstruction, 1 for best effort and 2 for required (default: 0)
+  - `gen-proof`: generate a kernel-checked proof that depends only on Lean's standard axioms
+                 (no `sorryAx`), i.e., implies `(reconstruct: 2)` (default: 0).
+                 The `blaster_theorem name : statement` command adds such a proof as a theorem.
 
 ### Call to the solver
 

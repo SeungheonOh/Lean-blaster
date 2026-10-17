@@ -86,6 +86,8 @@ theorem nat_div_eq (a b : Nat) : Nat.div a b = a / b := rfl
 theorem nat_mod_eq (a b : Nat) : Nat.mod a b = a % b := rfl
 theorem nat_pow_eq (a b : Nat) : Nat.pow a b = a ^ b := rfl
 theorem string_append_eq (a b : String) : String.append a b = a ++ b := rfl
+theorem except_throw_eq {ε : Type u} {α : Type v} (e : ε) : (throw e : Except ε α) = Except.error e := rfl
+theorem except_pure_eq {ε : Type u} {α : Type v} (a : α) : (pure a : Except ε α) = Except.ok a := rfl
 theorem list_append_eq {α : Type u} (a b : List α) : List.append a b = a ++ b := rfl
 /-- Move numerals to the right of additions, i.e., the form expected by equation lemmas (`n + 1`). -/
 theorem nat_lit_add_comm (k : Nat) (n : Nat) :
@@ -109,6 +111,7 @@ macro "blaster_denorm" : tactic =>
               Blaster.Reconstruct.int_ediv_eq, Blaster.Reconstruct.int_emod_eq, Blaster.Reconstruct.int_pow_eq,
               Blaster.Reconstruct.nat_beq_denorm, Blaster.Reconstruct.nat_ble_denorm,
               Blaster.Reconstruct.string_append_eq, Blaster.Reconstruct.list_append_eq,
+              Blaster.Reconstruct.except_throw_eq, Blaster.Reconstruct.except_pure_eq,
               Int.ofNat_eq_coe] at *))
 
 namespace Blaster.Reconstruct

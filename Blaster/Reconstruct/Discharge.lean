@@ -74,8 +74,10 @@ def attempt [Monad m] [MonadBacktrack s m] [MonadExcept Exception m] [MonadRunti
 /-- Try to close goal `type` with tactic `tac`. The elaboration state is restored on failure. -/
 def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHeartbeats) : TermElabM (Option Expr) := do
   let s ← saveState
-  -- NOTE: info trees produced by internal tactic runs are discarded (e.g., linters would process them).
+  -- NOTE: info trees and messages produced by internal tactic runs are discarded (e.g., linters
+  -- would process the info trees).
   let infoState ← getInfoState
+  let msgs ← Core.getMessageLog
   let r ← attempt budget do
     let mvar ← mkFreshExprMVar type
     -- NOTE: asynchronous elaboration is disabled such that kernel errors on auxiliary declarations
@@ -87,6 +89,7 @@ def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHe
     return some prf
   if r.isNone then s.restore
   setInfoState infoState
+  Core.setMessageLog msgs
   return r
 
 /-- Try to prove `lhs = rhs` by definitional unfolding. -/
@@ -565,7 +568,7 @@ def deepCases : TermElabM (TSyntax `tactic) :=
   `(tactic| (intros <;> blaster_denorm <;> blaster_cases_nonrec 1024 <;> blaster_unfold_user <;>
              (try simp_all) <;> (try blaster_unfold_user) <;>
              (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
-             (try decide) <;> done))
+             (try decide) <;> first | done | ((repeat' split) <;> (try simp_all) <;> omega)))
 
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
@@ -590,7 +593,7 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("cases", ← `(tactic| (blaster_denorm <;> blaster_cases_vars <;> blaster_unfold_user <;>
                           (try simp_all) <;> (try blaster_unfold_user) <;>
                           (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
-                          (try decide) <;> done))),
+                          (try decide) <;> first | done | ((repeat' split) <;> (try simp_all) <;> omega)))),
     -- equivalence of recursive functions
     ("induction", ← `(tactic| blaster_funind))
   ]
@@ -784,7 +787,7 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("unfold + cases", ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;> blaster_unfold_user <;>
                                      (try simp_all) <;> (try blaster_unfold_user) <;>
                                      (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
-                                     (try decide) <;> done))),
+                                     (try decide) <;> first | done | ((repeat' split) <;> (try simp_all) <;> omega)))),
     -- `match` expressions over arithmetic: case analysis on the discriminants
     ("split", ← `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> (repeat' split) <;>
                           (try simp_all) <;> first | done | omega | grind))),
@@ -819,8 +822,8 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
                      Nat.div_div_eq_div_mul, Nat.div_le_self, Nat.mod_le, Nat.mod_lt, Nat.mod_eq_of_lt,
                      Nat.add_mul_div_right, Nat.add_div_right, Nat.mul_self_inj, Nat.div_lt_iff_lt_mul,
                      Nat.le_div_iff_mul_le, Nat.div_lt_self, Nat.mod_def, Nat.mul_div_le, Nat.not_lt,
-                     Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_ediv,
-                     Int.ediv_add_emod, Nat.pos_iff_ne_zero]; done)
+                     Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_mul_ediv,
+                     Int.mul_ediv_add_emod, Int.fmod_add_mul_fdiv, Int.tmod_add_mul_tdiv, Nat.pos_iff_ne_zero]; done)
         | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega))))
   ]
   let large ← involvesLargeMatch e
