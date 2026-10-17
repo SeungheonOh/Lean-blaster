@@ -151,9 +151,31 @@ def reconMaxRecDepth : Nat := 100000
 -/
 def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome := do
   let s ← saveState
-  tryCatchRuntimeEx (withReconRecDepth (reconstruct task recon)) fun ex => do
+  let out ← tryCatchRuntimeEx (withReconRecDepth (reconstruct task recon)) fun ex => do
     s.restore
     return { failure := m!"exception: {ex.toMessageData}" }
+  if out.proof?.isSome then return out
+  -- fallback: prove the original goal directly with Lean's decision procedures
+  let startTime ← IO.monoMsNow
+  let s ← saveState
+  let direct ← tryCatchRuntimeEx (withReconRecDepth (proveDirect task.goal)) fun _ => do
+    s.restore
+    return none
+  match direct with
+  | some (p, m) => return { out with proof? := some p, failure := m!"", residual := s!"direct by {m}",
+                                     elapsedMs := out.elapsedMs + ((← IO.monoMsNow) - startTime) }
+  | none => return out
+where
+  proveDirect (goal : Expr) : TermElabM (Option (Expr × String)) := do
+    let goal ← instantiateMVars goal
+    if goal.hasMVar || goal.hasFVar then return none
+    let r ← (do
+      if let some p ← proveByDefEq goal then return some (p, "rfl")
+      if let some p ← proveWithTactic goal (← `(tactic| decide +kernel)) then return some (p, "decide")
+      proveResidual goal : TermElabM _)
+    let some (p, m) := r | return none
+    if (← kernelCheck goal p).isSome then return none
+    return some (p, m)
 
 /-- Same as `reconstructRewrite` but any exception is reported as a reconstruction failure. -/
 def reconstructRewriteSafe (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermElabM ReconOutcome := do

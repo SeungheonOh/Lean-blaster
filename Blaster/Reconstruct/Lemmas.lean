@@ -275,6 +275,8 @@ theorem forall_eq_of_left {a : Prop} (p : a → Prop) (h : a) : (∀ x, p x) = p
   propext ⟨fun h' => h' h, fun h' _ => h'⟩
 theorem forall_const' (α : Sort u) [Nonempty α] (b : Prop) : (α → b) = b :=
   propext ⟨fun h => h (Classical.choice inferInstance), fun h _ => h⟩
+theorem exists_const' (α : Sort u) [Nonempty α] (b : Prop) : (∃ _ : α, b) = b :=
+  propext ⟨fun ⟨_, h⟩ => h, fun h => ⟨Classical.choice inferInstance, h⟩⟩
 
 /-! ## Equality (see `optimizeEq`) -/
 

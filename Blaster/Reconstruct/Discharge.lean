@@ -311,6 +311,34 @@ where
     | .mdata _ e | .proj _ _ e => collect e acc
     | _ => acc
 
+syntax (name := blasterByCases) "blaster_by_cases" : tactic
+
+/-- Case analysis on the conditions of the `dite`/`ite` expressions of the main goal (up to 3 conditions),
+    including those applied to additional arguments (not supported by `split`).
+-/
+@[tactic blasterByCases] def evalBlasterByCases : Tactic := fun _ => withMainContext do
+  let target ← instantiateMVars (← getMainTarget)
+  let conds := collect target #[]
+  if conds.isEmpty then throwError "blaster_by_cases: no condition"
+  for c in conds.extract 0 3 do
+    let c ← Term.exprToSyntax c
+    evalTactic (← `(tactic| all_goals by_cases $c))
+where
+  collect (e : Expr) (acc : Array Expr) : Array Expr :=
+    let acc := match e.getAppFn with
+      | .const n _ =>
+          if (n == ``dite || n == ``ite) && e.getAppNumArgs ≥ 5 then
+            let c := e.getArg! 1
+            if c.hasLooseBVars || acc.contains c then acc else acc.push c
+          else acc
+      | _ => acc
+    match e with
+    | .app f a => collect a (collect f acc)
+    | .lam _ t b _ | .forallE _ t b _ => collect b (collect t acc)
+    | .letE _ t v b _ => collect b (collect v (collect t acc))
+    | .mdata _ e | .proj _ _ e => collect e acc
+    | _ => acc
+
 syntax (name := blasterExists) "blaster_exists" : tactic
 
 /-- Return the natural number literals occurring in `e` (and their neighbours). -/
@@ -514,7 +542,7 @@ syntax (name := blasterFunInd) "blaster_funind" : tactic
   throwError "blaster_funind: failed"
 
 /-- Maximum number of alternatives of a `match` expression for case analysis strategies. -/
-def maxMatchAlts : Nat := 8
+def maxMatchAlts : Nat := 32
 
 /-- Return `true` if `e` contains a matcher with more than `maxMatchAlts` alternatives, possibly
     within the body of a (non-recursive) user definition occurring in `e`.
@@ -545,8 +573,16 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("simp", ← `(tactic| (blaster_denorm <;> simp [*] <;> done))),
     ("omega", ← `(tactic| ((try apply propext) <;> blaster_denorm <;> omega))),
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
+    -- cancellation of non-zero divisors (side conditions proved by `omega`)
+    ("arith simp", ← `(tactic| (blaster_denorm <;>
+        simp (disch := omega) only [Nat.mul_div_cancel, Nat.mul_div_cancel_left, Nat.mul_mod_left,
+          Nat.mul_mod_right, Nat.div_self, Nat.mod_self, Int.mul_ediv_cancel, Int.mul_ediv_cancel_left,
+          Int.mul_emod_left, Int.mul_emod_right, Int.ediv_self, Int.emod_self] <;> done))),
     -- case analysis (e.g., `match` expressions normalized to `Blaster.dite'`)
     ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind))),
+    -- case analysis on conditions applied to additional arguments
+    ("split", ← `(tactic| (blaster_denorm <;> blaster_by_cases <;> (try simp_all [Int.sub_eq_add_neg]) <;>
+                          first | done | omega | grind))),
     -- case analysis with cancellation of non-zero factors
     ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> (try simp_all) <;> (try blaster_mul_cancel) <;>
                           first | (simp_all; done) | omega | grind))),
