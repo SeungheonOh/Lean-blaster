@@ -238,7 +238,11 @@ def constMatchPropagation?
         let e2' ← pushMatchInDIteExpr cm margs idx e2
         let diteExpr := (← mkBlasterDIteApp retType pcond e1' e2')
         if extra_args.isEmpty
-        then return diteExpr
+        then
+          recordDefEqHint (mkAppN cm cargs) diteExpr do
+            let fn := mkLambda `z .default (← inferType cargs[idx]!) (mkAppN cm (margs.set! idx (.bvar 0)))
+            mkAppM ``Blaster.Reconstruct.apply_dite' #[fn, pcond, e1, e2]
+          return diteExpr
         else return mkAppN diteExpr extra_args
       else return none
 
@@ -270,7 +274,10 @@ def constMatchPropagation?
 def matchReduction? (f : Expr) (args : Array Expr) (mInfo : MatchInfo) : TranslateEnvT (Option Expr) :=
   withLocalContext $ do
     -- try match reduction first
-    if let some r ← reduceMatch? f args mInfo then return r
+    if let some r ← reduceMatch? f args mInfo then
+      -- NOTE: the match is reduced by `whnf`, i.e., it is definitionally equal to `r`
+      recordDefEqHint (mkAppN f args) r (Lean.Meta.mkEqRefl (mkAppN f args))
+      return r
     -- try to apply match constant propagation rules
     constMatchPropagation? f args mInfo
 
@@ -312,7 +319,7 @@ def isFVarPattern (e : Expr) : Bool :=
 -/
 @[always_inline, inline]
 def optimizeMatchAlt
-  (args : Array Expr) (mInfo : MatchInfo) (altIdx : Nat) (rhs : Expr)
+  (f : Expr) (args : Array Expr) (mInfo : MatchInfo) (altIdx : Nat) (rhs : Expr)
   (stack : List OptimizeStack) : TranslateEnvT (List OptimizeStack) := withLocalContext $ do
  let currIdx := altIdx - mInfo.getFirstAltPos
  let alts := getMatchAlts args mInfo
@@ -322,7 +329,9 @@ def optimizeMatchAlt
  lambdaBoundedTelescope rhs (max 1 (← retrieveAltsArgs lhs).altArgs.size) fun params body => do
    let mut mcontext := h
    let mut idxParams := 0
+   let origBody := body
    let mut body := body
+   let mut substs : Array (Nat × Expr) := #[]
    for j in mInfo.getDiscrRange do
      let idxLhs := j - mInfo.getFirstDiscrPos
      let pattern := lhs[idxLhs]!
@@ -334,13 +343,56 @@ def optimizeMatchAlt
      if pattern.isFVar then
        -- pattern should only be an fvar (i.e., not even a named pattern alias of an fvar
        body := Expr.replaceFVar body params[idxParams]! args[j]!
+       substs := substs.push (idxLhs, params[idxParams]!)
      idxParams := nextIdx
-   let matchCtx ← mkMatchStackContext mcontext
-   let lctx ← mkLocalDeclStackContext (← mkLocalContext)
-   return .InitOptimizeExpr body :: .MatchAltWaitForExpr params lctx matchCtx :: stack
+   let altBody := body
+   let altContext := mcontext
+   let mkFrame (hyps : Array Expr) (substs : Array (Expr × Expr)) : TranslateEnvT (List OptimizeStack) := do
+     let matchCtx ← mkMatchStackContext altContext
+     let lctx ← mkLocalDeclStackContext (← mkLocalContext)
+     return .InitOptimizeExpr altBody :: .MatchAltWaitForExpr params lctx matchCtx origBody hyps substs :: stack
+   -- When tracking proof terms, the equalities `dⱼ = pⱼ` between the discriminants and the patterns
+   -- of the alternative are declared in the local context, such that the rewrites performed under
+   -- the match context can be justified (see `Blaster.Reconstruct.mkMatchCongr`).
+   let some hypTypes ← discrPatternEqs? f args mInfo currIdx params | mkFrame #[] #[]
+   withLocalDeclsDND (hypTypes.map (matchHypName, ·)) fun hyps => do
+     -- each pattern variable substituted by its discriminant must correspond to the expected parameter
+     let mut hsubsts := #[]
+     for (idxLhs, x) in substs do
+       if lhs[idxLhs]!.replaceFVars xs params != x then return ← mkFrame #[] #[]
+       hsubsts := hsubsts.push (x, hyps[idxLhs]!)
+     mkFrame hyps hsubsts
 
 
   where
+   /-- Return the equalities `dⱼ = pⱼ` between the discriminants and the patterns of alternative `altIdx`
+       of match application `f args`, instantiated with the alternative's parameters `params`.
+       NOTE: The patterns are obtained from the matcher's type and not from the optimized generic
+       instance, as the latter may contain optimized patterns that are not definitionally equal
+       to the patterns of the matcher (e.g., `Nat.add 1 n` instead of `n + 1`).
+       Return `none` when proof terms are not tracked or when the equalities can't be constructed.
+   -/
+   discrPatternEqs? (f : Expr) (args : Array Expr) (mInfo : MatchInfo) (altIdx : Nat) (params : Array Expr) :
+     TranslateEnvT (Option (Array Expr)) := do
+     if !(← isTracking) then return none
+     try
+       let fType ← instantiateForall (← inferType f) (args.take mInfo.numParams)
+       forallBoundedTelescope fType (1 + mInfo.numDiscrs + mInfo.numAlts) fun fvars _ => do
+         let some altVar := fvars[1 + mInfo.numDiscrs + altIdx]? | return none
+         let motive := fvars[0]!
+         forallTelescope (← inferType altVar) fun xs b => do
+           if !b.getAppFn.isFVarOf motive.fvarId! then return none
+           let lhs := b.getAppArgs
+           if xs.size != params.size || lhs.size != mInfo.numDiscrs then return none
+           let mut eqs := #[]
+           for j in mInfo.getDiscrRange do
+             let pattern := (lhs[j - mInfo.getFirstDiscrPos]!.replaceFVars xs params).replaceFVar motive args[mInfo.numParams]!
+             let eq ← mkEq args[j]! pattern
+             Meta.check eq
+             eqs := eqs.push eq
+           return some eqs
+     catch _ => return none
+
    onlyOnePattern (lhs : Array Expr) (idx : Nat) (onlyOne : Bool) : TranslateEnvT Bool := do
      if h : idx ≥ lhs.size then return onlyOne
      else if !isFVarPattern lhs[idx] then
@@ -398,9 +450,17 @@ def optimizeMatchAlt
          - return none
 -/
 def elimMatch?
-  (mInfo : MatchInfo) (args : Array Expr) : TranslateEnvT (Option Expr) := do
-  if let some re ← commonRhs? mInfo args then return re
-  if let some re ← matchInHyps? mInfo args then return re
+  (f : Expr) (mInfo : MatchInfo) (args : Array Expr) : TranslateEnvT (Option Expr) := do
+  let lhs := mkAppN f args
+  if let some re ← commonRhs? mInfo args then
+    -- each alternative is equal to `re`
+    recordStepM lhs re (mkMatchCasesProof lhs (fun _ => pure re) fun _ _ _ alt rhs => do
+      mkExpectedTypeHint (← Lean.Meta.mkEqRefl alt) (← mkEq alt rhs))
+    return re
+  if let some (re, altIdx) ← matchInHyps? mInfo args then
+    -- the discriminants are equal to the patterns of alternative `altIdx` in the match context
+    recordStepM lhs re (proveMatchInContext lhs re altIdx)
+    return re
   lastPatternReduction? mInfo args
 
 where
@@ -437,7 +497,7 @@ where
       return (true, patternArgs)
 
   @[always_inline, inline]
-  matchInHyps? (mInfo : MatchInfo) (args : Array Expr) : TranslateEnvT (Option Expr) := do
+  matchInHyps? (mInfo : MatchInfo) (args : Array Expr) : TranslateEnvT (Option (Expr × Nat)) := do
     let h := (← get).optEnv.matchInContext
     let alts := getMatchAlts args mInfo
     for i in [mInfo.getFirstAltPos : mInfo.arity] do
@@ -446,8 +506,8 @@ where
       if inContext then
         setRestart
         if altArgs.isEmpty
-        then return getLambdaBody args[i]! -- case when there is no free variables in pattern.
-        else return betaLambda args[i]! altArgs
+        then return (getLambdaBody args[i]!, altIdx) -- case when there is no free variables in pattern.
+        else return (betaLambda args[i]! altArgs, altIdx)
     return none
 
   @[always_inline, inline]
@@ -545,7 +605,7 @@ def optimizeMatch
  let lhs := mkAppN f args
  -- check for match elimination rules first
  clearSteps
- if let some r ← elimMatch? mInfo args then
+ if let some r ← elimMatch? f mInfo args then
    return (← stackContinuity xs r (← pf.trans (← ruleStep lhs r "elimMatch")))
  -- check for match equivalence afterwards
  let (f', args') ← structEqMatch f args mInfo

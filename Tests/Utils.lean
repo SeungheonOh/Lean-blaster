@@ -30,7 +30,13 @@ where
     let outcome ← tryCatchRuntimeEx (do
         -- NOTE: universe level metavariables must be instantiated (see `normLevel`)
         let e ← instantiateMVars (← parseTerm stx)
+        -- NOTE: `commandPf` restores the name generator after optimization. A dedicated prefix is
+        -- used during optimization such that the names generated during reconstruction (e.g.,
+        -- metavariables) do not clash with the ones created when building proof terms.
+        let ngen ← getNGen
+        setNGen { ngen with namePrefix := ngen.namePrefix ++ `_blaster_opt }
         let ((optExpr, pf), env) ← Blaster.Optimize.commandPf { sOpts with reconstruct := 1 } e
+        setNGen ngen
         Blaster.Reconstruct.reconstructRewriteSafe e optExpr pf env.recon)
       (fun ex => do s.restore; pure { failure := m!"exception: {ex.toMessageData}" })
     Blaster.Reconstruct.dumpStats outcome s!"testOptimize:{name}"

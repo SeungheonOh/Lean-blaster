@@ -39,18 +39,32 @@ inductive EqPf where
       Each entry `(i, aᵢ, pfᵢ)` keeps the argument `aᵢ` before rewriting.
   -/
   | depArgs (pre : EqPf) (args : Array (Nat × Expr × EqPf))
+  /-- Evidence for a match alternative `alt` rewritten to `alt'` under the match context of the
+      alternative, i.e., `p : ∀ args (h₁ : d₁ = p₁) ... (hₙ : dₙ = pₙ), alt args = alt' args` with
+      `d₁ ... dₙ` the discriminants and `p₁ ... pₙ` the patterns of the alternative.
+      This evidence can only be consumed by the congruence over the enclosing match application
+      (see `Blaster.Reconstruct.mkMatchCongr`), i.e., it is considered `unknown` otherwise.
+  -/
+  | matchAlt (p : Expr)
 deriving Inhabited, Repr
 
 /-- Consider evidence that can only be consumed by dedicated congruence lemmas as `unknown`. -/
 @[always_inline, inline]
 def EqPf.simplify : EqPf → EqPf
-  | .lamBody _ | .depArgs .. => .unknown
+  | .lamBody _ | .depArgs .. | .matchAlt _ => .unknown
   | pf => pf
 
 /-- Key used to tag a proof obligation (i.e., hole) in a proof term.
     A hole is represented as `mdata {blaster.hole := id} (sorryAx (lhs = rhs) true)`.
 -/
 def holeKey : Name := `blaster.hole
+
+/-- Key used to tag a *fallback region* in a proof term, i.e., a proof `p : lhs = rhs` built from finer
+    grained proof obligations. When one of them cannot be discharged, the whole region is replaced by
+    the proof obligation `lhs = rhs` (see `Blaster.Reconstruct.dischargeHoles`).
+    A region is represented as `mdata {blaster.fallback := true} p`.
+-/
+def fallbackKey : Name := `blaster.fallback
 
 /-- Origin of a proof obligation. Used to report reconstruction coverage. -/
 inductive HoleKind where

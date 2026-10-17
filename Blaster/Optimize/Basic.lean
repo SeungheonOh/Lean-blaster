@@ -326,7 +326,7 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr Ã
            -- skipping optimization for discriminators as already performed by choice reduction on match
            return (.AppOptimizeExplicitArgs f args (idx + 1) stopIdx pInfo mInfo pf :: nxtStack)
          else if idx >= argInfo.getFirstAltPos && idx < argInfo.arity then
-           optimizeMatchAlt args argInfo idx args[idx]! stack
+           optimizeMatchAlt f args argInfo idx args[idx]! stack
          else return (.InitOptimizeExpr args[idx]! :: stack)
       else return (.InitOptimizeExpr args[idx]! :: stack)
 

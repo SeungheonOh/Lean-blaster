@@ -110,6 +110,17 @@ target another Blaster branch.
    handled by dedicated congruence lemmas (`dite'_congr`). Rewrites served from the optimizer's
    cache reuse the cached evidence after a scope check.
 
+   `match` alternatives are optimized under a *match context*: fvar patterns are replaced by their
+   discriminants, and nested matches on the same discriminants are eliminated. When tracking proof
+   terms, the equalities `h : dⱼ = pⱼ` between the discriminants and the patterns of the alternative
+   are declared in the local context (`optimizeMatchAlt`). The evidence for an alternative is then
+   `p : ∀ args h₁ ... hₙ, alt args = alt' args` (`EqPf.matchAlt`). Once all the alternatives are
+   optimized, the evidence is combined by a case split over the matcher's *splitter*
+   (`Reconstruct/Match.lean`, `mkMatchCongr`). The splitter is applied to the motive
+   `fun xs => (d = xs) → match xs with alts = match xs with alts'`, and each case is closed with
+   the match equations (or by iota for `casesOn`). Unreachable alternatives (e.g., wildcard
+   alternatives of a match over structures) are closed from the splitter's overlap hypotheses.
+
 2. **Rule certificates.** Each rewriting rule can record the lemma that justifies it:
    `withThm lhs rhs thm args`, or `withHypThm` when the rule relies on a hypothesis. The stack machine
    collects the recorded steps after each rule application and chains them (`ruleStep`). Any gap
@@ -118,6 +129,12 @@ target another Blaster branch.
    equality, quantifiers/implications, existentials, commutativity normalization, cancellation under
    non-zero hypotheses, `dite'` propagation, and opaque-constant normalization (`ite`, `dite`,
    `decide`, `Nat.succ`, ...). The lemmas live in `Reconstruct/Lemmas.lean`.
+   The `match` rules are justified as follows:
+   - `matchReduction` on constructor discriminants: definitional (iota);
+   - `matchReduction` pushing a match over `Blaster.dite'` (`constMatchPropagation?`): `apply_dite'`;
+   - `elimMatch` with a common rhs: a case split over the splitter with `rfl` in each case;
+   - `elimMatch` with the match context (`matchInHyps?`): the discriminants are rewritten with the
+     equalities `h : dⱼ = pⱼ` of the enclosing alternative, then the match is reduced.
 
 3. **Discharging proof obligations** (`Reconstruct/Discharge.lean`). Each obligation is
    type-checked, then attempted in its own local context, with every binder and hypothesis of the
@@ -132,6 +149,21 @@ target another Blaster branch.
    6. induction for equivalences between recursive functions (`blaster_funind`): functional induction
       following one of the functions of the equation, or structural induction on one variable;
    7. a deeper case analysis with a larger budget.
+   8. `match cases`: for an obligation `match ds with alts = rhs`, a case split over the
+      matcher's splitter, where the discriminants are replaced by the patterns in `rhs`. Each case is
+      discharged recursively with the portfolio, with the pattern equalities and the overlap
+      hypotheses in the local context.
+
+   Obligations are closed terms, but their proofs may use the hypotheses of their local context
+   (e.g., `simp [*]` with the pattern equalities). The same obligation can occur under different
+   binders, for example when a proof is reused through the proof cache. It is therefore discharged
+   once per binder scope (`transformScoped`), not once per term as `Meta.transform` would do.
+
+   The congruence over a `match` application is a *fallback region*. If one of the obligations of its
+   alternatives cannot be discharged, the whole region is replaced by the coarse obligation
+   `match ds with alts = match ds with alts'`. Finer evidence therefore never loses a goal that the
+   coarse obligation could prove. This matters when an alternative contains ill-typed intermediate
+   rewrites (see below).
 
    Each attempt has a heartbeat budget, and failed attempts leave no trace (state, messages and info
    trees are restored). Blaster's internal forms (`Nat.add`, `Blaster.dite'`, `Nat.beq`, ...) are first
@@ -191,7 +223,9 @@ Reconstruction checks every individual rewrite, so it surfaces problems in the t
 ```
 
 This runs every test file with `BLASTER_RECONSTRUCT=1`. Each `#testOptimize` case is also audited
-for a kernel-checked proof of `e = optimize(e)`. One JSON line per attempt is written, and
+for a kernel-checked proof of `e = optimize(e)`. The audit runs after the test's own check, and it
+optimizes with a dedicated name-generator prefix. Otherwise names created while building proof
+terms could clash with those created during reconstruction. One JSON line per attempt is written, and
 `scripts/recon_report.py` summarizes the results. The summary covers success rates per category,
 discharge methods, failure reasons, and proof obligations per rewrite site. The rewrite-site
 breakdown is the to-do list for further rule instrumentation.
@@ -219,6 +253,16 @@ because of the unsound rewrite above (18 attempts).
 | + existential elimination lemma, applied `dite` case analysis, direct fallback | 99.1% | 99.5%                     | 93.9%               | 98.7% | **99.3%**          |
 
 ¹ more tests were measured in this run, as earlier runs aborted some test files.
+² measured against `d0b8686` (casts, existential witnesses), which reaches 98.4%, 93.8%, 78.5% and 96.7%
+with the same harness. The row includes 8 new tests in `Tests/Reconstruct/Basic.lean`. Excluding that file,
+the rates go from 98.4% / 92.9% / 78.0% / 96.7% to 98.5% / 93.5% / 83.4% / 97.2%: 16 goals gain a
+kernel-checked proof and none regresses. On the match-heavy files, `Tests/Smt/SmtMatch.lean` goes from
+49 to 58 of 74 goals and `Tests/Optimize/OptimizeMatch/*` from 61 to 63 of 68 certificates. Unresolved
+obligations drop from 193 to 96. Over all attempts, `frame::*match*` obligations (coarse obligations over
+whole `match` applications) go from 172 (40 unresolved) to 0, and `rule:matchReduction:*` obligations from
+630 (63 unresolved) to 4. `elimMatch` no longer leaves obligations. The `match`-to-`ite` normalization is
+now visible as 86 `rule:normMatchExpr:*` obligations (5 unresolved); these were previously hidden inside
+frame obligations.
 
 Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
 to 16.6k. Proof obligations left to tactics dropped from 13.2k to 4.0k, of which only 127 remain
@@ -235,6 +279,14 @@ unresolved (down from 796).
   - non-linear residuals (`SmtNatDiv`), `match`-heavy `Int` residuals (`SmtMatch`), and one kernel
     rejection (`DIteFalseEqCond_17`, a `dite` whose condition is rewritten without its
     `Decidable` instance).
+- `match` rules that rely on the *negative* match context (`lastPatternReduction?`, i.e., the
+  discriminant does not match the patterns of the previous alternatives) are not justified
+  explicitly yet. The overlap hypotheses of the splitter could be declared in the alternative's local
+  context, like the pattern equalities. Matches normalized to `ite` (`normMatchExpr?`) rely on the
+  `match cases` discharge.
+- Match equations and splitters are generated by Lean on demand (`Match.getEquationsFor`). For
+  matchers with many overlapping patterns, the generation can exceed Lean's fixed heartbeat
+  budget. These matchers fall back to coarse obligations.
 - Goals proved by the SMT solver rely on Lean decision procedures. The next step is to replay Z3
   proofs, or at least use unsat cores and quantifier instantiations from Z3 as hints.
 - Equivalences between recursive functions that need a generalized induction hypothesis or mutual
