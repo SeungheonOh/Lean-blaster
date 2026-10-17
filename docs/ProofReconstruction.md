@@ -134,11 +134,13 @@ are the fraction of attempts producing a kernel-checked proof.
 | + robust discharge (runtime exceptions), relational lemmas, split strategy | 92.8%  | 92.0%                     | 39.8%               | 89.0% |
 | + dependent `dite'` congruence, `dite'` propagation lemmas, arithmetic residuals | 92.9% | 92.0%                | 44.2%               | 89.5% |
 | + residual: user-definition unfolding with bounded case analysis | 92.9%                  | 92.0%                     | 65.5%               | 91.0% |
+| + non-linear `div`/`mod` lemmas, induction for recursive-function equivalences | 95.1%  | 93.1%                     | 70.9%               | 93.3% |
 
 ¹ more tests were measured in this run, as earlier runs aborted some test files.
 
 Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
-to 16.0k. Proof obligations left to tactics dropped from 13.2k to 4.5k. The extended `div`/`mod`
+to 16.0k. Proof obligations left to tactics dropped from 13.2k to 4.5k, of which only 419 remain
+unresolved (down from 796). The extended `div`/`mod`
 lemma set then raised the `Tests/Smt/SmtNat` goals further, from 95 to 107 of 132.
 
 ## Current limitations / next steps
@@ -146,8 +148,9 @@ lemma set then raised the `Tests/Smt/SmtNat` goals further, from 95 to 107 of 13
 - `match` alternatives optimized under a pattern context (`MatchAltWaitForExpr`) produce coarse
   obligations at the match level. The next step is to support them through the matcher's splitter
   and equation lemmas.
-- Rewrites of recursive functions into structurally equivalent ones (`storeRecFunDef`) require
-  induction. Those obligations are currently not dischargeable.
+- Rewrites of recursive functions into structurally equivalent ones (`storeRecFunDef`) are justified
+  by `blaster_funind`, which applies function extensionality and then induction on one argument.
+  Equivalences that need a generalized induction hypothesis or mutual induction still fail.
 - Goals proved by the SMT solver rely on Lean decision procedures. The next step is to replay Z3
   proofs, or at least use unsat cores and quantifier instantiations from Z3 as hints.
 - Universe-polymorphic goals cannot be reconstructed while `normLevel` is applied.
