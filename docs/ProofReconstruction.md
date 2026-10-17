@@ -251,18 +251,18 @@ because of the unsound rewrite above (18 attempts).
 | + separate proof run (universe levels kept)           | 98.4%                        | 93.2%                     | 80.4%               | 96.8% | 97.3%              |
 | + functional induction, case analysis of nested structures, `div`/`mod` facts | 99.0%  | 97.9%                     | 89.6%               | 98.2% | 98.8%              |
 | + existential elimination lemma, applied `dite` case analysis, direct fallback | 99.1% | 99.5%                     | 93.9%               | 98.7% | **99.3%**          |
+| + `match` alternatives (splitter congruence, `match cases`, fallback regions, stuck-match case analysis) | 99.2%² | 99.5% | 96.4%        | 99.0% | **99.6%**          |
 
 ¹ more tests were measured in this run, as earlier runs aborted some test files.
-² measured against `d0b8686` (casts, existential witnesses), which reaches 98.4%, 93.8%, 78.5% and 96.7%
-with the same harness. The row includes 8 new tests in `Tests/Reconstruct/Basic.lean`. Excluding that file,
-the rates go from 98.4% / 92.9% / 78.0% / 96.7% to 98.5% / 93.5% / 83.4% / 97.2%: 16 goals gain a
-kernel-checked proof and none regresses. On the match-heavy files, `Tests/Smt/SmtMatch.lean` goes from
-49 to 58 of 74 goals and `Tests/Optimize/OptimizeMatch/*` from 61 to 63 of 68 certificates. Unresolved
-obligations drop from 193 to 96. Over all attempts, `frame::*match*` obligations (coarse obligations over
-whole `match` applications) go from 172 (40 unresolved) to 0, and `rule:matchReduction:*` obligations from
-630 (63 unresolved) to 4. `elimMatch` no longer leaves obligations. The `match`-to-`ite` normalization is
-now visible as 86 `rule:normMatchExpr:*` obligations (5 unresolved); these were previously hidden inside
-frame obligations.
+² measured against `deaf200` with the same harness. The row includes the match tests of
+`Tests/Reconstruct/Basic.lean` and `Tests/Reconstruct/MatchEdge.lean`. Excluding them, the rates go from
+99.1% / 99.4% / 93.8% / 98.7% / 99.3% to 99.2% / 99.4% / 96.0% / 99.0% / 99.6% (3188 to 3197 of 3229 attempts),
+and no goal regresses. `Tests/Smt/SmtMatch.lean` goes from 69 to 74 of 74 goals and
+`Tests/Optimize/OptimizeMatch/*` from 62 to 65 of 68 certificates. Unresolved obligations drop from 127 to 62.
+Over all attempts, `frame::*match*` obligations (coarse obligations over whole `match` applications) go
+from 196 (7 unresolved) to 0, and `rule:matchReduction:*` obligations from 632 (63 unresolved) to 4.
+`elimMatch` no longer leaves obligations. The `match`-to-`ite` normalization is now visible as
+99 `rule:normMatchExpr:*` obligations (3 unresolved); these were previously hidden inside frame obligations.
 
 Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
 to 16.6k. Proof obligations left to tactics dropped from 13.2k to 4.0k, of which only 127 remain
@@ -270,13 +270,15 @@ unresolved (down from 796).
 
 ## Current limitations / next steps
 
-- The remaining failures (23 of 3238 attempts) fall into a few classes:
-  - `match` expressions over `Int`/`Nat` literal patterns with many alternatives (`MatchToITE`), where
-    the equivalence with the `dite'` chain needs a case analysis on the matcher's splitter;
+- The remaining failures (14 of 3267 attempts, excluding refused unsound eliminations) fall into a few classes:
+  - `match` expressions over `Int` literal patterns with many alternatives (`MatchToITE_9`, `_10`,
+    `_15`): the `normMatchExpr` obligation (a 15-alternative match against its `dite'` chain) is
+    beyond the budget of the case analysis on stuck matches, and the matcher's splitter cannot be
+    generated;
   - residual goals of the SMT solver over polymorphic or uninterpreted functions with quantified
     hypotheses (`Issue15`, `Issue25`, `Issue32`, `SmtPredQualifier`), which need quantifier
     instantiations from the solver;
-  - non-linear residuals (`SmtNatDiv`), `match`-heavy `Int` residuals (`SmtMatch`), and one kernel
+  - non-linear residuals (`SmtNatDiv`), and one kernel
     rejection (`DIteFalseEqCond_17`, a `dite` whose condition is rewritten without its
     `Decidable` instance).
 - `match` rules that rely on the *negative* match context (`lastPatternReduction?`, i.e., the
