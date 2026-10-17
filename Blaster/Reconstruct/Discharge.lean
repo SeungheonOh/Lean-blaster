@@ -428,10 +428,15 @@ def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
       evalTactic (← `(tactic| try simp only [$(mkIdent hName):ident] at *))
   if idx == 0 then throwError "blaster_wf_eval: no evaluation"
   if (← getGoals).isEmpty then return
+  -- the evaluation equations are applied again after case analysis (e.g., on a `match` whose
+  -- discriminant is an evaluated application, which can't be rewritten before the case split)
+  let evalLemmas ← (List.range idx).toArray.mapM fun i =>
+    `(Lean.Parser.Tactic.simpLemma| $(mkIdent (Name.mkSimple s!"blaster_eval_{i}")):ident)
   evalTactic (← `(tactic| first
     | rfl
     | decide +kernel +revert
-    | ((repeat' split) <;> (try $unfoldAtTac:tactic) <;> (try simp_all) <;> (try subst_vars) <;>
+    | ((repeat' split) <;> (try simp only [$evalLemmas,*] at *) <;> (try $unfoldAtTac:tactic) <;>
+        (try simp_all) <;> (try subst_vars) <;>
         first | done | rfl | blaster_closed_contra | (blaster_close_proofs; decide +kernel) |
                 decide +kernel +revert)))
 where
