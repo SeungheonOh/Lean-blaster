@@ -51,27 +51,96 @@ def isNullaryCtor (c : Name) : TranslateEnvT Bool := do
       pure (info.numFields == 0 && !info.type.isProp)
   | _ => pure false
 
+/-- Return `some d` only when an instance for `cstr` can be synthesized without resorting to
+    any local instance.
+    Local instances are ignored so that the result only depends on the global environment.
+    In particular, a quantified instance `[inst : C]` that is about to be eliminated must not be
+    used to justify its own inhabitation. Moreover, outer instance binders are not visible from all
+    the places where an expression may later be retrieved from the optimization cache.
+    NOTE: The synthesize instance cache is bypassed for the same reason.
+-/
+def trySynthWithoutLocalInstances? (cstr : Expr) : TranslateEnvT (Option Expr) := do
+  withLCtx (← getLCtx) #[] $ do
+    try
+      match (← trySynthInstance cstr) with
+      | LOption.some d => return (some d)
+      | _ => return none
+    catch _ => return none
+
+/-- Return `true` only when an instance for `[Nonempty t]` can be found (see `trySynthWithoutLocalInstances?`).
+    Note that an `Inhabited` instance also induces a `Nonempty` instance.
+-/
+def hasNonemptyInstance (t : Expr) : TranslateEnvT Bool := do
+  try
+    let cstr := mkApp (mkConst ``Nonempty [← getLevel t]) t
+    return (← trySynthWithoutLocalInstances? cstr).isSome
+  catch _ => return false
+
+/-- Classes for which an instance can always be constructed, whatever the class arguments, e.g.:
+     - `Decidable p` (classically, see `Classical.propDecidable`);
+     - `BEq α` (fun _ _ => true);
+     - `LT α` and `LE α` (fun _ _ => True);
+     - `Max α` and `Min α` (fun x _ => x);
+     - `Hashable α` (fun _ => 0);
+     - `Ord α` (fun _ _ => Ordering.eq);
+     - `Repr α` and `ToString α` (fun _ .. => default).
+-/
+def instanceFreeClasses : List Name :=
+  [``Decidable, ``BEq, ``LT, ``LE, ``Max, ``Min, ``Hashable, ``Ord, ``Repr, ``ToString]
+
+/-- Return `true` if `t` is a class constraint (or a dependent arrow to a class constraint, e.g., `DecidableEq α`)
+    for which an instance can be constructed without any assumption (see `instanceFreeClasses`).
+-/
+def isInstanceFreeClass (t : Expr) : TranslateEnvT Bool := do
+  try
+    forallTelescopeReducing t fun _ b => do
+      match (← whnfR b).getAppFn' with
+      | Expr.const c _ => return instanceFreeClasses.contains c
+      | _ => return false
+  catch _ => return false
+
 /-- Return `true` if `t` is not a Prop and corresponds to one of the following:
     - is a sort type; or
-    - is a class constraint; or
-    - is an inductive type for which either at least one nullary constructor or an Inhabited instance exists.
+    - is an arrow type for which the codomain satisfies `isSortOrInhabited`; or
+    - is a class constraint for which an instance can be constructed without any assumption
+      (see `isInstanceFreeClass`) or for which an instance can be synthesized; or
+    - is a non-indexed inductive type with at least one nullary constructor; or
+    - is a type for which a `Nonempty` (or `Inhabited`) instance can be synthesized
+      without resorting to local instances (see `hasNonemptyInstance`); or
+    - is a definition (e.g., an abbreviation) for which the unfolded type satisfies `isSortOrInhabited`.
+  Return `false` otherwise, in particular for type variables, which may be instantiated with an empty type.
  TODO: extends check to also consider parametric constructor for which each parameter type satisfy `isSortOrInhabited`.
 -/
-def isSortOrInhabited (t : Expr) : TranslateEnvT Bool := do
+partial def isSortOrInhabited (t : Expr) : TranslateEnvT Bool := do
  if (← isPropEnv t) then return false
  else
-   match t.getAppFn' with
-   | Expr.const n _ =>
-       if (← isClassConstraint n) then return true -- break if class constraint
-       else match (← getConstEnvInfo n) with
-            | ConstantInfo.inductInfo indVal =>
-                for ctorName in indVal.ctors do
-                  -- inductive type has at least one nullary constructor
-                  if (← isNullaryCtor ctorName) then return true
-                -- check if InHabited instance exists for t
-                hasInhabitedInstance t
-            | _ => isTypeEnv t
-   | _ => isTypeEnv t
+   match t.consumeMData with
+   | Expr.sort _ => return true
+   | Expr.forallE .. =>
+       try forallTelescope t fun _ b => isSortOrInhabited b
+       catch _ => return false
+   | _ =>
+     match t.getAppFn' with
+     | Expr.const n _ =>
+         if (← isClassConstraint n) then
+           if (← isInstanceFreeClass t) then return true
+           return (← trySynthWithoutLocalInstances? t).isSome
+         else match (← getConstEnvInfo n) with
+              | ConstantInfo.inductInfo indVal =>
+                  -- a nullary constructor only inhabits all instances of a non-indexed inductive type
+                  if indVal.numIndices == 0 then
+                    for ctorName in indVal.ctors do
+                      -- inductive type has at least one nullary constructor
+                      if (← isNullaryCtor ctorName) then return true
+                  -- check if Nonempty instance exists for t
+                  hasNonemptyInstance t
+              | ConstantInfo.defnInfo _ =>
+                  if (← hasNonemptyInstance t) then return true
+                  let t' ← whnfD t
+                  if t' == t then return false
+                  isSortOrInhabited t'
+              | _ => hasNonemptyInstance t
+     | _ => hasNonemptyInstance t
 
 
 /-- Return `! e` when `b = false`. Otherwise return `e`. -/

@@ -1148,15 +1148,6 @@ def synthDecidableWithNotFound! (e : Expr) : TranslateEnvT Expr := do
       return cstr
   | some d => return d
 
-/-- Return `true` only when an instance for `[Inhabited n]` can be found.
-    Assume that `n` is a name expression for an inductive datatype.
--/
-@[always_inline, inline]
-def hasInhabitedInstance (n : Expr) : TranslateEnvT Bool := do
-  let inhCstr ← mkExpr (mkApp (← mkInhabitedConst) n)
-  return (← trySynthConstraintInstance? inhCstr).isSome
-
-
 /-- Return `true` only when an instance for `[LawfulBEq t beqInst]` can be found. -/
 @[always_inline, inline]
 def hasLawfulBEqInstance (t : Expr) (beqInst : Expr) : TranslateEnvT Bool := do

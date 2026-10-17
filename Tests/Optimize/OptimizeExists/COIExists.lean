@@ -119,43 +119,45 @@ inductive Color where
 -- ∀ (α : Type) (a b c : Bool) (xs ys : List α), ∃ (x y : α), [LT α] → [Decidable (x < y)] →
 --  let cond := !((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then if x < y then [x, y] else [y, x] else ys) = xs ===>
--- ∀ (α : Type) (xs ys : List α), ys = xs
+-- ∀ (α : Type) (xs ys : List α), ∃ (x y : α), ys = xs
 -- Test case: COI reduction rule also removes unused constraints.
+-- NOTE: quantifiers over `α` are not removed as `α` may be empty.
 #testOptimize [ "ExistsCOI_15" ] ∀ (α : Type) (a b c : Bool) (xs ys : List α), ∃ (x y : α), [LT α] → [Decidable (x < y)] →
                                      let cond := !((!a || ((b || c) && !(c || b))) || a);
                                      (if cond then if x < y then [x, y] else [y, x] else ys) = xs ===>
-                                 ∀ (α : Type) (xs ys : List α), xs = ys
+                                 ∀ (α : Type) (xs ys : List α), ∃ (_x _y : α), xs = ys
 
 
 -- ∀ (α : Type), ∃ (x y : α), ∀ (a b c : Bool) (xs ys : List α), [LT α] → [Decidable (x < y)] →
 --  let cond := !((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then if x < y then [x, y] else [y, x] else ys) = xs ===>
--- ∀ (α : Type) (xs ys : List α), ys = xs
+-- ∀ (α : Type), ∃ (x y : α), ∀ (xs ys : List α), ys = xs
 -- Test case: COI reduction rule also removes unused constraints.
+-- NOTE: quantifiers over `α` are not removed as `α` may be empty.
 #testOptimize [ "ExistsCOI_16" ]  ∀ (α : Type), ∃ (x y : α), ∀ (a b c : Bool) (xs ys : List α), [LT α] → [Decidable (x < y)] →
                                      let cond := !((!a || ((b || c) && !(c || b))) || a);
                                      (if cond then if x < y then [x, y] else [y, x] else ys) = xs ===>
-                                  ∀ (α : Type) (xs ys : List α), xs = ys
+                                  ∀ (α : Type), ∃ (_x _y : α), ∀ (xs ys : List α), xs = ys
 
 -- ∀ (α : Type) (β : Type) (x : α) (y z : β), ∃ (f : α → β), ∃ (a b c : Bool),
 --  let cond := !((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then f x else y) = z ===>
--- ∀ (β : Type) (y z : β), y = z
--- Test case: COI reduction rules removes unused quantified functions.
+-- ∀ (α : Type) (β : Type) (x : α) (y z : β), ∃ (f : α → β), y = z
+-- Test case: COI reduction rules do not remove unused quantified functions with a possibly empty codomain.
 #testOptimize [ "ExistsCOI_17" ] ∀ (α : Type) (β : Type) (x : α) (y z : β), ∃ (f : α → β), ∃ (a b c : Bool),
                                    let cond := !((!a || ((b || c) && !(c || b))) || a);
                                    (if cond then f x else y) = z ===>
-                                 ∀ (β : Type) (y z : β), y = z
+                                 ∀ (α : Type) (β : Type) (_x : α) (y z : β), ∃ (_f : α → β), y = z
 
 -- ∀ (α : Type) (β : Type), ∃ (f : α → β), ∃ (a b c : Bool), ∀ (x : α) (y z : β),
 --  let cond := !((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then f x else y) = z ===>
--- ∀ (β : Type) (y z : β), y = z
--- Test case: COI reduction rules removes unused quantified functions.
+-- ∀ (α : Type) (β : Type), ∃ (f : α → β), ∀ (x : α) (y z : β), y = z
+-- Test case: COI reduction rules do not remove unused quantified functions with a possibly empty codomain.
 #testOptimize [ "ExistsCOI_18" ] ∀ (α : Type) (β : Type), ∃ (f : α → β), ∃ (a b c : Bool), ∀ (x : α) (y z : β),
                                    let cond := !((!a || ((b || c) && !(c || b))) || a);
                                    (if cond then f x else y) = z ===>
-                                 ∀ (β : Type) (y z : β), y = z
+                                 ∀ (α : Type) (β : Type), ∃ (_f : α → β), ∀ (_x : α) (y z : β), y = z
 
 -- ∀ (α : Type), ∃ (x y : α), ∃ (ys : List α), ∀ (a b c : Bool) (xs : List α), [LT α] → [Decidable (x < y)] →
 --  let cond := ((!a || ((b || c) && !(c || b))) || a);
@@ -286,11 +288,12 @@ inductive NoInstance where
 -- ∀ (α : Type) (β : Type), ∃ (f : α → β), ∃ (a b c : Bool), ∀ (x : α) (y z : β),
 --  let cond := ((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then f x else y) = z ===>
--- ∀ (α : Type) (β : Type), ∃ (f : α → β), ∀ (x : α) (z : β), z = f x
+-- ∀ (α : Type) (β : Type), ∃ (f : α → β), ∀ (x : α) (y z : β), z = f x
 -- Test case: COI reduction rules not removing still referenced quantified function.
+-- NOTE: unused quantifier `y` is not removed as `β` may be empty.
 #testOptimize [ "ExistsCOIUnchanged_15" ] ∀ (α : Type) (β : Type), ∃ (f : α → β), ∃ (a b c : Bool), ∀ (x : α) (y z : β),
                                              let cond := ((!a || ((b || c) && !(c || b))) || a);
                                              (if cond then f x else y) = z ===>
-                                          ∀ (α : Type) (β : Type), ∃ (f : α → β), ∀ (x : α) (z : β), z = f x
+                                          ∀ (α : Type) (β : Type), ∃ (f : α → β), ∀ (x : α) (_y z : β), z = f x
 
 end Test.COIExists
