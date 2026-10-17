@@ -315,6 +315,26 @@ syntax (name := blasterCloseProofs) "blaster_close_proofs" : tactic
     if !(← changed.get) then throwError "blaster_close_proofs: no proof to close"
     return [← g.replaceTargetDefEq t']
 
+syntax (name := blasterClosedContra) "blaster_closed_contra" : tactic
+
+/-- Close the goal when one of the hypotheses is a closed decidable proposition evaluating to
+    `false` (e.g., an infeasible branch condition `"abc".length < 2` after a case analysis).
+-/
+@[tactic blasterClosedContra] def evalBlasterClosedContra : Tactic := fun _ =>
+  liftMetaTactic fun g => g.withContext do
+    for d in ← getLCtx do
+      if d.isImplementationDetail then continue
+      let p ← instantiateMVars d.type
+      if p.hasFVar || p.hasMVar || !(← isProp p) then continue
+      try
+        let r ← withAtLeastTransparency .default <| whnf (← mkDecide (mkNot p))
+        if !r.isConstOf ``true then continue
+        let np ← mkDecideProof (mkNot p)
+        g.assign (← mkAbsurd (← g.getType) d.toExpr np)
+        return []
+      catch _ => continue
+    throwError "blaster_closed_contra: no contradiction"
+
 syntax (name := blasterWfEval) "blaster_wf_eval" : tactic
 
 /-- Return `true` if `f` is defined by well-founded recursion. -/
@@ -412,7 +432,8 @@ def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
     | rfl
     | decide +kernel +revert
     | ((repeat' split) <;> (try $unfoldAtTac:tactic) <;> (try simp_all) <;> (try subst_vars) <;>
-        first | done | rfl | (blaster_close_proofs; decide +kernel) | decide +kernel +revert)))
+        first | done | rfl | blaster_closed_contra | (blaster_close_proofs; decide +kernel) |
+                decide +kernel +revert)))
 where
   arity (env : Environment) (n : Name) : Nat :=
     ((env.find? n).map fun info => info.type.getForallArity).getD 0
@@ -810,7 +831,10 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
           Nat.mul_mod_right, Nat.div_self, Nat.mod_self, Int.mul_ediv_cancel, Int.mul_ediv_cancel_left,
           Int.mul_emod_left, Int.mul_emod_right, Int.ediv_self, Int.emod_self] <;> done))),
     -- case analysis (e.g., `match` expressions normalized to `Blaster.dite'`)
-    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind))),
+    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;>
+        first | omega | (simp_all; done) | grind | (simp_all [String.ext_iff]; done) |
+                -- infeasible branches whose condition is used by a dependent proof in the goal
+                (exfalso; simp_all; done)))),
     -- case analysis on `Int.negSucc` patterns (symbolic `Int.negSucc` is normalized by the optimizer)
     ("split", ← `(tactic| (blaster_denorm <;>
         simp (disch := decide) only [Blaster.Reconstruct.neg_natCast_add_eq_negSucc, Nat.reduceSub, Nat.zero_add] at * <;>
