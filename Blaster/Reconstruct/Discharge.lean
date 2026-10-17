@@ -1275,6 +1275,8 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("unfold", ← `(tactic| (intros <;> blaster_denorm <;>
         (try blaster_lit_add) <;>
         blaster_unfold_user <;> (try simp_all) <;> done))),
+    -- equivalence of recursive functions (e.g., when the solver unfolds both definitions)
+    ("induction", ← `(tactic| (intros <;> blaster_funind))),
     -- division/modulo facts
     ("div/mod facts", ← `(tactic| (intros <;> blaster_denorm <;> blaster_divmod_facts <;> first
       | omega

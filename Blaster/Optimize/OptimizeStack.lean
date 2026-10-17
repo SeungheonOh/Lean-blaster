@@ -222,12 +222,15 @@ def stackContinuity
        -- optExpr corresponds to optimized forall binder type
        -- check forall reduction to avoid optimizing body
        let isProp ← isPropEnv (← mkForallExpr n bi optExpr body)
-       if let some r ← forallReduction? optExpr body isProp then
-         -- NOTE: the reduction is justified w.r.t. the forall with the optimized binder type
-         let rpf ←
-           if (← isTracking) && pf.isDefEq then do
-             ruleStep (← mkForallExpr n bi optExpr body) r "forallReduction"
-           else pure EqPf.unknown
+       -- NOTE: when tracking proof terms, the reduction is justified w.r.t. the original binder type `t`,
+       -- i.e., the body is instantiated with a proof of `t` (see `trackedForallReduction?`).
+       let red? ←
+         if (← isTracking) then trackedForallReduction? n bi optExpr pf t body isProp
+         else do
+           match ← forallReduction? optExpr body isProp with
+           | some r => pure (some (r, EqPf.unknown))
+           | none => pure none
+       if let some (r, rpf) := red? then
          match r with
          | Expr.const ``True _ => stackContinuity xs r rpf
          | _ => return Sum.inl (← pushTrans r rpf xs)
@@ -473,6 +476,46 @@ def stackContinuity
   | _ => throwEnvError "stackContinuity: unexpected optimize stack continuity {reprStr stack} !!!"
 
   where
+    /-- Same as `forallReduction?` but when tracking proof terms, i.e., given `∀ (n : t), body` with `t`
+        optimized to `t'` (with evidence `pf`), perform the following:
+         - When `t' := True` and a proof `hT : t` can be obtained from `pf`
+             - return `some (body[hT], forall_eq_of_left (fun n : t => body) hT)`
+         - When `t' := False` and a proof `hF : ¬ t` can be obtained from `pf`
+             - return `some (True, eq_true (fun h : t => False.elim (hF h)))`
+         - Otherwise `none` (i.e., the body is optimized).
+    -/
+    trackedForallReduction? (n : Name) (bi : BinderInfo) (t' : Expr) (pf : EqPf) (t : Expr) (body : Expr) (isProp : Bool) :
+      TranslateEnvT (Option (Expr × EqPf)) := do
+      if !isProp then return none
+      let pfProof? : Option Expr := match pf with
+        | .proof p => if containsHole p then none else some p
+        | _ => none
+      match t' with
+      | Expr.const ``True _ =>
+          let hT? ← if t.isConstOf ``True then pure (some (mkConst ``True.intro))
+                    else match pfProof? with
+                      | some p => tryInLocalContext (mkAppM ``of_eq_true #[p])
+                      | none => pure none
+          let some hT := hT? | return none
+          let r ← hashcons (body.instantiate1 hT)
+          let some p ← tryInLocalContext (mkAppM ``Blaster.Reconstruct.forall_eq_of_left #[Expr.lam n t body bi, hT])
+            | return none
+          return some (r, .proof p)
+      | Expr.const ``False _ =>
+          let hF? ← if t.isConstOf ``False then pure (some (Expr.lam `h (mkConst ``False) (.bvar 0) .default))
+                    else match pfProof? with
+                      | some p => tryInLocalContext (mkAppM ``of_eq_false #[p])
+                      | none => pure none
+          let some hF := hF? | return none
+          let some p ← tryInLocalContext do
+              let lam ← withLocalDecl n bi t fun h => do
+                let b := body.instantiate1 h
+                mkLambdaFVars #[h] (← mkAppOptM ``False.elim #[b, mkApp hF h])
+              mkAppM ``eq_true #[lam]
+            | return none
+          return some (← mkPropTrue, .proof p)
+      | _ => return none
+
     /-- When tracking proof terms and `r` is the swapped form (see `isITESwap?`) of `dite' c₀ t e x₁ ... xₙ`
         with dependent branches, i.e., `dite' c e t` with `c₀` rewritten to `¬ c` (or `false = b` with
         `c := true = b`), return the well-typed swapped `dite'` (see `dite'_swap_dep`) and its evidence.
