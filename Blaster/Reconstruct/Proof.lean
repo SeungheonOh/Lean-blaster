@@ -327,6 +327,40 @@ def recordStepM (lhs rhs : Expr) (p : TranslateEnvT Expr) : TranslateEnvT Unit :
   let some p ← tryInLocalContext p | return
   modify fun env => { env with recon.stepLog := env.recon.stepLog.push (lhs, rhs, .proof p) }
 
+/-- Record that `lhs` has been rewritten to `rhs` with `thm args : lhs = rhs` and return `rhs`.
+    This is the main helper used by rewriting rules to justify the rewrites they perform.
+-/
+@[always_inline, inline]
+def withThm (lhs rhs : Expr) (thm : Name) (args : Array Expr) (us : List Level := []) : TranslateEnvT Expr := do
+  if (← isTracking) && lhs != rhs then
+    modify fun env => { env with recon.stepLog := env.recon.stepLog.push (lhs, rhs, .proof (mkAppN (mkConst thm us) args)) }
+  return rhs
+
+/-- Same as `withThm` but for a definitional rewrite. -/
+@[always_inline, inline]
+def withDefEq (lhs rhs : Expr) : TranslateEnvT Expr := do
+  recordDefEq lhs rhs
+  return rhs
+
+/-- Return `some p` only when `p` is a proof of `key`, i.e., a hypothesis proof that can safely be used
+    in a proof term. This is not always the case as hypothesis keys are kept in normalized form.
+-/
+def hypProof? (key : Expr) (p : Expr) : TranslateEnvT (Option Expr) := do
+  let some t ← tryInLocalContext (inferType p) | return none
+  if t == key then return some p
+  return none
+
+/-- Same as `withThm` but for a rewrite justified by hypothesis `h : key`, i.e., `thm args h : lhs = rhs`.
+    Nothing is recorded when `h` is not a proof of `key` (see `hypProof?`).
+-/
+@[always_inline, inline]
+def withHypThm
+  (lhs rhs : Expr) (key : Expr) (h : Expr) (thm : Name) (args : Array Expr) (us : List Level := []) :
+  TranslateEnvT Expr := do
+  if !(← isTracking) then return rhs
+  let some h ← hypProof? key h | return rhs
+  withThm lhs rhs thm (args.push h) us
+
 /-- Clear the rewrite steps log. -/
 @[always_inline, inline]
 def clearSteps : TranslateEnvT Unit := do

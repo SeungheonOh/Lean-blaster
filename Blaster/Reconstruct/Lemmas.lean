@@ -107,3 +107,132 @@ theorem dite'_congr {α : Sort u} {c c' : Prop} {t : c → α} {e : ¬ c → α}
   rw [h1, h2]
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Commutativity (see `reorderOperands`) -/
+
+theorem nat_add_comm' (a b : Nat) : Nat.add a b = Nat.add b a := Nat.add_comm a b
+theorem nat_mul_comm' (a b : Nat) : Nat.mul a b = Nat.mul b a := Nat.mul_comm a b
+theorem int_add_comm' (a b : Int) : Int.add a b = Int.add b a := Int.add_comm a b
+theorem int_mul_comm' (a b : Int) : Int.mul a b = Int.mul b a := Int.mul_comm a b
+theorem eq_comm' {α : Sort u} (a b : α) : (a = b) = (b = a) := propext eq_comm
+theorem and_comm' (a b : Prop) : (a ∧ b) = (b ∧ a) := propext And.comm
+theorem or_comm' (a b : Prop) : (a ∨ b) = (b ∨ a) := propext Or.comm
+theorem bool_and_comm' (a b : Bool) : (a && b) = (b && a) := Bool.and_comm a b
+theorem bool_or_comm' (a b : Bool) : (a || b) = (b || a) := Bool.or_comm a b
+theorem beq_comm' {α : Type u} [inst : BEq α] [LawfulBEq α] (a b : α) : (a == b) = (b == a) := by
+  apply Bool.eq_iff_iff.mpr
+  simp only [beq_iff_eq]
+  exact ⟨Eq.symm, Eq.symm⟩
+
+end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Propositional connectives (see `optimizeNot`, `optimizeAnd`, `optimizeOr`, `optimizeIff`) -/
+
+theorem not_false_eq' : (¬ False) = True := propext ⟨fun _ => trivial, fun _ h => h⟩
+theorem not_true_eq' : (¬ True) = False := propext ⟨fun h => h trivial, fun h => h.elim⟩
+theorem not_not_eq' (p : Prop) : (¬ ¬ p) = p := propext Classical.not_not
+theorem not_false_eq_bool (e : Bool) : (¬ (false = e)) = (true = e) := by cases e <;> simp
+theorem not_true_eq_bool (e : Bool) : (¬ (true = e)) = (false = e) := by cases e <;> simp
+theorem nat_not_zero_lt (e : Nat) : (¬ (0 < e)) = (0 = e) := by
+  apply propext; constructor <;> intro h <;> omega
+theorem not_and_not_eq (a b : Prop) : (¬ (¬ a ∧ ¬ b)) = (a ∨ b) := by
+  apply propext; constructor
+  . intro h; by_cases ha : a
+    . exact Or.inl ha
+    . by_cases hb : b
+      . exact Or.inr hb
+      . exact (h ⟨ha, hb⟩).elim
+  . intro h ⟨ha, hb⟩; cases h <;> contradiction
+theorem not_or_not_eq (a b : Prop) : (¬ (¬ a ∨ ¬ b)) = (a ∧ b) := by
+  apply propext; constructor
+  . intro h; exact ⟨Classical.byContradiction (fun ha => h (Or.inl ha)),
+                    Classical.byContradiction (fun hb => h (Or.inr hb))⟩
+  . intro ⟨ha, hb⟩ h; cases h <;> contradiction
+
+theorem false_and' (p : Prop) : (False ∧ p) = False := false_and p
+theorem true_and' (p : Prop) : (True ∧ p) = p := true_and p
+theorem and_self' (p : Prop) : (p ∧ p) = p := and_self p
+theorem and_not_self' (p : Prop) : (p ∧ ¬ p) = False := propext ⟨fun ⟨h1, h2⟩ => h2 h1, False.elim⟩
+theorem and_bool_neg (e : Bool) : ((true = e) ∧ (false = e)) = False := by cases e <;> simp
+theorem and_imp_self (a c : Prop) : (a ∧ (a → c)) = (a ∧ c) :=
+  propext ⟨fun ⟨h1, h2⟩ => ⟨h1, h2 h1⟩, fun ⟨h1, h2⟩ => ⟨h1, fun _ => h2⟩⟩
+theorem and_imp_left (a c : Prop) : (a ∧ (c → a)) = a := propext ⟨fun h => h.1, fun h => ⟨h, fun _ => h⟩⟩
+theorem imp_and_not_imp (c d : Prop) : ((c → d) ∧ (¬ c → d)) = d := by
+  apply propext; constructor
+  . intro ⟨h1, h2⟩; by_cases h : c
+    . exact h1 h
+    . exact h2 h
+  . intro h; exact ⟨fun _ => h, fun _ => h⟩
+theorem and_eq_right_of {a : Prop} (b : Prop) (h : a) : (a ∧ b) = b := propext ⟨fun h' => h'.2, fun h' => ⟨h, h'⟩⟩
+theorem and_eq_left_of (a : Prop) {b : Prop} (h : b) : (a ∧ b) = a := propext ⟨fun h' => h'.1, fun h' => ⟨h', h⟩⟩
+
+theorem false_or' (p : Prop) : (False ∨ p) = p := false_or p
+theorem true_or' (p : Prop) : (True ∨ p) = True := true_or p
+theorem or_self' (p : Prop) : (p ∨ p) = p := or_self p
+theorem or_not_self' (p : Prop) : (p ∨ ¬ p) = True := propext ⟨fun _ => trivial, fun _ => Classical.em p⟩
+theorem or_bool_neg (e : Bool) : ((true = e) ∨ (false = e)) = True := by cases e <;> simp
+theorem or_imp_self (a c : Prop) : (a ∨ (a → c)) = True := by
+  apply propext; constructor
+  . intro _; trivial
+  . intro _; by_cases h : a
+    . exact Or.inl h
+    . exact Or.inr (fun h' => (h h').elim)
+theorem or_imp_left (a c : Prop) : (a ∨ (c → a)) = (c → a) :=
+  propext ⟨fun h => h.elim (fun h' _ => h') id, Or.inr⟩
+theorem or_eq_true_of_left {a : Prop} (b : Prop) (h : a) : (a ∨ b) = True := propext ⟨fun _ => trivial, fun _ => Or.inl h⟩
+theorem or_eq_true_of_right (a : Prop) {b : Prop} (h : b) : (a ∨ b) = True := propext ⟨fun _ => trivial, fun _ => Or.inr h⟩
+theorem iff_eq_and_imp (a b : Prop) : (a ↔ b) = ((a → b) ∧ (b → a)) :=
+  propext ⟨fun h => ⟨h.mp, h.mpr⟩, fun h => ⟨h.1, h.2⟩⟩
+
+end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Boolean operators (see `optimizeBoolAnd`, `optimizeBoolOr`, `optimizeBoolNot`) -/
+
+theorem bool_false_and (b : Bool) : (false && b) = false := rfl
+theorem bool_true_and (b : Bool) : (true && b) = b := rfl
+theorem bool_and_self (b : Bool) : (b && b) = b := by cases b <;> rfl
+theorem bool_and_not_self (b : Bool) : (b && !b) = false := by cases b <;> rfl
+theorem bool_and_eq_right_of {a : Bool} (b : Bool) (h : true = a) : (a && b) = b := by subst h; rfl
+theorem bool_and_eq_left_of (a : Bool) {b : Bool} (h : true = b) : (a && b) = a := by subst h; cases a <;> rfl
+theorem bool_and_eq_false_of_left {a : Bool} (b : Bool) (h : false = a) : (a && b) = false := by subst h; rfl
+theorem bool_and_eq_false_of_right (a : Bool) {b : Bool} (h : false = b) : (a && b) = false := by
+  subst h; cases a <;> rfl
+theorem bool_false_or (b : Bool) : (false || b) = b := rfl
+theorem bool_true_or (b : Bool) : (true || b) = true := rfl
+theorem bool_or_self (b : Bool) : (b || b) = b := by cases b <;> rfl
+theorem bool_or_not_self (b : Bool) : (b || !b) = true := by cases b <;> rfl
+theorem bool_or_eq_true_of_left {a : Bool} (b : Bool) (h : true = a) : (a || b) = true := by subst h; rfl
+theorem bool_or_eq_true_of_right (a : Bool) {b : Bool} (h : true = b) : (a || b) = true := by
+  subst h; cases a <;> rfl
+theorem bool_or_eq_right_of {a : Bool} (b : Bool) (h : false = a) : (a || b) = b := by subst h; rfl
+theorem bool_or_eq_left_of (a : Bool) {b : Bool} (h : false = b) : (a || b) = a := by subst h; cases a <;> rfl
+theorem bool_not_true : (!true) = false := rfl
+theorem bool_not_false : (!false) = true := rfl
+theorem bool_not_not (b : Bool) : (!!b) = b := by cases b <;> rfl
+theorem bool_not_decide' (p : Prop) : (!Blaster.decide' p) = Blaster.decide' (¬ p) := by
+  cases h : Blaster.decide' p
+  . have h1 := (Blaster.decide'_false p).mp h
+    exact ((Blaster.decide'_true (¬ p)).mpr h1).symm
+  . have h1 := (Blaster.decide'_true p).mp h
+    exact ((Blaster.decide'_false (¬ p)).mpr (fun h2 => h2 h1)).symm
+
+/-! ## `Blaster.decide'` (see `optimizeDecideCore`) -/
+
+theorem decide'_False : Blaster.decide' False = false := (Blaster.decide'_false _).mpr id
+theorem decide'_True : Blaster.decide' True = true := (Blaster.decide'_true _).mpr trivial
+theorem decide'_true_eq (p : Bool) : Blaster.decide' (true = p) = p := by
+  cases p
+  . exact (Blaster.decide'_false _).mpr Bool.noConfusion
+  . exact (Blaster.decide'_true _).mpr rfl
+theorem decide'_false_eq (p : Bool) : Blaster.decide' (false = p) = !p := by
+  cases p
+  . exact (Blaster.decide'_true _).mpr rfl
+  . exact (Blaster.decide'_false _).mpr Bool.noConfusion
+
+end Blaster.Reconstruct

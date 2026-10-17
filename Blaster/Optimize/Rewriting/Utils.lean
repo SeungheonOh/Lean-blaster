@@ -1,5 +1,6 @@
 import Lean
 import Blaster.Optimize.Telescope
+import Blaster.Reconstruct.Proof
 
 open Lean Meta Declaration
 
@@ -379,7 +380,7 @@ def reorderIntOp (args: Array Expr) : (Expr × Expr) :=
       if isIntNegExprOf e1' e2' then (e2', e1') else (e1', e2')
 
 /-- Reorder operands for commutative operators -/
-def reorderOperands (f : Expr) (args : Array Expr) : TranslateEnvT (Array Expr) := do
+def reorderOperandsAux (f : Expr) (args : Array Expr) : TranslateEnvT (Array Expr) := do
   let Expr.const n _ := f | return args
   match n with
   | ``Nat.add
@@ -418,6 +419,32 @@ def reorderOperands (f : Expr) (args : Array Expr) : TranslateEnvT (Array Expr) 
        return #[op1, op2]
 
   | _ => return args
+
+/-- Reorder operands for commutative operators.
+    NOTE: The commutativity rewrite is recorded for proof reconstruction (see `Blaster.Reconstruct`).
+-/
+def reorderOperands (f : Expr) (args : Array Expr) : TranslateEnvT (Array Expr) := do
+  let args' ← reorderOperandsAux f args
+  if (← Blaster.Reconstruct.isTracking) && !(args.zip args' |>.all fun (a, b) => exprEq a b) then
+    Blaster.Reconstruct.recordStepM (mkAppN f args) (mkAppN f args') (commProof f args)
+  return args'
+
+  where
+    /-- Return the commutativity proof for `f args` when `f` is a binary commutative operator. -/
+    commProof (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
+      let Expr.const n us := f | throwEnvError "commProof: constant expected"
+      match n with
+      | ``Nat.add => return mkApp2 (mkConst ``Blaster.Reconstruct.nat_add_comm') args[0]! args[1]!
+      | ``Nat.mul => return mkApp2 (mkConst ``Blaster.Reconstruct.nat_mul_comm') args[0]! args[1]!
+      | ``Int.add => return mkApp2 (mkConst ``Blaster.Reconstruct.int_add_comm') args[0]! args[1]!
+      | ``Int.mul => return mkApp2 (mkConst ``Blaster.Reconstruct.int_mul_comm') args[0]! args[1]!
+      | ``Eq => return mkApp3 (mkConst ``Blaster.Reconstruct.eq_comm' us) args[0]! args[1]! args[2]!
+      | ``And => return mkApp2 (mkConst ``Blaster.Reconstruct.and_comm') args[0]! args[1]!
+      | ``Or => return mkApp2 (mkConst ``Blaster.Reconstruct.or_comm') args[0]! args[1]!
+      | ``and => return mkApp2 (mkConst ``Blaster.Reconstruct.bool_and_comm') args[0]! args[1]!
+      | ``or => return mkApp2 (mkConst ``Blaster.Reconstruct.bool_or_comm') args[0]! args[1]!
+      | ``BEq.beq => mkAppOptM ``Blaster.Reconstruct.beq_comm' #[args[0]!, args[1]!, none, args[2]!, args[3]!]
+      | _ => throwEnvError "commProof: unexpected operator {n}"
 
 /-- Return `true` if `e` corresponds t a casesOn function. -/
 def isCasesOnRec (e : Expr) : TranslateEnvT Bool := do

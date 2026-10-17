@@ -1,7 +1,7 @@
 import Lean
 import Blaster.Optimize.Rewriting.Utils
 
-open Lean Meta
+open Lean Meta Blaster.Reconstruct
 namespace Blaster.Optimize
 
 /-- Given op the operand for `not`,
@@ -28,13 +28,16 @@ def notDecideProp? (op : Expr) : TranslateEnvT (Option Expr) := do
 def optimizeBoolNot (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
  if args.size != 1 then throwEnvError "optimizeBoolNot: exactly one argument expected"
  let op := args[0]!
+ let lhs := mkApp f op
  match op with
- | Expr.const ``true _ => mkBoolFalse
- | Expr.const ``false _ => mkBoolTrue
+ | Expr.const ``true _ => withThm lhs (← mkBoolFalse) ``bool_not_true #[]
+ | Expr.const ``false _ => withThm lhs (← mkBoolTrue) ``bool_not_false #[]
  | _ =>
-    if let some e := boolNot? op then return e
-    if let some r ← notDecideProp? op then return r
-    return (mkApp f op)
+    if let some e := boolNot? op then return ← withThm lhs e ``bool_not_not #[e]
+    if let some r ← notDecideProp? op then
+      let some e := decide'? op | return r
+      return ← withThm lhs r ``bool_not_decide' #[e]
+    return lhs
 
 /-- Apply simplification/normalization rules on Boolean `not` operator.
 -/
