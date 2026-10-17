@@ -280,10 +280,15 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
                                      (try simp_all) <;> (try decide) <;> done))),
     -- non-linear division/modulo identities
     ("arith simp", ← `(tactic| (intros <;> blaster_denorm <;>
-        simp_all [Nat.mod_add_div, Nat.div_add_mod, Nat.mul_div_mul_left, Nat.mul_div_cancel_left,
-                  Nat.mul_mod_right, Nat.mul_mod_left, Nat.mod_mod, Nat.mod_self, Nat.div_self,
-                  Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_ediv,
-                  Int.ediv_add_emod, Nat.pos_iff_ne_zero] <;> done)))
+        first
+        | (simp_all [Nat.mod_add_div, Nat.div_add_mod, Nat.mul_div_mul_left, Nat.mul_div_cancel_left,
+                     Nat.mul_mod_right, Nat.mul_mod_left, Nat.mod_mod, Nat.mod_self, Nat.div_self,
+                     Nat.div_div_eq_div_mul, Nat.div_le_self, Nat.mod_le, Nat.mod_lt, Nat.mod_eq_of_lt,
+                     Nat.add_mul_div_right, Nat.add_div_right, Nat.mul_self_inj, Nat.div_lt_iff_lt_mul,
+                     Nat.le_div_iff_mul_le, Nat.div_lt_self, Nat.mod_def, Nat.mul_div_le, Nat.not_lt,
+                     Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_ediv,
+                     Int.ediv_add_emod, Nat.pos_iff_ne_zero]; done)
+        | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega))))
   ]
   for (name, tac) in tacs do
     if let some prf ← proveWithTactic e tac (budget := 4 * dischargeHeartbeats) then

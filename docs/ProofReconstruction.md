@@ -132,11 +132,14 @@ are the fraction of attempts producing a kernel-checked proof.
 | + `dite'` congruence, denormalization, sync kernel check, explicit Prop/Bool/`decide'` rules | 91.4% | 84.4% | 33.3%¹ | 87.0% |
 | + forall/Eq/arith rule lemmas, seeded instantiation, validated steps | 90.9%¹       | 92.0%                     | 39.8%               | 87.4% |
 | + robust discharge (runtime exceptions), relational lemmas, split strategy | 92.8%  | 92.0%                     | 39.8%               | 89.0% |
+| + dependent `dite'` congruence, `dite'` propagation lemmas, arithmetic residuals | 92.9% | 92.0%                | 44.2%               | 89.5% |
+| + residual: user-definition unfolding with bounded case analysis | 92.9%                  | 92.0%                     | 65.5%               | 91.0% |
 
 ¹ more tests were measured in this run, as earlier runs aborted some test files.
 
 Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
-to 15.4k. Proof obligations left to tactics dropped from 13.2k to 4.9k.
+to 16.0k. Proof obligations left to tactics dropped from 13.2k to 4.5k. The extended `div`/`mod`
+lemma set then raised the `Tests/Smt/SmtNat` goals further, from 95 to 107 of 132.
 
 ## Current limitations / next steps
 
