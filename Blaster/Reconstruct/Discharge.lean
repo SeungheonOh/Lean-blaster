@@ -168,6 +168,35 @@ syntax (name := introFacts) "intro_facts" : tactic
     g := g'
   replaceMainGoal [g]
 
+/-! ## Existential witnesses
+
+The SMT solver proves `∃ x, P x` without providing a witness. For `Nat`/`Int` existentials, a few
+candidate witnesses built from the variables in context are tried, the remaining goal being closed by `omega`.
+-/
+
+syntax (name := blasterExists) "blaster_exists" : tactic
+
+@[tactic blasterExists] def evalBlasterExists : Tactic := fun _ => do
+  let g ← getMainGoal
+  let some (_, .lam _ t _ _) := (← whnfR (← instantiateMVars (← g.getType))).app2? ``Exists
+    | throwError "blaster_exists: existential expected"
+  let isNat := t.isConstOf ``Nat
+  if !isNat && !t.isConstOf ``Int then throwError "blaster_exists: Nat/Int existential expected"
+  let mut candidates : Array Term := #[← `(0), ← `(1)]
+  for d in ← g.withContext getLCtx do
+    if d.isImplementationDetail || d.userName.isInaccessibleUserName then continue
+    if ← g.withContext (isDefEq d.type t) then
+      let x := mkIdent d.userName
+      candidates := candidates ++ #[← `($x), ← `($x - 1), ← `($x + 1)]
+  let s ← saveState
+  for c in candidates do
+    try
+      evalTactic (← `(tactic| (refine ⟨$c, ?_⟩ <;> omega)))
+      if (← getUnsolvedGoals).isEmpty then return
+      s.restore
+    catch _ => s.restore
+  throwError "blaster_exists: no witness found"
+
 /-! ## Equivalence of recursive functions
 
 The optimizer replaces a recursive function with a structurally equivalent one (see `storeRecFunDef`),
@@ -428,6 +457,19 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     -- user definitions (e.g., derived `BEq` instances) with case analysis on inductive variables
     ("unfold + cases", ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;> blaster_unfold_user <;>
                                      (try simp_all) <;> (try decide) <;> done))),
+    -- existential goals: witness search
+    ("exists", ← `(tactic| (intros <;> blaster_denorm <;> blaster_exists))),
+    -- non-linear arithmetic with core lemmas
+    ("nonlinear", ← `(tactic| (intros <;> blaster_denorm <;> first
+      | (grind [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mul_le_mul, Nat.eq_of_mul_eq_mul_left,
+                Int.eq_of_mul_eq_mul_left, Nat.mod_lt, Nat.add_mul_div_right, Nat.div_eq_sub_div,
+                Nat.mod_eq_sub_mod, Nat.mul_mod_mul_right, Nat.mod_add_div, Nat.sub_mul_div, Nat.div_mul_le_self])
+      | (simp_all [Nat.div_eq, Nat.mod_eq]; done)
+      | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mul_le_mul, Nat.mul_mod_mul_right,
+                   Nat.mul_comm]; done)
+      | (simp_all [Nat.div_eq_sub_div, Nat.mod_eq_sub_mod, Nat.mul_left_cancel_iff, Nat.pos_iff_ne_zero,
+                   Int.mul_eq_mul_left_iff]; done)
+      | (rw [Nat.div_eq, Nat.mod_eq]; split <;> simp_all <;> omega)))),
     -- non-linear division/modulo identities
     ("arith simp", ← `(tactic| (intros <;> blaster_denorm <;>
         first
