@@ -75,23 +75,24 @@ inductive Color where
 -- ∀ (α : Type) (a b c : Bool) (x y : α) (xs ys : List α), [LT α] → [Decidable (x < y)] →
 --  let cond := !((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then if x < y then [x, y] else [y, x] else ys) = xs ===>
--- ∀ (α : Type) (xs ys : List α), ys = xs
+-- ∀ (α : Type) (x y : α) (xs ys : List α), ys = xs
 -- Test case: COI reduction rule also removes unused constraints.
+-- NOTE: quantifiers over `α` are not removed as `α` may be empty.
 #testOptimize [ "ForallCOI_9" ]
   ∀ (α : Type) (a b c : Bool) (x y : α) (xs ys : List α), [LT α] → [Decidable (x < y)] →
       let cond := !((!a || ((b || c) && !(c || b))) || a);
       (if cond then if x < y then [x, y] else [y, x] else ys) = xs ===>
-  ∀ (α : Type) (xs ys : List α), xs = ys
+  ∀ (α : Type) (_x _y : α) (xs ys : List α), xs = ys
 
 -- ∀ (α : Type) (β : Type) (f : α → β) (x : α) (y z : β) (a b c : Bool),
 --  let cond := !((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then f x else y) = z ===>
--- ∀ (β : Type) (y z : β), y = z
--- Test case: COI reduction rules removes unused quantified functions.
+-- ∀ (α : Type) (β : Type) (f : α → β) (x : α) (y z : β), y = z
+-- Test case: COI reduction rules do not remove unused quantified functions with a possibly empty codomain.
 #testOptimize [ "ForallCOI_10" ]
   ∀ (α : Type) (β : Type) (f : α → β) (x : α) (y z : β) (a b c : Bool),
     let cond := !((!a || ((b || c) && !(c || b))) || a); (if cond then f x else y) = z ===>
-  ∀ (β : Type) (y z : β), y = z
+  ∀ (α : Type) (β : Type) (_f : α → β) (_x : α) (y z : β), y = z
 
 
 -- ∀ (α : Type) (a b c : Bool) (x y : α) (xs ys : List α), [LT α] → [Decidable (x < y)] →
@@ -193,11 +194,12 @@ inductive NoInstance where
 -- ∀ (α : Type) (β : Type) (f : α → β) (x : α) (y z : β) (a b c : Bool),
 --  let cond := ((!a || ((b || c) && !(c || b))) || a);
 --  (if cond then f x else y) = z ===>
--- ∀ (α : Type) (β : Type) (f : α → β) (x : α) (z : β), z = f x
+-- ∀ (α : Type) (β : Type) (f : α → β) (x : α) (y z : β), z = f x
 -- Test case: COI reduction rules not removing still referenced quantified function.
+-- NOTE: unused quantifier `y` is not removed as `β` may be empty.
 #testOptimize [ "ForallCOIUnchanged_10" ]
   ∀ (α : Type) (β : Type) (f : α → β) (x : α) (y z : β) (a b c : Bool),
     let cond := ((!a || ((b || c) && !(c || b))) || a); (if cond then f x else y) = z ===>
-  ∀ (α : Type) (β : Type) (f : α → β) (x : α) (z : β), z = f x
+  ∀ (α : Type) (β : Type) (f : α → β) (x : α) (_y z : β), z = f x
 
 end Test.COIForAll
