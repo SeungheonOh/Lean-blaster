@@ -126,6 +126,8 @@ structure ReconTask where
   optPf : EqPf
   /-- `true` when `optExpr` has been proved valid by the backend SMT solver. -/
   bySmt : Bool
+  /-- The reconstruction environment obtained when optimizing `fullGoal` while tracking proof terms. -/
+  recon : ReconEnv := {}
 deriving Inhabited
 
 end Blaster.Reconstruct

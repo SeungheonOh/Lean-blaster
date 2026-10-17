@@ -29,7 +29,9 @@ partial def optimizeExprAux (stack : List OptimizeStack) : TranslateEnvT (Expr �
 
           | Expr.sort l =>
               -- sort is used for Type u, Prop, etc
-              let s := Expr.sort (normLevel l)
+              -- NOTE: universe levels are only normalized for the SMT translation, i.e., not when
+              -- tracking proof terms (the normalization is not an equivalence preserving rewrite).
+              let s := if (← isTracking) then e else Expr.sort (normLevel l)
               clearSteps
               let (s', pf) ← mkExprPf s (← ruleStep e s "normLevel")
               match (← stackContinuity i_stack s' pf) with
@@ -364,14 +366,14 @@ def cacheOpaqueRecFun : TranslateEnvT Unit := do
     NOTE: Proof terms are only tracked when proof reconstruction is activated
     (see option `reconstruct`). Otherwise, `EqPf.unknown` is returned.
 -/
-def Optimize.mainPf (e : Expr) : TranslateEnvT (Expr × EqPf) := do
+def Optimize.mainPf (e : Expr) (track : Option Bool := none) : TranslateEnvT (Expr × EqPf) := do
   -- set start local context
   updateLocalContext (← mkLocalContext)
   -- populate recFunInstCache with recursive function definition.
   setTracking false
   cacheOpaqueRecFun
   -- track proof terms only for the expression to be optimized
-  setTracking ((← get).optEnv.options.solverOptions.reconstruct > 0)
+  setTracking (track.getD ((← get).optEnv.options.solverOptions.reconstruct > 0))
   let res ← optimizeExprAux [.InitOptimizeExpr e]
   setTracking false
   return res

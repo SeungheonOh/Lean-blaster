@@ -51,10 +51,26 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
     let goal ← toPropExpr e
     let axioms ← findLocalAxiomDecls
     let e' ← addAxioms goal (axioms.map Prod.snd)
-    let (optExpr, optPf) ← profileTask "Optimization" $ Optimize.mainPf e'
+    -- NOTE: the verdict is always computed without tracking proof terms, such that proof
+    -- reconstruction never alters Blaster's behavior.
+    let (optExpr, _) ← profileTask "Optimization" $ Optimize.mainPf e' (track := false)
     trace[Translate.optExpr] "optimized expression: {← ppExpr optExpr}"
-    let mkTask (bySmt : Bool) : Option Reconstruct.ReconTask :=
-      some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr, optPf, bySmt }
+    let sOpts := (← get).optEnv.options.solverOptions
+    let mkTask (bySmt : Bool) : TranslateEnvT (Option Reconstruct.ReconTask) := do
+      if sOpts.reconstruct == 0 then return none
+      -- proof run: optimize again while tracking proof terms (see `Blaster.Reconstruct`)
+      let proofEnv := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
+      let r ← (do
+        let s ← Meta.saveState
+        tryCatchRuntimeEx
+          (some <$> (Optimize.mainPf e' (track := true)).run proofEnv)
+          (fun _ => do s.restore; return none) : MetaM _)
+      match r with
+      | some ((optExprP, optPf), envP) =>
+          return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr := optExprP, optPf,
+                        bySmt, recon := envP.recon }
+      | none =>
+          return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr, optPf := .unknown, bySmt }
     match (toResult optExpr) with
     | res@(.Undetermined) =>
         if (← get).optEnv.options.solverOptions.onlyOptimize then
@@ -72,12 +88,12 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
           if !isUndeterminedResult res || logUndetermined then logResult res
           discard $ exitSmt
           match res with
-          | .Valid => return (res, optExpr, mkTask true)
+          | .Valid => return (res, optExpr, ← mkTask true)
           | _ => return (res, optExpr, none)
     | res =>
        logResult res
        match res with
-       | .Valid => return (res, optExpr, mkTask false)
+       | .Valid => return (res, optExpr, ← mkTask false)
        | _ => return (res, optExpr, none)
 
   where

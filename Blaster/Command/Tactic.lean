@@ -43,7 +43,7 @@ def blasterTacticImp : Tactic := fun stx =>
    let sOpts ← parseSolveOptions opts (← BlasterOptions.fromEnv)
    let (goal, nbQuantifiers) ← revertHypotheses (← getMainGoal)
    let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-   let ((result, optExpr, task?), env') ←
+   let ((result, optExpr, task?), _) ←
      withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $ do
        IO.setNumHeartbeats 0
        Translate.mainWithTask (← goal.getType >>= instantiateMVars') (logUndetermined := false) |>.run env
@@ -52,7 +52,7 @@ def blasterTacticImp : Tactic := fun stx =>
        match task? with
        | some task =>
           if sOpts.reconstruct > 0 then
-            let outcome ← Reconstruct.reconstructSafe task env'.recon
+            let outcome ← Reconstruct.reconstructSafe task task.recon
             Reconstruct.dumpStats outcome "tactic"
             Reconstruct.reportOutcome sOpts outcome
             match outcome.proof? with

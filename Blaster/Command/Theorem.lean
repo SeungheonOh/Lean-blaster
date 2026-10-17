@@ -36,10 +36,10 @@ def elabBlasterTheorem : CommandElab := fun stx => do
       let e ← instantiateMVars e
       if e.hasMVar then throwError "blaster_theorem: statement contains metavariables{indentExpr e}"
       let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-      let ((result, _, task?), env') ← Translate.mainWithTask e |>.run env
+      let ((result, _, task?), _) ← Translate.mainWithTask e |>.run env
       let .Valid := result | throwError "blaster_theorem: the statement could not be proved"
       let some task := task? | throwError "blaster_theorem: no reconstruction information"
-      let outcome ← Reconstruct.reconstructSafe task env'.recon
+      let outcome ← Reconstruct.reconstructSafe task task.recon
       Reconstruct.dumpStats outcome "blaster_theorem"
       let some proof := outcome.proof?
         | throwError "blaster_theorem: proof reconstruction failed: {outcome.failure}"

@@ -82,7 +82,8 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
            if (← isPartialDef n) then throwEnvError "normConst: partial function not supported {n} !!!"
            if (← isUnsafeDef n) then throwEnvError "normConst: unsafe definition not supported {n} !!!"
            if let some r ← isToNormOpaqueFun n then return r
-           let e' := normConstLevel n l
+           -- NOTE: universe levels are not normalized when tracking proof terms (see `Expr.sort` case)
+           let e' := if (← isTracking) then e else normConstLevel n l
            -- NOTE: level normalization is not an equivalence preserving rewrite when `l` contains level parameters.
            let pf ← normLevelStep e'
            if let some r ← isHOF n e' pf then return r

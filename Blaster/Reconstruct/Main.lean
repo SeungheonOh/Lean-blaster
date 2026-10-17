@@ -226,10 +226,10 @@ def command (sOpts: BlasterOptions) (stx : Syntax) : TermElabM Unit := do
    withRef stx do
      instantiateMVars (← withSynthesize (postpone := .partial) <| elabTerm stx none) >>= fun e => do
        let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-       let ((_, _, task?), env') ← Translate.mainWithTask e |>.run env
+       let ((_, _, task?), _) ← Translate.mainWithTask e |>.run env
        if sOpts.reconstruct == 0 then return
        let some task := task? | return
-       let outcome ← reconstructSafe task env'.recon
+       let outcome ← reconstructSafe task task.recon
        dumpStats outcome "command"
        reportOutcome sOpts outcome
        if sOpts.genProof then
