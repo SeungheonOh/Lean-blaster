@@ -46,7 +46,7 @@ Column "main?": does the repro still give a false `Valid` on `origin/main` 585c5
 
 | # | Root cause | Where | Repro | main? |
 |---|---|---|---|---|
-| 6 | **`isSortOrInhabited` over-approximates inhabitedness.** It returns true for any type variable, function type or non-inductive (fallback `isTypeEnv`), any class type, and any indexed family with a nullary ctor (`Idx 1` with only `Idx.z : Idx 0`). The `∀ x:t, e ⇒ e` and `∃ x:t, e ⇒ e` drops built on it are unsound, e.g. `∀ α : Type, ¬ ∀ _ : α, False` gives `Valid`. | `Optimize/Rewriting/Utils.lean:60-75`, `OptimizeForAll.lean:143,154`, `OptimizeExists.lean:164` | `OptCore_ForallDrop`, `Logic_Exists` | partly: ∃ over type var / fn type fixed; `Idx`, class, ∀ cases still unsound |
+| 6 | **`isSortOrInhabited` over-approximates inhabitedness.** It returns true for any type variable, function type or non-inductive (fallback `isTypeEnv`), any class type, and any indexed family with a nullary ctor (`Idx 1` with only `Idx.z : Idx 0`). The `∀ x:t, e ⇒ e` and `∃ x:t, e ⇒ e` drops built on it are unsound, e.g. `∀ α : Type, ¬ ∀ _ : α, False` gives `Valid`. | `Optimize/Rewriting/Utils.lean:60-75`, `OptimizeForAll.lean:143`, `OptimizeExists.lean:18` | `OptCore_ForallDrop`, `Logic_Exists` | partly: ∃ over type var / fn type fixed; `Idx`, class, ∀ cases still unsound |
 | 7 | **`LT`/`LE` instance argument is never checked.** Only the carrier type (Nat/Int/…) is inspected, so `@LT.lt Nat revLT` and `@LE.le Nat ⟨fun _ _ => False⟩` get Nat semantics. The SMT side ignores the instance too. | `Optimize/Env.lean:1189-1197` (`isOpaqueRelational`), `OptimizeRelational.lean:249-276,322-342`, `OptimizePropNot.lean:39`, `Smt/Translate/Application.lean:332-338` | `Arith_CustomLTInst`, `Logic_CustomLT` | yes |
 | 8 | **`structEq?` treats proofs as distinguishing.** It walks ctor args and returns `False` on different ctor names, including inside Prop fields, so `P.mk (Or.inl _) = P.mk (Or.inr _)` becomes `False`, contradicting proof irrelevance. | `Optimize/Rewriting/OptimizeEq.lean:13-45` | `Arith_StructEqProofIrrel` | yes |
 | 9 | **`structEq?` compares ctor constants by pointer, levels included.** `normLevel` does not normalize `max u v` vs `max v u`, so `PUnit.unit.{max u v+1} = PUnit.unit.{max v u+1}` becomes `False`. | `OptimizeEq.lean:17-19`, `OptimizeConst.lean:17` | `Arith_StructEqLevels` | yes |
@@ -57,7 +57,7 @@ Column "main?": does the repro still give a false `Valid` on `origin/main` 585c5
 | # | Root cause | Where | Repro | main? |
 |---|---|---|---|---|
 | 11 | **`matchInHyps?` ignores first-match-wins.** Inside outer alternative `n+1`, an inner `match x with \| 1 => 10 \| m+1 => 20 \| 0 => 30` is reduced to `20`, which is wrong at `x = 1`. It never checks that the earlier inner alternatives fail; `lastPatternReduction?` does. | `Optimize/Rewriting/OptimizeMatch.lean:440-451` (context built at :323-333) | `Match_FirstWins` | yes |
-| 12 | **The pattern-variable list is misaligned with the alternative's binders.** A variable repeated via an inaccessible pattern (`rfl`) is collected twice, and the discriminant equation `h : x = pat` is not collected at all. Values get substituted into the wrong parameters (`k := a`; extra args pushed into `h`). | `Optimize/Rewriting/NormalizeMatch.lean:106-136` (consumers: :26-29, :511, `OptimizeMatch.lean:322-336`, `FunPropagation.lean:70-73,191-193`, `Smt/Translate/Match.lean:201-202`) | `Match_AltArgsMisalign`, `Match_DiscrEqApp` | yes |
+| 12 | **The pattern-variable list is misaligned with the alternative's binders.** A variable repeated via an inaccessible pattern (`rfl`) is collected twice, and the discriminant equation `h : x = pat` is not collected at all. Values get substituted into the wrong parameters (`k := a`; extra args pushed into `h`). | `Optimize/Rewriting/NormalizeMatch.lean:106-136` (consumers: :26-29, :508, `OptimizeMatch.lean:322-336`, `FunPropagation.lean:70-73,191-193`, `Smt/Translate/Match.lean:201-202`) | `Match_AltArgsMisalign`, `Match_DiscrEqApp` | yes |
 | 13 | **`getLambdaBody` strips the alternative's own lambdas**, not just the `Unit` thunk. `fun _ => fun y => ¬y` becomes `¬#0`, and the loose bvar is then captured by the `dite'` hypothesis binder. | `NormalizeMatch.lean:26-29,561-563`; same pattern at `OptimizeMatch.lean:410,415,449`, `Smt/Translate/Match.lean:202` | `Match_FunValuedCapture` | yes |
 | 14 | **`mkAppInRhs` uses `max 1 nbParams`**, which assumes a `Unit` thunk. Direct `casesOn` minors for field-less ctors have none, so extra args land one binder too deep: `(fun y z => y - z) 5` becomes `fun y => y - 5`. | `Optimize/Rewriting/FunPropagation.lean:70-73,193` | `Match_CasesOnDepth` | yes |
 
@@ -77,7 +77,7 @@ Column "main?": does the repro still give a false `Valid` on `origin/main` 585c5
 | # | Root cause | Where | Repro | main? |
 |---|---|---|---|---|
 | 21 | **`findLocalAxioms` assumes every Prop axiom of the current module, including `unsafe` ones.** `unsafe axiom u : False` then `theorem t : False := by blaster` is accepted, although the kernel rejects using `u` directly. Even for safe axioms, the dependency is hidden: `#print axioms` shows only `sorryAx`. | `Optimize/Env.lean:1726-1740`; used at `Smt/Translate.lean:47`, `StateMachine/StateMachine.lean:197` | `Cmd_UnsafeAxiom` | yes |
-| 22 | **BMC / k-induction semantics differ from the documented ones.** The docs say `stᵢ₊₁ = next inᵢ stᵢ` with `assumptions inᵢ stᵢ`. The code uses `stₖ = next inₖ stₖ₋₁`, so `in₀` never feeds `next` and `assumptions` constrains the post-state. `#kind` reports `Valid` for an invariant the documented machine violates (checked in Lean with `simp`). Either the code or the docs must change. | `StateMachine/BMC.lean:52-60`, `StateMachine/KInduction.lean:203-208` vs docs `BMC.lean:13-16`, `KInduction.lean:122-133` | `Cmd_SMSem` | yes |
+| 22 | **BMC / k-induction semantics differ from the documented ones.** The docs say `stᵢ₊₁ = next inᵢ stᵢ` with `assumptions inᵢ stᵢ`. The code uses `stₖ = next inₖ stₖ₋₁`, so `in₀` never feeds `next` and `assumptions` constrains the post-state. `#kind` reports `Valid` for an invariant the documented machine violates (checked in Lean with `simp`). Either the code or the docs must change. | `StateMachine/BMC.lean:52-60`, `StateMachine/KInduction.lean:94-97` vs docs `StateMachine/BMC.lean:13-16`, `StateMachine/KInduction.lean:14-23` | `Cmd_SMSem` | yes |
 
 ### Suggested fix directions
 
@@ -107,20 +107,20 @@ Column "main?": does the repro still give a false `Valid` on `origin/main` 585c5
 ## B. Suspected / latent unsoundness (not exploited)
 
 * `andBoolReduction?` returns Prop `False` instead of `Bool.false`, producing ill-typed terms
-  (`OptimizeBoolBinary.lean:72`). Fixed on main (#177), not on staging. `Audit/Explore/Logic_AndBoolPropFalse.lean`.
+  (`OptimizeBoolBinary.lean:26`). Fixed on main (#177), not on staging. `Audit/Explore/Logic_AndBoolPropFalse.lean`.
 * `define-fun-rec` parameters are unguarded Ints, so `g n := if n = 0 then 0 else g (n/2) + 1` yields the
   inconsistent `g(-1) = g(-1) + 1` (`Smt/Translate/Application.lean:507-519`). Z3 looped rather than
   returning unsat in our tests, but this is an inconsistent axiom set.
 * `natModSmt` swaps its operands (`emodSmt op2 op1`, `Smt/Term.lean:338-339`). Currently unused.
 * SMT symbols are quoted as `|…|` without rejecting `|` or `\` (`Smt/Syntax.lean:152-153`). `«a|b»`
   breaks the query, so a crafted name can inject SMT commands.
-* Non-function axioms/opaques get no `@` prefix (`Application.lean:776`), so a user constant named `true`
+* Non-function axioms/opaques get no `@` prefix (`Smt/Translate/Application.lean:776`), so a user constant named `true`
   shadows the SMT literal. `@is<Type>` predicates can collide with user functions named `is<Type>`.
 * `intRelLeftReduce?` returns True for `N + e < e` when `N ≤ 0`, but `N = 0` should give False
   (`OptimizeRelational.lean:27-29`). It is currently masked because `0 + e` is simplified first.
-* `isGenericParam` inspects only the last arg of an application (`Env.lean:1508-1528`). `normLevel` maps
+* `isGenericParam` inspects only the last arg of an application (`Optimize/Env.lean:1508-1528`). `normLevel` maps
   every level param to `1` (`OptimizeConst.lean:19`), losing the `Sort 0` case. `isMatcherCache` is keyed by
-  name only (`Env.lean:1329`).
+  name only (`Optimize/Env.lean:1331`).
 * The funext axiom (fixed in 175c35d) is now sound but over-strong: its premise ranges over all SMT values,
   not only Lean-domain ones.
 * String alphabet mismatch remains even after escaping: Z3 chars go up to 0x2FFFF and include surrogates,
@@ -132,7 +132,7 @@ Repros in `Audit/Crash/`.
 
 * `String.replace` always errors: it checks `args.size != 2` but reads `args[3]!`
   (`OptimizeString.lean:106-112`).
-* `Exists p` with a non-lambda `p` gives `coiExists: lambda expression expected` (`OptimizeExists.lean:166`).
+* `Exists p` with a non-lambda `p` gives `coiExists: lambda expression expected` (`OptimizeExists.lean:20`).
 * `impliesToNeg?` has no Prop guard on the antecedent: `∀ _ : Empty, b` becomes the ill-typed `¬Empty`
   (`OptimizeForAll.lean:56-65`). The same rule would also be semantically wrong.
 * Tactic: `introNP (max currQuantifiers nbQuantifiers)` miscounts when the optimizer drops unused binders,
@@ -148,7 +148,7 @@ Repros in `Audit/Crash/`.
     (`Inductive datatype … not supported: Eq`).
   * Repeated pattern vars cause an index OOB panic at `OptimizeMatch.lean:336`.
   * Char/Fin/UInt8 literal patterns fail with `mkCstLet: unexpected pattern expression`
-    (`NormalizeMatch.lean:245`).
+    (`NormalizeMatch.lean:245-246`).
   * Matching on `Decidable` fails.
   * Function-valued matches yield ill-typed terms or Z3 sort errors.
   * `commonRhs?` returns `7` for an all-`fun _ => 7` match (`OptimizeMatch.lean:410-416`).
@@ -165,9 +165,9 @@ Repros in `Audit/Crash/`.
 * Options and state machine:
   * The `unfold-depth` option is parsed but never read anywhere (`Command/Options.lean:29`).
   * The minimum Z3 version is never checked (`Smt/Env.lean:78-98`).
-  * `solve-result` is ignored by `logNoCexAtDepth`/`logUndeterminedAtDepth` (`StateMachine.lean:110-116`).
+  * `solve-result` is ignored by `logNoCexAtDepth`/`logUndeterminedAtDepth` (`StateMachine/StateMachine.lean:110-117`).
   * `random-seed: 0` means "no seed".
-  * `IO.setNumHeartbeats 0` resets the heartbeat budget of the surrounding declaration (`Tactic.lean:41`).
+  * `IO.setNumHeartbeats 0` resets the heartbeat budget of the surrounding declaration (`Command/Tactic.lean:41`).
 
 ## D. Inefficiencies
 
@@ -176,10 +176,10 @@ Measured ones carry numbers; repros in `Audit/Perf/`.
 | Where | Issue | Evidence |
 |---|---|---|
 | `Optimize/Env.lean:1728` `findLocalAxioms` | Converts the whole environment (~140k constants with core only) to a list on every call. Iterate `env.constants.map₂` (current module) instead. | 63 ms per call; about 70% of a trivial `blaster` call; grows with imports |
-| `OptimizePropBinary.lean:271-276` `optimizeIff` | `p ↔ q` becomes `(p→q) ∧ (q→p)`, duplicating both sides | nested depth 8/12/16: 0.08 s / 0.54 s / 7.9 s |
+| `OptimizePropBinary.lean:159-164` `optimizeIff` | `p ↔ q` becomes `(p→q) ∧ (q→p)`, duplicating both sides | nested depth 8/12/16: 0.08 s / 0.54 s / 7.9 s |
 | `OptimizeEq.lean:13-45` `structEq?` | Unmemoized recursion over shared ctor DAGs | depth 16/20/22: 0.7 s / 10.6 s / 41.7 s (control 0.05 s) |
 | `FunPropagation.lean:127-215`, `OptimizeMatch.lean:189-265` | Each ite/match-valued arg copies the whole application into every branch (2ⁿ) | n=8/12/14/16: 1.2 s / 6 s / 22 s / 88 s |
-| `StateMachine/BMC.lean:60`, `KInduction.lean:206` | States are inlined as growing terms instead of fresh SMT constants per step | query bytes at depth 2/4/6/8: 1.6K / 7.4K / 53K / 596K; time 1.1 s → 18.2 s |
+| `StateMachine/BMC.lean:60`, `StateMachine/KInduction.lean:97` | States are inlined as growing terms instead of fresh SMT constants per step | query bytes at depth 2/4/6/8: 1.6K / 7.4K / 53K / 596K; time 1.1 s → 18.2 s |
 | `Logging/Basic.lean:24-29` | `logSmtQuery` reprints every accumulated command at each depth (quadratic) | — |
 | `Optimize/Env.lean:1489-1501` `getFVarsInExpr` | No visited set (exponential on DAGs); re-infers fvar types at every occurrence | — |
 | `OptimizeStack.lean:72,86` | Local rewrite cache wiped per hypothesis scope / match alternative | — |
