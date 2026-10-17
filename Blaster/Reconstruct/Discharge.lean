@@ -1348,6 +1348,32 @@ syntax (name := blasterStructFacts) "blaster_struct_facts" : tactic
 @[tactic blasterInstHyps] def evalBlasterInstHyps : Tactic := fun _ =>
   liftMetaTactic fun g => return [← instHypsWithSeeds g]
 
+syntax (name := blasterNoMatch) "blaster_nomatch" : tactic
+
+/-- Close the goal by exhibiting an element of an empty type, i.e., `nomatch f default ... default`
+    for a local variable or an axiom `f` occurring in the goal (e.g., `g : Nat → E` with `E` empty).
+-/
+@[tactic blasterNoMatch] def evalBlasterNoMatch : Tactic := fun _ => withMainContext do
+  let env ← getEnv
+  let mut cands : Array Expr := #[]
+  for d in ← getLCtx do
+    if d.isImplementationDetail || (← isProp d.type) then continue
+    cands := cands.push d.toExpr
+  for n in (← instantiateMVars (← getMainTarget)).getUsedConstants do
+    if let some (.axiomInfo _) := env.find? n then cands := cands.push (← mkConstWithFreshMVarLevels n)
+  let s ← saveState
+  for c in cands.extract 0 16 do
+    let arity ← forallTelescopeReducing (← inferType c) fun xs _ => pure xs.size
+    let t ← Term.exprToSyntax c
+    for k in [0:min arity 3 + 1] do
+      let args := Array.replicate k (← `(default))
+      try
+        evalTactic (← `(tactic| exact nomatch ($t $args*)))
+        if (← getGoals).isEmpty then return
+      catch _ => pure ()
+      s.restore
+  throwError "blaster_nomatch: no element of an empty type"
+
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
 -/
@@ -1379,6 +1405,10 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     -- case analysis on the variables `match` applications are stuck on
     ("match cases", ← matchCasesTactic),
     ("exists", ← `(tactic| (intros <;> blaster_denorm <;> blaster_exists))),
+    -- existential goals over types (e.g., `∃ (α : Type) (x : α), α = Nat`)
+    ("exists", ← `(tactic| (intros <;> first | exact ⟨_, rfl⟩ | exact ⟨_, default, rfl⟩ | exact ⟨_, _, rfl⟩))),
+    -- goals valid due to an empty type (e.g., `g : Nat → E` with `E` empty)
+    ("empty", ← `(tactic| (intros <;> blaster_nomatch))),
     -- recursive functions: unfolding equation lemmas (e.g., `f (n + 1) = ...`)
     ("unfold", ← `(tactic| (intros <;> blaster_denorm <;>
         (try blaster_lit_add) <;>
