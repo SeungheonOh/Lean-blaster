@@ -278,6 +278,121 @@ where
     | .mdata _ e | .proj _ _ e => collect e acc
     | _ => acc
 
+syntax (name := blasterWfEval) "blaster_wf_eval" : tactic
+
+/-- Return `true` if `f` is defined by well-founded recursion. -/
+def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
+  if env.contains (f ++ `_unary) then return true
+  let some info := env.find? f | return false
+  let some v := info.value? | return false
+  return v.getUsedConstants.contains ``WellFounded.fix
+
+/-- Evaluation of closed applications of functions defined by well-founded recursion, which the
+    kernel cannot reduce efficiently (i.e., `decide` gets stuck). For each closed application `f a`
+    of such a function (or of a non-recursive user definition calling one), an equation `f a = v` is
+    proved by unfolding the equation lemmas step by step, each `if` condition being decided.
+    The equations are then used to rewrite the main goal (with a case analysis on dependent `match`
+    discriminants), which is finally closed by `rfl` or `decide`.
+-/
+@[tactic blasterWfEval] def evalBlasterWfEval : Tactic := fun _ => withMainContext do
+  let env ← getEnv
+  let target ← instantiateMVars (← getMainTarget)
+  -- well-founded definitions reachable from the goal through (up to 3 levels of) user definitions,
+  -- and the non-recursive user definitions on the way (wrappers)
+  let mut wfs : Array Name := #[]
+  let mut wrappers0 : Array Name := #[]
+  let mut frontier := target.getUsedConstants
+  for _ in [0:3] do
+    let mut next := #[]
+    for n in frontier do
+      if wfs.contains n || wrappers0.contains n then continue
+      if isWellFoundedDef env n then wfs := wfs.push n
+      else if isUserDefinition env n then
+        let some v := (env.find? n).bind (·.value?) | continue
+        wrappers0 := wrappers0.push n
+        next := next ++ v.getUsedConstants
+    frontier := next
+  -- only keep the wrappers leading to a well-founded definition
+  let allWrappers := wrappers0
+  let wrappers := allWrappers.filter fun n =>
+    ((env.find? n).bind (·.value?) |>.map (·.getUsedConstants.any fun m => wfs.contains m || allWrappers.contains m)).getD false
+  if wfs.isEmpty then throwError "blaster_wf_eval: no well-founded definition"
+  let mut step ← `(tactic| fail "no unfolding")
+  for n in wfs do
+    let e := mkIdent (n ++ `eq_1)
+    step ← `(tactic| first
+      | rewrite [$e:ident, if_pos (by decide)] | rewrite [$e:ident, if_neg (by decide)]
+      | rewrite [$e:ident, dif_pos (by decide)] | rewrite [$e:ident, dif_neg (by decide)] | ($step:tactic))
+  let unfoldTac ← `(tactic| repeat ($step:tactic))
+  -- same as `unfoldTac` but on the hypotheses (e.g., after a case analysis on a `match` discriminant)
+  let mut stepAt ← `(tactic| fail "no unfolding")
+  for n in wfs do
+    let e := mkIdent (n ++ `eq_1)
+    stepAt ← `(tactic| first
+      | rewrite [$e:ident, if_pos (by decide)] at * | rewrite [$e:ident, if_neg (by decide)] at *
+      | rewrite [$e:ident, dif_pos (by decide)] at * | rewrite [$e:ident, dif_neg (by decide)] at *
+      | ($stepAt:tactic))
+  let unfoldAtTac ← `(tactic| repeat ($stepAt:tactic))
+  let evalTac ← `(tactic| ($unfoldTac <;> exact rfl))
+  -- unfold the wrappers
+  let wrapperLemmas ← wrappers.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+  if !wrappers.isEmpty then evalTactic (← `(tactic| try simp only [$wrapperLemmas,*] at *))
+  let mut idx := 0
+  let mut done : Array Expr := #[]
+  for _ in [0:6] do
+    if (← getGoals).isEmpty then break
+    let apps ← withMainContext do
+      let mut ts := #[← instantiateMVars (← getMainTarget)]
+      for d in ← getLCtx do
+        if !d.isImplementationDetail then ts := ts.push (← instantiateMVars d.type)
+      let apps := ts.foldl (fun acc t => collect env wfs t acc) #[]
+      return apps.filter (!done.contains ·)
+    if apps.isEmpty then break
+    for app in apps.extract 0 4 do
+      done := done.push app
+      if (← getGoals).isEmpty then break
+      -- prove `app = v` (with `v` assigned by `rfl` after unfolding)
+      let eqn? ← withMainContext do
+        let v ← mkFreshExprMVar (← inferType app)
+        let eqGoal ← mkFreshExprMVar (← mkEq app v)
+        try
+          let gs ← withoutErrToSorry <| Term.withSynthesize <| Tactic.run eqGoal.mvarId! (evalTactic evalTac)
+          let prf ← instantiateMVars eqGoal
+          let v ← instantiateMVars v
+          if !gs.isEmpty || prf.hasMVar || v.hasMVar || prf.hasSorry || v == app then return none
+          return some (← mkEq app v, prf)
+        catch _ => return none
+      let some (eqTy, prf) := eqn? | continue
+      let hName := Name.mkSimple s!"blaster_eval_{idx}"
+      idx := idx + 1
+      let g ← getMainGoal
+      let (_, g') ← (← g.assert hName eqTy prf).intro1P
+      replaceMainGoal [g']
+      evalTactic (← `(tactic| try simp only [$(mkIdent hName):ident] at *))
+  if idx == 0 then throwError "blaster_wf_eval: no evaluation"
+  if (← getGoals).isEmpty then return
+  evalTactic (← `(tactic| first
+    | rfl
+    | decide +kernel +revert
+    | ((repeat' split) <;> (try $unfoldAtTac:tactic) <;> (try simp_all) <;> (try subst_vars) <;>
+        first | done | rfl | decide +kernel +revert)))
+where
+  arity (env : Environment) (n : Name) : Nat :=
+    ((env.find? n).map fun info => info.type.getForallArity).getD 0
+  collect (env : Environment) (fs : Array Name) (e : Expr) (acc : Array Expr) : Array Expr :=
+    let acc := match e.getAppFn with
+      | .const n _ =>
+          if fs.contains n && !e.hasFVar && !e.hasMVar && !e.hasLooseBVars && !acc.contains e
+             && e.getAppNumArgs ≥ arity env n
+          then acc.push e else acc
+      | _ => acc
+    match e with
+    | .app f a => collect env fs a (collect env fs f acc)
+    | .lam _ t b _ | .forallE _ t b _ => collect env fs b (collect env fs t acc)
+    | .letE _ t v b _ => collect env fs b (collect env fs v (collect env fs t acc))
+    | .mdata _ e | .proj _ _ e => collect env fs e acc
+    | _ => acc
+
 syntax (name := blasterNlDiv) "blaster_nl_div" : tactic
 
 /-- Non-linear `Nat` division goals: for each `a / b` in the main goal, add `0 < b`, the division
@@ -655,6 +770,9 @@ def dischargeOne (type : Expr) : TermElabM (Option (Expr × String)) := do
   -- closed obligations (e.g., concrete computations) are decided by kernel evaluation
   if !type.hasFVar && !type.hasMVar then
     if let some prf ← proveWithTactic type (← `(tactic| decide +kernel)) then return some (prf, "decide")
+    -- closed computations involving well-founded recursion
+    if let some prf ← proveWithTactic type (← `(tactic| blaster_wf_eval)) (budget := 4 * dischargeHeartbeats) then
+      return some (prf, "decide")
   -- NOTE: case analysis on (or unfolding of) large `match` expressions requires the generation of
   -- costly auxiliary lemmas (e.g., splitters), which are not subject to the discharge budget.
   let large ← involvesLargeMatch type
