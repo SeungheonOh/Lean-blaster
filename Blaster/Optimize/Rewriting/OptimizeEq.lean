@@ -1,7 +1,7 @@
 import Lean
 import Blaster.Optimize.Hypotheses
 
-open Lean Meta
+open Lean Meta Blaster.Reconstruct
 namespace Blaster.Optimize
 
 /-- Return `some true` if op1 and op2 are constructors that are structurally equivalent modulo
@@ -363,29 +363,72 @@ def optimizeEq (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
  let op1 := args[1]!
  let op2 := args[2]!
  let eqType := args[0]!
+ let lhs ← mkApp3Expr f eqType op1 op2
  if let Expr.const ``False _ := op1 then
     setRestart
-    return ← mkAppExpr (← mkPropNotOp) op2
- if let Expr.const ``True _ := op1 then return op2
- if isNotExprOf op2 op1 || isBoolNotExprOf op2 op1 then return ← mkPropFalse
- if exprEq op1 op2 then return ← mkPropTrue
+    return ← withThm lhs (← mkAppExpr (← mkPropNotOp) op2) ``false_eq' #[op2]
+ if let Expr.const ``True _ := op1 then return ← withThm lhs op2 ``true_eq' #[op2]
+ if isNotExprOf op2 op1 then return ← withThm lhs (← mkPropFalse) ``eq_not_self' #[op1]
+ if isBoolNotExprOf op2 op1 then return ← withThm lhs (← mkPropFalse) ``bool_eq_not_self #[op1]
+ if exprEq op1 op2 then return ← withThm lhs (← mkPropTrue) ``eq_self #[eqType, op1] f.constLevels!
  if let some false ← structEq? op1 op2 then return ← mkPropFalse
- if let some (e1, e2) ← notNegEqSimp? op1 op2 then return ← mkApp3Expr f eqType e1 e2
+ if let some (e1, e2) ← notNegEqSimp? op1 op2 then
+   let r ← mkApp3Expr f eqType e1 e2
+   match op1, boolNot? op2, boolNot? op1 with
+   | Expr.const ``true _, some e, _ => return ← withThm lhs r ``true_eq_not #[e]
+   | Expr.const ``false _, some e, _ => return ← withThm lhs r ``false_eq_not #[e]
+   | _, some b, some a => return ← withThm lhs r ``not_eq_not_bool #[a, b]
+   | _, _, _ =>
+     match propNot? op1, propNot? op2 with
+     | some a, some b => return ← withThm lhs r ``not_eq_not_prop #[a, b]
+     | _, _ => return r
  if let some r ← zeroEqNegReduce? op1 op2 eqType then return r
  if let some r ← intCtorEqReduce? op1 op2 then return r
- if let some r ← natZeroEqMulReduce? op1 op2 then return r
- if let some r ← intZeroEqMulReduce? op1 op2 then return r
+ if let some r ← natZeroEqMulReduce? op1 op2 then
+   if let some (x, y) := natMul? op2 then
+     if let (some hx, some hy) := (← nonZeroNatProof? x, ← nonZeroNatProof? y) then
+       return ← withThm lhs r ``nat_zero_eq_mul #[x, y, hx, hy]
+   return r
+ if let some r ← intZeroEqMulReduce? op1 op2 then
+   if let some (x, y) := intMul? op2 then
+     if let (some hx, some hy) := (← nonZeroIntProof? x, ← nonZeroIntProof? y) then
+       return ← withThm lhs r ``int_zero_eq_mul #[x, y, hx, hy]
+   return r
  if let some r ← addNatEqZeroReduce? op1 op2 then return r
  if let some r ← addIntEqZeroReduce? op1 op2 then return r
  if let some r ← arithEq? op1 op2 then return r
  if let some (e1, e2) ← natAddEqReduce? op1 op2 then return ← mkApp3Expr f eqType e1 e2
  if let some (e1, e2) ← intAddEqReduce? op1 op2 then return ← mkApp3Expr f eqType e1 e2
- if let some (e1, e2) ← natMulEqReduce? op1 op2 then return ← mkApp3Expr f eqType e1 e2
- if let some (e1, e2) ← intMulEqReduce? op1 op2 then return ← mkApp3Expr f eqType e1 e2
+ if let some (e1, e2) ← natMulEqReduce? op1 op2 then
+   let r ← mkApp3Expr f eqType e1 e2
+   if !(← isTracking) then return r
+   return ← withMulCancel lhs r (natMul? op1) (natMul? op2) nonZeroNatProof?
+            #[``nat_mul_cancel_ll, ``nat_mul_cancel_lr, ``nat_mul_cancel_rl, ``nat_mul_cancel_rr]
+ if let some (e1, e2) ← intMulEqReduce? op1 op2 then
+   let r ← mkApp3Expr f eqType e1 e2
+   if !(← isTracking) then return r
+   return ← withMulCancel lhs r (intMul? op1) (intMul? op2) nonZeroIntProof?
+            #[``int_mul_cancel_ll, ``int_mul_cancel_lr, ``int_mul_cancel_rl, ``int_mul_cancel_rr]
  -- no caching at this level as optimizeEq is called by optimizeDecideEq
  mkApp3Expr f eqType op1 op2
 
  where
+   /-- Record the justification of the multiplicative cancellation `lhs ⟶ r` (see `natMulEqReduce?`),
+       with `thms` the cancellation lemmas for each operand configuration (in the order applied by the rule).
+   -/
+   withMulCancel
+     (lhs r : Expr) (m1 m2 : Option (Expr × Expr)) (nonZero : Expr → TranslateEnvT (Option Expr))
+     (thms : Array Name) : TranslateEnvT Expr := do
+     let (some (e1, e2), some (e3, e4)) := (m1, m2) | return r
+     let cases := #[(e1, e3, e2, e4), (e1, e4, e2, e3), (e2, e3, e1, e4), (e2, e4, e1, e3)]
+     for h : i in [:cases.size] do
+       let (x, x', y, z) := cases[i]
+       if exprEq x x' then
+         -- NOTE: stop at the first matching configuration (i.e., the one applied by the rule)
+         let some hx ← nonZero x | return r
+         return ← withThm lhs r thms[i]! #[x, y, z, hx]
+     return r
+
    /- Given `op1` and `op2` corresponding to the operands for `Eq`,
        - When `op1 := Int.neg x` ∧ `op2 := Int.neg y`:
           - return `x = y`
@@ -485,15 +528,20 @@ def optimizeBEq (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
  -- args[3] right operand
  let op1 := args[2]!
  let op2 := args[3]!
+ let lhs ← mkApp4Expr f args[0]! args[1]! op1 op2
  if let Expr.const ``false _ :=  op1 then
    setRestart
-   return ← mkAppExpr (← mkBoolNotOp) op2
- if let Expr.const ``true _ := op1 then return op2
- if isBoolNotExprOf op2 op1 then return (←  mkBoolFalse)
- if exprEq op1 op2 then return (← mkBoolTrue)
+   return ← withThm lhs (← mkAppExpr (← mkBoolNotOp) op2) ``bool_false_beq #[op2]
+ if let Expr.const ``true _ := op1 then return ← withThm lhs op2 ``bool_true_beq #[op2]
+ if isBoolNotExprOf op2 op1 then return ← withThm lhs (←  mkBoolFalse) ``bool_beq_not_self #[op1]
+ if exprEq op1 op2 then
+   return ← withProofM lhs (← mkBoolTrue) (mkAppOptM ``beq_self' #[args[0]!, args[1]!, none, op1])
  if let some false ← structEq? op1 op2 then return (← mkBoolFalse)
- if let some r ← boolNotEqReduce? op1 op2 then return r
- mkApp4Expr f args[0]! args[1]! op1 op2
+ if let some r ← boolNotEqReduce? op1 op2 then
+   if let (some a, some b) := (boolNot? op1, boolNot? op2) then
+     return ← withThm lhs r ``bool_not_beq_not #[a, b]
+   return r
+ return lhs
 
  where
    /-- Given `op1` and `op2` corresponding to the operands for `BEq.beq`,
@@ -565,19 +613,27 @@ def optimizeDecideEq (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
     match isBoolValue? op1 with
     | some bv =>
       match (← isBeqCompatibleType? op2) with
-      | some (beq_sort, _, beq_op1, beq_op2) =>
+      | some (beq_sort, beq_inst, beq_op1, beq_op2) =>
           let eqExpr ← mkApp3Expr f beq_sort beq_op1 beq_op2
           setRestart
+          let lhs ← mkApp3Expr f (← mkBoolType) op1 op2
           if bv
-          then return eqExpr -- return when bv = true
-          else mkAppExpr (← mkPropNotOp) eqExpr
+          then -- return when bv = true
+            return some (← withProofM lhs eqExpr
+              (mkAppOptM ``true_eq_beq #[beq_sort, beq_inst, none, beq_op1, beq_op2]))
+          else
+            return some (← withProofM lhs (← mkAppExpr (← mkPropNotOp) eqExpr)
+              (mkAppOptM ``false_eq_beq #[beq_sort, beq_inst, none, beq_op1, beq_op2]))
       | _ => return none
     | none =>
+       let lhs ← mkApp3Expr f (← mkBoolType) op1 op2
        match (← isBeqCompatibleType? op1), (← isBeqCompatibleType? op2) with
-         | some (beq_sort, _, beq_op1, beq_op2), _ =>
-             mkBeqToEq beq_sort beq_op1 beq_op2 op2
-         | _, some (beq_sort, _, beq_op1, beq_op2) =>
-             mkBeqToEq beq_sort beq_op1 beq_op2 op1
+         | some (beq_sort, beq_inst, beq_op1, beq_op2), _ =>
+             let r ← mkBeqToEq beq_sort beq_op1 beq_op2 op2
+             withProofM lhs r (mkAppOptM ``beq_eq_bool #[beq_sort, beq_inst, none, op2, beq_op1, beq_op2])
+         | _, some (beq_sort, beq_inst, beq_op1, beq_op2) =>
+             let r ← mkBeqToEq beq_sort beq_op1 beq_op2 op1
+             withProofM lhs r (mkAppOptM ``bool_eq_beq #[beq_sort, beq_inst, none, op1, beq_op1, beq_op2])
          | _, _ => return none
 
    /- Given `op1` and `op2` corresponding to the operands for `Eq`,
@@ -591,7 +647,14 @@ def optimizeDecideEq (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
        match isBoolValue? a_op1, isBoolValue? b_op1 with
        | some bv1, some bv2 => do
            setRestart
-           mkApp3Expr f eq_sort (← toBoolNotExpr bv1 a_op2) (← toBoolNotExpr bv2 b_op2)
+           let r ← mkApp3Expr f eq_sort (← toBoolNotExpr bv1 a_op2) (← toBoolNotExpr bv2 b_op2)
+           if !isBoolType eq_sort then return r
+           let thm := match bv1, bv2 with
+             | true, true => ``bool_eq_bool_eq_tt
+             | true, false => ``bool_eq_bool_eq_tf
+             | false, true => ``bool_eq_bool_eq_ft
+             | false, false => ``bool_eq_bool_eq_ff
+           withThm (← mkApp3Expr f (← mkPropType) op1 op2) r thm #[a_op2, b_op2]
        | _, _ => return none
     | _, _ => return none
 
@@ -601,11 +664,12 @@ def optimizeDecideEq (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
       Otherwise `none`.
    -/
    decideBoolEqSimp? (op1: Expr) (op2 : Expr) : TranslateEnvT (Option Expr) := do
+    let lhs ← mkApp3Expr f (← mkBoolType) op1 op2
     match op1, decide'? op2 with
-    | Expr.const ``true _, some e => return some e -- no need to restart
+    | Expr.const ``true _, some e => return some (← withThm lhs e ``true_eq_decide' #[e]) -- no need to restart
     | Expr.const ``false _, some e =>
          setRestart
-         mkAppExpr (← mkPropNotOp) e
+         return some (← withThm lhs (← mkAppExpr (← mkPropNotOp) e) ``false_eq_decide' #[e])
     | _, _ => return none
 
    /- Given `op1` and `op2` corresponding to the operands for `Eq`,
@@ -615,16 +679,19 @@ def optimizeDecideEq (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
       Otherwise `none`.
    -/
    decideEqDecide? (op1: Expr) (op2 : Expr) : TranslateEnvT (Option Expr) := do
+     let lhs ← mkApp3Expr f (← mkBoolType) op1 op2
      match decide'? op1, decide'? op2 with
      | some e1, some e2 =>
           setRestart
-          mkApp3Expr f (← mkPropType) e1 e2
+          return some (← withThm lhs (← mkApp3Expr f (← mkPropType) e1 e2) ``decide'_eq_decide' #[e1, e2])
      | some e1, _ =>
           setRestart
-          mkApp3Expr f (← mkPropType) e1 (← mkApp3Expr f (← mkBoolType) (← mkBoolTrue) op2)
+          let r ← mkApp3Expr f (← mkPropType) e1 (← mkApp3Expr f (← mkBoolType) (← mkBoolTrue) op2)
+          return some (← withThm lhs r ``decide'_eq_bool #[e1, op2])
      | _, some e1 =>
           setRestart
-          mkApp3Expr f (← mkPropType) e1 (← mkApp3Expr f (← mkBoolType) (← mkBoolTrue) op1)
+          let r ← mkApp3Expr f (← mkPropType) e1 (← mkApp3Expr f (← mkBoolType) (← mkBoolTrue) op1)
+          return some (← withThm lhs r ``bool_eq_decide' #[e1, op1])
      | _, _ => return none
 
 

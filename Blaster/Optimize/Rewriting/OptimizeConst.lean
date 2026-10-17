@@ -1,7 +1,7 @@
 import Lean
 import Blaster.Optimize.Rewriting.OptimizeApp
 
-open Lean Meta Elab
+open Lean Meta Elab Blaster.Reconstruct
 
 namespace Blaster.Optimize
 
@@ -108,17 +108,21 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
   match e with
   | Expr.const n l =>
       match n with
-      | ``Nat.zero => stackContinuity stack (← mkNatLitExpr 0)
+      | ``Nat.zero => stackContinuity stack (← mkNatLitExpr 0) (← defEqStep)
       | _ =>
         if (← isPartialDef n) then throwEnvError "normConst: partial function not supported {n} !!!"
         if (← isUnsafeDef n) then throwEnvError "normConst: unsafe definition not supported {n} !!!"
         if let some r ← isToNormOpaqueFun n then return r
-        let e' ← normConstLevel n l
-        if (← isCtorName n) then return ← stackContinuity stack e'
-        if let some r ← isHOF n e' then return r
+        -- NOTE: universe levels are not normalized when tracking proof terms (see `Expr.sort` case)
+        let e' ← if (← isTracking) then pure e else normConstLevel n l
+        -- NOTE: level normalization is not an equivalence preserving rewrite when `l` contains level parameters.
+        let pf ← normLevelStep e'
+        if (← isCtorName n) then return ← stackContinuity stack e' pf
+        if let some r ← isHOF n e' pf then return r
         if (← isResolvableType e')
-        then stackContinuity stack (← resolveTypeAbbrev e')
-        else stackContinuity stack e'
+        -- NOTE: type abbreviation resolution is a definitional step.
+        then stackContinuity stack (← resolveTypeAbbrev e') pf
+        else stackContinuity stack e' pf
 
   | _ => throwEnvError "normConst: name expression expected but got {reprStr e}"
 
@@ -130,6 +134,26 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
       -- reuse the original node when levels are unchanged (avoids allocating
       -- a fresh const just to probe the hash-cons cache)
       if levelsEq ls xs then mkExpr e else mkExpr (Expr.const n ls)
+
+    @[always_inline, inline]
+    normLevelStep (e' : Expr) : TranslateEnvT EqPf := do
+      if !(← isTracking) then return .unknown
+      clearSteps
+      ruleStep e e' "normLevel"
+
+    /-- Return evidence for rewriting `e` to `r` with an optional justification lemma `thm`. -/
+    @[always_inline, inline]
+    constStep (r : Expr) (label : String) (thm : Option Expr := none) : TranslateEnvT EqPf := do
+      if !(← isTracking) then return .unknown
+      clearSteps
+      if let some p := thm then recordStep e r p
+      ruleStep e r label
+
+    /-- Same as `stackContinuity` but with evidence for rewriting `e` to `r`. -/
+    @[always_inline, inline]
+    constContinuity (r : Expr) (label : String) (thm : Option Expr := none)
+      (skipCache := false) : TranslateEnvT OptimizeContinuity := do
+      stackContinuity stack r (← constStep r label thm) skipCache
 
     /-- Apply the following normalization rules on opaque functions:
          - Nat.pred ==> λ n => n - 1
@@ -149,19 +173,19 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
      | ``Nat.pred =>
            let body ← mkApp2Expr (← mkNatSubOp) (← mkBVarExpr 0) (← mkNatLitExpr 1)
            let lam ← mkLambdaExpr (← Term.mkFreshBinderName) BinderInfo.default (← mkNatType) body
-           stackContinuity stack lam
+           constContinuity lam "Nat.pred" (some (mkConst ``Blaster.Reconstruct.nat_pred_eq))
 
      | ``Nat.succ =>
            let body ← mkApp2Expr (← mkNatAddOp) (← mkNatLitExpr 1) (← mkBVarExpr 0)
            let lam ← mkLambdaExpr (← Term.mkFreshBinderName) BinderInfo.default (← mkNatType) body
-           stackContinuity stack lam
+           constContinuity lam "Nat.succ" (some (mkConst ``Blaster.Reconstruct.nat_succ_eq))
 
      | ``Nat.le =>
           let ltExpr ← mkApp2Expr (← mkNatLtOp) (← mkBVarExpr 0) (← mkBVarExpr 1)
           let notExpr ← mkAppExpr (← mkPropNotOp) ltExpr
           let lam1 ← mkLambdaExpr `y BinderInfo.default (← mkNatType) notExpr
           let lam2 ← mkLambdaExpr `x BinderInfo.default (← mkNatType) lam1
-          stackContinuity stack lam2
+          constContinuity lam2 "Nat.le" (some (mkConst ``Blaster.Reconstruct.nat_le_fun_eq_not_lt))
 
      | ``Nat.ble =>
            if (← isOptimizeRecCall) then
@@ -169,16 +193,16 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
              let body ← mkAppExpr (← mkBlasterDecideConst) leExpr
              let lam1 ← mkLambdaExpr (← Term.mkFreshBinderName) BinderInfo.default (← mkNatType) body
              let lam2 ← mkLambdaExpr (← Term.mkFreshBinderName) BinderInfo.default (← mkNatType) lam1
-             stackContinuity stack lam2
-           else stackContinuity stack (skipCache := true) e -- don't catch
+             constContinuity lam2 "Nat.ble" (some (mkConst ``Blaster.Reconstruct.nat_ble_fun_eq_not_lt))
+           else stackContinuity stack (skipCache := true) e .defeq -- don't catch
 
      | ``Nat.beq =>
            if (← isOptimizeRecCall) then
              let body ← mkApp2Expr (← mkNatBEqOp) (← mkBVarExpr 1) (← mkBVarExpr 0)
              let lam1 ← mkLambdaExpr (← Term.mkFreshBinderName) BinderInfo.default (← mkNatType) body
              let lam2 ← mkLambdaExpr (← Term.mkFreshBinderName) BinderInfo.default (← mkNatType) lam1
-             stackContinuity stack lam2
-           else stackContinuity stack (skipCache := true) e -- don't catch
+             constContinuity lam2 "Nat.beq" (some (mkConst ``Blaster.Reconstruct.nat_beq_eq))
+           else stackContinuity stack (skipCache := true) e .defeq -- don't catch
 
      | ``Int.negSucc =>
              if !(← isInFunApp) then
@@ -186,15 +210,16 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
                let intExpr ← mkAppExpr (← mkIntOfNat) addExpr
                let body ← mkAppExpr (← mkIntNegOp) intExpr
                let lam ← mkLambdaExpr (← Term.mkFreshBinderName) BinderInfo.default (← mkNatType) body
-               stackContinuity stack (skipCache := true) lam -- don't catch
-             else stackContinuity stack (skipCache := true) (← mkIntNegSucc) -- don't catch
+               constContinuity (skipCache := true) lam "Int.negSucc"
+                 (some (mkConst ``Blaster.Reconstruct.int_negSucc_eq)) -- don't catch
+             else stackContinuity stack (skipCache := true) (← mkIntNegSucc) .defeq -- don't catch
 
      | ``Int.le =>
           let ltExpr ← mkApp2Expr (← mkIntLtOp) (← mkBVarExpr 0) (← mkBVarExpr 1)
           let notExpr ← mkAppExpr (← mkPropNotOp) ltExpr
           let lam1 ← mkLambdaExpr `y BinderInfo.default (← mkIntType) notExpr
           let lam2 ← mkLambdaExpr `x BinderInfo.default (← mkIntType) lam1
-          stackContinuity stack lam2
+          constContinuity lam2 "Int.le" (some (mkConst ``Blaster.Reconstruct.int_le_fun_eq_not_lt))
 
      | ``ite =>
           let hName ← Term.mkFreshBinderName
@@ -202,41 +227,44 @@ def normConst (e : Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeCo
             let thenExpr ← mkLambdaExpr hName BinderInfo.default xs[1]! xs[3]!
             let notCond ← mkAppExpr (← mkPropNotOp) xs[1]!
             let elseExpr ← mkLambdaExpr hName BinderInfo.default notCond xs[4]!
-            let appExpr ← mkApp4Expr (← mkBlasterDIteOp) xs[0]! xs[1]! thenExpr elseExpr
+            let appExpr ← mkBlasterDIteApp xs[0]! xs[1]! thenExpr elseExpr
             let lam ← mkLambdaFVarsExpr xs appExpr
-            stackContinuity stack lam
+            constContinuity lam "ite" (some (mkConst ``Blaster.ite_to_dite'_equiv e.constLevels!))
 
      | ``dite =>
          forallTelescope (← inferTypeEnv e) fun xs _ => do
-           let appExpr ← mkApp4Expr (← mkBlasterDIteOp) xs[0]! xs[1]! xs[3]! xs[4]!
+           let appExpr ← mkBlasterDIteApp xs[0]! xs[1]! xs[3]! xs[4]!
            let lam ← mkLambdaFVarsExpr xs appExpr
-           stackContinuity stack lam
+           constContinuity lam "dite" (some (mkConst ``Blaster.dite_equiv e.constLevels!))
 
      | ``Decidable.decide =>
           forallTelescope (← inferTypeEnv e) fun xs _ => do
             let appExpr ← mkAppExpr (← mkBlasterDecideConst) xs[0]!
             let lam ← mkLambdaFVarsExpr xs appExpr
-            stackContinuity stack lam
+            constContinuity lam "decide" (some (mkConst ``Blaster.decide'_equiv))
 
      | _ => return none
 
     @[always_inline, inline]
-    isHOF (f : Name) (e : Expr) : TranslateEnvT (Option OptimizeContinuity) := do
+    isHOF (f : Name) (e : Expr) (pf : EqPf) : TranslateEnvT (Option OptimizeContinuity) := do
       if (← isNotFun e) then return none
       if (← hasImplicitArgs e) then return none
       if (← isInFunApp) then
         if (← isNotFoldable e #[]) then return none
         if let some fbody ← getFunBody e then
           -- don't catch we may not optimize lambda body when e appear as an parameter afterwards
-          stackContinuity stack (skipCache := true) fbody
+          -- NOTE: unfolding a non-recursive definition is a definitional step.
+          stackContinuity stack (skipCache := true) fbody pf
         else return none
       else
         if (← isRecursiveFun f) then
-          return (some $ ← normRecFun e #[] e stack)
+          let stack' ← pushPf pf e stack
+          return (some $ ← normRecFun e #[] e stack')
         if (← isNotFoldable e #[]) then return none
         -- non recursive function case
         if let some fbody ← getFunBody e then
-          return (some $ Sum.inl $ .InitOptimizeExpr fbody :: stack)
+          -- NOTE: unfolding a non-recursive definition is a definitional step.
+          return (some $ Sum.inl $ (← pushTrans fbody pf stack))
         else return none
 
 /-- Given a ctor application `C x₁ ... xₙ`,

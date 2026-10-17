@@ -405,7 +405,7 @@ def normMatchExprAux?
      let lam1 ← mkLambdaExpr hName BinderInfo.default condTerm thenExpr
      let notCond ← mkAppExpr (← mkPropNotOp) condTerm
      let lam2 ← mkLambdaExpr hName BinderInfo.default notCond elseExpr
-     mkApp4Expr (← mkBlasterDIteOp) (getLambdaBody matchType) condTerm lam1 lam2
+     mkBlasterDIteApp (getLambdaBody matchType) condTerm lam1 lam2
 
 /-- Instantiating Heq match equation in provided rhs parameters  -/
 partial def assignEqRefl (mInfo : MatchInfo) (rhs_params : Array Expr) (margs : Array Expr) : TranslateEnvT (Array Expr) := do

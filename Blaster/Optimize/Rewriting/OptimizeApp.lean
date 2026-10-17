@@ -12,7 +12,7 @@ import Blaster.Optimize.Rewriting.OptimizeString
 import Blaster.Optimize.Rewriting.OptimizeList
 import Blaster.Optimize.OptimizeStack
 
-open Lean Meta
+open Lean Meta Blaster.Reconstruct
 
 namespace Blaster.Optimize
 
@@ -49,12 +49,20 @@ def reduceApp? (f : Expr) (args : Array Expr) : TranslateEnvT (Option BetaLambda
      betaLambdaEnv fbody auxFun.getAppArgs
 
    isFunRecReduction? (f : Expr) (args : Array Expr) : TranslateEnvT (Option BetaLambdaResult) := do
-     let Expr.const n _ := f | return none
+     let Expr.const n l := f | return none
      if !(← isRecursiveFun n) then return none
      if !(← allExplicitParamsAreCtor f args) then return none
      let some fbody ← getFunBody f
        | throwEnvError "reduceApp?: recursive function body expected for {reprStr f}"
-     betaLambdaEnv fbody args
+     let res ← betaLambdaEnv fbody args
+     if ← isTracking then
+       -- justification: the unfolding equation theorem of `f` (see `getFunBody`)
+       discard <| withProofM (← mkAppNExpr f args) res.betaReduced do
+         let some eqThm ← getUnfoldEqnFor? n | throwError "unfolding equation expected for {n}"
+         let nbParams := (← getConstEnvInfo eqThm).type.getForallBinderNames.length
+         let p := mkAppN (mkConst eqThm l) (args.extract 0 nbParams)
+         (args.extract nbParams args.size).foldlM (init := p) fun acc a => mkCongrFun acc a
+     return res
 
 /-- Perform constant propagation and apply simplification and normalization rules
     on application expressions.
@@ -98,21 +106,25 @@ def optimizeAppAux (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
 def finalizeRecApp
      (uf rf : Expr) (uargs : Array Expr)
      (params : ImplicitParameters) (xs : List OptimizeStack) : TranslateEnvT OptimizeContinuity := do
+     -- NOTE: when tracking proof terms, the replacement of `uf uargs` with an equivalent application
+     -- is justified by the equivalence of the corresponding recursive functions (see `recFunEquivs`).
+     let lhs ← mkAppNExpr uf uargs
      if params.isEmpty then
-       return ← stackContinuity xs rf
+       return ← recContinuity lhs rf xs
      if exprEq uf rf then
        -- case for when same recursive call
        -- trace[Optimize.recFun.app] "same recursive call case {reprStr rf} {reprStr uargs}"
        if rf.isConst then
-         stackContinuity xs (← mkAppNExpr rf uargs)
+         recContinuity lhs (← mkAppNExpr rf uargs) xs
        else -- polyomrphic case: we need to remove the generic parameters
          let auxApp ← betaLambdaShared rf (← getEffectiveParams params)
-         stackContinuity xs auxApp
+         recContinuity lhs auxApp xs
      else if rf.isConst then
          -- case when a polymorphic/non-polymorphic function is equivalent to another non-polymorphic one
          let eargs := Array.filterMap (λ p => if !p.isInstance then some p.effectiveArg else none) params
          -- trace[Optimize.recFun.app] "non-polymorphic equivalent case {reprStr rf} {reprStr eargs}"
-         isEquivOpaqueFun rf (← mkAppNExpr rf eargs) xs
+         let e ← mkAppNExpr rf eargs
+         isEquivOpaqueFun rf e (← recStep lhs e xs)
      else
        let auxApp ← betaLambdaShared rf (← getEffectiveParams params)
        if auxApp.isLambda then
@@ -120,10 +132,11 @@ def finalizeRecApp
          let appCall := getLambdaBody auxApp
          let (f, largs) := getAppFnWithArgs appCall
          -- trace[Optimize.recFun.app] "partially applied case {reprStr appCall.getAppFn'} {reprStr largs[0:largs.size-auxApp.getNumHeadLambdas]}"
-         isEquivOpaqueFun f (← mkAppNExpr f (largs.take (largs.size-auxApp.getNumHeadLambdas))) xs
+         let e ← mkAppNExpr f (largs.take (largs.size-auxApp.getNumHeadLambdas))
+         isEquivOpaqueFun f e (← recStep lhs e xs)
        else
          -- trace[Optimize.recFun.app] "polymorphic equivalent case {reprStr auxApp.getAppFn'} {reprStr auxApp.getAppArgs}"
-         isEquivOpaqueFun auxApp.getAppFn auxApp xs
+         isEquivOpaqueFun auxApp.getAppFn auxApp (← recStep lhs auxApp xs)
  where
    isEquivOpaqueFun (f : Expr) (e : Expr) (xs : List OptimizeStack) : TranslateEnvT OptimizeContinuity := do
      let isOpaqueRecFun (f : Expr) : Bool :=
@@ -134,7 +147,16 @@ def finalizeRecApp
          | _ => false
      if isOpaqueRecFun f then
        return Sum.inl (.InitOptimizeExpr e :: xs)
-     else stackContinuity xs e
+     else stackContinuity xs e .defeq
+
+   /-- Push the evidence for replacing `lhs` with the equivalent application `e` (only when tracking proof terms). -/
+   recStep (lhs e : Expr) (xs : List OptimizeStack) : TranslateEnvT (List OptimizeStack) := do
+     if !(← isTracking) || exprEq lhs e || lhs == e then return xs
+     clearSteps
+     return .TransWith (← ruleStep lhs e "recFunEquiv") e false :: xs
+
+   recContinuity (lhs e : Expr) (xs : List OptimizeStack) : TranslateEnvT OptimizeContinuity := do
+     stackContinuity (← recStep lhs e xs) e .defeq
 
 /-- Given application `f x₁ ... xₙ` perform the following:
     - when `f` corresponds to a recursive definition `λ p₁ ... pₙ → body` the following actions are performed:
@@ -238,18 +260,24 @@ def normRecFun (uf : Expr) (uargs : Array Expr) (appExpr : Expr) (xs : List Opti
 -/
 def optimizeApp
   (f : Expr) (args: Array Expr) (stack : List OptimizeStack) : TranslateEnvT OptimizeContinuity := do
+  clearSteps
   let e ← optimizeAppAux f args
+  let step ← if (← isTracking) then ruleStep (← mkAppNExpr f args) e "optimizeApp" else pure .unknown
   if ← isRestart then
     resetRestart
-    return Sum.inl (.InitOptimizeExpr e :: stack)
+    return Sum.inl (← pushTrans e step stack)
   else
     if e.isApp then
        let (f', args') := getAppFnWithArgs e
-       if let some r ← funPropagation? f' args' (← isAppArg) then return Sum.inl (r :: stack)
+       clearSteps
+       if let some r ← funPropagation? f' args' (← isAppArg) then
+         return Sum.inl (← pushRuleFrame e r "funPropagation" step stack)
        -- try to reduce app if all params are constructors
-       if let some be ← reduceApp? f' args' then return Sum.inl (.InitOptimizeExpr be.betaReduced be.prevMVarIdDecls :: stack)
-       normRecFun f' args' e stack
-    else stackContinuity stack e -- proceed with continuity
+       clearSteps
+       if let some be ← reduceApp? f' args' then
+         return Sum.inl (← pushRuleFrame e (.InitOptimizeExpr be.betaReduced be.prevMVarIdDecls) "reduceApp" step stack)
+       normRecFun f' args' e (← pushPf step e stack)
+    else stackContinuity stack e step -- proceed with continuity
 
   where
     @[always_inline, inline]

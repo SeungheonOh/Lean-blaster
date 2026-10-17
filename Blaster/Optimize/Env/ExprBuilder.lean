@@ -120,6 +120,22 @@ def mkEqOp : TranslateEnvT Expr :=
 def mkBlasterDIteOp : TranslateEnvT Expr :=
   return (← get).optEnv.memCache.commonExpr.blasterDite
 
+/-- Return the `Blaster.dite'` operator for sort `α`. The universe level of `Blaster.dite'` is `1` (i.e.,
+    universe levels are normalized), except when tracking proof terms, where it is the actual universe level of `α`.
+-/
+def mkBlasterDIteOpFor (α : Expr) : TranslateEnvT Expr := do
+  if (← get).recon.tracking && !α.hasLooseBVars then
+    try
+      let u ← instantiateLevelMVars (← getLevel α)
+      if u.normalize != levelOne then
+        return ← mkExpr (mkConst ``Blaster.dite' [u.normalize])
+    catch _ => pure ()
+  mkBlasterDIteOp
+
+/-- Return `Blaster.dite' α c t e` (see `mkBlasterDIteOpFor`). -/
+def mkBlasterDIteApp (α c t e : Expr) : TranslateEnvT Expr := do
+  mkExpr (mkApp4 (← mkBlasterDIteOpFor α) α c t e)
+
 
 /-- Return `LE.le` operator and cache result. -/
 def mkLeOp : TranslateEnvT Expr :=

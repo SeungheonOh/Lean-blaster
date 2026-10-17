@@ -48,32 +48,60 @@ partial def translateExpr (e : Expr) (topLevel := true) : TranslateEnvT SmtTerm 
      | Expr.sort _ => throwEnvError "translateExpr: unexpected sort type {reprStr e}" -- sort type are handled elsewhere
   visit e topLevel
 
-def Translate.main (e : Expr) (logUndetermined := true) : TranslateEnvT (Result × Expr) := do
-  -- set start local context
-  updateLocalContext (← mkLocalContext)
-  let e ← addAxioms (← toPropExpr e) (← findLocalAxioms)
-  let optExpr ← profileTask "Optimization" $ Optimize.mainAux e (applyHashCons := false)
-  trace[Translate.optExpr] "optimized expression: {← ppExpr optExpr}"
-  match (toResult optExpr) with
-  | res@(.Undetermined) =>
-      if (← get).optEnv.options.solverOptions.onlyOptimize then
-        if logUndetermined then logResult res
-        return (res, optExpr)
-      else
-        -- set backend solver
-        setBlasterProcess
-        let st ← profileTask "Translation" $ translateExpr optExpr
-        -- assert negation for check sat
-        profileTask "Submitting Smt Query" $ assertTerm (notSmt st)
-        -- dump smt commands submitted to backend solver when `dumpSmtLib` option is set.
-        logSmtQuery
-        let res ← profileTask "Solve" checkSat
-        if !isUndeterminedResult res || logUndetermined then logResult res
-        discard $ exitSmt
-        return (res, optExpr)
-  | res =>
-     logResult res
-     return (res, optExpr)
+/-- Same as `Translate.main` but also returns the information required to reconstruct a proof
+    when the result is `Valid` and proof reconstruction is activated.
+-/
+def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
+  TranslateEnvT (Result × Expr × Option Reconstruct.ReconTask) := do
+    -- set start local context
+    updateLocalContext (← mkLocalContext)
+    let goal ← toPropExpr e
+    let axioms ← findLocalAxiomDecls
+    let e' ← addAxioms goal (axioms.map Prod.snd)
+    -- NOTE: the verdict is always computed without tracking proof terms, such that proof
+    -- reconstruction never alters Blaster's behavior.
+    let (optExpr, _) ← profileTask "Optimization" $ Optimize.mainPf e' (track := false) (applyHashCons := false)
+    trace[Translate.optExpr] "optimized expression: {← ppExpr optExpr}"
+    let sOpts := (← get).optEnv.options.solverOptions
+    let mkTask (bySmt : Bool) : TranslateEnvT (Option Reconstruct.ReconTask) := do
+      if sOpts.reconstruct == 0 then return none
+      -- proof run: optimize again while tracking proof terms (see `Blaster.Reconstruct`)
+      let proofEnv := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
+      let r ← (do
+        let s ← Meta.saveState
+        tryCatchRuntimeEx
+          (some <$> (Optimize.mainPf e' (track := true) (applyHashCons := false)).run proofEnv)
+          (fun _ => do s.restore; return none) : MetaM _)
+      match r with
+      | some ((optExprP, optPf), envP) =>
+          return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr := optExprP, optPf,
+                        bySmt, recon := envP.recon }
+      | none =>
+          return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr, optPf := .unknown, bySmt }
+    match (toResult optExpr) with
+    | res@(.Undetermined) =>
+        if (← get).optEnv.options.solverOptions.onlyOptimize then
+          if logUndetermined then logResult res
+          return (res, optExpr, none)
+        else
+          -- set backend solver
+          setBlasterProcess
+          let st ← profileTask "Translation" $ translateExpr optExpr
+          -- assert negation for check sat
+          profileTask "Submitting Smt Query" $ assertTerm (notSmt st)
+          -- dump smt commands submitted to backend solver when `dumpSmtLib` option is set.
+          logSmtQuery
+          let res ← profileTask "Solve" checkSat
+          if !isUndeterminedResult res || logUndetermined then logResult res
+          discard $ exitSmt
+          match res with
+          | .Valid => return (res, optExpr, ← mkTask true)
+          | _ => return (res, optExpr, none)
+    | res =>
+       logResult res
+       match res with
+       | .Valid => return (res, optExpr, ← mkTask false)
+       | _ => return (res, optExpr, none)
 
   where
     isTheoremExpr (e : Expr) : TranslateEnvT (Option Expr) := do
@@ -94,6 +122,10 @@ def Translate.main (e : Expr) (logUndetermined := true) : TranslateEnvT (Result 
       | [] => return e
       | a :: tl =>
          addAxioms (← mkForallExpr (← Term.mkFreshBinderName) BinderInfo.default (← hashcons a) e) tl
+
+def Translate.main (e : Expr) (logUndetermined := true) : TranslateEnvT (Result × Expr) := do
+  let (res, optExpr, _) ← Translate.mainWithTask e logUndetermined
+  return (res, optExpr)
 
 def command (sOpts: BlasterOptions) (stx : Syntax) : TermElabM Unit := do
    withRef stx do

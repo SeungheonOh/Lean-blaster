@@ -624,4 +624,46 @@ def backwardProof (p : Expr) : TranslateEnvT Expr := do
   hashcons (← mkSorry p false)
 
 
+/-- Return a proof of `¬ (0 = e)` for `e : Nat` when `nonZeroNatInHyps e` holds
+    (used for proof reconstruction, see `Blaster.Reconstruct`).
+-/
+def nonZeroNatProof? (e : Expr) : TranslateEnvT (Option Expr) := do
+ match isNatValue? e with
+ | .some 0 => return none
+ | .some _ =>
+     return mkApp2 (mkConst ``Blaster.Reconstruct.nat_ne_zero_of_lit) e
+              (mkApp2 (mkConst ``Eq.refl [levelOne]) (mkConst ``Bool) (mkConst ``false))
+ | .none =>
+     let zero_nat ← mkNatLitExpr 0
+     let zero_lt ← mkNatLtExpr zero_nat e
+     if let some p := (← hypMapFind? zero_lt) then
+       if let some p ← Blaster.Reconstruct.hypProof? zero_lt p then
+         return mkApp2 (mkConst ``Blaster.Reconstruct.nat_ne_zero_of_pos) e p
+     let not_zero_eq ← mkAppExpr (← mkPropNotOp) (← mkNatEqExpr zero_nat e)
+     if let some p := (← hypMapFind? not_zero_eq) then return ← Blaster.Reconstruct.hypProof? not_zero_eq p
+     return none
+
+/-- Return a proof of `¬ (0 = e)` for `e : Int` when `nonZeroIntInHyps e` holds
+    (used for proof reconstruction, see `Blaster.Reconstruct`).
+-/
+def nonZeroIntProof? (e : Expr) : TranslateEnvT (Option Expr) := do
+ match isIntValue? e with
+ | .some (.ofNat 0) => return none
+ | .some _ =>
+     return mkApp2 (mkConst ``Blaster.Reconstruct.int_ne_zero_of_lit) e
+              (mkApp2 (mkConst ``Eq.refl [levelOne]) (mkConst ``Bool) (mkConst ``false))
+ | .none =>
+     let zero_int ← mkIntLitExpr (Int.ofNat 0)
+     let zero_lt ← mkIntLtExpr zero_int e
+     if let some p := (← hypMapFind? zero_lt) then
+       if let some p ← Blaster.Reconstruct.hypProof? zero_lt p then
+         return mkApp2 (mkConst ``Blaster.Reconstruct.int_ne_zero_of_pos) e p
+     let lt_zero ← mkIntLtExpr e zero_int
+     if let some p := (← hypMapFind? lt_zero) then
+       if let some p ← Blaster.Reconstruct.hypProof? lt_zero p then
+         return mkApp2 (mkConst ``Blaster.Reconstruct.int_ne_zero_of_neg) e p
+     let not_zero_eq ← mkAppExpr (← mkPropNotOp) (← mkIntEqExpr zero_int e)
+     if let some p := (← hypMapFind? not_zero_eq) then return ← Blaster.Reconstruct.hypProof? not_zero_eq p
+     return none
+
 end Blaster.Optimize

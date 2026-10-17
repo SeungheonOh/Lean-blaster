@@ -50,7 +50,11 @@ def normChoiceApplication?
       -- NOTE: We expect that the ite sort is of form ∀ α₀ → ... → αₙ to avoid type inference,
       -- which is costly.
       let dite_args := dite_args.set! 0 (args[0]!.getForallBodyMaxDepth (args.size - 4))
-      return some (.AppOptimizeImplicitArgs f dite_args 4 0 4 (← getFunEnvInfo f) prevInApp)
+      let lhs ← mkAppNExpr f args
+      let r ← mkAppNExpr f dite_args
+      discard <| Blaster.Reconstruct.withProofM lhs r
+        (Blaster.Reconstruct.mkDiteAppProof args[0]! args[1]! args[2]! args[3]! f.constLevels! (args.extract 4 args.size))
+      return some (.AppOptimizeImplicitArgs f dite_args 4 0 4 (← getFunEnvInfo f) prevInApp .unknown)
 
     mkAppInRhs (args : Array Expr) (beginIdx endIdx : Nat) (nbParams : Nat) (rhs : Expr) : TranslateEnvT Expr := do
       applyOnLambdaBoundedBody rhs nbParams (fun body => mkAppRangeExpr body beginIdx endIdx args)
@@ -69,7 +73,7 @@ def normChoiceApplication?
         margs ← margs.modifyM i (mkAppInRhs args argInfo.arity args.size alts[altIdx]!.getNumHeadForalls)
       -- update match return type
       margs ← margs.modifyM idxType (updateMatchReturnType retType)
-      return some (.AppOptimizeImplicitArgs f margs argInfo.arity 0 argInfo.arity (← getFunEnvInfo f) prevInApp)
+      return some (.AppOptimizeImplicitArgs f margs argInfo.arity 0 argInfo.arity (← getFunEnvInfo f) prevInApp .unknown)
 
 /-- Apply the following propagation rules on any function application `fn e₁ ... eₙ`
     only when fn := Expr.const n l ∧ n ≠ Blaster.dite' ∧ propagate fn e₁ ... eₙ
@@ -187,12 +191,14 @@ def funPropagation?
         propagateReuseContext e2 e2' 0
         -- NOTE: we also need to set the sort type for the pulled dite' to meet the function's return type
         let dite_args := #[retType, pcond, e1', e2']
-        let dite_op ← mkBlasterDIteOp
+        let dite_op ← mkBlasterDIteOpFor retType
         let fInfo ← getFunEnvInfo dite_op
         setIsAppArg prevInApp
+        discard <| Blaster.Reconstruct.withProofM (← mkAppNExpr f args) (← mkAppNExpr dite_op dite_args)
+          (Blaster.Reconstruct.mkApplyDiteProof f args idxArg _psort pcond e1 e2 retType)
         if resolveArgs then
-          return some (.AppOptimizeImplicitArgs dite_op dite_args 0 0 4 fInfo prevInApp)
-        else return some (.AppOptimizeExplicitArgs dite_op dite_args 2 4 fInfo none prevInApp)
+          return some (.AppOptimizeImplicitArgs dite_op dite_args 0 0 4 fInfo prevInApp .unknown)
+        else return some (.AppOptimizeExplicitArgs dite_op dite_args 2 4 fInfo none prevInApp .unknown)
       else return none
 
     updateRhsWithFun
@@ -224,12 +230,12 @@ def funPropagation?
           let fInfo ← getFunEnvInfo argInfo.nameExpr
           setIsAppArg prevInApp
           if resolveArgs then
-            return some (.AppOptimizeImplicitArgs argInfo.nameExpr pargs 0 0 argInfo.arity fInfo prevInApp)
+            return some (.AppOptimizeImplicitArgs argInfo.nameExpr pargs 0 0 argInfo.arity fInfo prevInApp .unknown)
           else
             return some (.AppOptimizeExplicitArgs
                           argInfo.nameExpr pargs
                           argInfo.getFirstAltPos
-                          argInfo.arity fInfo argInfo prevInApp)
+                          argInfo.arity fInfo argInfo prevInApp .unknown)
       else return none
 
 end Blaster.Optimize

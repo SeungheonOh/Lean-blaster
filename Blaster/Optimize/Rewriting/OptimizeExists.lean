@@ -2,7 +2,7 @@ import Lean
 import Blaster.Optimize.Rewriting.Utils
 import Blaster.Optimize.Env
 
-open Lean Meta Elab
+open Lean Meta Elab Blaster.Reconstruct
 namespace Blaster.Optimize
 
 /-- Apply the following COI reduction rule on `Exists`.
@@ -15,7 +15,10 @@ def coiExists (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
   if args.size != 2 then throwEnvError "coiExists: two arguments expected but got {reprStr args}"
   match args[1]! with
   | Expr.lam _n t e _bi =>
-      if (← (isSortOrInhabited t (existsQuantifier := true)) <&&> (pure !(e.hasLooseBVar 0))) then return e
+      if (← (isSortOrInhabited t (existsQuantifier := true)) <&&> (pure !(e.hasLooseBVar 0))) then
+        return ← withProofM (← mkAppNExpr f args) e (do
+          let u ← getLevel t
+          return mkApp3 (mkConst ``Blaster.Reconstruct.exists_const' [u]) t (← nonemptyProof t) e)
       mkAppNExpr f args
   | _ => throwEnvError "coiExists: lambda expression expected but got {reprStr args[1]!}"
 

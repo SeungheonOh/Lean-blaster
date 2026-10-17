@@ -820,8 +820,8 @@ def removeOutParam : Expr → Expr
  | e => e
 
 
-/-- Returns all axioms only defined in current module. -/
-def findLocalAxioms : MetaM (List Expr) := do
+/-- Returns the name and type of all the propositional axioms only defined in current module. -/
+def findLocalAxiomDecls : MetaM (List (Name × Expr)) := do
  let env ← getEnv
  (Environment.constants env).toList.filterMapM
     (λ c : Name × ConstantInfo => do
@@ -831,10 +831,14 @@ def findLocalAxioms : MetaM (List Expr) := do
         | .axiomInfo info =>
             if wasOriginallyTheorem env c.1 then return none
             if ← isProp (info.type) then
-              return some info.type
+              return some (c.1, info.type)
             else return none
         | _ => return none
       else return none
     )
+
+/-- Returns all axioms only defined in current module. -/
+def findLocalAxioms : MetaM (List Expr) :=
+  return (← findLocalAxiomDecls).map Prod.snd
 
 end Blaster.Optimize

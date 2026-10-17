@@ -106,7 +106,9 @@ variable (c : Nat)
 #testOptimize [ "UnfoldEq_30" ] ∀ (α : Type), (List.nil : List α) ≠ List.nil ===> False
 
 -- ∀ (α : Type) (x y z : α), List.nil = [x, y, z] ===> False
-#testOptimize [ "UnfoldEq_31" ] ∀ (α : Type) (x y z : α), List.nil = [x, y, z] ===> False
+-- NOTE: quantifiers over `α` are not removed as `α` may be empty.
+#testOptimize [ "UnfoldEq_31" ] ∀ (α : Type) (x y z : α), List.nil = [x, y, z] ===>
+                                ∀ (α : Type), α → α → α → False
 
 -- ∀ (α : Type) (x y z : α), List.nil ≠ [x, y, z] ===> True
 #testOptimize [ "UnfoldEq_32" ] ∀ (α : Type) (x y z : α), List.nil ≠ [x, y, z] ===> True

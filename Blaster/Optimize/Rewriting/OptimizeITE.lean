@@ -71,11 +71,30 @@ def extractDependentITEExpr (e : Expr) : TranslateEnvT Expr := do
 
 -/
 def isITESwap? (f : Expr) (iteType : Expr) (c : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr) := do
- if let Expr.app (Expr.const ``Not _) ne := c
- then mkApp4Expr f iteType ne e t
- else if let some c' ← (isITEBoolSwap? c)
- then mkApp4Expr f iteType c' e t
+ if let Expr.app (Expr.const ``Not _) ne := c then
+    let r ← mkApp4Expr f iteType ne e t
+    return ← swapWithProof r ne ``Blaster.Reconstruct.dite'_not_swap ne
+ else if let some c' ← (isITEBoolSwap? c) then
+    let r ← mkApp4Expr f iteType c' e t
+    let some (_, _, b) := eq? c | return r
+    return ← swapWithProof r c' ``Blaster.Reconstruct.dite'_false_swap b
  else return none
+
+ where
+   /-- When tracking proof terms and both branches are non-dependent, return the swapped `dite'` with
+       binder types updated to the new condition `c'`, and record the rewrite with the justification `thm`.
+       Otherwise return `r`.
+       NOTE: swapping branches without updating the binder types yields an ill-typed `dite'`.
+   -/
+   swapWithProof (r : Expr) (c' : Expr) (thm : Name) (thmArg : Expr) : TranslateEnvT Expr := do
+     if !(← Blaster.Reconstruct.isTracking) then return r
+     let (Expr.lam n1 _ a bi1, Expr.lam n2 _ b bi2) := (t, e) | return r
+     if a.hasLooseBVars || b.hasLooseBVars then return r
+     let thenBranch ← mkLambdaExpr n2 bi2 c' b
+     let elseBranch ← mkLambdaExpr n1 bi1 (← mkAppExpr (← mkPropNotOp) c') a
+     let r' ← mkApp4Expr f iteType c' thenBranch elseBranch
+     Blaster.Reconstruct.withProofM (← mkApp4Expr f iteType c t e) r' do
+       return mkApp4 (mkConst thm f.constLevels!) iteType thmArg a b
 
 /-- Given `c`, `t` and `e` corresponding respectively to the conditional, then and else operands for `Blaster.dite'`,
     apply the following simplification rules:
@@ -189,6 +208,7 @@ def iteSimp? (iteType : Expr) (c : Expr) (t : Expr) (e : Expr) (inDiteChoice := 
      else return none
 
 
+
 /-- Given `a`, 't` and `e` the condition, then and else expressions for
     a Blaster.dite' expression,
      - When `t := sif h2 : c1 then e1 else e2` ∧
@@ -225,7 +245,7 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
             let hName ← Term.mkFreshBinderName
             let lam1 ← mkLambdaExpr hName BinderInfo.default or_e t1
             let lam2 ← mkLambdaExpr hName BinderInfo.default (← mkAppExpr (← mkPropNotOp) or_e) e1
-            return ← mkApp4Expr (← mkBlasterDIteOp) sort1 or_e lam1 lam2
+            return ← mkBlasterDIteApp sort1 or_e lam1 lam2
           else return none
       if exprEq c1 c2 then
         if exprEq t1 t2 then
@@ -237,8 +257,8 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
                   withLocalDecl' x1 bi1' tc1 fun x1' => do
                     let lam1 ← mkLambdaFVarsExpr #[n1'] (← instantiateShared1 e1' x1')
                     let lam2 ← mkLambdaFVarsExpr #[n2'] (← instantiateShared1 e2' x1')
-                    let dite ← mkLambdaFVarsExpr #[x1'] (← mkApp4Expr (← mkBlasterDIteOp) sort1 a lam1 lam2)
-                    return ← mkApp4Expr (← mkBlasterDIteOp) sort1 c1 t1 dite
+                    let dite ← mkLambdaFVarsExpr #[x1'] (← mkBlasterDIteApp sort1 a lam1 lam2)
+                    return ← mkBlasterDIteApp sort1 c1 t1 dite
               |_, _ => return none
         else if exprEq e1 e2 then
            withLocalDecl' n1 bi1 dc1 fun n1' => do
@@ -249,8 +269,8 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
                   withLocalDecl' x1 bi1' tc1 fun x1' => do
                     let lam1 ← mkLambdaFVarsExpr #[n1'] (← instantiateShared1 t1' x1')
                     let lam2 ← mkLambdaFVarsExpr #[n2'] (← instantiateShared1 t2' x1')
-                    let dite ← mkLambdaFVarsExpr #[x1'] (← mkApp4Expr (← mkBlasterDIteOp) sort1 a lam1 lam2)
-                    return ← mkApp4Expr (← mkBlasterDIteOp) sort1 c1 dite e1
+                    let dite ← mkLambdaFVarsExpr #[x1'] (← mkBlasterDIteApp sort1 a lam1 lam2)
+                    return ← mkBlasterDIteApp sort1 c1 dite e1
               |_, _ => return none
         else if exprEq t1 e2 && exprEq t2 e1 then
           setRestart
@@ -258,7 +278,7 @@ def diteFactorize? (a : Expr) (t : Expr) (e : Expr) : TranslateEnvT (Option Expr
           let hName ← Term.mkFreshBinderName
           let lam1 ← mkLambdaExpr hName BinderInfo.default eq_cond t1
           let lam2 ← mkLambdaExpr hName BinderInfo.default (← mkAppExpr (← mkPropNotOp) eq_cond) e1
-          return ← mkApp4Expr (← mkBlasterDIteOp) sort1 eq_cond lam1 lam2
+          return ← mkBlasterDIteApp sort1 eq_cond lam1 lam2
         else return none
       else return none
   | _, _ => return none

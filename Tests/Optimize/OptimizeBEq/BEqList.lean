@@ -12,11 +12,15 @@ namespace Test.BEqList
 #testOptimize [ "BEqListCst_1" ] ∀ (α : Type), [BEq α] → (List.nil : List α) == List.nil ===> True
 
 -- List.nil == [x, y, z] ===> False (with Type(x) = α)
-#testOptimize [ "BEqListCst_2" ] ∀ (α : Type) (x y z : α), [BEq α] → List.nil == [x, y, z] ===> False
+-- NOTE: quantifiers over `α` are not removed as `α` may be empty.
+#testOptimize [ "BEqListCst_2" ] ∀ (α : Type) (x y z : α), [BEq α] → List.nil == [x, y, z] ===>
+                                 ∀ (α : Type), α → α → α → False
 
 -- [x, y] == [x, y, z] ===> False
 -- NOTE: Reduce to False via `reduceApp` rule, which is also applicable on recursive functions
-#testOptimize [ "BEqListCst_3" ] ∀ (α : Type) (x y z : α), [BEq α] → [x, y] == [x, y, z] ===> False
+-- NOTE: quantifiers over `α` are not removed as `α` may be empty.
+#testOptimize [ "BEqListCst_3" ] ∀ (α : Type) (x y z : α), [BEq α] → [x, y] == [x, y, z] ===>
+                                 ∀ (α : Type), α → α → α → False
 
 
 /-! Test cases to ensure that the following simplification rules must not be applied on

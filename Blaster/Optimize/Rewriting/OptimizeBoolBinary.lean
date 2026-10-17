@@ -3,7 +3,7 @@ import Blaster.Optimize.Rewriting.Utils
 import Blaster.Optimize.Env
 
 
-open Lean Meta
+open Lean Meta Blaster.Reconstruct
 namespace Blaster.Optimize
 
  /-- Given `a` and `b` the operands for `and`, apply the simplification rules:
@@ -19,10 +19,16 @@ namespace Blaster.Optimize
         - return `none`
  -/
  def andBoolReduction? (a : Expr) (b : Expr) : TranslateEnvT (Option Expr) := do
-  if (← hypMapContains (← mkEqBool a true)) then return b
-  if (← hypMapContains (← mkEqBool b true)) then return a
-  if (← hypMapContains (← mkEqBool a false)) then return (← mkBoolFalse)
-  if (← hypMapContains (← mkEqBool b false)) then return (← mkBoolFalse)
+  let lhs ← mkApp2Expr (← mkBoolAndOp) a b
+  if let some h ← hypMapFind? (← mkEqBool a true) then
+    return ← withHypThm lhs b (← mkEqBool a true) h ``bool_and_eq_right_of #[a, b]
+  if let some h ← hypMapFind? (← mkEqBool b true) then
+    return ← withHypThm lhs a (← mkEqBool b true) h ``bool_and_eq_left_of #[a, b]
+  if let some h ← hypMapFind? (← mkEqBool a false) then
+    return ← withHypThm lhs (← mkBoolFalse) (← mkEqBool a false) h ``bool_and_eq_false_of_left #[a, b]
+  -- NOTE: `false` (and not `False`) is expected as result of `&&`.
+  if let some h ← hypMapFind? (← mkEqBool b false) then
+    return ← withHypThm lhs (← mkBoolFalse) (← mkEqBool b false) h ``bool_and_eq_false_of_right #[a, b]
   return none
 
 /-- Apply the following simplification/normalization rules on `and` :
@@ -47,10 +53,11 @@ def optimizeBoolAnd (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
  if args.size != 2 then throwEnvError "optimizeBoolAnd: exactly two arguments expected"
  let op1 := args[0]!
  let op2 := args[1]!
- if let Expr.const ``false _ := op1 then return op1
- if let Expr.const ``true _ := op1 then return op2
- if exprEq op1 op2 then return op1
- if isBoolNotExprOf op2 op1 then return (← mkBoolFalse)
+ let lhs ← mkApp2Expr f op1 op2
+ if let Expr.const ``false _ := op1 then return ← withThm lhs op1 ``bool_false_and #[op2]
+ if let Expr.const ``true _ := op1 then return ← withThm lhs op2 ``bool_true_and #[op2]
+ if exprEq op1 op2 then return ← withThm lhs op1 ``bool_and_self #[op1]
+ if isBoolNotExprOf op2 op1 then return ← withThm lhs (← mkBoolFalse) ``bool_and_not_self #[op1]
  if let some r ← andBoolReduction? op1 op2 then return r
  -- no caching at this level as optimizeBoolAnd is called by optimizeDecideBoolAnd
  mkApp2Expr f op1 op2
@@ -68,10 +75,15 @@ def optimizeBoolAnd (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
         - return `none`
  -/
  def orBoolReduction? (a : Expr) (b : Expr) : TranslateEnvT (Option Expr) := do
-  if (← hypMapContains (← mkEqBool a true)) then return (← mkBoolTrue)
-  if (← hypMapContains (← mkEqBool b true)) then return (← mkBoolTrue)
-  if (← hypMapContains (← mkEqBool a false)) then return b
-  if (← hypMapContains (← mkEqBool b false)) then return a
+  let lhs ← mkApp2Expr (← mkBoolOrOp) a b
+  if let some h ← hypMapFind? (← mkEqBool a true) then
+    return ← withHypThm lhs (← mkBoolTrue) (← mkEqBool a true) h ``bool_or_eq_true_of_left #[a, b]
+  if let some h ← hypMapFind? (← mkEqBool b true) then
+    return ← withHypThm lhs (← mkBoolTrue) (← mkEqBool b true) h ``bool_or_eq_true_of_right #[a, b]
+  if let some h ← hypMapFind? (← mkEqBool a false) then
+    return ← withHypThm lhs b (← mkEqBool a false) h ``bool_or_eq_right_of #[a, b]
+  if let some h ← hypMapFind? (← mkEqBool b false) then
+    return ← withHypThm lhs a (← mkEqBool b false) h ``bool_or_eq_left_of #[a, b]
   return none
 
 /-- Apply the following simplification/normalization rules on `or` :
@@ -96,10 +108,11 @@ def optimizeBoolOr (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
  if args.size != 2 then throwEnvError "optimizeBoolOr: exactly two arguments expected"
  let op1 := args[0]!
  let op2 := args[1]!
- if let Expr.const ``false _ := op1 then return op2
- if let Expr.const ``true _ := op1 then return op1
- if exprEq op1 op2 then return op1
- if isBoolNotExprOf op2 op1 then return (← mkBoolTrue)
+ let lhs ← mkApp2Expr f op1 op2
+ if let Expr.const ``false _ := op1 then return ← withThm lhs op2 ``bool_false_or #[op2]
+ if let Expr.const ``true _ := op1 then return ← withThm lhs op1 ``bool_true_or #[op2]
+ if exprEq op1 op2 then return ← withThm lhs op1 ``bool_or_self #[op1]
+ if isBoolNotExprOf op2 op1 then return ← withThm lhs (← mkBoolTrue) ``bool_or_not_self #[op1]
  if let some r ← orBoolReduction? op1 op2 then return r
  -- no caching at this level as optimizeBoolAnd is called by optimizeDecideBoolOr
  mkApp2Expr f op1 op2

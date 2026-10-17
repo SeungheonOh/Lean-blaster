@@ -50,7 +50,7 @@ def optimizeProjection? (n : Name) (idx : Nat) (s : Expr) : TranslateEnvT (Optio
       propagateReuseContext e1 e1' 0
       propagateReuseContext e2 e2' 0
       let ptype ← inferTypeEnv (← mkProjExpr n idx s)
-      mkApp4Expr (← mkBlasterDIteOp) ptype pcond e1' e2'
+      mkBlasterDIteApp ptype pcond e1' e2'
 
     updateRhsWithProj (typeName : Name) (idx : Nat) (nbParams : Nat) (rhs : Expr) : TranslateEnvT Expr := do
       applyOnLambdaBoundedBody rhs nbParams (fun body => mkProjExpr typeName idx body)

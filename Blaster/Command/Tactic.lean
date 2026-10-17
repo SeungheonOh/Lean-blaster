@@ -3,6 +3,7 @@ import Blaster.Command.Syntax
 import Blaster.Smt.Translate
 import Blaster.Optimize
 import Blaster.Logging.Basic
+import Blaster.Reconstruct.Main
 
 open Lean Elab Tactic Meta
 open Blaster.Optimize Blaster.Smt Blaster.Options Blaster.Syntax
@@ -23,6 +24,10 @@ Options:
   - `random-seed`: seed for the random number generator (default: none)
   - `solve-result`: specify the expected result from the blaster tactic, i.e.,
                     0 for 'Valid', 1 for 'Falsified' and 2 for 'Undetermined'. (default: 0)
+  - `reconstruct`: close 'Valid' goals with a proof term checked by the Lean kernel, i.e.,
+                   0 for no reconstruction, 1 for best effort and 2 for required (default: 0)
+  - `gen-proof`: same as `(reconstruct: 2)` but also requires the proof to only depend on Lean's
+                 standard axioms (default: 0)
 Example: `blaster (timeout: 10) (verbose: 1)`
 -/
 syntax (name := blasterTactic) "blaster" (solveOption)* : tactic
@@ -44,18 +49,43 @@ def blasterTacticImp : Tactic := fun stx =>
   withMainContext $ do
    -- Parse options in any order
    let opts := stx[1].getArgs
-   let sOpts ← parseSolveOptions opts default
+   let sOpts ← parseSolveOptions opts (← BlasterOptions.fromEnv)
    let goal ← revertHypotheses (← getMainGoal)
    let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-   let ((result, optExpr), _) ←
+   let ((result, optExpr, task?), _) ←
      withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $ do
        IO.setNumHeartbeats 0
-       Translate.main (← goal.getType) (logUndetermined := false) |>.run env
+       Translate.mainWithTask (← goal.getType >>= instantiateMVars) (logUndetermined := false) |>.run env
    match result with
    | .Valid =>
-      blasterAdmit goal
-      if (← getOptions).getBool `warn.sorry true then
-        logWarningAt stx "declaration uses 'blasterProven' (SMT-verified, no proof term)" -- TODO: replace with proof reconstruction
+      let admit : TacticM Unit := do
+        blasterAdmit goal
+        if (← getOptions).getBool `warn.sorry true then
+          logWarningAt stx "declaration uses 'blasterProven' (SMT-verified, no proof term)"
+      match task? with
+      | some task =>
+          if sOpts.reconstruct > 0 then
+            -- NOTE: reconstruction is not subject to the heartbeat limit of the enclosing declaration
+            let heartbeats ← IO.getNumHeartbeats
+            let outcome ← withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $
+              Reconstruct.reconstructSafe task task.recon
+            IO.setNumHeartbeats heartbeats
+            Reconstruct.dumpStats outcome "tactic"
+            Reconstruct.reportOutcome sOpts outcome
+            match outcome.proof? with
+            | some p =>
+                if sOpts.genProof then
+                  match ← Reconstruct.checkProofAxioms p task.axioms with
+                  | .error msg => throwTacticEx `blaster goal msg
+                  | .ok axs => logInfo m!"📜 Proof generated (axioms: {axs.toList})"
+                goal.assign p
+            | none =>
+                -- NOTE: no `admit` when a kernel-checked proof is required
+                if sOpts.reconstruct ≥ 2 then
+                  throwTacticEx `blaster goal "proof reconstruction failed (see above)"
+                admit
+          else admit
+      | none => admit
 
    | .Falsified cex => throwTacticEx `blaster goal "Goal was falsified (see counterexample above)"
    | .Undetermined =>

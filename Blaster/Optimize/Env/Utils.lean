@@ -327,6 +327,9 @@ partial def betaLambdaEnv (lam : Expr) (args : Array Expr) : TranslateEnvT BetaL
   let nbArgs := args.usize
   if nbArgs == 0
   then return ⟨lam, none⟩
+  -- NOTE: plain beta reduction (i.e., without meta-variables) when tracking proof terms
+  else if (← get).recon.tracking then
+    return ⟨← hashcons (lam.beta args), none⟩
   else if lam.isLambda then
     let nbEffective := if nbParamsU < nbArgs then nbParamsU else nbArgs
     let betaRes ← getBetaReduce lam args nbEffective
@@ -648,7 +651,7 @@ where
     An error is triggered if no corresponding entry can be found in `recFunMap`.
 -/
 def hasRecFunInst? (instApp : Expr) : TranslateEnvT (Option Expr) := do
-  let ⟨_, ⟨_, _, _, _, recFunInstCache,_,recFunMap, _, _, _, _, _, _, _⟩⟩ ← get
+  let ⟨_, ⟨_, _, _, _, recFunInstCache,_,recFunMap, _, _, _, _, _, _, _⟩, _⟩ ← get
   match recFunInstCache.get? instApp with
   | some fbody =>
      -- retrieve function application from recFunMap

@@ -6,6 +6,7 @@ import Blaster.Optimize.Env.ContextMap
 import Blaster.Optimize.MatchInfo
 import Blaster.Smt.Term
 import Blaster.Command.Options
+import Blaster.Reconstruct.Types
 
 open Lean Meta Blaster.Smt Blaster.Options
 open Blaster.Data.HashSet Blaster.Data.HashMap
@@ -795,11 +796,14 @@ structure TranslateEnv where
   smtEnv : SmtEnv
   /-- Environment used when optimization a lean expression. -/
   optEnv : OptimizeEnv
+  /-- Environment used for proof reconstruction. -/
+  recon : Blaster.Reconstruct.ReconEnv
 
 instance : Inhabited TranslateEnv where
   default :=
     { smtEnv := default,
-      optEnv := default
+      optEnv := default,
+      recon := default
     }
 
 abbrev TranslateEnvT := StateRefT TranslateEnv MetaM
@@ -847,7 +851,7 @@ macro_rules
   | `(throwEnvError $msg:term)            => `(Blaster.Optimize.throwEnvError $msg)
 
 @[inline] def modifyOptEnv (f : OptimizeEnv → OptimizeEnv) : TranslateEnvT Unit :=
-  modify fun ⟨s, o⟩ => ⟨s, f o⟩
+  modify fun ⟨s, o, r⟩ => ⟨s, f o, r⟩
 
 /-- Update global rewrite cache with `a := b`. -/
 @[inline] def updateHashConsCache (a : SharedExpr) : TranslateEnvT Unit := do
@@ -905,6 +909,8 @@ def updateEqualityMap (lhs : Expr) (rhs : Expr) (ctxId : CtxId) : TranslateEnvT 
     newest entry visible in the current context (tag ∈ active). -/
 @[always_inline, inline]
 def eqMapFind? (lhs : Expr) : TranslateEnvT (Option Expr) := do
+  -- NOTE: no substitution w.r.t. the equality map when tracking proof terms (see `Blaster.Reconstruct`)
+  if (← get).recon.tracking then return none
   let ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, _, _, ⟨_, _, _, _, _, _, active, _⟩, _, _, _⟩ := (← get).optEnv
   if equalityMap.size == 0
   then return none
@@ -963,6 +969,8 @@ def ContextReuseMap.findRaw (m : ContextReuseMap) (e : Expr) (idx : USize) (curC
 
 @[always_inline, inline]
 def reuseContext? (e : Expr) (idx : USize) : TranslateEnvT (Option CtxReuseScope) := do
+  -- NOTE: contexts are not reused when tracking proof terms (see `Blaster.Reconstruct`)
+  if (← get).recon.tracking then return none
   let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _⟩, _, _, _⟩ := (← get).optEnv
   memCache.contextReuseCache.findRaw e idx curCtx
 
@@ -1113,8 +1121,8 @@ def withLocalContext (f : TranslateEnvT α) : TranslateEnvT α := do
   withLCtx ctx.ctx ctx.localInsts $ do f
 
 @[inline] def modifyMemCache (f : MemoizeEnv → MemoizeEnv) : TranslateEnvT Unit :=
-  modify fun ⟨s, ⟨o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14⟩⟩ =>
-             ⟨s, ⟨o1, o2, o3, o4, o5, o6, o7, o8, o9, f o10, o11, o12, o13, o14⟩⟩
+  modify fun ⟨s, ⟨o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14⟩, r⟩ =>
+             ⟨s, ⟨o1, o2, o3, o4, o5, o6, o7, o8, o9, f o10, o11, o12, o13, o14⟩, r⟩
 
 @[inline] def updateConstInfoCache (n : Name) (info : ConstantInfo) : TranslateEnvT Unit :=
   modifyMemCache fun ⟨m1, m2, m3, m4, getConstInfoCache, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15, m16, m17, m18, m19, m20, m21⟩ =>

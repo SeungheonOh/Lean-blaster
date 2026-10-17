@@ -1,7 +1,7 @@
 import Lean
 import Blaster.Optimize.Rewriting.Utils
 
-open Lean Meta
+open Lean Meta Blaster.Reconstruct
 namespace Blaster.Optimize
 
 /-- Return `true` when `e` corresponds to the zero nat literal. -/
@@ -59,12 +59,16 @@ def notLTNumNorm? (ne : Expr) (restart := true) : TranslateEnvT (Option Expr) :=
 def optimizeNot (f : Expr) (args : Array Expr) (restart := true) : TranslateEnvT Expr := do
  if args.size != 1 then throwEnvError "optimizeNot: exactly one argument expected"
  let e := args[0]!
- if let Expr.const ``False _ := e then return (← mkPropTrue)
- if let Expr.const ``True _ := e then return (← mkPropFalse)
- if let some op := propNot? e then return op
- if let some (r, _) ← notEqSimp? e then return r
- if let some r ← notLTNumNorm? e restart then return r
- mkAppExpr f e
+ let lhs ← mkAppExpr f e
+ if let Expr.const ``False _ := e then return ← withThm lhs (← mkPropTrue) ``not_false_eq' #[]
+ if let Expr.const ``True _ := e then return ← withThm lhs (← mkPropFalse) ``not_true_eq' #[]
+ if let some op := propNot? e then return ← withThm lhs op ``not_not_eq' #[op]
+ if let some (r, op2, boolLit) ← notEqSimp? e then
+   return ← withThm lhs r (if boolLit then ``not_true_eq_bool else ``not_false_eq_bool) #[op2]
+ if let some r ← notLTNumNorm? e restart then
+   let some (_, _, _, op2) := lt? e | return r
+   return ← withThm lhs r ``nat_not_zero_lt #[op2]
+ return lhs
 
 
 /-- Given `ne` the operand for `Not` apply the following normalization rules:
@@ -100,7 +104,14 @@ def notLogicalSimp? (ne : Expr) (restart := true) : TranslateEnvT (Option Expr) 
 def optimizeAdvancedNot (f : Expr) (args : Array Expr) (restart := true) : TranslateEnvT Expr := do
   let e ← optimizeNot f args restart
   let some ne := propNot? e | return e
-  if let some r ← notLogicalSimp? ne restart then return r
+  if let some r ← notLogicalSimp? ne restart then
+    if let some (ne1, ne2) := propAnd? ne then
+      if let (some e1, some e2) := (propNot? ne1, propNot? ne2) then
+        return ← withThm e r ``not_and_not_eq #[e1, e2]
+    if let some (ne1, ne2) := propOr? ne then
+      if let (some e1, some e2) := (propNot? ne1, propNot? ne2) then
+        return ← withThm e r ``not_or_not_eq #[e1, e2]
+    return r
   return e
 
 

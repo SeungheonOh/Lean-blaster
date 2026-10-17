@@ -14,6 +14,33 @@ def callOptimize (sOpts : BlasterOptions) (stx : Syntax) : TermElabM Expr :=
     let optRes ← (Blaster.Optimize.command sOpts (← parseTerm stx))
     pure optRes.1
 
+/-- When environment variable `BLASTER_RECON_STATS` is set, try to reconstruct a kernel-checked proof
+    that the given term is equal to its optimized form and dump statistics (see `Blaster.Reconstruct.dumpStats`).
+    This is used to measure the coverage of proof reconstruction on the optimizer's test suite.
+-/
+def auditReconstruction (sOpts : BlasterOptions) (stx : Syntax) (name : String) : TermElabM Unit := do
+  if (← IO.getEnv "BLASTER_RECON_STATS").isNone then return
+  -- NOTE: the heartbeats consumed by the audit are not counted for the test itself
+  let heartbeats ← IO.getNumHeartbeats
+  try auditCore finally IO.setNumHeartbeats heartbeats
+where
+ auditCore : TermElabM Unit :=
+  withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0, maxRecDepth := 100000 }) $ do
+    let s ← saveState
+    let outcome ← tryCatchRuntimeEx (do
+        -- NOTE: universe level metavariables must be instantiated (see `normLevel`)
+        let e ← instantiateMVars (← parseTerm stx)
+        -- NOTE: `commandPf` restores the name generator after optimization. A dedicated prefix is
+        -- used during optimization such that the names generated during reconstruction (e.g.,
+        -- metavariables) do not clash with the ones created when building proof terms.
+        let ngen ← getNGen
+        setNGen { ngen with namePrefix := ngen.namePrefix ++ `_blaster_opt }
+        let ((optExpr, pf), env) ← Blaster.Optimize.commandPf { sOpts with reconstruct := 1 } e
+        setNGen ngen
+        Blaster.Reconstruct.reconstructRewriteSafe e optExpr pf env.recon)
+      (fun ex => do s.restore; pure { failure := m!"exception: {ex.toMessageData}" })
+    Blaster.Reconstruct.dumpStats outcome s!"testOptimize:{name}"
+
 /-! ## Definition of #testOptimize command to write unit test for Blaster.optimize
     The #testOptimize usage is as follows:
      #testOptimize [ "TestName" ] (verbose: num)? (norm-result: num)? TermToOptimize ==> OptimizedTerm
@@ -162,6 +189,7 @@ def testOptimizeImp : CommandElab := fun stx => do
    -- create a local declaration name for the test case
    let m ← getMainModule
    withDeclName (m ++ name.toName) $ do
+     auditReconstruction sOpts t1 name
      -- keep the current name generator and restore it afterwards
      let ngen ← getNGen
      let actual ← callOptimize sOpts t1

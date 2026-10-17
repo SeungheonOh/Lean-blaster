@@ -1,7 +1,7 @@
 import Lean
 import Blaster.Optimize.Hypotheses
 
-open Lean Meta Elab
+open Lean Meta Elab Blaster.Reconstruct
 namespace Blaster.Optimize
 
 /-- `mkImpliesExpr a b` return expression `a → b` without applying any normalization. -/
@@ -120,7 +120,7 @@ def hypReduction? (mscope : Option CtxScope) (h : Expr) (a : Expr) (b : Expr) (i
   Assume that `n` is a free variable expression. An error is triggered if this is not the case.
   Assume that `h` corresponds to the hypothesis map updated with hypotheses in `t`.
 -/
-def optimizeForall (n : Expr) (t : Expr) (b : Expr) (s : Option CtxScope) (isProp : Bool) : TranslateEnvT Expr := do
+def optimizeForallCore (n : Expr) (t : Expr) (b : Expr) (s : Option CtxScope) (isProp : Bool) : TranslateEnvT Expr := do
   if let Expr.const ``True _ := b then return b
   if let some r ← isNotDef? t b then return r
   if exprEq t b then if isProp then return (← mkPropTrue)
@@ -131,5 +131,67 @@ def optimizeForall (n : Expr) (t : Expr) (b : Expr) (s : Option CtxScope) (isPro
   if let some r ← hypReduction? s n t b isProp then return r
   if (← (isSortOrInhabited t) <&&> (pure isProp) <&&> (pure !containsFVar b n)) then return b
   return imp
+
+/-- Same as `optimizeForallCore` but also records the justification of the applied rule
+    when tracking proof terms (see `Blaster.Reconstruct`).
+-/
+def optimizeForall (n : Expr) (t : Expr) (b : Expr) (s : Option CtxScope) (isProp : Bool) : TranslateEnvT Expr := do
+  if !(← isTracking) then return ← optimizeForallCore n t b s isProp
+  -- record the justification for the applied simplification rule (see `Blaster.Reconstruct`)
+  let lhs ← mkForallFVarExpr n b
+  let r ← optimizeForallCore n t b s isProp
+  if lhs == r then return r
+  let isArrow := !containsFVar b n
+  let isPropBody ← isPropEnv b
+  if let Expr.const ``True _ := b then
+    return ← withProofM lhs r (return mkApp (mkConst ``forall_true' [← getLevel t]) t)
+  if isPropBody then
+    match t with
+    | Expr.const ``True _ =>
+        if isArrow then return ← withThm lhs r ``true_imp_eq #[b]
+        return ← withProofM lhs r (return mkApp (mkConst ``forall_true_dep) (← mkLambdaFVars #[n] b))
+    | Expr.const ``False _ =>
+        return ← withProofM lhs r (return mkApp (mkConst ``false_imp_eq) (← mkLambdaFVars #[n] b))
+    | _ => pure ()
+  if let Expr.const ``False _ := b then
+    if (← isPropEnv t) then return ← withDefEq lhs r -- `a → False` is `¬ a` by definition
+  if !isArrow || !isPropBody || !(← isPropEnv t) then
+    -- `∀ (n : t), e ===> e` (when t is inhabited)
+    if isArrow && isPropBody && exprEq r b then
+      return ← withProofM lhs r (do
+        let u ← getLevel t
+        return mkApp3 (mkConst ``forall_const' [u]) t (← nonemptyProof t) b)
+    return r
+  -- non-dependent implication `t → b` between propositions
+  if exprEq t b then return ← withThm lhs r ``imp_self_eq #[t]
+  let dependsOnBinder (p : Expr) : Bool := p.containsFVar n.fvarId!
+  if r.isConstOf ``True then
+    if let some p ← inHypMap lhs then
+      if !dependsOnBinder p then return ← withHypThm lhs r lhs p ``eq_true #[lhs]
+    if let some p ← inHypMap b then
+      if dependsOnBinder p then
+        -- hypothesis obtained from `t`
+        return ← withProofM lhs r (do
+          let p ← mkLambdaFVars #[n] p
+          return mkApp2 (mkConst ``eq_true) lhs p)
+      return ← withHypThm lhs r b p ``imp_eq_true_of_right #[t, b]
+    if let some p ← notInHypMap t then
+      if !dependsOnBinder p then
+        return ← withHypThm lhs r (mkApp (← mkPropNotOp) t) p ``imp_eq_true_of_not_left #[t, b]
+    return r
+  if let some ne := propNot? r then
+    if exprEq ne t then
+      if let some p ← notInHypMap b then
+        if dependsOnBinder p then
+          return ← withProofM lhs r (do
+            let p ← mkLambdaFVars #[n] p
+            if (← inferType p) != (← mkForallFVars #[n] (mkApp (← mkPropNotOp) b)) then throwError "unexpected hypothesis"
+            return mkApp3 (mkConst ``imp_eq_not_of_imp) t b p)
+        return ← withHypThm lhs r (mkApp (← mkPropNotOp) b) p ``imp_eq_not_of #[t, b]
+      return r
+  if exprEq r b then
+    if let some p ← inHypMap t then
+      if !dependsOnBinder p then return ← withHypThm lhs r t p ``imp_eq_of_left #[t, b]
+  return r
 
 end Blaster.Optimize

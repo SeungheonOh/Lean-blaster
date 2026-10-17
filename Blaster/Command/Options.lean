@@ -71,9 +71,35 @@ structure BlasterOptions where
   /-- Maximum analysis depth to be considered when performing BMC and K-Induction.
       It is set to 10 by default. -/
   maxDepth : Nat := 10
+
+  /-- Proof reconstruction level, i.e., whether a proof term checked by the Lean kernel
+      must be produced for `Valid` results.
+        - Level 0: no proof reconstruction (i.e., the result of the optimizer and the SMT solver is trusted).
+        - Level 1: try to reconstruct a proof. A warning is reported when reconstruction fails
+                   and the result is trusted.
+        - Level 2: proof reconstruction is required, i.e., an error is reported when reconstruction fails.
+      It is set to 0 by default.
+  -/
+  reconstruct : Nat := 0
+
+  /-- When set to `true`, a `Valid` result must come with a kernel-checked proof that only depends on
+      Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`) and on the local axioms
+      used as hypotheses (i.e., no `sorryAx`). Implies `reconstruct := 2`.
+  -/
+  genProof : Bool := false
  deriving Repr
 
 instance : Inhabited BlasterOptions where
   default := {}
+
+/-- Return the default options, possibly overridden by the following environment variables:
+     - `BLASTER_RECONSTRUCT`: default proof reconstruction level (see `reconstruct`).
+    NOTE: Options explicitly provided to `#blaster` or `blaster` take precedence.
+-/
+def BlasterOptions.fromEnv : IO BlasterOptions := do
+  let mut opts : BlasterOptions := default
+  if let some v ← IO.getEnv "BLASTER_RECONSTRUCT" then
+    if let some n := v.toNat? then opts := { opts with reconstruct := n }
+  return opts
 
 end Blaster.Options

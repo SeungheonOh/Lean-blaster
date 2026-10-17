@@ -4,8 +4,7 @@ import Blaster.Optimize.Rewriting.NormalizeMatch
 import Blaster.Optimize.Rewriting.OptimizeITE
 import Blaster.Optimize.Telescope
 
-open Lean Meta Elab Blaster.Data.HashSet Blaster.Data.HashMap
-
+open Lean Meta Elab Blaster.Data.HashSet Blaster.Data.HashMap Blaster.Reconstruct
 namespace Blaster.Optimize
 
 @[always_inline, inline]
@@ -406,16 +405,16 @@ def constMatchPropagation?
         -- NOTE: we need to propagate the reuse context to the new then and else expressions
         propagateReuseContext e1 e1' 0
         propagateReuseContext e2 e2' 0
-        let dite_op ← mkBlasterDIteOp
+        let dite_op ← mkBlasterDIteOpFor retType
         let pInfo ← getFunEnvInfo dite_op
         let dite_args := #[retType, pcond, e1', e2']
         setIsAppArg prevInApp
         if resolveArgs
-        then return some (.AppOptimizeImplicitArgs dite_op dite_args 0 0 4 pInfo prevInApp)
+        then return some (.AppOptimizeImplicitArgs dite_op dite_args 0 0 4 pInfo prevInApp .unknown)
         else
           -- all arguments have already been optimized for both pulled ite and parent match
           -- we only trigger optimization for then and else (e.g., stop at 4)
-          return some (.AppOptimizeExplicitArgs dite_op dite_args 2 4 pInfo none prevInApp)
+          return some (.AppOptimizeExplicitArgs dite_op dite_args 2 4 pInfo none prevInApp .unknown)
       else return none
 
     @[always_inline, inline]
@@ -435,13 +434,13 @@ def constMatchPropagation?
         let pInfo ← getFunEnvInfo argInfo.nameExpr
         setIsAppArg prevInApp
         if resolveArgs
-        then return some (.AppOptimizeImplicitArgs argInfo.nameExpr pargs 0 0 pargs.size pInfo prevInApp)
+        then return some (.AppOptimizeImplicitArgs argInfo.nameExpr pargs 0 0 pargs.size pInfo prevInApp .unknown)
         else
           -- all arguments have already been optimized for both pulled and parent match
           -- we only trigger optimization for alts (e.g., stop at argInfo.arity)
           return some (.AppOptimizeExplicitArgs
                         argInfo.nameExpr pargs argInfo.getFirstAltPos
-                        argInfo.arity pInfo argInfo prevInApp)
+                        argInfo.arity pInfo argInfo prevInApp .unknown)
       else return none
 
 /-- Given a match expression perform the following:
@@ -455,6 +454,9 @@ def matchReduction?
   (matchToIte := false) (resolveArgs := false) : TranslateEnvT (Option OptimizeStack) := do
     -- try match reduction first
     if let some r ← reduceMatch? args mInfo resolveArgs then
+      -- NOTE: the match reduction is a definitional step (iota)
+      if ← isTracking then
+        recordDefEqHint (← mkAppNExpr f args) r.betaReduced (do Lean.Meta.mkEqRefl (mkAppN f args))
       return some (.InitOptimizeExpr r.betaReduced r.prevMVarIdDecls)
     -- try to apply match constant propagation rules
     if let some r ← constMatchPropagation? f args mInfo prevInApp resolveArgs then return r
@@ -487,7 +489,7 @@ private def addNotEqPatternInContext (nextCtxId : CtxId) (discr : Expr) (pattern
 
 @[always_inline, inline]
 private def propagateNotEqPatternContext (discr : Expr) (nextCtxId : CtxId) : TranslateEnvT Unit := do
-  let ⟨_, ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, matchInContext, _, _, _, _, _⟩⟩ ← get
+  let ⟨_, ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, matchInContext, _, _, _, _, _⟩, _⟩ ← get
   match ← ContextMap.findRaw' equalityMap nextCtxId discr with
   | none => return ()
   | some v =>
@@ -733,7 +735,7 @@ partial def optimizeMatchAlt
        return .InitOptimizeExpr body :: .MatchAltWaitForExpr reuse.fvars (some reuse.scope) currIdx matchInst :: stack
   | none =>
        let alts ← getMatchAlts args mInfo
-       let ⟨_, ⟨_, _, _, _, _, _, _, _, _,_, ⟨_, _, _, _, _, nextCtxId, _, _⟩, _, _, _⟩⟩ ← get
+       let ⟨_, ⟨_, _, _, _, _, _, _, _, _,_, ⟨_, _, _, _, _, nextCtxId, _, _⟩, _, _, _⟩, _⟩ ← get
        let updatedMCtx ← addNotEqPatternToContext args mInfo alts 0 currIdx nextCtxId false
        forallTelescope alts[currIdx]! fun xs b => do
          let lhs := b.getAppArgs
@@ -743,6 +745,34 @@ partial def optimizeMatchAlt
          return .InitOptimizeExpr body :: .MatchAltWaitForExpr xs mscope currIdx matchInst :: stack
 
   where
+   /-- Return the equalities `dⱼ = pⱼ` between the discriminants and the patterns of alternative `altIdx`
+       of match application `f args`, instantiated with the alternative's parameters `params`.
+       NOTE: The patterns are obtained from the matcher's type and not from the optimized generic
+       instance, as the latter may contain optimized patterns that are not definitionally equal
+       to the patterns of the matcher (e.g., `Nat.add 1 n` instead of `n + 1`).
+       Return `none` when proof terms are not tracked or when the equalities can't be constructed.
+   -/
+   discrPatternEqs? (f : Expr) (args : Array Expr) (mInfo : MatchInfo) (altIdx : Nat) (params : Array Expr) :
+     TranslateEnvT (Option (Array Expr)) := do
+     if !(← isTracking) then return none
+     try
+       let fType ← instantiateForall (← inferType f) (args.take mInfo.numParams)
+       forallBoundedTelescope fType (1 + mInfo.numDiscrs + mInfo.numAlts) fun fvars _ => do
+         let some altVar := fvars[1 + mInfo.numDiscrs + altIdx]? | return none
+         let motive := fvars[0]!
+         forallTelescope (← inferType altVar) fun xs b => do
+           if !b.getAppFn.isFVarOf motive.fvarId! then return none
+           let lhs := b.getAppArgs
+           if xs.size != params.size || lhs.size != mInfo.numDiscrs then return none
+           let mut eqs := #[]
+           for j in mInfo.getDiscrRange do
+             let pattern := (lhs[j - mInfo.getFirstDiscrPos]!.replaceFVars xs params).replaceFVar motive args[mInfo.numParams]!
+             let eq ← mkEq args[j]! pattern
+             Meta.check eq
+             eqs := eqs.push eq
+           return some eqs
+     catch _ => return none
+
    onlyOnePattern (lhs : Array Expr) (idx : Nat) (onlyOne : Bool) : TranslateEnvT Bool := do
      if h : idx ≥ lhs.size then return onlyOne
      else if !isFVarPattern lhs[idx] then
