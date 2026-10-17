@@ -206,7 +206,13 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("omega", ← `(tactic| (intros <;> blaster_denorm <;> omega))),
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
     ("seeded instantiation", ← `(tactic| (intros <;> blaster_inst_hyps <;> blaster_denorm <;>
-                                           first | omega | grind)))
+                                           first | omega | grind))),
+    -- non-linear division/modulo identities
+    ("arith simp", ← `(tactic| (intros <;> blaster_denorm <;>
+        simp_all [Nat.mod_add_div, Nat.div_add_mod, Nat.mul_div_mul_left, Nat.mul_div_cancel_left,
+                  Nat.mul_mod_right, Nat.mul_mod_left, Nat.mod_mod, Nat.mod_self, Nat.div_self,
+                  Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_ediv,
+                  Int.ediv_add_emod, Nat.pos_iff_ne_zero] <;> done)))
   ]
   for (name, tac) in tacs do
     if let some prf ← proveWithTactic e tac (budget := 4 * dischargeHeartbeats) then

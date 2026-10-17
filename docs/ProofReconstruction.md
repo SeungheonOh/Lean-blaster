@@ -102,7 +102,12 @@ Reconstruction checks every individual rewrite, so it surfaces problems in the t
   - `isCstImplies?` substitutes `True.intro` for a hypothesis whose type was simplified to `True`.
     This yields ill-typed terms such as `Char.ofNatAux 84 True.intro`.
   - Universe levels are normalized to `1` (`normLevel`), so goals over `Sort u` are rewritten to
-    goals over `Type`.
+    goals over `Type`. This includes unassigned *or uninstantiated* level metavariables; for example,
+    `#testOptimize` passes terms with assigned but uninstantiated level metavariables.
+  - The `dite'` branch-swap rule (`isITESwap?`) produced a then-branch of type `¬¬c → α` instead of
+    `c → α`. When tracking proofs, the branches are now retyped.
+  - Rewriting the domain of quantified *function* variables (e.g. `f : c = true → α` to
+    `f : true = c → α`) leaves their dependent uses ill-typed. Reconstruction currently fails on these.
 
 ## Measuring coverage
 
@@ -116,6 +121,23 @@ for a kernel-checked proof of `e = optimize(e)`. One JSON line per attempt is wr
 discharge methods, failure reasons, and proof obligations per rewrite site. The rewrite-site
 breakdown is the to-do list for further rule instrumentation.
 
+## Coverage history
+
+Measured with `scripts/recon_coverage.sh` on the full test suite. Each row adds one milestone; percentages
+are the fraction of attempts producing a kernel-checked proof.
+
+| milestone                                            | `#testOptimize` certificates | goals closed by optimizer | goals closed by SMT | all   |
+|------------------------------------------------------|------------------------------|---------------------------|---------------------|-------|
+| proof-producing optimizer + tactic discharge         | 85.7%                        | 77.1%                     | 36.7%               | 82.4% |
+| + `dite'` congruence, denormalization, sync kernel check, explicit Prop/Bool/`decide'` rules | 91.4% | 84.4% | 33.3%¹ | 87.0% |
+| + forall/Eq/arith rule lemmas, seeded instantiation, validated steps | 90.9%¹       | 92.0%                     | 39.8%               | 87.4% |
+| + robust discharge (runtime exceptions), relational lemmas, split strategy | 92.8%  | 92.0%                     | 39.8%               | 89.0% |
+
+¹ more tests were measured in this run, as earlier runs aborted some test files.
+
+Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
+to 15.4k. Proof obligations left to tactics dropped from 13.2k to 4.9k.
+
 ## Current limitations / next steps
 
 - `match` alternatives optimized under a pattern context (`MatchAltWaitForExpr`) produce coarse
@@ -126,5 +148,7 @@ breakdown is the to-do list for further rule instrumentation.
 - Goals proved by the SMT solver rely on Lean decision procedures. The next step is to replay Z3
   proofs, or at least use unsat cores and quantifier instantiations from Z3 as hints.
 - Universe-polymorphic goals cannot be reconstructed while `normLevel` is applied.
-- Arithmetic (`Nat`/`Int`), relational, `match` and `ite` rules still rely on tactic discharge rather
-  than explicit lemmas.
+- Arithmetic (`Nat`/`Int`) constant folding and `match`/`ite` normalization rules still rely on tactic
+  discharge rather than explicit lemmas.
+- Residual goals involving derived `BEq` instances or recursive functions need their definitions
+  unfolded, as the SMT solver receives them as axioms.
