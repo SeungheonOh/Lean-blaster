@@ -134,6 +134,22 @@ where
   finish (startTime : Nat) (o : ReconOutcome) : TermElabM ReconOutcome := do
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
 
+/-- Same as `reconstruct` but any exception (including runtime exceptions such as maximum recursion
+    depth or heartbeats) is reported as a reconstruction failure.
+-/
+def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome := do
+  let s ← saveState
+  tryCatchRuntimeEx (reconstruct task recon) fun ex => do
+    s.restore
+    return { failure := m!"exception: {ex.toMessageData}" }
+
+/-- Same as `reconstructRewrite` but any exception is reported as a reconstruction failure. -/
+def reconstructRewriteSafe (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermElabM ReconOutcome := do
+  let s ← saveState
+  tryCatchRuntimeEx (reconstructRewrite e optExpr pf recon) fun ex => do
+    s.restore
+    return { failure := m!"exception: {ex.toMessageData}" }
+
 /-- Append a JSON summary of `o` to the file referred by environment variable `BLASTER_RECON_STATS` (if set). -/
 def dumpStats (o : ReconOutcome) (label : String) : TermElabM Unit := do
   let some path ← IO.getEnv "BLASTER_RECON_STATS" | return
@@ -182,7 +198,7 @@ def command (sOpts: BlasterOptions) (stx : Syntax) : TermElabM Unit := do
        let ((_, _, task?), env') ← Translate.mainWithTask e |>.run env
        if sOpts.reconstruct == 0 then return
        let some task := task? | return
-       let outcome ← reconstruct task env'.recon
+       let outcome ← reconstructSafe task env'.recon
        dumpStats outcome "command"
        reportOutcome sOpts outcome
 

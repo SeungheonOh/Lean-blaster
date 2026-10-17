@@ -20,12 +20,13 @@ def callOptimize (sOpts : BlasterOptions) (stx : Syntax) : TermElabM Expr :=
 -/
 def auditReconstruction (sOpts : BlasterOptions) (stx : Syntax) (name : String) : TermElabM Unit := do
   if (← IO.getEnv "BLASTER_RECON_STATS").isNone then return
-  withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0, maxRecDepth := 0 }) $ do
-    let outcome ← try
+  withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0, maxRecDepth := 100000 }) $ do
+    let s ← saveState
+    let outcome ← tryCatchRuntimeEx (do
         let e ← parseTerm stx
         let ((optExpr, pf), env) ← Blaster.Optimize.commandPf { sOpts with reconstruct := 1 } e
-        Blaster.Reconstruct.reconstructRewrite e optExpr pf env.recon
-      catch ex => pure { failure := m!"exception: {ex.toMessageData}" }
+        Blaster.Reconstruct.reconstructRewriteSafe e optExpr pf env.recon)
+      (fun ex => do s.restore; pure { failure := m!"exception: {ex.toMessageData}" })
     Blaster.Reconstruct.dumpStats outcome s!"testOptimize:{name}"
 
 /-! ## Definition of #testOptimize command to write unit test for Blaster.optimize

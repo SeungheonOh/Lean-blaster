@@ -1,7 +1,7 @@
 import Lean
 import Blaster.Optimize.Hypotheses
 
-open Lean Meta Elab
+open Lean Meta Elab Blaster.Reconstruct
 namespace Blaster.Optimize
 
 /-- `mkImpliesExpr a b` return expression `a → b` without applying any normalization. -/
@@ -131,7 +131,7 @@ def hypReduction? (h : Expr) (a : Expr) (b : Expr) : TranslateEnvT (Option Expr)
   Assume that `n` is a free variable expression. An error is triggered if this is not the case.
   Assume that `h` corresponds to the hypothesis map updated with hypotheses in `t`.
 -/
-def optimizeForall (n : Expr) (t : Expr) (h : HypothesisMap) (b : Expr) : TranslateEnvT Expr := do
+def optimizeForallCore (n : Expr) (t : Expr) (h : HypothesisMap) (b : Expr) : TranslateEnvT Expr := do
   if let Expr.const ``True _ := b then return b
   if let some r ← isCstImplies? n t b then return r
   if let some r ← isNotDef? t b then return r
@@ -142,5 +142,61 @@ def optimizeForall (n : Expr) (t : Expr) (h : HypothesisMap) (b : Expr) : Transl
   if let some r ← hypReduction? n t b then return r
   if (← (isSortOrInhabited t) <&&> (isPropEnv b) <&&> (pure !fVarInExpr n.fvarId! b)) then return b
   mkForallFVar n b
+
+/-- Same as `optimizeForallCore` but also records the justification of the applied rule
+    when tracking proof terms (see `Blaster.Reconstruct`).
+-/
+def optimizeForall (n : Expr) (t : Expr) (h : HypothesisMap) (b : Expr) : TranslateEnvT Expr := do
+  if !(← isTracking) then return ← optimizeForallCore n t h b
+  -- record the justification for the applied simplification rule (see `Blaster.Reconstruct`)
+  let lhs ← mkForallFVar n b
+  let r ← optimizeForallCore n t h b
+  if lhs == r then return r
+  let isArrow := !fVarInExpr n.fvarId! b
+  let isPropBody ← isPropEnv b
+  if let Expr.const ``True _ := b then
+    return ← withProofM lhs r (return mkApp (mkConst ``forall_true' [← getLevel t]) t)
+  if isPropBody then
+    match t with
+    | Expr.const ``True _ =>
+        if isArrow then return ← withThm lhs r ``true_imp_eq #[b]
+        return ← withProofM lhs r (return mkApp (mkConst ``forall_true_dep) (← mkLambdaFVars #[n] b))
+    | Expr.const ``False _ =>
+        return ← withProofM lhs r (return mkApp (mkConst ``false_imp_eq) (← mkLambdaFVars #[n] b))
+    | _ => pure ()
+  if let Expr.const ``False _ := b then
+    if (← isPropEnv t) then return ← withDefEq lhs r -- `a → False` is `¬ a` by definition
+  if !isArrow || !isPropBody || !(← isPropEnv t) then
+    -- `∀ (n : t), e ===> e` (when t is inhabited)
+    if isArrow && isPropBody && exprEq r b then
+      return ← withProofM lhs r (mkAppOptM ``forall_const' #[t, none, b])
+    return r
+  -- non-dependent implication `t → b` between propositions
+  if exprEq t b then return ← withThm lhs r ``imp_self_eq #[t]
+  let hyps := (← get).optEnv.hypothesisContext.hypothesisMap
+  if r.isConstOf ``True then
+    if let some p ← inHypMap lhs hyps then return ← withHypThm lhs r lhs p ``eq_true #[lhs]
+    if let some p ← inHypMap b h then
+      -- hypothesis obtained from `t`
+      return ← withProofM lhs r (do
+        let p ← mkLambdaFVars #[n] p
+        return mkApp2 (mkConst ``eq_true) lhs p)
+    if let some p ← inHypMap b hyps then return ← withHypThm lhs r b p ``imp_eq_true_of_right #[t, b]
+    if let some p ← notInHypMap t hyps then
+      return ← withHypThm lhs r (mkApp (← mkPropNotOp) t) p ``imp_eq_true_of_not_left #[t, b]
+    return r
+  if let some ne := propNot? r then
+    if exprEq ne t then
+      if let some p ← notInHypMap b h then
+        return ← withProofM lhs r (do
+          let p ← mkLambdaFVars #[n] p
+          if (← inferType p) != (← mkForallFVar n (mkApp (← mkPropNotOp) b)) then throwError "unexpected hypothesis"
+          return mkApp3 (mkConst ``imp_eq_not_of_imp) t b p)
+      if let some p ← notInHypMap b hyps then
+        return ← withHypThm lhs r (mkApp (← mkPropNotOp) b) p ``imp_eq_not_of #[t, b]
+      return r
+  if exprEq r b then
+    if let some p ← inHypMap t hyps then return ← withHypThm lhs r t p ``imp_eq_of_left #[t, b]
+  return r
 
 end Blaster.Optimize

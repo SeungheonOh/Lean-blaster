@@ -49,7 +49,7 @@ def blasterTacticImp : Tactic := fun stx =>
        match task? with
        | some task =>
           if sOpts.reconstruct > 0 then
-            let outcome ← Reconstruct.reconstruct task env'.recon
+            let outcome ← Reconstruct.reconstructSafe task env'.recon
             Reconstruct.dumpStats outcome "tactic"
             Reconstruct.reportOutcome sOpts outcome
             match outcome.proof? with

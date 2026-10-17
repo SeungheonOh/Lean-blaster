@@ -137,6 +137,53 @@ def dischargeHoles (p : Expr) (holes : Array HoleInfo := #[]) : TermElabM (Expr 
             return .done e)
   return (p', ← stats.get)
 
+/-! ## Seeded quantifier instantiation
+
+SMT solvers frequently prove goals by instantiating universally quantified hypotheses with terms
+that do not occur in the goal (e.g., `(∀ n : Nat, 0 < n) → P` is valid as `0 < 0` is false).
+E-matching based procedures (e.g., `grind`) fail on such goals. As a first approximation, we
+specialize universally quantified hypotheses with a few seed values of the quantified type.
+-/
+
+/-- Return seed values for type `t`. -/
+def seedsFor (t : Expr) : MetaM (Array Expr) := do
+  match ← whnfR t with
+  | .const ``Nat _ => return #[mkNatLit 0, mkNatLit 1]
+  | .const ``Int _ => return #[toExpr (0 : Int), toExpr (1 : Int), toExpr (-1 : Int)]
+  | .const ``Bool _ => return #[toExpr true, toExpr false]
+  | .sort .zero => return #[mkConst ``False, mkConst ``True]
+  | _ => return #[]
+
+/-- Return the specializations of `p : ty` (up to `depth` quantifiers) w.r.t. seed values. -/
+partial def specializeWithSeeds (p ty : Expr) (depth : Nat) : MetaM (Array (Expr × Expr)) := do
+  if depth == 0 then return #[]
+  let .forallE _ d b _ ← whnfR ty | return #[]
+  let mut res := #[]
+  for s in ← seedsFor d do
+    let p' := mkApp p s
+    let ty' := b.instantiate1 s
+    res := res.push (p', ty')
+    res := res ++ (← specializeWithSeeds p' ty' (depth - 1))
+  return res
+
+/-- Add the seeded specializations of all propositional hypotheses of `g` to its local context. -/
+def instHypsWithSeeds (g : MVarId) : MetaM MVarId := g.withContext do
+  let mut hs := #[]
+  for decl in ← getLCtx do
+    if decl.isImplementationDetail then continue
+    let ty ← instantiateMVars decl.type
+    if !(← isProp ty) then continue
+    for (p, pty) in ← specializeWithSeeds decl.toExpr ty 2 do
+      hs := hs.push { userName := `h_seed, type := pty, value := p : Hypothesis }
+  if hs.isEmpty then return g
+  let (_, g) ← g.assertHypotheses hs
+  return g
+
+syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
+
+@[tactic blasterInstHyps] def evalBlasterInstHyps : Tactic := fun _ =>
+  liftMetaTactic fun g => return [← instHypsWithSeeds g]
+
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
 -/
@@ -146,7 +193,9 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("decide", ← `(tactic| decide)),
     ("simp", ← `(tactic| (blaster_denorm <;> simp <;> done))),
     ("omega", ← `(tactic| (intros <;> blaster_denorm <;> omega))),
-    ("grind", ← `(tactic| (blaster_denorm <;> grind)))
+    ("grind", ← `(tactic| (blaster_denorm <;> grind))),
+    ("seeded instantiation", ← `(tactic| (intros <;> blaster_inst_hyps <;> blaster_denorm <;>
+                                           first | omega | grind)))
   ]
   for (name, tac) in tacs do
     if let some prf ← proveWithTactic e tac (budget := 4 * dischargeHeartbeats) then

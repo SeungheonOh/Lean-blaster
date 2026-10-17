@@ -1,7 +1,7 @@
 import Lean
 import Blaster.Optimize.Hypotheses
 
-open Lean Meta
+open Lean Meta Blaster.Reconstruct
 namespace Blaster.Optimize
 
 /-- Return `some true` if op1 and op2 are constructors that are structurally equivalent modulo
@@ -328,16 +328,28 @@ def optimizeEq (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
  let op1 := args[1]!
  let op2 := args[2]!
  let eqType := args[0]!
+ let lhs := mkApp3 f eqType op1 op2
  if let Expr.const ``False _ := op1 then
     setRestart
-    return mkApp (← mkPropNotOp) op2
- if let Expr.const ``True _ := op1 then return op2
- if isNotExprOf op2 op1 || isBoolNotExprOf op2 op1 then return ← mkPropFalse
- if exprEq op1 op2 then return ← mkPropTrue
+    return ← withThm lhs (mkApp (← mkPropNotOp) op2) ``false_eq' #[op2]
+ if let Expr.const ``True _ := op1 then return ← withThm lhs op2 ``true_eq' #[op2]
+ if isNotExprOf op2 op1 then return ← withThm lhs (← mkPropFalse) ``eq_not_self' #[op1]
+ if isBoolNotExprOf op2 op1 then return ← withThm lhs (← mkPropFalse) ``bool_eq_not_self #[op1]
+ if exprEq op1 op2 then return ← withThm lhs (← mkPropTrue) ``eq_self #[eqType, op1] f.constLevels!
  if let some false ← structEq? op1 op2 then return ← mkPropFalse
- if let some (e1, e2) ← notNegEqSimp? op1 op2 then return mkApp3 f eqType e1 e2
+ if let some (e1, e2) ← notNegEqSimp? op1 op2 then
+   let r := mkApp3 f eqType e1 e2
+   match op1, boolNot? op2, boolNot? op1 with
+   | Expr.const ``true _, some e, _ => return ← withThm lhs r ``true_eq_not #[e]
+   | Expr.const ``false _, some e, _ => return ← withThm lhs r ``false_eq_not #[e]
+   | _, some b, some a => return ← withThm lhs r ``not_eq_not_bool #[a, b]
+   | _, _, _ =>
+     match propNot? op1, propNot? op2 with
+     | some a, some b => return ← withThm lhs r ``not_eq_not_prop #[a, b]
+     | _, _ => return r
  if let some r ← zeroEqNegReduce? op1 op2 eqType then return r
- if let some (e1, e2) ← intNegEqReduce? op1 op2 then return mkApp3 f eqType e1 e2
+ if let some (e1, e2) ← intNegEqReduce? op1 op2 then
+   return ← withThm lhs (mkApp3 f eqType e1 e2) ``int_neg_eq_neg #[e1, e2]
  if let some r ← natZeroEqMulReduce? op1 op2 then return r
  if let some r ← intZeroEqMulReduce? op1 op2 then return r
  if let some r ← arithEq? op1 op2 then return r

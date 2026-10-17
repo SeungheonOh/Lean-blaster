@@ -336,6 +336,12 @@ def withThm (lhs rhs : Expr) (thm : Name) (args : Array Expr) (us : List Level :
     modify fun env => { env with recon.stepLog := env.recon.stepLog.push (lhs, rhs, .proof (mkAppN (mkConst thm us) args)) }
   return rhs
 
+/-- Same as `withThm` but with a proof term computed lazily (only when tracking proof terms). -/
+@[always_inline, inline]
+def withProofM (lhs rhs : Expr) (p : TranslateEnvT Expr) : TranslateEnvT Expr := do
+  recordStepM lhs rhs p
+  return rhs
+
 /-- Same as `withThm` but for a definitional rewrite. -/
 @[always_inline, inline]
 def withDefEq (lhs rhs : Expr) : TranslateEnvT Expr := do

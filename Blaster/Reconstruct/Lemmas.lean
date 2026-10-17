@@ -236,3 +236,47 @@ theorem decide'_false_eq (p : Bool) : Blaster.decide' (false = p) = !p := by
   . exact (Blaster.decide'_false _).mpr Bool.noConfusion
 
 end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Quantifiers and implications (see `optimizeForall`) -/
+
+theorem forall_true' (α : Sort u) : (α → True) = True := propext ⟨fun _ => trivial, fun _ _ => trivial⟩
+theorem true_imp_eq (p : Prop) : (True → p) = p := propext ⟨fun h => h trivial, fun h _ => h⟩
+theorem forall_true_dep (p : True → Prop) : (∀ h, p h) = p True.intro := propext ⟨fun h => h _, fun h _ => h⟩
+theorem false_imp_eq (p : False → Prop) : (∀ h, p h) = True := propext ⟨fun _ => trivial, fun _ h => h.elim⟩
+theorem imp_self_eq (p : Prop) : (p → p) = True := propext ⟨fun _ => trivial, fun _ h => h⟩
+theorem imp_eq_not_of (a : Prop) {b : Prop} (h : ¬ b) : (a → b) = ¬ a := propext ⟨fun h1 h2 => h (h1 h2), fun h1 h2 => (h1 h2).elim⟩
+theorem imp_eq_not_of_imp {a : Prop} (b : Prop) (h : a → ¬ b) : (a → b) = ¬ a :=
+  propext ⟨fun h1 h2 => h h2 (h1 h2), fun h1 h2 => (h1 h2).elim⟩
+theorem imp_eq_true_of_right (a : Prop) {b : Prop} (h : b) : (a → b) = True := propext ⟨fun _ => trivial, fun _ _ => h⟩
+theorem imp_eq_true_of_not_left {a : Prop} (b : Prop) (h : ¬ a) : (a → b) = True :=
+  propext ⟨fun _ => trivial, fun _ h' => (h h').elim⟩
+theorem imp_eq_of_left {a : Prop} (b : Prop) (h : a) : (a → b) = b := propext ⟨fun h' => h' h, fun h' _ => h'⟩
+theorem forall_eq_of_left {a : Prop} (p : a → Prop) (h : a) : (∀ x, p x) = p h :=
+  propext ⟨fun h' => h' h, fun h' _ => h'⟩
+theorem forall_const' (α : Sort u) [Nonempty α] (b : Prop) : (α → b) = b :=
+  propext ⟨fun h => h (Classical.choice inferInstance), fun h _ => h⟩
+
+/-! ## Equality (see `optimizeEq`) -/
+
+theorem false_eq' (e : Prop) : (False = e) = ¬ e :=
+  propext ⟨fun h h' => h ▸ h', fun h => propext ⟨False.elim, h⟩⟩
+theorem true_eq' (e : Prop) : (True = e) = e := propext ⟨fun h => h ▸ trivial, fun h => (eq_true h).symm⟩
+theorem eq_not_self' (e : Prop) : (e = ¬ e) = False := by
+  apply propext; constructor
+  . intro h; have h1 : ¬ e := fun he => (h ▸ he) he; exact h1 (h ▸ h1)
+  . intro h; exact h.elim
+theorem bool_eq_not_self (e : Bool) : (e = !e) = False := by cases e <;> simp
+theorem true_eq_not (e : Bool) : (true = !e) = (false = e) := by cases e <;> simp
+theorem false_eq_not (e : Bool) : (false = !e) = (true = e) := by cases e <;> simp
+theorem not_eq_not_bool (a b : Bool) : ((!a) = !b) = (a = b) := by cases a <;> cases b <;> simp
+theorem not_eq_not_prop (a b : Prop) : ((¬ a) = (¬ b)) = (a = b) := by
+  apply propext; constructor
+  . intro h; apply propext; constructor
+    . intro ha; exact Classical.byContradiction (fun hb => (h ▸ hb : ¬ a) ha)
+    . intro hb; exact Classical.byContradiction (fun ha => (h.symm ▸ ha : ¬ b) hb)
+  . intro h; rw [h]
+theorem int_neg_eq_neg (a b : Int) : (Int.neg a = Int.neg b) = (a = b) := propext Int.neg_inj
+
+end Blaster.Reconstruct
