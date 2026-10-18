@@ -593,6 +593,8 @@ def macroTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("simp", ← `(tactic| (intros; simp [Int.natCast_ediv, Int.natCast_emod]; done))),
     ("grind", ← `(tactic| (intros; grind)))]
 
+theorem toNat_ediv_two (y : Int) : (y / 2).toNat = y.toNat / 2 := by omega
+
 def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) := do
   let arith := #[
     ("omega", ← `(tactic| (intros; omega))),
@@ -623,7 +625,9 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
     ("nat cases unfold lhs", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
                                    (try blaster_cases_vars) <;> blaster_unfold_lhs <;> (try blaster_unfold_nonrec) <;>
                                    (try simp_all) <;> (try split) <;> first | done | omega | grind))),
-    ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;> grind)))]
+    ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;> grind))),
+    -- `@Nat.log2` (see `auxiliaryInterp`): one unfolding step
+    ("log2", ← `(tactic| (intros; rw [Nat.log2_def] <;> simp only [toNat_ediv_two] at * <;> split <;> omega)))]
   match rule with
   | "th-lemma" => return arith ++ simp ++ grind ++ unfold
   -- datatype lemmas over generalized terms (e.g., `x = C (C.0 x) ∨ ¬ is-C x`)

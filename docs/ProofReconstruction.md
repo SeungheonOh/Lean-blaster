@@ -260,12 +260,13 @@ tactic strategies), `first`, `only` (no tactic strategies, to measure the replay
 ### Results
 
 On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=only` (no tactic strategy for
-SMT residuals), the replay of Z3 proofs proves **88.9%** of the goals closed by the SMT solver (248/279, nightly
-Z3). Most of the remaining failures are polymorphic goals with several sort variables, `match` patterns on
-`Nat`/`Int` with variables and named patterns (`Tests/Smt/SmtMatch.lean`), and non-linear arithmetic lemmas
-on `div`/`mod` (`Tests/Smt/SmtNat/SmtNatDiv.lean`). With the default mode (`last`), the replay complements the
-tactic strategies: 99.7% of all the reconstruction attempts succeed (3895/3905), 367/368 for the goals closed
-by the SMT solver.
+SMT residuals), the replay of Z3 proofs proves **93.5%** of the goals closed by the SMT solver (302/323, nightly
+Z3; 88.9%, 248/279, before the closed-statement tactics, the polymorphic universe interpretation and the
+nonlinear lemmas). The remaining failures are mostly `match` patterns on `Int` with named patterns
+(`Tests/Smt/SmtMatch.lean`, 9) and polymorphic Lean functions in goals with several sort variables
+(`Tests/FixedIssues/Issue26.lean`, 7). With the default mode (`last`), the replay complements the tactic
+strategies: 99.8% of all the reconstruction attempts succeed (3914/3921), including all the 380 goals closed by
+the SMT solver; the 7 failures are `#testOptimize` certificates of `match` normalizations.
 
 The replay also scales to the validators of
 [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
