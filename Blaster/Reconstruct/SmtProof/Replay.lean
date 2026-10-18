@@ -326,6 +326,42 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
       h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 300}"
   return r.map fun (pf, _) => mkAppN pf vals
 
+/-- `quant-intro` (Z3): from `h : ∀ xs, a xs = b xs` (resp. `∀ xs, a xs → b xs`), a proof of
+    `(∀ xs, a xs) = (∀ xs, b xs)` (resp. `(∀ xs, a xs) → (∀ xs, b xs)`), when `concl` has this form. -/
+partial def quantIntro (t h concl : Expr) : MetaM (Option Expr) := do
+  match t, concl with
+  -- equality: `forall_congr` under each binder
+  | .forallE n ty body bi, _ =>
+      if let some (_, .forallE _ ty₁ _ _, .forallE _ ty₂ _ _) := concl.eq? then
+        if ty == ty₁ && ty == ty₂ then
+          let some (_, .forallE n₁ _ b₁ bi₁, .forallE n₂ _ b₂ bi₂) := concl.eq? | return none
+          return ← withLocalDecl n bi ty fun x => do
+            let inner := mkApp h x
+            let innerTy := body.instantiate1 x
+            let concl' ← mkEq (b₁.instantiate1 x) (b₂.instantiate1 x)
+            -- deeper binders, or the equality itself
+            let some p ← (if innerTy.isForall then quantIntro innerTy inner concl'
+                          else do if ← isDefEq innerTy concl' then pure (some inner) else pure none) | return none
+            let _ := (n₁, bi₁, n₂, bi₂)
+            return some (← mkAppM ``forall_congr #[← mkLambdaFVars #[x] p])
+      -- implication (`~` is interpreted as `→`)
+      if let .forallE _ (.forallE _ ty₁ b₁ _) (.forallE _ ty₂ b₂ _) _ := concl then
+        if ty == ty₁ && ty == ty₂ then
+          return ← withLocalDeclD `h₁ (.forallE n ty₁ b₁ bi) fun h₁ => do
+            let r ← withLocalDecl n bi ty fun x => do
+              let p := mkApp h x
+              let a := mkApp h₁ x
+              let pt ← whnfR (← inferType p)
+              if pt.isArrow then return some (← mkLambdaFVars #[x] (mkApp p a))
+              -- `a x = b x`
+              if let some _ := pt.eq? then return some (← mkLambdaFVars #[x] (← mkEqMP p a))
+              return none
+            match r with
+            | some f => return some (← mkLambdaFVars #[h₁] f)
+            | none => return none
+      return none
+  | _, _ => return none
+
 mutual
 
 /-- Proof of the interpretation of the conclusion of step `i`. -/
@@ -554,6 +590,14 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       record step.rule "exact"
       return mkApp6 (Lean.mkConst ``Or.elim) q nq concl (mkApp (Lean.mkConst ``Classical.em) q) r rn
   | "proof-bind" => replayBind step
+  | "quant-intro" =>
+      -- `∀ xs, a xs = b xs` (resp. `→`, for `~`) gives `(∀ xs, a xs) = (∀ xs, b xs)` (resp. `→`)
+      let ps ← premises step
+      let #[(t, p)] := ps | throwError "quant-intro: one premise expected"
+      let r ← quantIntro t p concl
+      let some pf := r | throwError "quant-intro: unexpected forms"
+      if ← propEq (← inferType pf) concl then record step.rule "exact"; return pf
+      throwError "quant-intro: conclusion mismatch"
   | "monotonicity" | "cong" => replayCongr step concl
   | "commutativity" => replayComm concl
   | "sk" =>
