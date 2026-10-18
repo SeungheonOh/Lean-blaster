@@ -731,6 +731,14 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
           let gen ← Local.generalizeCommon eq l r
           let t1 ← IO.monoMsNow
           if let some (g, vals) := gen then
+            -- propositional differences (e.g., associativity of connectives, `ite` on propositions): exact proof
+            let pp? ← forallTelescope g fun zs body => do
+              let some (ty, _, _) := body.eq? | return none
+              if !ty.isProp then return none
+              match ← PropEngine.prove #[] body with
+              | some p => some <$> mkLambdaFVars zs p
+              | none => pure none
+            if let some pp := pp? then return some (mkAppN pp vals)
             let r ← cfg.proveStep rule g
             if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
               let t2 ← IO.monoMsNow
