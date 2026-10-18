@@ -549,6 +549,8 @@ partial def congrDescent (eqs : Array (Expr × Expr × Expr)) (l r : Expr) (fuel
   let las := l.getAppArgs
   let ras := r.getAppArgs
   if lf != rf || las.size != ras.size then return none
+  -- conditionals (the instance depends on the condition)
+  if let some p ← Local.iteCongr? l r (congrDescent eqs · · (fuel - 1)) then return some p
   -- congruence on each argument (dependent arguments must be equal)
   let mut pf ← mkEqRefl (mkAppN lf #[])
   let mut cur := lf

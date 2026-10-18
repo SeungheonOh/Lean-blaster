@@ -16,6 +16,24 @@ open Lean Meta Elab Term
 
 namespace Blaster.Reconstruct.SmtProof.Local
 
+theorem classical_ite_congr {α : Sort u} {c c' : Prop} {x x' y y' : α} (hc : c = c') (hx : x = x') (hy : y = y') :
+    @ite α c (Classical.propDecidable c) x y = @ite α c' (Classical.propDecidable c') x' y' := by
+  subst hc hx hy; rfl
+
+/-- `ite c x y = ite c' x' y'` (with the classical instances of the interpretation, whose argument depends on
+    the condition), given the proofs of the equalities of the arguments (`sub`). -/
+def iteCongr? [Monad m] [MonadLiftT MetaM m] (l r : Expr) (sub : Expr → Expr → m (Option Expr)) : m (Option Expr) := do
+  if !(l.isAppOfArity ``ite 5 && r.isAppOfArity ``ite 5) then return none
+  let la := l.getAppArgs
+  let ra := r.getAppArgs
+  if !(la[2]!.isAppOfArity ``Classical.propDecidable 1 && ra[2]!.isAppOfArity ``Classical.propDecidable 1) then return none
+  if la[0]! != ra[0]! then return none
+  let some pc ← (if la[1]! == ra[1]! then liftM (mkEqRefl la[1]!) >>= (pure ∘ some) else sub la[1]! ra[1]!) | return none
+  let some px ← (if la[3]! == ra[3]! then liftM (mkEqRefl la[3]!) >>= (pure ∘ some) else sub la[3]! ra[3]!) | return none
+  let some py ← (if la[4]! == ra[4]! then liftM (mkEqRefl la[4]!) >>= (pure ∘ some) else sub la[4]! ra[4]!) | return none
+  let u ← liftM (getLevel la[0]!)
+  return some (mkAppN (mkConst ``classical_ite_congr [u]) #[la[0]!, la[1]!, ra[1]!, la[3]!, ra[3]!, la[4]!, ra[4]!, pc, px, py])
+
 /-- Whether `e` has at most `n` nodes (as a tree), without traversing more than `n` nodes. -/
 def sizeLe (e : Expr) (n : Nat) : Bool :=
   (go e n).isSome
@@ -160,6 +178,8 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
           if r?.isSome then return r?
       | _, _ => pure ()
     return ← whole
+  -- conditionals (the instance depends on the condition)
+  if let some p ← iteCongr? l r (diffEq prove budget) then return some p
   let as := l.getAppArgs
   let bs := r.getAppArgs
   let info ← getFunInfoNArgs fl as.size
