@@ -2,6 +2,7 @@ import Lean
 import Blaster.Optimize.Decidable
 import Blaster.Reconstruct.SmtProof.Interp
 import Blaster.Reconstruct.Discharge
+import Blaster.Reconstruct.SmtProof.Poly
 
 /-!
 # Bridge between goals and the interpretation of their translation
@@ -17,7 +18,9 @@ of the translation:
 This module proves the equality of a goal term `a` with the interpretation `b` of its translation by a
 simultaneous traversal of both terms: congruence on their common structure, and lemmas for each
 encoding at the points where they differ. The proven statement is `W(a) = b` where `W` is the
-mapping to the SMT world: `(↑a : Int)` for `Nat` terms, `a = true` for `Bool` terms, `a` otherwise.
+mapping to the SMT world: `(↑a : Int)` for `Nat` terms, `a = true` for `Bool` terms, the world of the
+type of `a` for the terms of the polymorphic encoding (e.g., `Poly.inj α a` for `a : α`, see `Poly.lean`),
+`a` otherwise.
 
 `match` expressions are related to their `ite` encoding by auxiliary theorems stated for abstract
 discriminants and alternatives (i.e., small statements, proved once per matcher instance by `proveMatchIte`,
@@ -203,6 +206,9 @@ inductive World where
   | nat
   /-- `Bool` term interpreted as a proposition: `(a = true) = b` -/
   | bool
+  /-- term of the polymorphic encoding: `w a = b` where `w` is the world of its type (e.g., `inj α a = b` for
+      `a : α` with `α` a sort variable, see `Poly.mkWorld`), with a proof `inj` of the injectivity of `w` -/
+  | poly (w inj : Expr)
   deriving BEq, Inhabited
 
 def natCast (a : Expr) : Expr :=
@@ -215,6 +221,7 @@ def World.lift : World → Expr → Expr
   | .same, a => a
   | .nat, a => natCast a
   | .bool, a => boolTrue a
+  | .poly w _, a => Poly.applyWorld w a
 
 def worldOf (ta tb : Expr) : MetaM (Option World) := do
   if ta == tb then return some .same
@@ -224,6 +231,7 @@ def worldOf (ta tb : Expr) : MetaM (Option World) := do
   if ta'.isConstOf ``Nat && tb'.isConstOf ``Int then return some .nat
   if ta'.isConstOf ``Bool && tb'.isProp then return some .bool
   if ← isDefEq ta tb then return some .same
+  if let some (w, h) ← Poly.mkWorld ta tb then return some (.poly w h)
   return none
 
 /-! ## Matchers -/
@@ -659,6 +667,48 @@ def proveMatchIte (stmt : Expr) (fuel := 256) : Term.TermElabM (Option Expr) := 
     dbg m!"bridge: {ex.toMessageData}"
     s.restore; return none
 
+/-- `∀ ys, G₁ → … → Gₙ → Q` where the guards `Gᵢ` (membership predicates of the polymorphic encoding, see `Poly`)
+    follow all the binders (e.g., Blaster's translation of `∀ (xs : List β) (f : List β → Nat), P`): the equivalent
+    proposition where each guard follows the last binder it mentions (i.e., the order of the goal), with a proof
+    of their equality. -/
+partial def interleaveGuards (b : Expr) : MetaM (Option (Expr × Expr)) := do
+  -- only for quantifiers over the types of the encoding
+  let rec univBinder (e : Expr) (fuel : Nat) : Bool :=
+    match fuel, e with
+    | fuel + 1, .forallE _ t body _ => Poly.hasUniv t || univBinder body fuel
+    | _, _ => false
+  let .forallE _ _ (.forallE ..) _ := b | return none
+  if !univBinder b 8 then return none
+  go b #[] #[]
+where
+  isGuard (t : Expr) : Bool := t.isAppOfArity ``Poly.Img 4 && t.appArg!.isFVar
+  go (e : Expr) (ys gs : Array Expr) : MetaM (Option (Expr × Expr)) := do
+    if let .forallE n t body bi := e then
+      if gs.isEmpty && !(← isProp t) then
+        return ← withLocalDecl n bi t fun y => go (body.instantiate1 y) (ys.push y) gs
+      if isGuard t && !body.hasLooseBVars then
+        return ← withLocalDecl n bi t fun g => go body ys (gs.push g)
+    finish e ys gs
+  finish (q : Expr) (ys gs : Array Expr) : MetaM (Option (Expr × Expr)) := do
+    if gs.isEmpty || ys.size < 2 then return none
+    -- each guard after the last binder it mentions
+    let mut order := #[]
+    let mut placed := Array.replicate gs.size false
+    for y in ys do
+      order := order.push y
+      for i in [:gs.size] do
+        if placed[i]! then continue
+        let gt ← inferType gs[i]!
+        if ys.all fun y' => !gt.containsFVar y'.fvarId! || order.contains y' then
+          order := order.push gs[i]!
+          placed := placed.set! i true
+    if placed.any (!·) || order == ys ++ gs then return none
+    let b' ← mkForallFVars order q
+    let b ← mkForallFVars (ys ++ gs) q
+    let mp ← withLocalDeclD `h b' fun h => do mkLambdaFVars #[h] (← mkLambdaFVars (ys ++ gs) (mkAppN h order))
+    let mpr ← withLocalDeclD `h b fun h => do mkLambdaFVars #[h] (← mkLambdaFVars order (mkAppN h (ys ++ gs)))
+    return some (b', mkApp3 (mkConst ``propext) b' b (mkApp4 (mkConst ``Iff.intro) b' b mp mpr))
+
 /-! ## Traversal -/
 
 structure Cfg where
@@ -846,10 +896,14 @@ partial def walkCore (a b : Expr) : BridgeM (Option Expr) := do
   let ta ← inferType a
   let tb ← inferType b
   let some w ← worldOf ta tb | return none
+  -- applications of functions of the polymorphic encoding (e.g., `f x` with `f : α → β`)
+  if a.isApp && b.isApp && !a.getAppFn.isConst then
+    if let some p ← walkLiftedApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
   match w with
   | .same => walkSame a b
   | .nat => walkNat a b
   | .bool => walkBool a b
+  | .poly w h => walkPoly w h a b
 
 /-- Small terms: definitional equality (e.g., literals in different forms). -/
 partial def byDefEq (lhs b : Expr) : BridgeM (Option Expr) := do
@@ -863,6 +917,8 @@ partial def byDefEq (lhs b : Expr) : BridgeM (Option Expr) := do
 
 /-- `ite` on the goal side: `W(ite c x y) = ite c' x' y'`. -/
 partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  -- NOTE: `ite` in the world of the polymorphic encoding is handled by `walkPoly`
+  if let .poly .. := w then return none
   if a.isAppOfArity ``dite 5 then
     if let some p ← walkDite w a b then return some p
   let some (α, c, inst, x, y, pa) ← iteView? a | return none
@@ -879,7 +935,7 @@ partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
     | return none
   -- `W(a) = W(ite c x y) = ite c W(x) W(y)`
   let pLift ← match w with
-    | .same => mkEqRefl a
+    | .same | .poly .. => mkEqRefl a
     | .nat =>
         mkEqTrans (← mkCongrArg (mkApp2 (mkConst ``Nat.cast [levelZero]) (mkConst ``Int) (mkConst ``instNatCastInt)) pa)
           (mkApp4 (mkConst ``natCast_ite) c inst x y)
@@ -887,7 +943,7 @@ partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
         mkEqTrans (← mkCongrArg (mkLambda `z .default (mkConst ``Bool) (boolTrue (.bvar 0))) pa)
           (mkApp4 (mkConst ``boolEq_ite) c inst x y)
   let (α', x₀, y₀) := match w with
-    | .same => (α, x, y)
+    | .same | .poly .. => (α, x, y)
     | .nat => (mkConst ``Int, natCast x, natCast y)
     | .bool => (mkSort levelZero, boolTrue x, boolTrue y)
   let u ← getLevel α'
@@ -915,6 +971,7 @@ partial def walkDite (w : World) (a b : Expr) : BridgeM (Option Expr) := do
       return some (mkAppN (mkConst ``dite_congr_dep [u]) #[α, c, c', inst, x, y, x', y', pc, px, py])
   | .nat => return some (mkAppN (mkConst ``natCast_dite_congr) #[c, c', inst, x, y, x', y', pc, px, py])
   | .bool => return some (mkAppN (mkConst ``boolEq_dite_congr) #[c, c', inst, x, y, x', y', pc, px, py])
+  | .poly .. => return none
 
 /-- Matchers on the goal side: `W(a) = W(i)` where `i` is the `ite` encoding of `a`, then `W(i) = b`. -/
 partial def walkMatcher (w : World) (a b : Expr) : BridgeM (Option Expr) := do
@@ -924,6 +981,7 @@ partial def walkMatcher (w : World) (a b : Expr) : BridgeM (Option Expr) := do
     | .same => pure pa
     | .nat => mkCongrArg (mkApp2 (mkConst ``Nat.cast [levelZero]) (mkConst ``Int) (mkConst ``instNatCastInt)) pa
     | .bool => mkCongrArg (mkLambda `z .default (mkConst ``Bool) (boolTrue (.bvar 0))) pa
+    | .poly w _ => mkCongrArg w pa
   return some (← mkEqTrans pa' pi)
 
 /-- Congruence: `f a₁ ... aₙ = f b₁ ... bₙ` from `aᵢ = bᵢ` (arguments without forward dependencies). -/
@@ -1055,6 +1113,7 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
       match w with
       | .nat => return some (mkApp6 (mkConst ``nat_eq) aa[1]! aa[2]! ba[1]! ba[2]! px py)
       | .bool => return some (mkApp6 (mkConst ``bool_eq) aa[1]! aa[2]! ba[1]! ba[2]! px py)
+      | .poly _ h => return some (← mkAppM ``Poly.eq_world #[h, px, py])
       | .same => pure ()
   for (op, lem) in [(``LE.le, ``nat_le), (``LT.lt, ``nat_lt)] do
     if a.isAppOfArity op 4 && b.isAppOfArity op 4 then
@@ -1075,6 +1134,11 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
     if t'.isConstOf ``True && !body'.hasLooseBVars && !(a.isForall && a.bindingDomain!.isConstOf ``True) then
       let some p ← walk a body' | return none
       return some (mkApp3 (mkConst ``true_imp) a body' p)
+  -- quantifiers over the types of the polymorphic encoding, guarded by membership predicates
+  if let some (b', h) ← interleaveGuards b then
+    let some p ← walk a b' | return none
+    return some (← mkEqTrans p h)
+  if let some p ← walkPolyBinder a b then return some p
   -- quantifiers over `Nat`, translated as quantifiers over `Int` guarded by `0 ≤ x`
   if let some p ← walkNatBinder a b then return some p
   -- binders
@@ -1141,6 +1205,110 @@ partial def walkNatBinder (a b : Expr) : BridgeM (Option Expr) := do
     let ql := mkLambda n .default (mkConst ``Int) q
     let pf := mkApp3 (mkConst lem) pl ql (← mkLambdaFVars #[x] h)
     return some (← mkExpectedTypeHint pf (← mkEq a b))
+
+/-- `∀ x : T, P x` (resp. `∃ x : T, P x`) and `∀ y : D, Img w y → Q y` (resp. `∃ y : D, Img w y ∧ Q y`) where
+    `w : T → D` is the world of `T` in the polymorphic encoding (see `Poly`). -/
+partial def walkPolyBinder (a b : Expr) : BridgeM (Option Expr) := do
+  -- (binder name, `T`, body of `P`, `D`, guard, body of `Q` (with one loose bound variable each), `∃`)
+  let view? : Option (Name × Expr × Expr × Expr × Expr × Expr × Bool) :=
+    match a, b with
+    | .forallE n t p _, .forallE _ d (.forallE _ guard q _) _ =>
+        if q.hasLooseBVar 0 then none else some (n, t, p, d, guard, q.lowerLooseBVars 1 1, false)
+    | _, _ =>
+        if a.isAppOfArity ``Exists 2 && b.isAppOfArity ``Exists 2 then
+          match a.getArg! 1, b.getArg! 1 with
+          | .lam n t p _, .lam _ d g _ =>
+              if g.isAppOfArity ``And 2 then some (n, t, p, d, g.getArg! 0, g.getArg! 1, true) else none
+          | _, _ => none
+        else none
+  let some (n, t, p, d, guard, q, ex) := view? | return none
+  if t.hasLooseBVars || d.hasLooseBVars || !Poly.hasUniv d then return none
+  let some (w, _) ← Poly.mkWorld t d | return none
+  -- the guard is the membership predicate of the world
+  let ok ← withLocalDeclD `y d fun y => do
+    withReducible (isDefEq (guard.instantiate1 y) (← mkAppM ``Poly.Img #[w, y]))
+  if !ok then return none
+  withLocalDeclD n t fun x => do
+    let some h ← walk (p.instantiate1 x) (q.instantiate1 (Poly.applyWorld w x)) | return none
+    let pf ← mkAppOptM (if ex then ``Poly.exists_world else ``Poly.forall_world)
+      (#[t, d, w, mkLambda n .default t p, mkLambda `y .default d q, ← mkLambdaFVars #[x] h].map some)
+    return some (← mkExpectedTypeHint pf (← mkEq a b))
+
+/-- `W(f x) = F X` where `f : A → B` is a function of the polymorphic encoding (e.g., `f : α → β` with `α`, `β` sort
+    variables), whose world is `liftFun wa wb dflt`: from `liftFun wa wb dflt f = F` and `wa x = X`. The proof
+    states `wb (f x) = F X`, i.e., `W(f x) = F X` up to definitional unfolding. -/
+partial def walkLiftedApp (a b : Expr) : BridgeM (Option Expr) := do
+  let .app fa xa := a | return none
+  let .app fb xb := b | return none
+  let tF ← inferType fb
+  if !Poly.hasUniv tF then return none
+  let some (wf, hf) ← Poly.mkWorld (← inferType fa) tF | return none
+  if !(wf.isAppOfArity ``Poly.liftFun 7 && hf.isAppOfArity ``Poly.liftFun_injective 9) then return none
+  let wa := wf.getArg! 4
+  let some pf ← walk fa fb | return none
+  let some px ← walk xa xb | return none
+  let pf ← mkExpectedTypeHint pf (← mkEq (Poly.applyWorld wf fa) fb)
+  let px ← mkExpectedTypeHint px (← mkEq (Poly.applyWorld wa xa) xb)
+  return some (← mkAppM ``Poly.app_world #[hf.getArg! 5, pf, px])
+
+/-- `w a = b` where `w` is the world of the type of `a` in the polymorphic encoding (see `Poly.mkWorld`), with
+    `h` the proof of its injectivity. -/
+partial def walkPoly (w h a b : Expr) : BridgeM (Option Expr) := do
+  let la := Poly.applyWorld w a
+  if la == b then return some (← mkEqRefl b)
+  match a, b with
+  | .mdata _ a', _ => return ← walk a' b
+  | _, .mdata _ b' => return ← walk a b'
+  | .lam n t body _, .lam _ d body' _ =>
+      -- functions: `liftFun wa wb dflt (fun x => t) = fun y => t'` from `wb t = t'[y := wa x]` and `t'` being
+      -- `dflt` outside of the domain (e.g., the identity)
+      if !(w.isAppOfArity ``Poly.liftFun 7 && h.isAppOfArity ``Poly.liftFun_injective 9) then return none
+      let (wa, wb, dflt) := (w.getArg! 4, w.getArg! 5, w.getArg! 6)
+      let some hb ← withLocalDeclD n t fun x => do
+          let some p ← walk (body.instantiate1 x) (body'.instantiate1 (Poly.applyWorld wa x)) | return none
+          some <$> mkLambdaFVars #[x] p
+        | return none
+      let some hout ← withLocalDeclD `y d fun y => do
+          withLocalDeclD `hy (mkNot (← mkAppM ``Poly.Img #[wa, y])) fun hy => do
+          let l := Poly.applyWorld dflt y
+          let r := body'.instantiate1 y
+          if !(← withReducible (isDefEq l r)) then return none
+          some <$> mkLambdaFVars #[y, hy] (← mkExpectedTypeHint (← mkEqRefl r) (← mkEq l r))
+        | return none
+      let ts := #[w.getArg! 0, w.getArg! 1, w.getArg! 2, w.getArg! 3]
+      return some (← mkAppOptM ``Poly.lam_world ((ts ++ #[wa, h.getArg! 5, wb, dflt, a, b, hb, hout]).map some))
+  | _, _ => pure ()
+  -- `ite` on the goal side
+  if let some (α, c, inst, x, y, pa) ← iteView? a then
+    if let some (c', x', y', _) := classicalIte? b then
+      let some pc ← walk c c' | return none
+      let branch (cond v v' : Expr) : BridgeM (Option Expr) :=
+        withLocalDeclD `hc cond fun hc => withReader (fun cfg => { cfg with facts := cfg.facts.push hc }) do
+          let some p ← walk v v' | return none
+          some <$> mkLambdaFVars #[hc] (← mkExpectedTypeHint p (← mkEq (Poly.applyWorld w v) v'))
+      let some px ← branch c x x' | return none
+      let some py ← branch (mkNot c) y y' | return none
+      let pIte ← mkAppOptM ``Poly.ite_world (#[α, ← inferType b, w, c, c', inst, x, y, x', y', pc, px, py].map some)
+      return some (← mkEqTrans (← mkCongrArg w pa) pIte)
+  -- constructors of the functors (e.g., `List.map w (x :: xs)` is `w x :: List.map w xs`)
+  let ctor (map ctor : Name) (mapArity ctorArity : Nat) (ws : Array Expr) : BridgeM (Option Expr) := do
+    if !(w.isAppOfArity map mapArity && a.isAppOfArity ctor ctorArity && b.isAppOfArity ctor ctorArity) then
+      return none
+    let nps := ctorArity - ws.size
+    let mut pf ← mkEqRefl (mkAppN b.getAppFn (b.getAppArgs.extract 0 nps))
+    for i in [:ws.size] do
+      let (x, x') := (a.getArg! (nps + i), b.getArg! (nps + i))
+      let some p ← walk x x' | return none
+      pf ← mkCongr pf (← mkExpectedTypeHint p (← mkEq (Poly.applyWorld ws[i]! x) x'))
+    return some (← mkExpectedTypeHint pf (← mkEq la b))
+  if w.isAppOfArity ``List.map 3 then
+    if let some p ← ctor ``List.map ``List.cons 3 3 #[w.getArg! 2, w] then return some p
+  if w.isAppOfArity ``Option.map 3 then
+    if let some p ← ctor ``Option.map ``Option.some 3 2 #[w.getArg! 2] then return some p
+  if w.isAppOfArity ``Prod.map 6 then
+    if let some p ← ctor ``Prod.map ``Prod.mk 6 4 #[w.getArg! 4, w.getArg! 5] then return some p
+  if let some p ← walkMatcher (.poly w h) a b then return some p
+  byDefEq la b
 
 /-- `(↑a : Int) = b` -/
 partial def walkNat (a b : Expr) : BridgeM (Option Expr) := do

@@ -123,6 +123,20 @@ def runBackend (backend : Backend) (cmds : Array SExpr) : IO (Except String Stri
   finally
     IO.FS.removeFile path
 
+/-- Results of the backends on the last query, reused by the replays of a goal with the different interpretations
+    of the polymorphic encoding (see `proveBySmtProof`). -/
+initialize backendRuns : IO.Ref (String × Std.HashMap String (Except String String)) ← IO.mkRef ("", {})
+
+/-- `runBackend`, reusing the result of a previous run of `backend` on the same query. -/
+def runBackendCached (backend : Backend) (cmds : Array SExpr) : IO (Except String String) := do
+  let query := String.intercalate "\n" (cmds.toList.map toString)
+  let (q, runs) ← backendRuns.get
+  let runs := if q == query then runs else {}
+  if let some r := runs.get? backend.name then return r
+  let r ← runBackend backend cmds
+  backendRuns.set (query, runs.insert backend.name r)
+  return r
+
 /-! ## Interpretation of the query symbols -/
 
 /-- Lean name of an SMT symbol produced by `nameToSmtSymbol` (possibly quoted). -/
@@ -153,25 +167,77 @@ def auxiliaryInterp (s : String) : MetaM (Option Expr) := do
 def unquote (s : String) : String :=
   if s.startsWith "|" && s.endsWith "|" && s.length ≥ 2 then (s.drop 1).dropRight 1 else s
 
+/-- Interpretation of Blaster's polymorphic encoding (see `Poly`), given the sort variables of the goal with their
+    SMT symbols: the membership predicates of the types with sort variables are the images of their worlds (e.g.,
+    `@isFun α β f` is `Img (liftFun (inj α) (inj β) _) f`), and the constants of the goal the images of their values
+    (e.g., `x : α` is `inj α x`). The sorts `@Type` and `@Instance` and the predicates `@isInstance` are interpreted by
+    `buildSymTable`. -/
+def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMap String Expr)
+    (sortVars : Array (String × Expr)) : MetaM SymTable := do
+  let mut tbl := tbl
+  for (s, α) in sortVars do tbl := { tbl with syms := tbl.syms.insert s (.expr α) }
+  -- membership predicates of the types with sort variables (cached as `fun αs => T`): `fun αs v => Img w v`
+  for (k, decl) in env.smtEnv.indTypeInstCache.toList do
+    let .lam .. := k.expr | continue
+    try
+      let sort ← ofExcept (parseSExpr (toString decl.instSort))
+      let d ← (sortToType sort).run { table := tbl }
+      let pred ← lambdaTelescope k.expr fun αs t => do
+        if ← αs.anyM fun α => do return !isTypeUniverse (← inferType α) then throwError "not a sort variable"
+        let some (w, _) ← Poly.mkWorld t d | throwError "no world for {t}"
+        withLocalDeclD `v d fun v => do mkLambdaFVars (αs.push v) (← mkAppM ``Poly.Img #[w, v])
+      let n := toString decl.instName
+      -- NOTE: the recursive definitions of the predicates of datatypes (`_LRec`) have the same interpretation
+      let rec_ := if n.startsWith "|" then s!"|{unquote n}_LRec|" else s!"{n}_LRec"
+      tbl := { tbl with syms := tbl.syms.insert n (.lam pred) |>.insert rec_ (.lam pred) }
+    catch _ => pure ()
+  -- constants of the goal
+  for c in cmds do
+    let some #[SExpr.atom "declare-const", SExpr.atom n, s] := c.list? | continue
+    let some x := consts.get? n | continue
+    try
+      let d ← (sortToType s).run { table := tbl }
+      if let some (w, _) ← Poly.mkWorld (← inferType x) d then
+        tbl := { tbl with syms := tbl.syms.insert n (.expr (Poly.applyWorld w x)) }
+    catch _ => pure ()
+  return tbl
+
 /-- Build the interpretation of the symbols of the query `cmds`, given the translation environment
-    and the map from SMT constants (`$k`) to Lean free variables. -/
+    and the map from SMT constants (`$k`) to Lean free variables. Blaster's polymorphic encoding is interpreted
+    with `@Instance` as `instanceType?` (a single sort variable), or as `Poly.Univ` given the sort variables
+    `polySortVars?` (see `polySymTable`). -/
 def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMap String Expr)
-    (instanceType? : Option Expr := none) : MetaM SymTable := do
+    (instanceType? : Option Expr := none) (polySortVars? : Option (Array (String × Expr)) := none) :
+    MetaM SymTable := do
   let mut tbl : SymTable := {}
+  -- polymorphic encoding: the sorts `@Type` and `@Instance` of the sort variables of `Sort u` (cached on `Sort u`),
+  -- and their membership predicates `@isInstance v α`
+  let mut polySorts : Std.HashMap String Expr := {}
+  if polySortVars?.isSome then
+    for (k, decl) in env.smtEnv.indTypeInstCache.toList do
+      let .sort u := k.expr | continue
+      let (.SymbolSort ty, some (.SymbolSort inst)) := (decl.instSort, decl.instInstanceSort) | continue
+      let univ := Lean.mkConst ``Poly.Univ [u]
+      let mem ← withLocalDeclD `v univ fun v => withLocalDeclD `α (mkSort u) fun α => do
+        mkLambdaFVars #[v, α] (← mkAppM ``Poly.Img #[mkApp (Lean.mkConst ``Poly.inj [u]) α, v])
+      polySorts := polySorts.insert (toString ty) (mkSort u) |>.insert (toString inst) univ
+      tbl := { tbl with syms := tbl.syms.insert (toString decl.instName) (.lam mem) }
   -- Lean functions of the translation
   let mut funs : Std.HashMap String Expr := {}
   for (k, v) in env.smtEnv.funInstCache.toList do
     let nm := match v with
       | .SimpleIdent s => toString s
       | .QualifiedIdent s _ => toString s
-    funs := funs.insert nm k.expr
+    funs := funs.insert nm (← instantiateSortParams instanceType? k.expr)
   let mut datatypeSorts : Array SExpr := #[]
   for c in cmds do
     let some xs := c.list? | continue
     match xs[0]?.bind SExpr.atom?, xs[1]?.bind SExpr.atom? with
     | some "declare-sort", some n =>
         -- polymorphic encoding (see `proveBySmtProof`)
-        if n.startsWith "@Type" then
+        if let some t := polySorts.get? n then
+          tbl := { tbl with sorts := tbl.sorts.insert n t }
+        else if n.startsWith "@Type" then
           tbl := { tbl with sorts := tbl.sorts.insert n (mkConst ``Unit) }
         else if n.startsWith "@Instance" then
           if let some t := instanceType? then tbl := { tbl with sorts := tbl.sorts.insert n t }
@@ -190,7 +256,7 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
           tbl := { tbl with syms := tbl.syms.insert n (.expr e) }
         else if n.startsWith "@apply" then
           tbl := { tbl with syms := tbl.syms.insert n .apply }
-        else if n.startsWith "@is" then
+        else if n.startsWith "@is" && !tbl.syms.contains n then
           tbl := { tbl with syms := tbl.syms.insert n .trueFun }
     | some "define-fun", some n =>
         let some (SExpr.list ps) := xs[2]? | continue
@@ -225,6 +291,7 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
           let some (SExpr.atom n) := s.list? >>= (·[0]?) | continue
           tbl ← addDatatype tbl n d
     | _, _ => pure ()
+  if let some sortVars := polySortVars? then tbl ← polySymTable tbl cmds env consts sortVars
   -- datatype sorts of the query as they occur in proofs (with expanded aliases)
   let ctx : InterpCtx := { table := tbl }
   let mut expanded : Std.HashMap String (Option Expr) := {}
@@ -242,6 +309,20 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
     if let some t := v then tbl := { tbl with expandedSorts := tbl.expandedSorts.insert k t }
   return tbl
 where
+  /-- Lean functions of the translation abstracted over their generic parameters (instances of
+      `Blaster.Optimize.getInstApp`, e.g., `fun α [BEq α] a b => a == b`), which are erased in their SMT
+      signatures: with a single sort variable `α` interpreting `@Instance`, the explicit sort parameters are
+      instantiated with `α` (the instances are synthesized when the function is applied, and the implicit
+      parameters inferred from the arguments, see `mkAppCoerce`). -/
+  instantiateSortParams (instanceType? : Option Expr) (e : Expr) : MetaM Expr := do
+    let some α := instanceType? | return e
+    let ty ← inferType α
+    let mut e := e.headBeta
+    for _ in [:16] do
+      let .lam _ t b bi := e | break
+      if !bi.isExplicit || !(← isDefEq t ty) then break
+      e := (b.instantiate1 α).headBeta
+    return e
   lambdaDef? (e : SExpr) : Option (String × STerm) := Id.run do
     let some #[SExpr.atom "forall", SExpr.list vs, SExpr.list ann] := e.list? | return none
     if ann[0]? != some (SExpr.atom "!") then return none
@@ -294,6 +375,14 @@ where
         if let some (SExpr.atom sel) := fields[i].list? >>= (·[0]?) then
           tbl := { tbl with syms := tbl.syms.insert sel (.selector leanCtor i) }
     return tbl
+
+/-- `buildSymTable` with the polymorphic encoding interpreted by `Poly`, for the sort variables `sortVars` (declared
+    by the translation `env`). -/
+def polyBuildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMap String Expr)
+    (sortVars : Array Expr) : TermElabM SymTable := do
+  let (syms, _) ← (sortVars.mapM fun α => do
+      return (toString (← typeParamNameToSmtSymbol α.fvarId!), α) : TranslateEnvT (Array (String × Expr))).run env
+  buildSymTable cmds env consts (polySortVars? := some syms)
 
 /-- Interpretation of the skolem constants introduced by `sk` steps (Z3): for
     `(~ (not (forall ((x S)) φ)) (not φ[x := c]))` (resp. `(~ (exists ((x S)) φ) φ[x := c])`),
@@ -656,31 +745,69 @@ partial def sortQuantifiers (e : Expr) : Array Expr := Id.run do
     | _ => pure ()
   return acc
 
+/-- Sort variables of the goal `∀ xs, body` (Blaster's polymorphic encoding: sort variables are values of the sort
+    `@Type`, and the values of the types they denote are values of the sort `@Instance`): the leading binders and the
+    variables of the local context (e.g., auto-bound implicit arguments) whose type is a sort other than `Prop`, and
+    whether `body` quantifies over sorts. -/
+def sortVariables (xs : Array Expr) (body : Expr) : MetaM (Array Expr × Bool) := do
+  let isSortVar (t : Expr) : MetaM Bool := do
+    let t ← whnfR t
+    return t.isSort && !t.isProp
+  let mut sortVars ← xs.filterM fun x => do isSortVar (← inferType x)
+  for d in ← getLCtx do
+    if d.isImplementationDetail || sortVars.contains d.toExpr then continue
+    if ← isSortVar d.type then
+      if body.containsFVar d.fvarId || (← xs.anyM fun x => do return (← inferType x).containsFVar d.fvarId) then
+        sortVars := sortVars.push d.toExpr
+  -- propositions quantifying over sorts (below the leading binders)
+  let quantifiedSorts ← (sortQuantifiers body).anyM fun s => isProp s
+  return (sortVars, quantifiedSorts)
+
+/-- Interpretations of the polymorphic encoding tried in order (`true`: `Poly`, `false`: `@Instance` as the sort
+    variable). With a single sort variable `α`, `@Instance` is first interpreted as `α` and `@Type` as `Unit`
+    (membership predicates as `True`), which fails when `α` may be empty (e.g., skolem constants of sort
+    `@Instance`). -/
+def polyModes (sortVars : Array Expr) (quantifiedSorts : Bool) : Array Bool :=
+  if quantifiedSorts then #[true]
+  else if sortVars.isEmpty then #[false]
+  else if sortVars.size == 1 then #[false, true]
+  else #[true, false]
+
 /-- Try to prove `e` (a closed proposition proved valid by the SMT solver) by replaying a proof of the
-    SMT backend. -/
-partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Except String SmtProofResult) := do
+    SMT backend. The polymorphic encoding is interpreted by `Poly` when `poly?` is `some true`, with `@Instance` as
+    the sort variable when `some false`, and with the interpretations of `modes` tried in order otherwise. -/
+partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option Bool := none) :
+    TermElabM (Except String SmtProofResult) := do
   if let some (e', back) ← prenex e then
-    match ← proveBySmtProof e' sOpts with
+    match ← proveBySmtProof e' sOpts poly? with
     | .ok r => return .ok { r with proof := ← back r.proof }
     | .error msg => return .error msg
+  if poly?.isNone then
+    let modes ← dataBinders e fun xs body => do
+      let (sortVars, quantifiedSorts) ← sortVariables xs body
+      return polyModes sortVars quantifiedSorts
+    if modes.size > 1 then
+      let s ← saveState
+      let ngen ← getNGen
+      let mut msgs := #[]
+      for poly in modes do
+        s.restore
+        -- NOTE: the name generator (not restored by `restore`) is reset too, such that the translations (whose
+        -- SMT symbols have fresh names) coincide and the proofs of the backends are reused (see `runBackendCached`)
+        setNGen ngen
+        match ← proveBySmtProof e sOpts (some poly) with
+        | .ok r => return .ok r
+        | .error msg => msgs := msgs.push msg
+      -- the error of the general interpretation first
+      let errs := if modes[0]! then msgs else msgs.reverse
+      return .error (String.intercalate "; with the other interpretation of the polymorphic encoding: " errs.toList)
   -- NOTE: each tactic attempt has its own heartbeat budget (see `proveWithTactic`)
   withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) do
   dataBinders e fun xs body => do
   try
-    -- Blaster's polymorphic encoding: sort variables are values of the sort `@Type`, and the values of
-    -- the types they denote are values of the sort `@Instance`. With a single sort variable `α`, `@Instance`
-    -- is interpreted as `α` and `@Type` as `Unit` (membership predicates as `True`).
-    let mut sortVars ← xs.filterM fun x => do return (← whnfR (← inferType x)).isSort
-    -- sort variables of the local context (e.g., auto-bound implicit arguments)
-    for d in ← getLCtx do
-      if d.isImplementationDetail || sortVars.contains d.toExpr then continue
-      if (← whnfR d.type).isSort && !d.type.isProp then
-        if body.containsFVar d.fvarId || (← xs.anyM fun x => do return (← inferType x).containsFVar d.fvarId) then
-          sortVars := sortVars.push d.toExpr
-    if sortVars.size > 1 then throwError "smt proof: polymorphic goals with several sort variables are not supported"
-    -- propositions quantifying over sorts (below the leading binders)
-    for s in sortQuantifiers body do
-      if ← isProp s then throwError "smt proof: polymorphic goals with quantified sort variables are not supported"
+    -- polymorphic encoding (see `sortVariables`), interpreted by `Poly` when `poly` is set
+    let (sortVars, quantifiedSorts) ← sortVariables xs body
+    let poly := poly?.getD (polyModes sortVars quantifiedSorts)[0]!
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
@@ -732,7 +859,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         | "z3+" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout (simplifiers := true))
         | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
         | b => throwError "unknown proof backend {b}"
-      match ← runBackend backend cmds with
+      match ← runBackendCached backend cmds with
       | .error msg => errors := errors.push msg
       | .ok out =>
           match backend.parseProof out with
@@ -746,10 +873,12 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let lctx ← getLCtx
     for (v, idx) in tenv.smtEnv.fvarsCache.toList do
       if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
-    let tbl ← buildSymTable cmds tenv consts sortVars[0]?
+    let tbl ← if poly then polyBuildSymTable cmds tenv consts sortVars else buildSymTable cmds tenv consts sortVars[0]?
     let tbl ← addSkolems sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
+    -- axioms of the polymorphic encoding (see `Poly`)
+    let bridge ← if poly then pure (#[("poly", ← `(tactic| blaster_poly))] ++ bridge) else pure bridge
     -- matcher instances optimized by Blaster (whose patterns are the translated ones)
     let mut insts : Std.HashMap Name Expr := {}
     for (k, v) in tenv.optEnv.memCache.isMatcherCache.toList do insts := insts.insert k.name v.instApp

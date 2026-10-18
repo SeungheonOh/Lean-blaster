@@ -11,7 +11,9 @@ SMT terms occurring in a proof are interpreted as Lean terms:
  - `Bool`-sorted terms are interpreted as propositions, and converted with `decide` (resp. `= true`)
    when a Lean `Bool` is expected (resp. given);
  - other sorts (e.g., datatypes, `String`, uninterpreted sorts) are interpreted as the corresponding
-   Lean types.
+   Lean types; the sorts `@Instance` and `@Type` of Blaster's polymorphic encoding are interpreted as a
+   sort variable and `Unit`, or as the universe `Poly.Univ.{u}` of the values of `Sort u` and `Sort u`
+   (see `Poly.lean`).
 
 The interpretation of the symbols of the query is given by a `SymTable`. Each step of an SMT proof is
 then replayed as a Lean proof of the interpretation of its conclusion. Since the Lean proof is checked by
@@ -31,6 +33,9 @@ inductive SymInterp where
   | macro (params : Array (String × SExpr)) (body : STerm)
   /-- a type predicate of Blaster's encoding, interpreted as `fun _ => True` -/
   | trueFun
+  /-- a Lean function given as a lambda (e.g., the membership predicates of the polymorphic encoding, see
+      `Poly.lean`): applications are β-reduced -/
+  | lam (e : Expr)
   /-- a datatype constructor -/
   | ctor (n : Name)
   /-- a datatype selector: constructor, index of the field -/
@@ -228,7 +233,7 @@ partial def sortToType (s : SExpr) : InterpM Expr := do
     | .atom a =>
         if let some s' := tbl.aliases.get? a then return ← sortToType s'
         match tbl.sorts.get? a with
-        | some (.const n _) =>
+        | some (.const n []) =>
             let info ← getConstInfo n
             return mkConst n (info.levelParams.map fun _ => levelZero)
         | some t => return t
@@ -582,6 +587,9 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) {}
         withReader (fun c => { c with locals }) (interp body)
     | some .trueFun => return mkConst ``True
+    | some (.lam e) =>
+        if args.isEmpty then return e
+        return (← mkAppCoerce e (← args.mapM interp)).headBeta
     | some (.ctor n) =>
         let c ← mkConstWithFreshMVarLevels n
         if args.isEmpty then
