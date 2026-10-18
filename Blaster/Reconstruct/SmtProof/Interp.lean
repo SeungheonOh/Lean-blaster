@@ -133,6 +133,13 @@ partial def coerce (e actual expected : Expr) : MetaM Expr := do
               ms[i]!.mvarId!.assign (← coerce args[i]! (← inferType args[i]!) fty)
             let r ← instantiateMVars (mkAppN k ms)
             if !r.hasExprMVar then return r
+  -- functions (e.g., lambda terms with `Nat` parameters and an `Int` body where `Nat → Nat` is expected): the
+  -- arguments are coerced back and the results coerced, pointwise
+  if let (.forallE _ a b _, .forallE n a' b' bi) := (actual, expected') then
+    if !b.hasLooseBVars && !b'.hasLooseBVars then
+      return ← withLocalDecl n bi a' fun y => do
+        let x ← coerce y a' a
+        mkLambdaFVars #[y] (← coerce (mkApp e x).headBeta b b')
   throwError "smt proof: can't coerce {e} : {actual} to {expected}"
 
 /-- Normalize the type of an interpreted term for the SMT world: `Nat` terms are cast to `Int`,
