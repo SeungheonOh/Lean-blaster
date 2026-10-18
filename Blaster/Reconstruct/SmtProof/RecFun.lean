@@ -1,4 +1,5 @@
 import Lean
+import Blaster.Reconstruct.Discharge
 import Blaster.Reconstruct.SmtProof.Z3
 import Blaster.Reconstruct.SmtProof.Replay
 
@@ -21,7 +22,7 @@ in practice (e.g., on the CEK evaluation of validators). This module:
     and reducing the conditionals of the body with the guards; lemmas on case predicates are propositional.
 -/
 
-open Lean Meta Elab Term
+open Lean Meta Elab Term Tactic
 
 namespace Blaster.Reconstruct.SmtProof.RecFun
 
@@ -216,14 +217,60 @@ def rewriteQuery (cmds : Array SExpr) : Except String (Array SExpr × Array Pair
 
 /-! ## Interpretation -/
 
+/-- Auxiliary definitions interpreting Z3's `fold-rec-n` functions (see `addProofDefs`), expanded by
+    `blaster_rec_eqn`. -/
+initialize auxDefs : IO.Ref NameSet ← IO.mkRef {}
+
+/-- Function symbols applied in `t`. -/
+partial def appliedSymbols (t : STerm) (acc : Std.HashSet String := {}) : Std.HashSet String :=
+  match t with
+  | .sym f => acc.insert f
+  | .app f args | .iapp f _ args | .qual f _ args => args.foldl (fun acc a => appliedSymbols a acc) (acc.insert f)
+  | .quant _ _ b | .annot b _ => appliedSymbols b acc
+  | _ => acc
+
 /-- Extend the interpretation with the functions defined in the proof output that are not symbols of the query
-    (Z3's auxiliary functions `fold-rec-n`, interpreted as macros), and with the guards of the case predicates of
-    recursive functions given by the lemmas `(or (not ((_ case-def k f) a⃗)) g)` (see `interpCaseDef`). -/
-def addProofDefs (proof : Proof) (tbl : SymTable) : SymTable := Id.run do
+    (Z3's auxiliary functions `fold-rec-n`, which name subterms of the bodies of recursive functions), and with the
+    guards of the case predicates of recursive functions given by the lemmas `(or (not ((_ case-def k f) a⃗)) g)`
+    (see `interpCaseDef`). The auxiliary functions are interpreted as auxiliary Lean definitions (in dependency
+    order), which keeps the interpretation of their applications small (Z3 only unfolds them in its lemmas, see
+    `rewriteChain`), or as macros when their body can't be interpreted. Returns the names of the auxiliary
+    definitions. -/
+def addProofDefs (proof : Proof) (tbl : SymTable) : TermElabM (SymTable × NameSet) := do
+  let defs : Std.HashMap String FunDef := proof.defs.foldl (fun m d => if tbl.syms.contains d.name then m else m.insert d.name d) {}
   let mut tbl := tbl
+  let mut aux : NameSet := {}
+  -- dependency order (depth-first, a function after the auxiliary functions it uses)
+  let mut order : Array FunDef := #[]
+  let mut visited : Std.HashSet String := {}
   for d in proof.defs do
-    if !tbl.syms.contains d.name then
-      tbl := { tbl with syms := tbl.syms.insert d.name (.macro d.params d.body) }
+    if !defs.contains d.name || visited.contains d.name then continue
+    let mut stack : Array (FunDef × Bool) := #[(d, false)]
+    while !stack.isEmpty do
+      let (e, expanded) := stack.back!
+      stack := stack.pop
+      if expanded then order := order.push e; continue
+      if visited.contains e.name then continue
+      visited := visited.insert e.name
+      stack := stack.push (e, true)
+      for s in appliedSymbols e.body do
+        if let some e' := defs.get? s then
+          if !visited.contains s then stack := stack.push (e', false)
+  for d in order do
+    let r ← try
+        let lam ← instantiateMVars (← (interpQuant .lambda d.params d.body).run { table := tbl })
+        if lam.hasMVar || lam.hasFVar then pure none else
+        let n ← Term.mkAuxName `smtFoldRec
+        let e ← mkAuxDefinition n (← inferType lam) lam (compile := false)
+        pure (some e)
+      catch _ => pure none
+    match r with
+    | some e =>
+        tbl := { tbl with syms := tbl.syms.insert d.name (.expr e) }
+        if let some c := e.getAppFn.constName? then
+          aux := aux.insert c
+          auxDefs.modify (·.insert c)
+    | none => tbl := { tbl with syms := tbl.syms.insert d.name (.macro d.params d.body) }
   for s in proof.steps do
     if s.rule != "th-lemma" || s.attrs[0]? != some (SExpr.atom "recfun") || !s.premises.isEmpty then continue
     let .app "or" #[l₁, l₂] := s.concl.stripAnnot | continue
@@ -233,7 +280,132 @@ def addProofDefs (proof : Proof) (tbl : SymTable) : SymTable := Id.run do
       let some key := caseDefKey? idx | continue
       tbl := { tbl with caseGuards := tbl.caseGuards.insert key ((tbl.caseGuards.getD key #[]).push (args, g)) }
       break
-  return tbl
+  return (tbl, aux)
+
+/-! ## Definitional equations -/
+
+/-- The application `f a⃗` of the left-hand side of a definitional equation, through the conversions of the
+    interpretation (`↑(f a⃗)` for functions returning `Nat`, `f a⃗ = true` for functions returning `Bool`). -/
+def lhsApp (e : Expr) : Expr :=
+  let e := if e.isAppOfArity ``Eq 3 && (e.getArg! 0).isConstOf ``Bool && (e.getArg! 2).isConstOf ``Bool.true then
+    e.getArg! 1 else e
+  if e.isAppOfArity ``Nat.cast 3 then e.appArg! else e
+
+/-- Head constant of the application of the left-hand side of a definitional equation (see `lhsApp`). -/
+def lhsHead? (e : Expr) : Option Name := (lhsApp e).getAppFn.constName?
+
+/-- The variable whose case analysis unblocks the eliminator with major premise or discriminant `d`: `d` itself,
+    or the structure whose projection is `d`. Variables of type `Int` and `Nat` are not case-analyzed. -/
+partial def blockingVar? (d : Expr) : MetaM (Option FVarId) := do
+  match d with
+  | .fvar x =>
+      let t ← whnfD (← inferType d)
+      let .const n _ := t.getAppFn | return none
+      if n == ``Int || n == ``Nat then return none
+      let some (.inductInfo info) := (← getEnv).find? n | return none
+      if info.numIndices != 0 || (← isProp t) then return none
+      return some x
+  | .proj _ _ s => blockingVar? s
+  | .mdata _ e => blockingVar? e
+  | _ =>
+      if let .const f _ := d.getAppFn then
+        if let some info ← getProjectionFnInfo? f then
+          if d.getAppNumArgs == info.numParams + 1 then return ← blockingVar? d.appArg!
+      return none
+
+/-- Variables blocking the eliminators (`casesOn`, recursors, `match`) occurring in `e`. -/
+partial def blockingVars (e : Expr) : MetaM (Array FVarId) := do
+  let mut acc := #[]
+  let mut stack := #[e]
+  let mut seen : Std.HashSet Expr := {}
+  while !stack.isEmpty do
+    let s := stack.back!
+    stack := stack.pop
+    if seen.contains s then continue
+    seen := seen.insert s
+    if s.isApp then
+      let mut majors := #[]
+      if let some m ← matchMatcherApp? s (alsoCasesOn := true) then majors := m.discrs
+      else if let .const r _ := s.getAppFn then
+        if let some (.recInfo info) := (← getEnv).find? r then
+          if let some d := s.getAppArgs[info.getMajorIdx]? then majors := #[d]
+      for d in majors do
+        if let some x ← blockingVar? d then
+          if !acc.contains x then acc := acc.push x
+    match s with
+    | .app f a => stack := stack.push f |>.push a
+    | .mdata _ b | .proj _ _ b => stack := stack.push b
+    | _ => pure ()
+  return acc
+
+/-- Maximal number of goals of the case analyses of `blaster_rec_eqn`. -/
+def maxEqnGoals : Nat := 512
+
+syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
+
+/-- Proof of the definitional equation `∀ x⃗, f x⃗ = body` of a recursive function `f`, where `body` is the
+    interpretation of its SMT definition (Blaster's translation of the optimized definition of `f`): `f x⃗` is
+    unfolded once (equation `f.eq_def`), the user definitions are unfolded, and the variables blocking the
+    eliminators (`match`, `casesOn`) of the goal are case-analyzed, until both sides are simplified to the same
+    term. -/
+@[tactic blasterRecEqn] def evalBlasterRecEqn : Tactic := fun _ => do
+  evalTactic (← `(tactic| intros))
+  -- one unfolding of the head function of the left-hand side
+  let g ← getMainGoal
+  let g ← g.withContext do
+    let some (_, lhs, _) := (← whnfR (← instantiateMVars (← g.getType))).eq?
+      | throwError "blaster_rec_eqn: equality expected"
+    let app := lhsApp lhs
+    let .const f _ := app.getAppFn | throwError "blaster_rec_eqn: application of a constant expected"
+    let some eqn ← getUnfoldEqnFor? f (nonRec := true) | throwError "blaster_rec_eqn: no equation for {f}"
+    let eqc ← mkConstWithFreshMVarLevels eqn
+    let (ms, _, eqTy) ← forallMetaTelescopeReducing (← inferType eqc)
+    let some (_, l, _) := eqTy.eq? | throwError "blaster_rec_eqn: ill-formed equation {eqn}"
+    if !(← isDefEq l app) then throwError "blaster_rec_eqn: equation {eqn} does not apply"
+    let r ← g.rewrite (← g.getType) (← instantiateMVars (mkAppN eqc ms))
+    let g' ← g.replaceTargetEq r.eNew r.eqProof
+    -- the auxiliary definitions of the body (Z3's `fold-rec-n` functions) are expanded
+    let aux ← auxDefs.get
+    g'.withContext do g'.replaceTargetDefEq (← deltaExpand (← instantiateMVars (← g'.getType)) aux.contains)
+  replaceMainGoal [g]
+  try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
+  -- case analyses: the goals are reduced (`dsimp`), split on their blocking variables, and closed by `simp`
+  let mut todo := ← getGoals
+  let mut count := todo.length
+  let mut unfolded : Std.HashSet MVarId := {}
+  let mut remaining := []
+  while !todo.isEmpty do
+    let g := todo.head!
+    todo := todo.tail!
+    setGoals [g]
+    try evalTactic (← `(tactic| dsimp only)) catch _ => pure ()
+    let some g ← (do return (← getGoals).head?) | continue
+    let vars ← g.withContext do
+      let mut e ← instantiateMVars (← g.getType)
+      for d in ← getLCtx do
+        if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
+      blockingVars e
+    if let some x := vars[0]? then
+      let subgoals ← g.cases x
+      count := count + subgoals.size
+      if count > maxEqnGoals then
+        debugLog m!"blaster_rec_eqn: too many cases\n{← Meta.ppGoal g}"
+        throwError "blaster_rec_eqn: too many cases"
+      todo := subgoals.toList.map (·.mvarId) ++ todo
+      continue
+    setGoals [g]
+    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done))) catch _ => pure ()
+    if (← getGoals).isEmpty then continue
+    if unfolded.contains g then remaining := remaining ++ [g]; continue
+    -- user definitions exposed by the case analyses
+    try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
+    for g' in ← getGoals do
+      unfolded := unfolded.insert g'
+      todo := g' :: todo
+  if !remaining.isEmpty then
+    for g in remaining.take 2 do debugLog m!"blaster_rec_eqn: unsolved case\n{← Meta.ppGoal g}"
+    throwError "blaster_rec_eqn: unsolved cases"
+  setGoals []
 
 /-! ## Lemmas -/
 
@@ -249,24 +421,19 @@ structure DefEq where
 
 structure Ctx where
   eqs : Array DefEq := #[]
+  /-- auxiliary definitions (Z3's `fold-rec-n` functions), unfolded by `rewriteChain` -/
+  aux : NameSet := {}
   /-- proof of a definitional equation (e.g., with the bridge tactics) -/
   proveDef : Expr → TermElabM (Option Expr) := fun _ => pure none
   /-- proof of `g₁ → ... → gₙ → l = r` for the rewritten sides `l` and `r` of an unfolding under the guards `gᵢ`
       when they differ (e.g., in the normal forms of Blaster and Z3, like `0 < x` and `¬ x ≤ 0`) -/
   proveImp : Expr → TermElabM (Option Expr) := fun _ => pure none
 
-/-- Head constant of an application `f a⃗`, through the conversions of the interpretation (`↑(f a⃗)` for
-    functions returning `Nat`, `f a⃗ = true` for functions returning `Bool`). -/
-def lhsHead? (e : Expr) : Option Name :=
-  let e := if e.isAppOfArity ``Eq 3 && (e.getArg! 0).isConstOf ``Bool && (e.getArg! 2).isConstOf ``Bool.true then
-    e.getArg! 1 else e
-  let e := if e.isAppOfArity ``Nat.cast 3 then e.appArg! else e
-  e.getAppFn.constName?
 
 /-- Definitional equations of the recursive functions `pairs`: the interpretation of `∀ x⃗, f x⃗ = body` for the
     body of `f` in the definitions `defs` of the proof output, and of the axiom of `f` in the query. -/
-def mkCtx (tbl : SymTable) (pairs : Array Pair) (defs : Array FunDef) (proveDef proveImp : Expr → TermElabM (Option Expr)) :
-    TermElabM Ctx := do
+def mkCtx (tbl : SymTable) (aux : NameSet) (pairs : Array Pair) (defs : Array FunDef)
+    (proveDef proveImp : Expr → TermElabM (Option Expr)) : TermElabM Ctx := do
   if !pairs.isEmpty then debugLog m!"recfun: {pairs.size} recursive functions, {defs.size} definitions in the proof"
   let interpStmt (φ : STerm) : TermElabM (Option (Expr × Name)) := do
     try
@@ -294,14 +461,32 @@ def mkCtx (tbl : SymTable) (pairs : Array Pair) (defs : Array FunDef) (proveDef 
         if head.isAnonymous then head := h
         if h == head then stmts := stmts.push stmt
     if !stmts.isEmpty then eqs := eqs.push { stmts, head, proof := ← IO.mkRef none }
-  return { eqs, proveDef, proveImp }
+  return { eqs, aux, proveDef, proveImp }
 
 /-- Proof of the definitional equation `eq` (attempted once; the proof is shared by the lemmas using it). -/
 def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
   if let some r ← eq.proof.get then return r
   let mut r := none
   for stmt in eq.stmts do
-    if let some p ← (try ctx.proveDef stmt catch _ => pure none) then
+    let prove : TermElabM (Option Expr) := do
+      let t0 ← IO.monoMsNow
+      let p ← if stmt.hasFVar then pure none else
+        withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 400000)
+      debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} ({(← IO.monoMsNow) - t0} ms)"
+      -- the reason of the failure (debugging)
+      if p.isNone && !stmt.hasFVar && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
+        withoutModifyingState <| withLCtx {} {} do
+          try
+            let m ← mkFreshExprMVar stmt
+            let t0 ← IO.monoMsNow
+            let h0 ← IO.getNumHeartbeats
+            let gs ← withoutErrToSorry <| Tactic.run m.mvarId! (evalTactic (← `(tactic| blaster_rec_eqn)))
+            let prf ← instantiateMVars m
+            debugLog m!"recfun: blaster_rec_eqn: {gs.length} goals left, {(← IO.monoMsNow) - t0} ms, {((← IO.getNumHeartbeats) - h0) / 1000} heartbeats, mvars {prf.hasMVar}, errors {(← Core.getMessageLog).hasErrors}"
+          catch ex => debugLog m!"recfun: blaster_rec_eqn: {ex.toMessageData}"
+      if p.isSome then return p
+      ctx.proveDef stmt
+    if let some p ← (try prove catch _ => pure none) then
       let m ← mkFreshExprMVar stmt
       m.mvarId!.assign p
       r := some (stmt, m)
@@ -375,6 +560,11 @@ where
       | some (true, hc) => return some (a, mkAppN (mkConst ``if_pos us) #[c, inst, hc, α, a, b])
       | some (false, hn) => return some (b, mkAppN (mkConst ``if_neg us) #[c, inst, hn, α, a, b])
       | none => return none
+    -- auxiliary definitions: delta
+    if let .const c _ := t.getAppFn then
+      if ctx.aux.contains c then
+        if let some t' ← unfoldDefinition? t then
+          return some (t', ← mkExpectedTypeHint (← mkEqRefl t) (← mkEq t t'))
     let some h := lhsHead? t | return none
     for eq in ctx.eqs do
       if eq.head != h then continue

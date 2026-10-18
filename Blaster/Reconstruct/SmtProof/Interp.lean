@@ -300,6 +300,8 @@ def mkIntNeg (a : Expr) : Expr := mkApp (mkApp2 (mkConst ``Neg.neg [0]) intType 
 def mkIntLe (a b : Expr) : Expr := mkApp4 (mkConst ``LE.le [0]) intType (mkConst ``Int.instLEInt) a b
 def mkIntLt (a b : Expr) : Expr := mkApp4 (mkConst ``LT.lt [0]) intType (mkConst ``Int.instLTInt) a b
 
+def mkStrLt (a b : Expr) : Expr := mkApp4 (mkConst ``LT.lt [0]) (mkConst ``String) (mkConst ``String.instLT) a b
+
 /-- `if c then a else b` with the classical instance. -/
 def mkClassicalIte (c a b : Expr) : MetaM Expr := do
   let t ← inferType a
@@ -570,6 +572,9 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   | ">", _ => chain (fun a b => pure (mkIntLt b a)) (← args.mapM interpInt)
   | "str.++", _ | "seq.++", _ => foldBin (fun a b => mkApp2 (mkConst ``String.append) a b) (← args.mapM interp)
   | "str.len", 1 | "seq.len", 1 => return mkIntOfNat (mkApp (mkConst ``String.length) (← interp args[0]!))
+  -- lexicographic order (`str.<=` as the negation of the converse, the order being total)
+  | "str.<", 2 => return mkStrLt (← interp args[0]!) (← interp args[1]!)
+  | "str.<=", 2 => return mkNot (mkStrLt (← interp args[1]!) (← interp args[0]!))
   -- strings as sequences of characters (Z3 proofs): `(seq.unit (_ Char n))`
   | "seq.unit", 1 => return mkApp (mkConst ``String.singleton) (← interp args[0]!)
   | "seq.empty", 0 => return mkStrLit ""

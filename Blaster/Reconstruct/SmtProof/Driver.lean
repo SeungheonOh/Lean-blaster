@@ -751,7 +751,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let tbl ← buildSymTable cmds tenv consts sortVars[0]?
     let tbl ← addSkolems sproof tbl
     -- auxiliary functions and case predicates of recursive functions (Z3)
-    let tbl := RecFun.addProofDefs sproof tbl
+    let (tbl, recAux) ← RecFun.addProofDefs sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
     -- matcher instances optimized by Blaster (whose patterns are the translated ones)
@@ -781,11 +781,12 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       portfolio tacs stmt rule
     -- recursive functions (`z3rec`): definitional equations, proved with the bridge tactics in the empty local
     -- context when closed (see `proveClosed`), and differences of normal forms in their unfoldings
-    let recCtx ← RecFun.mkCtx tbl recPairs sproof.defs
+    let recCtx ← RecFun.mkCtx tbl recAux recPairs sproof.defs
       (fun stmt => do
         let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
         if stmt.hasFVar then run else withLCtx {} {} run)
       (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
+    let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -816,9 +817,13 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           return r.map (·.1)
         proveStep
         proveRecFun := fun c n => do
+          -- NOTE: the lemmas have no premises (a failure is not retried)
+          if let some r := (← recCache.get).get? c then return r
           let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
           if r.isNone then debugLog m!"recfun lemma failed: {c}"
-          return r }
+          recCache.modify (·.insert c r)
+          return r
+        recFunOnly := !recPairs.isEmpty }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
       let global := (scopedSteps sproof).map (!·)

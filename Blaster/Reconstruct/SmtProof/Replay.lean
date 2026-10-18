@@ -46,6 +46,9 @@ structure ReplayConfig where
   /-- proof of a lemma of Z3's theory of recursive functions (`th-lemma recfun`), given the interpretation
       of its clause and its number of literals (see `RecFun.lean`) -/
   proveRecFun : Expr → Nat → TermElabM (Option Expr) := fun _ _ => pure none
+  /-- whether the lemmas of recursive functions are only replayed by `proveRecFun` (the generic tactics being
+      costly and unlikely to succeed on them) -/
+  recFunOnly : Bool := false
 
 structure ReplayCtx where
   proof : Proof
@@ -204,6 +207,9 @@ def weakenClause (lits : Array Expr) (d : Expr) (refute : Expr → MetaM (Option
   let target := if targetLits.isEmpty then Lean.mkConst ``False else targetLits.pop.foldr mkOr targetLits.back!
   orElim lits d target fun i h => do
     let l := lits[i]!
+    -- NOTE: syntactic matches first (the definitional ones are costly on large literals)
+    for j in [:targetLits.size] do
+      if targetLits[j]! == l then return ← mkOrInj targetLits j h
     if let some r ← refute l then
       return mkApp2 (Lean.mkConst ``False.elim [levelZero]) target (mkApp r h)
     for j in [:targetLits.size] do
@@ -212,6 +218,12 @@ def weakenClause (lits : Array Expr) (d : Expr) (refute : Expr → MetaM (Option
 
 /-- Refutation of `l` by one of the unit proofs: `u : ¬ l` or `u : a` with `l = ¬ a`. -/
 def refuteBy (units : Array (Expr × Expr)) (l : Expr) : MetaM (Option Expr) := do
+  -- NOTE: syntactic matches first (the definitional ones are costly on large literals)
+  for (t, u) in units do
+    if let some a := t.not? then
+      if a == l then return some u
+    if let some a := l.not? then
+      if a == t then return some (← withLocalDeclD `h l fun h => mkLambdaFVars #[h] (mkApp h u))
   for (t, u) in units do
     if let some a := t.not? then
       if ← propEq a l then return some u
@@ -595,7 +607,7 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       throwError "iff-false: conclusion mismatch"
   | "resolution" | "th_resolution" | "reordering" | "contraction" => replayRup step concl
   | "unit-resolution" =>
-      let ps ← premises step
+      let ps ← timed "premises" (premises step)
       let some (c, pc) := ps[0]? | throwError "unit-resolution: premises expected"
       let units := ps.extract 1 ps.size
       -- the clause premise is `(or l₁ ... lₙ)`
@@ -607,7 +619,7 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
         if step.clauseSize == 0 then #[]
         else if single then #[concl]
         else disjuncts concl step.clauseSize
-      let r ← weakenClause lits pc (refuteBy units) targetLits
+      let r ← timed "weaken" (weakenClause lits pc (refuteBy units) targetLits)
       record step.rule "exact"
       return r
   | "quant-inst" | "forall_inst" =>
@@ -859,6 +871,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     if let some p ← timed "recfun" (cfg.proveRecFun concl step.clauseSize) then
       record step.rule "recfun"
       return p
+    if cfg.recFunOnly then throwError "recfun lemma not replayed"
   if step.rule == "th-lemma" && step.premises.isEmpty then
     if let some p ← (try replayDatatype concl catch _ => pure none) then
       if ← propEq (← inferType p) concl then
