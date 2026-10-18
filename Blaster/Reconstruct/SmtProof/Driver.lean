@@ -505,6 +505,13 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         proveDirect := fun c => do
           if ← withReducible (isDefEq c (mkNot body)) then return some hneg
           if ← withReducible (isDefEq c (mkNot body')) then return some hneg
+          -- e.g., projections vs. case analyses, casts of literals (with a budget)
+          let defeq (a b : Expr) : TermElabM Bool := do
+            try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
+                  withCurrHeartbeats <| withDefault <| isDefEq a b
+            catch _ => return false
+          if c.isAppOfArity ``Not 1 then
+            if ← defeq c (mkNot body') then return some (← mkExpectedTypeHint hneg c)
           let r ← portfolio bridge c "bridge"
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
             logInfo m!"bridge failed: {c}"
