@@ -68,6 +68,21 @@ def optimizeIntAdd (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
      | _ => return none
   | none => return none
 
+/-- Apply the following simplification/normalization rules on `Int.pow` :
+     - n ^ 0 ==> 1
+     - N1 ^ N2 ==> N1 "^" N2
+   Assume that f = Expr.const ``Int.pow.
+   An error is triggered when args.size ≠ 2 (i.e., only fully applied `Int.pow` expected at this stage)
+-/
+def optimizeIntPow (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
+ if args.size != 2 then throwEnvError "optimizeIntPow: exactly two arguments expected"
+ let op1 := args[0]!
+ let op2 := args[1]!
+ match isIntValue? op1, isNatValue? op2 with
+ | _, some 0 => mkIntLitExpr 1
+ | some n1, some n2 => mkIntLitExpr (n1 ^ n2)
+ | _, _ => return (mkApp2 f op1 op2)
+
 /-- Apply the following simplification/normalization rules on `Int.mul` :
      - 0 * n ==> 0
      - 1 * n ==> n
@@ -436,6 +451,7 @@ def optimizeInt? (f : Expr) (args : Array Expr) : TranslateEnvT (Option Expr) :=
   match n with
   | ``Int.add => optimizeIntAdd f args
   | ``Int.mul => optimizeIntMul f args
+  | ``Int.pow => optimizeIntPow f args
   | ``Int.neg => optimizeIntNeg f args
   | ``Int.negSucc => optimizeIntNegSucc f args
   | ``Int.toNat => optimizeIntToNat f args

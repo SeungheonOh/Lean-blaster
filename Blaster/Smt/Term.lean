@@ -183,6 +183,11 @@ def intPowSymbol : SmtSymbol := mkReservedSymbol "@Int.pow"
 -/
 def natPowSymbol : SmtSymbol := mkReservedSymbol "@Nat.pow"
 
+/-! Nat base-two logarithm Smt symbol.
+    NOTE: This function is defined during translation whenever required.
+-/
+def natLog2Symbol : SmtSymbol := mkReservedSymbol "@Nat.log2"
+
 /-! Nat subtraction Smt symbol.
     NOTE: This function is defined during translation whenever required.
 -/
@@ -230,6 +235,24 @@ def strReplaceAllSymbol : SmtSymbol := mkReservedSymbol "str.replace_all"
 
 /-! length Smt symbol for String. -/
 def strLengthSymbol : SmtSymbol := mkReservedSymbol "str.len"
+
+/-! from code Smt symbol for String (i.e., singleton string for a given code point). -/
+def strFromCodeSymbol : SmtSymbol := mkReservedSymbol "str.from_code"
+
+/-! String.mk Smt symbol (i.e., converting a `List Char` to a String).
+    NOTE: This function is defined during translation whenever required.
+-/
+def strMkSymbol : SmtSymbol := mkReservedSymbol "@String.mk"
+
+/-! Smt symbol converting a `Char` to a singleton String.
+    NOTE: This function is defined during translation whenever required.
+-/
+def charToStrSymbol : SmtSymbol := mkReservedSymbol "@Char.toStr"
+
+/-! Smt symbol converting a `Char` not denotable in an Smt String to a singleton String.
+    NOTE: This function is declared during translation whenever required.
+-/
+def charHighToStrSymbol : SmtSymbol := mkReservedSymbol "@Char.highToStr"
 
 /-! ## Builtin Smt functions. -/
 
@@ -342,6 +365,10 @@ def natModSmt (op1 : SmtTerm) (op2 : SmtTerm) : SmtTerm :=
 def natPowSmt (op1 : SmtTerm) (op2 : SmtTerm) : SmtTerm :=
   mkSimpleSmtAppN natPowSymbol #[op1, op2]
 
+/-! Create an Nat base-two logarithm Smt application. -/
+def natLog2Smt (op : SmtTerm) : SmtTerm :=
+  mkSimpleSmtAppN natLog2Symbol #[op]
+
 /-! Create an Integer absolute Smt application. -/
 def absSmt (op : SmtTerm) : SmtTerm :=
   mkSimpleSmtAppN absSymbol #[op]
@@ -383,6 +410,10 @@ def strReplaceAllSmt (s : SmtTerm) (src : SmtTerm) (dst : SmtTerm) : SmtTerm :=
 /-! Create a String length Smt application. -/
 def strLengthSmt (s : SmtTerm) : SmtTerm :=
   mkSimpleSmtAppN strLengthSymbol #[s]
+
+/-! Create a String from code Smt application. -/
+def strFromCodeSmt (n : SmtTerm) : SmtTerm :=
+  mkSimpleSmtAppN strFromCodeSymbol #[n]
 
 
 /-! Create an as-array Smt application (i.e., converting a function to an array representation). -/

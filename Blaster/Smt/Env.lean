@@ -457,6 +457,17 @@ def defineNatPow : TranslateEnvT Unit := do
   let fdef := λ xId yId => iteSmt (yEqZero yId) natOne (mulSmt xId (natPowSmt xId (natSubSmt yId natOne)))
   defineBinFun natPowSymbol natSort natSort natSort fdef (isRec := true)
 
+/-- Define Nat.log2 Smt function as follows (see `Nat.log2_def`):
+    (define-fun-rec @Nat.log2 ((@x Nat)) Nat
+      (ite (<= 2 @x) (+ (@Nat.log2 (div @x 2)) 1) 0))
+-/
+def defineNatLog2 : TranslateEnvT Unit := do
+  let xsym := mkReservedSymbol "@x"
+  let xId := smtSimpleVarId xsym
+  let natTwo := natLitSmt 2
+  let fdef := iteSmt (leqSmt natTwo xId) (addSmt (natLog2Smt (divSmt xId natTwo)) (natLitSmt 1)) (natLitSmt 0)
+  defineFun natLog2Symbol #[(xsym, natSort)] natSort fdef (isRec := true)
+
 
 /-- Define Int.toNat Smt function, i.e.,
      Int.toNat x := (ite (<= 0 x) x else 0)

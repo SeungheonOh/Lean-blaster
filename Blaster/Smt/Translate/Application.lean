@@ -41,6 +41,7 @@ def fullyAppliedConst : NameHashSet :=
     ``Nat.div,
     ``Nat.mod,
     ``Nat.pow,
+    ``Nat.log2,
     ``String.append,
     ``String.length,
     ``String.replace
@@ -250,6 +251,81 @@ def translateNatPow (f : Expr) : TranslateEnvT SmtQualifiedIdent := do
     return smtId
  | some smtId => return smtId
 
+/-- Perform the following actions:
+     - Return `SimpleIdent "@Nat.log2"` when entry `f := SimpleIdent "@Nat.log2"` exists in `funInstCache`
+     - Otherwise:
+        - define Nat sort (if necessary)
+        - define @Nat.log2 Smt function (i.e., see `defineNatLog2`)
+        - add entry `f := SimpleIdent "@Nat.log2"` to `funInstCache`
+        - return `SimpleIdent "@Nat.log2"`
+  Assume that `f := `Expr.const ``Nat.log2 []`
+-/
+def translateNatLog2 (f : Expr) : TranslateEnvT SmtQualifiedIdent := do
+ match (← get).smtEnv.funInstCache.get? f with
+ | none =>
+    discard $ translateNatType (← mkNatType)
+    defineNatLog2
+    updateFunInstCache f natLog2Symbol
+ | some smtId => return smtId
+
+
+/-- Highest code point denotable in an Smt string, i.e., the Smt-Lib Unicode Strings theory fixes
+    the string alphabet to the code points from `0x00000` to `0x2FFFF`.
+-/
+def maxSmtStrCodePoint : Nat := 0x2FFFF
+
+/-- Perform the following actions:
+     - Return `SimpleIdent "@String.mk"` when entry `f := SimpleIdent "@String.mk"` exists in `funInstCache`
+     - Otherwise:
+        - translate types `Char` and `List Char` (if necessary)
+        - declare and constrain function `@Char.highToStr` as follows:
+           (declare-fun @Char.highToStr (Char) String)
+           (assert (forall ((@c Char)) (! (= (str.len (@Char.highToStr @c)) 1) :pattern ((@Char.highToStr @c)))))
+        - define the following Smt functions:
+           (define-fun @Char.toStr ((@c Char)) String
+              (ite (<= code(@c) 196607) (str.from_code code(@c)) (@Char.highToStr @c)))
+           (define-fun-rec @String.mk ((@l (List Char))) String
+              (ite (is-List.nil @l) "" (str.++ (@Char.toStr (List.cons.1 @l)) (@String.mk (List.cons.2 @l)))))
+          with `code(@c) := (Fin.mk.1 (BitVec.ofFin.1 (UInt32.ofBitVec.1 (Char.mk.1 @c))))`.
+        - add entry `f := SimpleIdent "@String.mk"` to `funInstCache`
+        - return `SimpleIdent "@String.mk"`
+
+    NOTE: Lean `Char` ranges over the Unicode scalar values up to `0x10FFFF` while Smt strings
+    only range over code points up to `0x2FFFF` (see `maxSmtStrCodePoint`). Characters beyond this bound
+    have no Smt counterpart and are therefore mapped to an unspecified singleton string, i.e.,
+    only `String.length` is preserved.
+    Assume that `f := `Expr.const ``String.mk []`
+-/
+def translateStringMk (f : Expr) (termTranslator : Expr → TranslateEnvT SmtTerm) : TranslateEnvT SmtQualifiedIdent := do
+ match (← get).smtEnv.funInstCache.get? f with
+ | some smtId => return smtId
+ | none =>
+    let charType := mkConst ``Char
+    let charSort ← translateType termTranslator charType
+    let listSort ← translateType termTranslator (mkApp (mkConst ``List [levelZero]) charType)
+    discard $ translateNatType (← mkNatType)
+    discard $ translateOpaqueType (mkConst ``String)
+    -- declare @Char.highToStr
+    let csym := mkReservedSymbol "@c"
+    let cId := smtSimpleVarId csym
+    declareFun charHighToStrSymbol #[charSort] stringSort
+    let highApp := mkSimpleSmtAppN charHighToStrSymbol #[cId]
+    let qidName := appendSymbol charHighToStrSymbol "cstr"
+    assertTerm (mkForallTerm none #[(csym, charSort)] (eqSmt (strLengthSmt highApp) (natLitSmt 1))
+                 (some #[mkPattern #[highApp], mkQid qidName]))
+    -- define @Char.toStr
+    let selector := λ (ctor : Name) (t : SmtTerm) => mkSimpleSmtAppN (mkCtorSelectorSymbol ctor 1) #[t]
+    let code := selector ``Fin.mk (selector ``BitVec.ofFin (selector ``UInt32.ofBitVec (selector ``Char.mk cId)))
+    let toStrBody := iteSmt (leqSmt code (natLitSmt maxSmtStrCodePoint)) (strFromCodeSmt code) highApp
+    defineFun charToStrSymbol #[(csym, charSort)] stringSort toStrBody
+    -- define @String.mk
+    let lsym := mkReservedSymbol "@l"
+    let lId := smtSimpleVarId lsym
+    let headStr := mkSimpleSmtAppN charToStrSymbol #[mkSimpleSmtAppN (mkCtorSelectorSymbol ``List.cons 1) #[lId]]
+    let tailStr := mkSimpleSmtAppN strMkSymbol #[mkSimpleSmtAppN (mkCtorSelectorSymbol ``List.cons 2) #[lId]]
+    let mkBody := iteSmt (mkCtorTestorTerm ``List.nil lId) (strLitSmt "") (strAppendSmt headStr tailStr)
+    defineFun strMkSymbol #[(lsym, listSort)] stringSort mkBody (isRec := true)
+    updateFunInstCache f strMkSymbol
 
 /-- Perform the following actions:
      - Return `SimpleIdent "@Int.toNat"` when entry `n := SimpleIdent "@Int.toNat"` exists in `funInstCache`
@@ -329,6 +405,7 @@ def translateOpaqueFun (f : Expr) (n : Name) (args : Array Expr) : TranslateEnvT
   | ``Nat.mod => translateIntEMod f
   | ``Int.pow => translateIntPow f
   | ``Nat.pow => translateNatPow f
+  | ``Nat.log2 => translateNatLog2 f
   | ``LE.le
   | ``Nat.ble => getOpaqueSmtEquivFun f leqSymbol
   | ``LT.lt =>
@@ -738,11 +815,14 @@ def translateConst
   where
     translateCtor (c : Name) : TranslateEnvT (Option SmtTerm) := do
       let ConstantInfo.ctorInfo info ← getConstEnvInfo c | return none
+      let t ← inferTypeEnv e
+      -- proof constructor (e.g., `True.intro`): translate the corresponding proposition (see `translateTheorem?`)
+      if ← isPropEnv t then return (← termTranslator (← optimizeExpr' t))
       if info.numParams != 0 then
         throwEnvError "translateConst: unexpected implicit arguments for ctor {c}"
       if info.numFields == 0 then
         -- nullary constructor case
-        let st ← translateType termTranslator (← inferTypeEnv e)
+        let st ← translateType termTranslator t
         return (smtQualifiedVarId (nameToSmtSymbol c) st)
       else termTranslator (← Optimize.etaExpand e) -- parameterized constructor case
 
@@ -925,6 +1005,12 @@ def translateApp
       let ConstantInfo.ctorInfo info ← getConstEnvInfo n | return none
       if args.size < info.numParams + info.numFields
       then termTranslator (← Optimize.etaExpand e) -- partially applied ctor case
+      else if ← isPropEnv (← inferTypeEnv e) then
+        -- proof constructor (e.g., `And.intro h1 h2`): translate the corresponding proposition (see `translateTheorem`)
+        termTranslator (← optimizeExpr' (← inferTypeEnv e))
+      else if n == ``String.mk then
+        -- String is an opaque type (see `translateStringMk`)
+        return mkSmtAppN (← translateStringMk f termTranslator) #[← termTranslator args[0]!]
       else
         let st ← translateType termTranslator (← inferTypeEnv e)
         if info.numFields == 0 then

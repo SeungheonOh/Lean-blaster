@@ -56,6 +56,7 @@ def opaqueFuns : NameHashSet :=
     ``Nat.ble, -- Nat.blt is defined with Nat.beq
     ``Nat.beq,
     ``Nat.pow,
+    ``Nat.log2,
     ``Nat.le, -- defining LE.le for Nat, Nat.lt is defined with Nat.le
     ``Blaster.decide', -- decide predicate that ignores decidable instance
     ``Blaster.dite', -- dependent ite that ignores decidable instance
