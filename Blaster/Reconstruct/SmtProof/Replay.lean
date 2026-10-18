@@ -137,6 +137,8 @@ def mkOrInj (lits : Array Expr) (i : Nat) (p : Expr) : MetaM Expr := do
 /-- Case analysis on a proof `d` of the disjunction of `lits`: `k i hᵢ` builds a proof of `goal`
     from a proof `hᵢ` of the `i`-th literal. -/
 partial def orElim (lits : Array Expr) (d : Expr) (goal : Expr) (k : Nat → Expr → MetaM Expr) (start := 0) : MetaM Expr := do
+  -- empty clause: `d : False`
+  if start ≥ lits.size then return mkApp2 (Lean.mkConst ``False.elim [← getLevel goal]) goal d
   if lits.size - start == 1 then return ← k start d
   let a := lits[start]!
   let b := (lits.extract (start+1) lits.size).pop.foldr mkOr lits.back!
@@ -164,6 +166,62 @@ def refuteBy (units : Array (Expr × Expr)) (l : Expr) : MetaM (Option Expr) := 
     if let some a := l.not? then
       if ← propEq a t then return some (← withLocalDeclD `h l fun h => mkLambdaFVars #[h] (mkApp h u))
   return none
+
+/-- Propositional replay by unit propagation (RUP): given clauses (literals and proofs of their
+    disjunction), prove the disjunction of `target` literals. The negation of the target is assumed,
+    and unit propagation on the clauses must derive a conflict. This justifies resolution steps
+    (e.g., Alethe's `resolution`, Z3's `unit-resolution`) independently of pivot annotations. -/
+partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr) : MetaM Expr := do
+  let goal := if target.isEmpty then Lean.mkConst ``False else target.pop.foldr mkOr target.back!
+  let r ← withLocalDeclD `hn (mkNot goal) fun hn => do
+    -- known literals: proposition ↦ proof, and refuted propositions ↦ proof of the negation
+    let mut trues : Std.HashMap Expr Expr := {}
+    let mut falses : Std.HashMap Expr Expr := {}
+    for k in [:target.size] do
+      let l := target[k]!
+      let nl ← withLocalDeclD `h l fun h => do mkLambdaFVars #[h] (mkApp hn (← mkOrInj target k h))
+      falses := falses.insert l nl
+    let refutation (trues falses : Std.HashMap Expr Expr) (l : Expr) : MetaM (Option Expr) := do
+      if let some p := falses.get? l then return some p
+      if let some a := l.not? then
+        if let some pa := trues.get? a then
+          return some (← withLocalDeclD `h l fun h => mkLambdaFVars #[h] (mkApp h pa))
+      return none
+    let mut changed := true
+    let mut used := Array.replicate clauses.size false
+    let mut conflict : Option Expr := none
+    while changed && conflict.isNone do
+      changed := false
+      for ci in [:clauses.size] do
+        if used[ci]! then continue
+        let (lits, pc) := clauses[ci]!
+        let mut unknown := #[]
+        let mut refs := #[]
+        for l in lits do
+          match ← refutation trues falses l with
+          | some r => refs := refs.push (some r)
+          | none => unknown := unknown.push l; refs := refs.push none
+        if unknown.isEmpty then
+          -- conflict: all literals are refuted
+          let p ← orElim lits pc (Lean.mkConst ``False) fun i h => return mkApp refs[i]!.get! h
+          conflict := some p
+          break
+        if unknown.size == 1 then
+          let l := unknown[0]!
+          if trues.contains l then
+            used := used.set! ci true
+            continue
+          let p ← orElim lits pc l fun i h => do
+            match refs[i]! with
+            | some r => return mkApp2 (Lean.mkConst ``False.elim [levelZero]) l (mkApp r h)
+            | none => return h
+          trues := trues.insert l p
+          if let some a := l.not? then falses := falses.insert a p
+          used := used.set! ci true
+          changed := true
+    let some pf := conflict | throwError "smt proof: unit propagation did not derive a conflict"
+    mkLambdaFVars #[hn] pf
+  return mkApp2 (Lean.mkConst ``Classical.byContradiction) goal r
 
 mutual
 
@@ -195,11 +253,18 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
         logInfo m!"step {i} ({step.rule}) failed: {ex.toMessageData}"
       return none
   if let some p ← attempt then return p
+  -- fallback: unit propagation (e.g., for clauses whose literals are disjunctions)
+  if ["unit-resolution", "resolution", "th_resolution"].contains step.rule then
+    try return ← replayRup step concl
+    catch _ => pure ()
   -- fallback: tactics on `premises → conclusion` (e.g., when an explicit construction fails due to casts)
   if !(["asserted", "goal", "hypothesis", "lemma", "proof-bind"].contains step.rule) then
     try return ← replayByTactic step concl
     catch _ => pure ()
-  -- fallback: direct proof of the conclusion
+  -- fallback: direct proof of the conclusion (except for `False`, which amounts to proving the goal
+  -- without the proof of the backend)
+  if concl.isConstOf ``False then
+    throwError "smt proof: could not replay step {i} ({step.rule}) concluding false"
   if let some p ← ctx.cfg.proveDirect concl then
     record step.rule "direct"
     return p
@@ -214,7 +279,7 @@ partial def premises (step : Step) : ReplayM (Array (Expr × Expr)) :=
 partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := do
   let ctx ← read
   match step.rule with
-  | "asserted" | "goal" =>
+  | "asserted" | "goal" | "assume" =>
       let some p ← ctx.cfg.proveDirect concl | throwError "asserted formula not proved"
       record step.rule "bridge"
       return p
@@ -269,6 +334,7 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       let r ← mkAppM ``eq_false #[p]
       if ← propEq (← inferType r) concl then record step.rule "exact"; return r
       throwError "iff-false: conclusion mismatch"
+  | "resolution" | "th_resolution" => replayRup step concl
   | "unit-resolution" =>
       let ps ← premises step
       let some (c, pc) := ps[0]? | throwError "unit-resolution: premises expected"
@@ -285,7 +351,7 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       let r ← weakenClause lits pc (refuteBy units) targetLits
       record step.rule "exact"
       return r
-  | "quant-inst" =>
+  | "quant-inst" | "forall_inst" =>
       -- `(or (not (forall xs. P)) P[ts])`
       let some (nq, inst) := orArgs? concl | throwError "quant-inst: disjunction expected"
       let some q := nq.not? | throwError "quant-inst: negated quantifier expected"
@@ -344,6 +410,23 @@ partial def replayBind (step : Step) : ReplayM Expr := do
   let r ← go 0 #[]
   record step.rule "exact"
   return r
+
+/-- Resolution steps: unit propagation on the premise clauses (see `rupProof`). -/
+partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
+  let ctx ← read
+  let mut clauses := #[]
+  for j in step.premises do
+    let c ← stepConcl j
+    let n := clauseSize ctx.proof.steps[j]!.concl
+    let lits := if n == 0 then #[] else disjuncts c n
+    clauses := clauseLitsWith clauses lits (← replay j)
+  let n := clauseSize step.concl
+  let target := if n == 0 then #[] else disjuncts concl n
+  let r ← rupProof clauses target
+  record step.rule "exact"
+  return r
+where
+  clauseLitsWith (cs : Array (Array Expr × Expr)) (lits : Array Expr) (p : Expr) := cs.push (lits, p)
 
 /-- Prove `p₁ → ... → pₙ → c` with tactics and apply it to the premise proofs. -/
 partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do

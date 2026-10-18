@@ -370,6 +370,9 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         if args.isEmpty then return e
         mkAppCoerce e (← args.mapM interp)
     | some (.macro params body) =>
+        if args.isEmpty && !params.isEmpty then
+          -- the function itself (e.g., `(= @isNat (lambda ((x Int)) (<= 0 x)))` in cvc5 proofs)
+          return ← interpQuant .lambda params body
         if params.size != args.size then throwError "smt proof: wrong number of arguments for {f}"
         let vals ← args.mapM interp
         let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) ctx.locals

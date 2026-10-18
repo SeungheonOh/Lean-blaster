@@ -1,6 +1,7 @@
 import Lean
 import Blaster.Smt.Translate
 import Blaster.Reconstruct.Discharge
+import Blaster.Reconstruct.SmtProof.Driver
 
 open Lean Meta Elab Term Blaster.Options Blaster.Optimize Blaster.Smt
 
@@ -116,7 +117,19 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   -- Proof of the residual goal
   let (residual, residualMethod) ← match task.optExpr with
     | .const ``True _ => pure (some (Lean.mkConst ``True.intro), "optimizer")
-    | e =>
+    | e => do
+        -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
+        -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
+        let mode := (← IO.getEnv "BLASTER_SMT_PROOF").getD "last"
+        let bySmtProof : TermElabM (Option (Expr × String)) := do
+          if mode == "off" || !task.bySmt then return none
+          match ← SmtProof.proveBySmtProof e {} with
+          | .ok r => return some (r.proof, s!"smt residual by {r.backend} proof replay")
+          | .error _ => return none
+        let first? ← if mode == "first" then bySmtProof else pure none
+        match first? with
+        | some (p, m) => pure (some p, m)
+        | none =>
         match ← proveResidual e with
         | some (p, m) => pure (some p, s!"smt residual by {m}")
         | none =>
@@ -124,7 +137,10 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
             let facts ← if recon.recFunEquivs.isEmpty then pure #[] else proveEquivalences recon.recFunEquivs
             match ← dischargeWithFacts e facts with
             | some p => pure (some p, "smt residual by induction+facts")
-            | none => pure (none, "none")
+            | none =>
+                match ← (if mode == "last" then bySmtProof else pure none) with
+                | some (p, m) => pure (some p, m)
+                | none => pure (none, "none")
   let out := { out with residual := residualMethod }
   let some residual := residual
     | finish { out with failure := m!"could not reconstruct a proof for the residual goal proved by the SMT solver{indentExpr task.optExpr}" }

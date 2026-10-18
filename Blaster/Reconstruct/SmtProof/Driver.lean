@@ -2,6 +2,7 @@ import Lean
 import Blaster.Smt.Translate
 import Blaster.Reconstruct.Discharge
 import Blaster.Reconstruct.SmtProof.Z3
+import Blaster.Reconstruct.SmtProof.Alethe
 import Blaster.Reconstruct.SmtProof.Replay
 
 /-!
@@ -42,7 +43,8 @@ def z3Backend (cmd : String) (timeoutSec : Nat) : Backend where
   name := "z3"
   cmd := cmd
   args := #["-in", "-smt2", s!"-T:{timeoutSec}"]
-  preamble := #["(set-option :produce-proofs true)"]
+  -- NOTE: `pp.simplify_implies` prints `(=> a (=> b c))` as `(=> (and a b) c)` by default
+  preamble := #["(set-option :produce-proofs true)", "(set-option :pp.simplify_implies false)"]
   dropCommand := isZ3SpecificCommand
   parseProof := Z3.parseProof
 
@@ -63,6 +65,22 @@ def guardNatQuantifiers (c : SExpr) : SExpr :=
         | _ => guard body
       .list #[.atom "assert", .list #[.atom "forall", .list vars, body']]
   | c => c
+
+/-- Commands of Blaster's query that are specific to Z3 (all options are set by the backend preamble). -/
+def isZ3OnlyCommand (c : SExpr) : Bool :=
+  match c.head? with
+  | some "set-simplifier" | some "set-option" | some "set-logic" => true
+  | _ => false
+
+/-- cvc5 with Alethe proofs. -/
+def cvc5Backend (cmd : String) (timeoutSec : Nat) : Backend where
+  name := "cvc5"
+  cmd := cmd
+  args := #["--lang=smt2", "--parsing-mode=lenient", s!"--tlimit={timeoutSec * 1000}", "--proof-format-mode=alethe",
+            "--proof-granularity=dsl-rewrite"]
+  preamble := #["(set-logic ALL)", "(set-option :produce-proofs true)"]
+  dropCommand := isZ3OnlyCommand
+  parseProof := Alethe.parseProof
 
 /-- Run `backend` on the query `cmds`, returning the raw proof output. -/
 def runBackend (backend : Backend) (cmds : Array SExpr) : IO (Except String String) := do
@@ -306,11 +324,23 @@ def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Except Stri
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
     let cmds := cmds.map guardNatQuantifiers
     -- 2. backend
-    let z3 := (← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3"
-    let backend := z3Backend z3 (sOpts.timeout.getD 20)
-    let out ← runBackend backend cmds
-    let out ← match out with | .ok o => pure o | .error msg => throwError msg
-    let sproof ← ofExcept (backend.parseProof out)
+    -- backends tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`)
+    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3").splitOn ","
+    let timeout := sOpts.timeout.getD 20
+    let mut res : Option (Backend × Proof) := none
+    let mut errors := #[]
+    for n in names do
+      let backend ← match n.trim with
+        | "z3" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout)
+        | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
+        | b => throwError "unknown proof backend {b}"
+      match ← runBackend backend cmds with
+      | .error msg => errors := errors.push msg
+      | .ok out =>
+          match backend.parseProof out with
+          | .ok p => res := some (backend, p); break
+          | .error msg => errors := errors.push s!"{backend.name}: {msg}"
+    let some (backend, sproof) := res | throwError "no proof: {errors}"
     -- 3. interpretation
     let mut consts : Std.HashMap String Expr := {}
     for x in xs do

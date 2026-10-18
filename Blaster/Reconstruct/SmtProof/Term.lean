@@ -126,6 +126,14 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
           let args ← (xs.extract 1 xs.size).mapM (ofSExpr env)
           match hd.toList with
           | .atom "_" :: .atom f :: idx => return .iapp f (← idx.toArray.mapM (ofSExpr env)) args
+          -- β-redex (e.g., after the expansion of named lambdas)
+          | [.atom "lambda", .list vs, body] =>
+              if vs.size != args.size then throw s!"ill-formed β-redex: {e}"
+              let mut env' := env
+              for (v, a) in vs.zip args do
+                let some (x : String) := v.list? >>= (·[0]?) >>= SExpr.atom? | throw s!"ill-formed binder: {v}"
+                env' := env'.insert x a
+              ofSExpr env' body
           | [.atom "as", .atom f, s] => return .qual f s args
           | _ => throw s!"unsupported application head: {SExpr.list hd}"
       | h => throw s!"unsupported application head: {h}"
