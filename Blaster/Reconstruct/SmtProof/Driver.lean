@@ -453,6 +453,8 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
   let simp := #[
     ("rfl", ← `(tactic| (intros; rfl))),
     ("simp", ← `(tactic| (intros; simp_all <;> done))),
+    -- associativity of the connectives (e.g., the flattening of n-ary connectives by Z3's rewriter)
+    ("simp ac", ← `(tactic| (intros; simp_all [and_assoc, or_assoc] <;> done))),
     ("simp only", ← `(tactic| (intros; simp only [*] <;> done)))]
   let grind := #[("grind", ← `(tactic| (intros; grind)))]
   let quant := #[
