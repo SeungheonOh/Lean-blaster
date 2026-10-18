@@ -96,11 +96,42 @@ def generalizeCommon (stmt l r : Expr) : MetaM (Option (Expr × Array Expr)) := 
     if !(← isTypeCorrect g) then return none
     return some (g, ss)
 
+/-- Leaves of the maximal tree of applications of the binary operation `op` (e.g., `And`) at the root of `e`. -/
+partial def opLeaves (op : Name) (e : Expr) (acc : Array Expr := #[]) : Array Expr :=
+  if e.isAppOfArity op 2 then opLeaves op e.appArg! (opLeaves op e.appFn!.appArg! acc) else acc.push e
+
+/-- Whether the trees of `op` applications at the roots of `l` and `r` have the same shape. -/
+partial def sameOpShape (op : Name) (l r : Expr) : Bool :=
+  match l.isAppOfArity op 2, r.isAppOfArity op 2 with
+  | true, true => sameOpShape op l.appFn!.appArg! r.appFn!.appArg! && sameOpShape op l.appArg! r.appArg!
+  | false, false => true
+  | _, _ => false
+
+/-- `e` with the leaves of its tree of `op` applications replaced by `f`. -/
+partial def mapOpLeaves (op : Name) (f : Expr → Expr) (e : Expr) : Expr :=
+  if e.isAppOfArity op 2 then mkApp2 e.appFn!.appFn! (mapOpLeaves op f e.appFn!.appArg!) (mapOpLeaves op f e.appArg!)
+  else f e
+
+/-- `e = e'` where `e'` is `e` with the leaves of its tree of `op` applications rewritten with `proofs`. -/
+partial def congrLeaves (op : Name) (proofs : Std.HashMap Expr Expr) (e : Expr) : MetaM Expr := do
+  if e.isAppOfArity op 2 then
+    let pa ← congrLeaves op proofs e.appFn!.appArg!
+    let pb ← congrLeaves op proofs e.appArg!
+    return ← mkCongr (← mkCongrArg e.appFn!.appFn! pa) pb
+  match proofs.get? e with
+  | some p => return p
+  | none => mkEqRefl e
+
+mutual
 /-- Proof of `l = r` by congruence on the common structure of `l` and `r`, proving the remaining
     differences with `prove` (given the equality to prove, returns a proof). At most `budget` calls of
-    `prove`. -/
+    `prove`. Conjunctions and disjunctions are compared modulo associativity and unit elements (e.g., the
+    flattening of n-ary connectives by Z3's rewriter). -/
 partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (l r : Expr) : TermElabM (Option Expr) := do
   if l == r then return some (← mkEqRefl l)
+  for op in [``And, ``Or] do
+    if (l.isAppOfArity op 2 || r.isAppOfArity op 2) && !sameOpShape op l r then
+      if let some p ← acEq prove budget op l r then return some p
   let whole : TermElabM (Option Expr) := do
     if (← budget.get) == 0 then return none
     budget.modify (· - 1)
@@ -143,6 +174,35 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
     pf ← mkEqTrans pf (← mkCongrArg ctx p)
     cur := cur.set! i bs[i]!
   return some pf
+
+/-- `l = r` for trees of `op` applications of different shapes: the leaves of `l` (except the unit
+    element, and the duplicates) are paired with the leaves of `r` in order and proved equal (`diffEq`),
+    then `l` with the leaves of `r` is proved equal to `r` with the leaves generalized (`prove`). -/
+partial def acEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (op : Name) (l r : Expr) :
+    TermElabM (Option Expr) := do
+  let unit := if op == ``And then ``True else ``False
+  let dedup (xs : Array Expr) : Array Expr := xs.foldl (fun acc x => if acc.contains x then acc else acc.push x) #[]
+  let ls := dedup ((opLeaves op l).filter (!·.isConstOf unit))
+  let rs := (opLeaves op r).filter (!·.isConstOf unit)
+  if ls.size != rs.size || ls.isEmpty then return none
+  -- leaves of `l` rewritten into the leaves of `r`
+  let mut m : Std.HashMap Expr Expr := {}
+  let mut proofs : Std.HashMap Expr Expr := {}
+  for (x, y) in ls.zip rs do
+    m := m.insert x y
+    if x != y then
+      let some p ← diffEq prove budget x y | return none
+      proofs := proofs.insert x p
+  let l' := mapOpLeaves op (fun x => m.getD x x) l
+  -- `l = l'` by congruence (the differences are the leaves)
+  let p₁ ← if proofs.isEmpty then mkEqRefl l else congrLeaves op proofs l
+  -- `l' = r`: associativity, units and duplicates (the leaves are generalized)
+  if l' == r then return some p₁
+  if (← budget.get) == 0 then return none
+  budget.modify (· - 1)
+  let some p₂ ← prove (← mkEq l' r) | return none
+  return some (← mkEqTrans p₁ p₂)
+end
 
 end Blaster.Reconstruct.SmtProof.Local
 
