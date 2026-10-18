@@ -146,7 +146,7 @@ def isUserDefinition (env : Environment) (n : Name) : Bool := Id.run do
   | none => return true
   | some idx =>
       let mod := env.header.moduleNames[idx.toNat]!
-      return !(mod.getRoot ∈ [`Init, `Lean, `Std, `Lake, `Blaster])
+      return !([`Init, `Lean, `Std, `Lake, `Blaster].contains mod.getRoot)
 
 syntax (name := blasterUnfoldUser) "blaster_unfold_user" : tactic
 
@@ -304,6 +304,51 @@ where
     | .mdata _ e | .proj _ _ e => collect e acc
     | _ => acc
 
+syntax (name := blasterCloseProofs) "blaster_close_proofs" : tactic
+
+/-- Replace the proofs occurring in the goal that depend on local hypotheses but whose type is a
+    closed decidable proposition (e.g., `s.length ≤ 64` for a string literal `s`) with proofs by
+    `decide`, which is a definitional change by proof irrelevance. This allows closed goals to be
+    decided by kernel evaluation after a case analysis (see `blaster_wf_eval`).
+-/
+@[tactic blasterCloseProofs] def evalBlasterCloseProofs : Tactic := fun _ =>
+  liftMetaTactic fun g => g.withContext do
+    let t ← instantiateMVars (← g.getType)
+    let changed ← IO.mkRef false
+    let t' ← Meta.transform t (pre := fun e => do
+      if !e.hasFVar || e.hasLooseBVars then return .continue
+      if !(← isProof e) then return .continue
+      let p ← instantiateMVars (← inferType e)
+      if p.hasFVar || p.hasMVar then return .continue
+      try
+        let r ← withAtLeastTransparency .default <| whnf (← mkDecide p)
+        if !r.isConstOf ``true then return .continue
+        changed.set true
+        return .done (← mkDecideProof p)
+      catch _ => return .continue)
+    if !(← changed.get) then throwError "blaster_close_proofs: no proof to close"
+    return [← g.replaceTargetDefEq t']
+
+syntax (name := blasterClosedContra) "blaster_closed_contra" : tactic
+
+/-- Close the goal when one of the hypotheses is a closed decidable proposition evaluating to
+    `false` (e.g., an infeasible branch condition `"abc".length < 2` after a case analysis).
+-/
+@[tactic blasterClosedContra] def evalBlasterClosedContra : Tactic := fun _ =>
+  liftMetaTactic fun g => g.withContext do
+    for d in ← getLCtx do
+      if d.isImplementationDetail then continue
+      let p ← instantiateMVars d.type
+      if p.hasFVar || p.hasMVar || !(← isProp p) then continue
+      try
+        let r ← withAtLeastTransparency .default <| whnf (← mkDecide (mkNot p))
+        if !r.isConstOf ``true then continue
+        let np ← mkDecideProof (mkNot p)
+        g.assign (← mkAbsurd (← g.getType) d.toExpr np)
+        return []
+      catch _ => continue
+    throwError "blaster_closed_contra: no contradiction"
+
 syntax (name := blasterWfEval) "blaster_wf_eval" : tactic
 
 /-- Return `true` if `f` is defined by well-founded recursion. -/
@@ -364,6 +409,7 @@ def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
   let wrapperLemmas ← wrappers.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
   if !wrappers.isEmpty then evalTactic (← `(tactic| try simp only [$wrapperLemmas,*] at *))
   let mut idx := 0
+  let mut evalTerms : Array Term := #[]
   let mut done : Array Expr := #[]
   for _ in [0:6] do
     if (← getGoals).isEmpty then break
@@ -394,14 +440,22 @@ def isWellFoundedDef (env : Environment) (f : Name) : Bool := Id.run do
       let g ← getMainGoal
       let (_, g') ← (← g.assert hName eqTy prf).intro1P
       replaceMainGoal [g']
-      evalTactic (← `(tactic| try simp only [$(mkIdent hName):ident] at *))
+      -- NOTE: the equation is used as a term, as `simp ... at *` also rewrites the hypothesis to `True`
+      let eqTerm ← Term.exprToSyntax prf
+      evalTerms := evalTerms.push eqTerm
+      evalTactic (← `(tactic| try simp only [$eqTerm:term] at *))
   if idx == 0 then throwError "blaster_wf_eval: no evaluation"
   if (← getGoals).isEmpty then return
+  -- the evaluation equations are applied again after case analysis (e.g., on a `match` whose
+  -- discriminant is an evaluated application, which can't be rewritten before the case split)
+  let evalLemmas ← evalTerms.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
   evalTactic (← `(tactic| first
     | rfl
     | decide +kernel +revert
-    | ((repeat' split) <;> (try $unfoldAtTac:tactic) <;> (try simp_all) <;> (try subst_vars) <;>
-        first | done | rfl | decide +kernel +revert)))
+    | ((repeat' split) <;> (try simp only [$evalLemmas,*] at *) <;> (try $unfoldAtTac:tactic) <;>
+        (try simp_all) <;> (try subst_vars) <;>
+        first | done | rfl | blaster_closed_contra | (blaster_close_proofs; decide +kernel) |
+                decide +kernel +revert)))
 where
   arity (env : Environment) (n : Name) : Nat :=
     ((env.find? n).map fun info => info.type.getForallArity).getD 0
@@ -728,6 +782,34 @@ syntax (name := blasterFunInd) "blaster_funind" : tactic
     catch _ => s.restore
   throwError "blaster_funind: failed"
 
+syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
+
+syntax (name := blasterGenDiscrs) "blaster_gen_discrs" : tactic
+
+/-- Generalize the non-variable discriminants of the first `match` expression occurring in the goal
+    (e.g., the symbolic `Int.negSucc` normalized by the optimizer), such that case analysis on the
+    `match` expression can be performed.
+-/
+@[tactic blasterGenDiscrs] def evalBlasterGenDiscrs : Tactic := fun _ =>
+  liftMetaTactic fun g => g.withContext do
+    let t ← instantiateMVars (← g.getType)
+    let some m ← findMatcher t
+      | throwError "blaster_gen_discrs: no match expression"
+    -- NOTE: closed discriminants (e.g., `Int.ofNat 10`) are kept such that the `match` can be reduced
+    let ds := m.discrs.filter fun d => !d.isFVar && !d.hasLooseBVars && d.hasFVar
+    if ds.isEmpty then throwError "blaster_gen_discrs: no discriminant to generalize"
+    let (_, g) ← g.generalize (ds.map fun d => { expr := d, xName? := `d : GeneralizeArg })
+    return [g]
+where
+  findMatcher (t : Expr) : MetaM (Option MatcherApp) := do
+    let r ← IO.mkRef none
+    Meta.forEachExpr' t fun e => do
+      if (← r.get).isSome then return false
+      if let some m ← matchMatcherApp? e then
+        r.set (some m); return false
+      return true
+    r.get
+
 /-- Maximum number of alternatives of a `match` expression for case analysis strategies. -/
 def maxMatchAlts : Nat := 32
 
@@ -754,6 +836,12 @@ def deepCases : TermElabM (TSyntax `tactic) :=
              (try simp_all [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]) <;>
              (try decide) <;> first | done | ((repeat' split) <;> (try simp_all) <;> omega)))
 
+/-- Case analysis on a `match` expression with generalized discriminants (see `blaster_gen_discrs`). -/
+def matchGeneralizeTactic : TermElabM (TSyntax `tactic) :=
+  `(tactic| (blaster_gen_discrs <;> blaster_denorm <;> split <;> (repeat' split) <;>
+             (try simp_all [Int.negSucc_eq]) <;> (try norm_cast at *) <;> (try simp_all) <;>
+             (try blaster_inst_hyps) <;> first | omega | (subst_vars; simp_all; done) | grind))
+
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
@@ -766,7 +854,14 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
           Nat.mul_mod_right, Nat.div_self, Nat.mod_self, Int.mul_ediv_cancel, Int.mul_ediv_cancel_left,
           Int.mul_emod_left, Int.mul_emod_right, Int.ediv_self, Int.emod_self] <;> done))),
     -- case analysis (e.g., `match` expressions normalized to `Blaster.dite'`)
-    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> first | omega | (simp_all; done) | grind))),
+    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;>
+        first | omega | (simp_all; done) | grind | (simp_all [String.ext_iff]; done) |
+                -- infeasible branches whose condition is used by a dependent proof in the goal
+                (exfalso; simp_all; done)))),
+    -- case analysis on `Int.negSucc` patterns (symbolic `Int.negSucc` is normalized by the optimizer)
+    ("split", ← `(tactic| (blaster_denorm <;>
+        simp (disch := decide) only [Blaster.Reconstruct.neg_natCast_add_eq_negSucc, Nat.reduceSub, Nat.add_zero] at * <;>
+        (repeat' split) <;> first | omega | (simp_all; done) | grind))),
     -- case analysis on conditions applied to additional arguments
     ("split", ← `(tactic| (blaster_denorm <;> blaster_by_cases <;> (try simp_all [Int.sub_eq_add_neg]) <;>
                           first | done | omega | grind))),
@@ -938,6 +1033,11 @@ partial def dischargeOne (type : Expr) (depth := matchCasesDepth) : TermElabM (O
     if let some prf ← proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats) then
       return some (prf, "cases")
   if let some prf ← proveByMatchCases type depth then return some (prf, "match cases")
+  -- case analysis on `match` expressions with generalized discriminants (e.g., symbolic `Int.negSucc`
+  -- normalized by the optimizer)
+  if !large then
+    if let some prf ← proveWithTactic type (← matchGeneralizeTactic) (budget := 4 * dischargeHeartbeats) then
+      return some (prf, "match cases")
   -- case analysis on the variables stuck `match` applications depend on (no splitter needed)
   if depth == matchCasesDepth then
     if (collectMatchApps (← getEnv) type).size > 0 then
@@ -1199,6 +1299,22 @@ partial def specializeWithLocals (vars : Array Expr) (p ty : Expr) : MetaM (Arra
   go p ty 0
   return ← res.get
 
+/-- Given a hypothesis `h : ∀ (k : Nat), ¬ a = k + c` (e.g., produced by the case analysis of a
+    `match` with pattern `k + c`), where `c` is a constant offset, return `h (a - c)`.
+-/
+def patternInstance? (h ty : Expr) : MetaM (Option (Expr × Expr)) := do
+  let .forallE _ d b _ := ty | return none
+  if !d.isConstOf ``Nat then return none
+  let some body := b.not? | return none
+  let some (_, l, r) := body.eq? | return none
+  let (a, r) := if l.hasLooseBVars then (r, l) else (l, r)
+  if a.hasLooseBVars || !r.hasLooseBVars then return none
+  let some c₀ ← evalNat (r.instantiate1 (mkNatLit 0)) |>.run | return none
+  let some c₁ ← evalNat (r.instantiate1 (mkNatLit 1)) |>.run | return none
+  if c₁ != c₀ + 1 then return none
+  let v := mkNatSub a (mkNatLit c₀)
+  return some (mkApp h v, ← instantiateForall ty #[v])
+
 /-- Add the seeded specializations of all propositional hypotheses of `g` to its local context,
     including their specializations w.r.t. the local variables.
 -/
@@ -1220,6 +1336,8 @@ def instHypsWithSeeds (g : MVarId) : MetaM MVarId := g.withContext do
       let pty ← instantiateMVars pty
       if p.hasMVar || pty.hasMVar then continue
       hs := hs.push { userName := `h_inst, type := pty, value := p : Hypothesis }
+    if let some (p, pty) ← try patternInstance? decl.toExpr ty catch _ => pure none then
+      hs := hs.push { userName := `h_pat, type := pty, value := p : Hypothesis }
   if hs.isEmpty then return g
   let (_, g) ← g.assertHypotheses hs
   return g
@@ -1249,10 +1367,42 @@ syntax (name := blasterStructFacts) "blaster_struct_facts" : tactic
     let (_, g) ← g.assertHypotheses hs
     return [g]
 
-syntax (name := blasterInstHyps) "blaster_inst_hyps" : tactic
 
 @[tactic blasterInstHyps] def evalBlasterInstHyps : Tactic := fun _ =>
   liftMetaTactic fun g => return [← instHypsWithSeeds g]
+
+syntax (name := blasterNoMatch) "blaster_nomatch" : tactic
+
+/-- Close the goal by exhibiting an element of an empty type, i.e., `nomatch f default ... default`
+    for a local variable or an axiom `f` occurring in the goal (e.g., `g : Nat → E` with `E` empty).
+-/
+@[tactic blasterNoMatch] def evalBlasterNoMatch : Tactic := fun _ => withMainContext do
+  let env ← getEnv
+  let mut cands : Array Expr := #[]
+  for d in ← getLCtx do
+    if d.isImplementationDetail || (← isProp d.type) then continue
+    cands := cands.push d.toExpr
+  for n in (← instantiateMVars (← getMainTarget)).getUsedConstants do
+    if let some (.axiomInfo _) := env.find? n then cands := cands.push (← mkConstWithFreshMVarLevels n)
+  let s ← saveState
+  for c in cands.extract 0 16 do
+    let arity ← forallTelescopeReducing (← inferType c) fun xs _ => pure xs.size
+    for k in [0:min arity 3 + 1] do
+      -- NOTE: created for each attempt, as the state is restored after a failed attempt
+      let t ← Term.exprToSyntax c
+      let args := Array.replicate k (← `(default))
+      -- NOTE: `nomatch` reports missing cases as an error message (with a `sorry` proof)
+      let msgs ← Core.getMessageLog
+      Core.setMessageLog {}
+      try
+        evalTactic (← `(tactic| exact nomatch ($t $args*)))
+        if (← getGoals).isEmpty && !(← Core.getMessageLog).hasErrors then
+          Core.setMessageLog msgs
+          return
+      catch _ => pure ()
+      s.restore
+      Core.setMessageLog msgs
+  throwError "blaster_nomatch: no element of an empty type"
 
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
@@ -1323,6 +1473,10 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
         | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega)))),
     -- `Nat.log2` (opaque for the solver, defined with `Nat.rec` in core): one unfolding step
     ("unfold", ← `(tactic| (intros <;> blaster_denorm <;> rw [Nat.log2_def] <;> split <;> first | omega | grind))),
+    -- existential goals over types (e.g., `∃ (α : Type) (x : α), α = Nat`)
+    ("exists", ← `(tactic| (intros <;> first | exact ⟨_, rfl⟩ | exact ⟨_, default, rfl⟩ | exact ⟨_, _, rfl⟩))),
+    -- goals valid due to an empty type (e.g., `g : Nat → E` with `E` empty)
+    ("empty", ← `(tactic| (intros <;> blaster_nomatch))),
   ]
   let large ← involvesLargeMatch e
   for (name, tac) in tacs do

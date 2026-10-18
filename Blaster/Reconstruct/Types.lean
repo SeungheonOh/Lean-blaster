@@ -124,6 +124,11 @@ structure ReconEnv where
   /-- Number of rewrite steps justified by definitional equality. -/
   nbDefEq : Nat := 0
 
+  /-- Evidence for the last expression optimized at the top level of the optimizer's stack, i.e.,
+      `e = optimize(e)` (see `stackContinuity`).
+  -/
+  resultPf : EqPf := .unknown
+
 instance : Inhabited ReconEnv := ⟨{}⟩
 
 /-- Information required to reconstruct a proof for a `Valid` result. -/

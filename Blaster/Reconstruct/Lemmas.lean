@@ -26,6 +26,16 @@ theorem nat_ble_eq : Nat.ble = fun x y => Blaster.decide' (x ≤ y) := by
     exact ((Blaster.decide'_false _).mpr h1).symm
   . exact ((Blaster.decide'_true _).mpr (Nat.le_of_ble_eq_true h)).symm
 
+theorem nat_le_fun_eq_not_lt : Nat.le = fun x y => ¬ (y < x) := by
+  funext x y; exact propext ⟨fun h => Nat.not_lt.mpr h, fun h => Nat.not_lt.mp h⟩
+
+theorem int_le_fun_eq_not_lt : Int.le = fun x y => ¬ (y < x) := by
+  funext x y; exact propext ⟨fun h => Int.not_lt.mpr h, fun h => Int.not_lt.mp h⟩
+
+theorem nat_ble_fun_eq_not_lt : Nat.ble = fun x y => Blaster.decide' (¬ (y < x)) := by
+  rw [nat_ble_eq]; funext x y
+  exact congrArg Blaster.decide' (propext ⟨fun h => Nat.not_lt.mpr h, fun h => Nat.not_lt.mp h⟩)
+
 theorem nat_beq_eq : Nat.beq = fun x y => x == y := by
   funext x y
   cases h : Nat.beq x y
@@ -48,6 +58,12 @@ theorem int_negSucc_eq : Int.negSucc = fun n => Int.neg (Int.ofNat (Nat.add 1 n)
   funext n
   show Int.negSucc n = Int.neg (Int.ofNat (1 + n))
   rw [Nat.add_comm]; rfl
+
+/-- Denormalization of `Int.negSucc` (see `int_negSucc_eq`), e.g., to reduce `match` expressions. -/
+theorem neg_natCast_add_eq_negSucc (k m : Nat) (h : 0 < k) : -((k + m : Nat) : Int) = Int.negSucc (m + (k - 1)) := by
+  cases k with
+  | zero => contradiction
+  | succ k => simp only [Nat.add_sub_cancel]; rw [Nat.add_comm]; rfl
 
 end Blaster.Reconstruct
 
