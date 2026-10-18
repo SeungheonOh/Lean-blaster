@@ -525,6 +525,10 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   | "*", _ => foldBin mkIntMul (← args.mapM interpInt)
   | "div", _ => foldBin mkIntDiv (← args.mapM interpInt)
   | "mod", 2 => return mkIntMod (← interpInt args[0]!) (← interpInt args[1]!)
+  -- Z3's (unspecified) division and modulo by zero (e.g., `(= (div x y) (div0 x y))` in the lemmas on `y = 0`),
+  -- interpreted as the division and modulo
+  | "div0", 2 => return mkIntDiv (← interpInt args[0]!) (← interpInt args[1]!)
+  | "mod0", 2 => return mkIntMod (← interpInt args[0]!) (← interpInt args[1]!)
   | "abs", 1 => return mkApp (mkConst ``Int.natAbs) (← interpInt args[0]!) |> mkIntOfNat
   | "<=", _ => chain (fun a b => pure (mkIntLe a b)) (← args.mapM interpInt)
   | "<", _ => chain (fun a b => pure (mkIntLt a b)) (← args.mapM interpInt)
