@@ -777,7 +777,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
   -- theory lemmas over large terms: the subterms common to the literals are generalized (e.g., datatype
   -- lemmas `x = C (C.0 x) ∨ ¬ is-C x` over a large term `x`)
-  if step.rule == "th-lemma" && ps.isEmpty && !(Local.sizeLe stmt 200) then
+  if step.rule == "th-lemma" && ps.isEmpty then
     let lits := disjuncts concl (clauseSize step.concl)
     if lits.size ≥ 2 then
       let rest := lits.extract 1 lits.size
