@@ -359,6 +359,10 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("nat def", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
                               blaster_cases_nat <;> (try simp only [Int.toNat_natCast] at *) <;>
                               (try blaster_unfold_user) <;> grind))),
+    -- definitions by case analysis on datatype arguments
+    ("nat def cases", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
+                              (try blaster_cases_nat) <;> blaster_cases_vars <;> (try simp only [Int.toNat_natCast] at *) <;>
+                              (try blaster_unfold_user) <;> (try simp_all) <;> first | done | grind))),
     ("omega", ← `(tactic| (intros; omega))),
     -- Blaster's normal forms (e.g., `Nat.add x y`, `Nat.mod x y`) in the negated goal
     ("denorm+omega", ← `(tactic| (intros; blaster_denorm; omega))),
@@ -554,19 +558,37 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let tbl ← addSkolems sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
+    let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
           if ← withReducible (isDefEq c (mkNot body)) then return some hneg
           if ← withReducible (isDefEq c (mkNot body')) then return some hneg
+          -- e.g., projections vs. case analyses, casts of literals (with a budget)
+          let defeq (a b : Expr) : TermElabM Bool := do
+            try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
+                  withCurrHeartbeats <| withDefault <| isDefEq a b
+            catch _ => return false
+          if c.isAppOfArity ``Not 1 then
+            if ← defeq c (mkNot body') then return some (← mkExpectedTypeHint hneg c)
           let r ← portfolio bridge c "bridge"
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
             logInfo m!"bridge failed: {c}"
+          if r.isNone then
+            if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
+              let h ← IO.FS.Handle.mk f .append
+              h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot body')}\n"
           return r.map (·.1)
-        proveStep := fun rule stmt => do portfolio (← stepTactics rule) stmt rule }
+        proveStep := fun rule stmt => do
+          -- NOTE: the tactic syntax of each rule is built once per replay
+          let tacs ← match (← tacCache.get).get? rule with
+            | some t => pure t
+            | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+          portfolio tacs stmt rule }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
-      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline }
+      let global := (scopedSteps sproof).map (!·)
+      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global }
       let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
                             catch ex => return Except.error ex) |>.run ctx).run {}
       let p ← match p? with
