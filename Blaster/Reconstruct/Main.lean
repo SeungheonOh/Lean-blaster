@@ -1,6 +1,7 @@
 import Lean
 import Blaster.Smt.Translate
 import Blaster.Reconstruct.Discharge
+import Blaster.Reconstruct.SmtProof.Driver
 
 open Lean Meta Elab Term Blaster.Options Blaster.Optimize Blaster.Smt
 
@@ -116,7 +117,43 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   -- Proof of the residual goal
   let (residual, residualMethod) ← match task.optExpr with
     | .const ``True _ => pure (some (Lean.mkConst ``True.intro), "optimizer")
-    | e =>
+    | e => do
+        -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
+        -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
+        let mode := (← IO.getEnv "BLASTER_SMT_PROOF").getD "last"
+        let bySmtProof : TermElabM (Option (Expr × String)) := do
+          if mode == "off" || !task.bySmt then return none
+          let st ← saveState
+          let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof e {})
+            (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
+          -- the proof is checked before being used, such that the other strategies can be tried otherwise
+          let res ← match res with
+            | .ok r =>
+                match ← kernelCheck e r.proof with
+                | none => pure (.ok r)
+                | some msg => pure (.error s!"kernel: {← msg.toString}")
+            | err => pure err
+          if let .error _ := res then st.restore
+          match res with
+          | .ok r =>
+              if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
+                let h ← IO.FS.Handle.mk f .append
+                let ms := Json.mkObj (r.stats.msByRule.toList.map fun (k, v) => (k, toJson v))
+                let methods := Json.mkObj (r.stats.byRule.toList.map fun (k, m) =>
+                  (k, Json.mkObj (m.toList.map fun (k', v) => (k', toJson v))))
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("ok", toJson true),
+                  ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]))
+              return some (r.proof, s!"smt residual by {r.backend} proof replay")
+          | .error msg =>
+              if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
+                let h ← IO.FS.Handle.mk f .append
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("error", toJson (msg.take 2000))]))
+              return none
+        let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
+        match first? with
+        | some (p, m) => pure (some p, m)
+        | none =>
+        if mode == "only" then pure (none, "none") else
         match ← proveResidual e with
         | some (p, m) => pure (some p, s!"smt residual by {m}")
         | none =>
@@ -124,7 +161,10 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
             let facts ← if recon.recFunEquivs.isEmpty then pure #[] else proveEquivalences recon.recFunEquivs
             match ← dischargeWithFacts e facts with
             | some p => pure (some p, "smt residual by induction+facts")
-            | none => pure (none, "none")
+            | none =>
+                match ← (if mode == "last" then bySmtProof else pure none) with
+                | some (p, m) => pure (some p, m)
+                | none => pure (none, "none")
   let out := { out with residual := residualMethod }
   let some residual := residual
     | finish { out with failure := m!"could not reconstruct a proof for the residual goal proved by the SMT solver{indentExpr task.optExpr}" }
