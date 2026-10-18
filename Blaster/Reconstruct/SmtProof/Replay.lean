@@ -777,15 +777,15 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
   -- theory lemmas over large terms: the subterms common to the literals are generalized (e.g., datatype
   -- lemmas `x = C (C.0 x) ∨ ¬ is-C x` over a large term `x`)
-  if step.rule == "th-lemma" && ps.isEmpty then
-    let lits := disjuncts concl (clauseSize step.concl)
-    if lits.size ≥ 2 then
-      let rest := lits.extract 1 lits.size
-      let restE := rest.foldl (fun acc l => mkAnd acc l) (mkConst ``True)
-      if let some (g, vals) ← Local.generalizeCommon concl restE lits[0]! then
+  if step.rule == "th-lemma" then
+    -- the parts of the statement: premises and literals of the conclusion
+    let parts := ps.map (·.1) ++ disjuncts concl (clauseSize step.concl)
+    if parts.size ≥ 2 then
+      let restE := (parts.extract 1 parts.size).foldl (fun acc l => mkAnd acc l) (mkConst ``True)
+      if let some (g, vals) ← Local.generalizeCommon stmt restE parts[0]! then
         if let some (pf, method) ← timed "datatype" ((← read).cfg.proveStep "datatype" g) then
           record step.rule s!"{method} (common)"
-          return mkAppN pf vals
+          return mkAppN (mkAppN pf vals) (ps.map (·.2))
   -- arithmetic lemmas over large atoms: the atoms are generalized
   if step.rule == "th-lemma" && (stmt.approxDepth.toNat > 8) then
     if let some (g, vals) ← Local.generalizeAtoms stmt then
