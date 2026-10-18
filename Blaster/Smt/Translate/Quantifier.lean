@@ -270,13 +270,89 @@ def createSortExpr (args : Array SortExpr) : TranslateEnvT SortExpr := do
   return (arraySort args)
 
 
+/-- Kind of an inductive datatype parameter w.r.t. its Smt representation (see `getIndParamKinds`). -/
+inductive IndParamKind where
+  /-- sort parameter (e.g., `α` in `List α`), kept as a parameter of the Smt datatype. -/
+  | sort
+  /-- class constraint (e.g., `[LE α]`), ignored in the Smt datatype. -/
+  | classConstraint
+  /-- value parameter (e.g., `n` in `Fin n` or `w` in `BitVec w`), erased from the Smt datatype. -/
+  | value
+deriving Inhabited, BEq
+
+/-- Given `indVal` an inductive value info, return the kind of each parameter/index `xᵢ`
+    of the inductive datatype (see `IndParamKind`).
+    Value parameters are erased from the Smt datatype, i.e., all instances of such an inductive datatype
+    share the same Smt sort (e.g., `Fin 5` and `Fin 7` are both represented by `@Fin`), while the constraints
+    imposed by the value parameters are captured by each instance's predicate qualifier
+    (see `defineInstPredicateQualifier`).
+    An error is triggered when:
+      - a value index is found (i.e., indexed families are not supported); or
+      - a sort parameter is not a `Type u` (e.g., `Sort u`).
+-/
+def getIndParamKinds (indVal : InductiveVal) : TranslateEnvT (Array IndParamKind) := do
+  Optimize.forallTelescope indVal.type fun fvars _ => do
+    let mut kinds := #[]
+    for h : i in [: fvars.size] do
+      let decl ← getFVarLocalDecl fvars[i]
+      if (← isClassConstraintExpr decl.type) then kinds := kinds.push .classConstraint
+      else
+        -- resolve type abbreviation (useful when handling instance parameters)
+        -- TODO: IMP need to apply optimizer on argument to instance parameters
+        let argType' ← removeTypeAbbrev decl.type
+        if argType'.isType then kinds := kinds.push .sort
+        else if !(isTypeFamily argType') && i < indVal.numParams then kinds := kinds.push .value
+        else throwEnvError "Inductive datatype with instance parameters not supported: {reprStr indVal.name}"
+    return kinds
+
+ where
+   /-- Return `true` when `t := ∀ x₁ ... xₙ, Sort u` with `u ≠ 0` (i.e., `n = 0` or a type family).
+       Note that predicates (e.g., `p : α → Prop` in `Subtype p`) are considered as value parameters.
+   -/
+   isTypeFamily (t : Expr) : Bool :=
+     let b := t.getForallBody
+     b.isSort && !b.isProp
+
+/-- Return `true` only when `i` corresponds to the index of a value parameter in `kinds`. -/
+def isValueParam (kinds : Array IndParamKind) (i : Nat) : Bool :=
+  kinds[i]? == some .value
+
+/-- Given `t x₀ ... xₖ` an inductive datatype instance, optimize each value parameter `xᵢ`
+    (see `getIndParamKinds`) so as to obtain a canonical instance (e.g., `BitVec 32` and `BitVec (2 ^ 5)`
+    both normalized to `BitVec 32`). Arguments are returned unchanged when `t` is not an inductive datatype.
+-/
+def normalizeIndArgs (t : Expr) (args : Array Expr) : TranslateEnvT (Array Expr) := do
+  let Expr.const n _ := t | return args
+  let ConstantInfo.inductInfo indVal ← getConstEnvInfo n | return args
+  if args.isEmpty then return args
+  let kinds ← getIndParamKinds indVal
+  let mut nargs := args
+  for h : i in [:args.size] do
+    if isValueParam kinds i then
+      nargs := nargs.set! i (← normalizeValue args[i])
+  return nargs
+
+ where
+   /-- NOTE: Value parameters obtained from ctor field types may not be in normal form
+       (e.g., `(instOfNatNat 8).1` for `UInt8.toBitVec : BitVec 8`). Hence, closed Nat
+       values are first reduced to literals before calling the optimizer.
+   -/
+   normalizeValue (v : Expr) : TranslateEnvT Expr := do
+     let v' ← optimizeExpr' v
+     if (isNatValue? v').isSome || v'.hasFVar || v'.hasMVar then return v'
+     if !(← isDefEq (← inferTypeEnv v) (mkConst ``Nat)) then return v'
+     match ← whnf v with
+     | Expr.lit l@(.natVal _) => return Expr.lit l
+     | _ => return v'
+
 /-- Given `n` corresponding to the name of an inductive datatype, and `x₀ ... xₖ` the parameters instantiating
     the inductive datatype, perform the following actions:
-     - When k > 0:
-         let A := [x₀, ..., xₖ]
-         let B := [typeTranslator A[i] | i ∈ [0..k] ∧ ¬ isClassConstraintExpr (← inferTypeEnv A[i])]
+     - let K ← getIndParamKinds n
+     - let A := [x₀, ..., xₖ]
+     - let B := [typeTranslator A[i] | i ∈ [0..k] ∧ K[i] = .sort]
+     - When B ≠ []:
           - return `ParamSort (indNameToSmtSymbol n) B`
-     - When k = 0:
+     - Otherwise:
         - return `SymbolSort indNameToSmtSymbol n)`
 -/
 def generateInstType
@@ -284,10 +360,14 @@ def generateInstType
   (typeTranslator : Expr → TranslateEnvT SortExpr) : TranslateEnvT SortExpr := do
  let indSym := indNameToSmtSymbol indName
  if args.size == 0 then return .SymbolSort indSym
+ let ConstantInfo.inductInfo indVal ← getConstEnvInfo indName
+   | throwEnvError "generateInstType: inductive info expected for {indName}"
+ let kinds ← getIndParamKinds indVal
  let mut iargs := #[]
  for h : i in [:args.size] do
-   if !(← isClassConstraintExpr (← inferTypeEnv args[i])) then -- ignore class constraints
+   if kinds[i]? == some .sort then -- ignore class constraints and value parameters
      iargs := iargs.push (← typeTranslator args[i])
+ if iargs.isEmpty then return .SymbolSort indSym
  return (.ParamSort indSym iargs)
 
 /-- Given arguments `x₀ ... xₙ` perform the following:
@@ -446,7 +526,7 @@ def getPredicateDeclaration (t : Expr) : TranslateEnvT (Option IndTypeDeclaratio
       let (f, args) := getAppFnWithArgs e
       if args.size == 0
       then return f
-      else getIndInst f args
+      else getIndInst f (← normalizeIndArgs f args)
 
   getType (e : Expr) : TranslateEnvT Expr := do
    match e with
@@ -794,21 +874,17 @@ def translateInductiveType
     else declareMutualDataTypes sortDecls typeDecls
 
   genIndParams (indVal : InductiveVal) : TranslateEnvT (Option (Array SmtSymbol)) := do
+   let kinds ← getIndParamKinds indVal
    let params ←
      Optimize.forallTelescope indVal.type fun fvars _ => do
         let mut polyParams := #[]
         for h : i in [: fvars.size] do
-          let arg := fvars[i]
-          let decl ← getFVarLocalDecl arg
-          if !(← isClassConstraintExpr decl.type) then -- ignore class constraints
+          -- ignore class constraints and value parameters (see `getIndParamKinds`)
+          if kinds[i]? == some .sort then
+            let arg := fvars[i]
             let Expr.fvar v := arg
               | throwEnvError "translateInductiveType: FVarExpr expected but got {reprStr arg}"
-            -- resolve type abbreviation (useful when handling instance parameters)
-            -- TODO: IMP need to apply optimizer on argument to instance parameters
-            let argType' ← removeTypeAbbrev decl.type
-            if argType'.isType then
-              polyParams := polyParams.push (← sortNameToSmtSymbol v false)
-            else throwEnvError "Inductive datatype with instance parameters not supported: {reprStr indVal.name}"
+            polyParams := polyParams.push (← sortNameToSmtSymbol v false)
         return polyParams
    if params.isEmpty then return none else return (some params)
 
@@ -866,12 +942,29 @@ partial def defineInstPredicateQualifier
     (termTranslator : Expr → TranslateEnvT SmtTerm)
     (t : Expr) (args : Array Expr) : TranslateEnvT Unit := do
  -- get inst application
+ let args ← normalizeIndArgs t args
  let instApp ← getIndInst t args
  unless ((← get).smtEnv.indTypeInstCache.get? instApp).isSome do
+   checkValueParams t args
    declareIndInst t args
 
 
 where
+  /-- Value parameters are erased from the Smt sort but appear in the predicate qualifier
+      body, which is defined at top level. Hence, they can only refer to top level free variables.
+  -/
+  checkValueParams (t : Expr) (args : Array Expr) : TranslateEnvT Unit := do
+    let Expr.const indName _ := t
+      | throwEnvError "checkValueParams: name expression expected but got {reprStr t}"
+    let ConstantInfo.inductInfo indVal ← getConstEnvInfo indName
+      | throwEnvError "checkValueParams: inductive info expected for {indName}"
+    let kinds ← getIndParamKinds indVal
+    for h : i in [:args.size] do
+      if isValueParam kinds i then
+        for fv in (← getFVarsInExpr args[i]) do
+          if !(← inferTypeEnv fv).isSort && !(← isTopLevelFVar fv.fvarId!) then
+            throwEnvError "Inductive datatype instance with non top level value parameter not supported: {reprStr (mkAppN t args)}"
+
   isEnumeration (indVal : InductiveVal) : TranslateEnvT Bool := do
     match indVal.all with
     | [n] =>
@@ -1129,7 +1222,7 @@ partial def translateTypeAux
    match e with
    | Expr.const .. =>
       if let some r ← translateOpaqueType e then return r
-      translateNonOpaqueType e t.getAppArgs
+      translateNonOpaqueType e (← normalizeIndArgs e t.getAppArgs)
         (λ a b => translateTypeAux termTranslator a b)
         termTranslator topts
 
