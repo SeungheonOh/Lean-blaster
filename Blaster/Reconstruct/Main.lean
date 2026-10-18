@@ -124,7 +124,15 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
           match ← SmtProof.proveBySmtProof e {} with
-          | .ok r => return some (r.proof, s!"smt residual by {r.backend} proof replay")
+          | .ok r =>
+              if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
+                let h ← IO.FS.Handle.mk f .append
+                let ms := Json.mkObj (r.stats.msByRule.toList.map fun (k, v) => (k, toJson v))
+                let methods := Json.mkObj (r.stats.byRule.toList.map fun (k, m) =>
+                  (k, Json.mkObj (m.toList.map fun (k', v) => (k', toJson v))))
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("ok", toJson true),
+                  ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]))
+              return some (r.proof, s!"smt residual by {r.backend} proof replay")
           | .error msg =>
               if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
                 let h ← IO.FS.Handle.mk f .append

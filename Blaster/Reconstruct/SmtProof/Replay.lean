@@ -1,6 +1,7 @@
 import Lean
 import Blaster.Reconstruct.SmtProof.IR
 import Blaster.Reconstruct.SmtProof.Interp
+import Blaster.Reconstruct.SmtProof.Prop
 
 /-!
 # Replay of SMT proofs
@@ -81,7 +82,8 @@ def stepConcl (i : Nat) : ReplayM Expr := do
   let c := match step.rule, step.concl with
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
-  let e ← liftInterp (interp c)
+  let e ← instantiateMVars (← liftInterp (interp c))
+  if e.hasExprMVar then throwError "smt proof: can't infer the types of {e}"
   if ctx.depth == 0 then modify fun s => { s with conclCache := s.conclCache.insert i e }
   return e
 
@@ -115,11 +117,11 @@ def clauseLits (t : STerm) : Array STerm :=
   | t => #[t]
 
 /-- Syntactic equality of propositions (up to instantiation of metavariables). -/
-def propEq (a b : Expr) : MetaM Bool := do
+def propEq (a b : Expr) (deep := false) : MetaM Bool := do
   if a == b then return true
   if ← withReducible <| isDefEq a b then return true
   -- e.g., `Int.toNat (↑n)` and `n`
-  withDefault <| isDefEq a b
+  if deep then withDefault <| isDefEq a b else return false
 
 /-- Proof of the `i`-th injection into the right-nested disjunction `lits` (of size `n`). -/
 def mkOrInj (lits : Array Expr) (i : Nat) (p : Expr) : MetaM Expr := do
@@ -242,6 +244,10 @@ partial def replay (i : Nat) : ReplayM Expr := do
     catch ex =>
       if ctx.depth == 0 then modify fun s => { s with failed := s.failed.insert i }
       else modify fun s => { s with scopeFailed := s.scopeFailed.insert i }
+      -- NOTE: premises are replayed before their consumers, i.e., the first failures are the deepest ones
+      let step := ctx.proof.steps[i]!
+      let msg := s!"step {i} ({step.rule}): {toString step.concl |>.take 300}: {(← ex.toMessageData.toString).take 300}"
+      modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
       throw ex
   if ctx.depth == 0 then modify fun s => { s with cache := s.cache.insert i p }
   else modify fun s => { s with scopeCache := s.scopeCache.insert i p }
@@ -286,9 +292,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   if let some p ← ctx.cfg.proveDirect concl then
     record step.rule "direct"
     return p
-  let msg := s!"step {i} ({step.rule}): {step.concl}"
-  modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
-  throwError "smt proof: could not replay {msg}"
+  throwError "smt proof: could not replay step {i} ({step.rule})"
 
 /-- Premise proofs with their propositions. -/
 partial def premises (step : Step) : ReplayM (Array (Expr × Expr)) :=
@@ -319,7 +323,7 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
           pure (some (mkApp peq pa, eq.bindingBody!))
         else pure none
       let some (p, r) := r | throwError "mp: unexpected premises"
-      if ← propEq r concl then record step.rule "exact"; return p
+      if ← propEq r concl (deep := true) then record step.rule "exact"; return p
       throwError "mp: conclusion mismatch"
   | "refl" =>
       if let some (_, a, _) := concl.eq? then
@@ -376,12 +380,30 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       let ts ← liftInterp (step.args.mapM interpInt?)
       let r ← withLocalDeclD `h q fun h => do
         let hi ← instantiateWithCoercion h ts
-        if !(← propEq (← inferType hi) inst) then throwError "quant-inst: instance mismatch"
+        if !(← propEq (← inferType hi) inst (deep := true)) then throwError "quant-inst: instance mismatch"
         mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inr) nq inst hi)
       let rn ← withLocalDeclD `h nq fun h => mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inl) nq inst h)
       record step.rule "exact"
       return mkApp6 (Lean.mkConst ``Or.elim) q nq concl (mkApp (Lean.mkConst ``Classical.em) q) r rn
   | "proof-bind" => replayBind step
+  | "monotonicity" => replayCongr step concl
+  | "sk" =>
+      -- `(¬ ∀ x, φ) → ¬ φ[ε]` or `(∃ x, φ) → φ[ε]` (see the interpretation of skolem constants)
+      let some (a, b) := (if concl.isArrow then some (concl.bindingDomain!, concl.bindingBody!) else none)
+        | throwError "sk: implication expected"
+      let r ← withLocalDeclD `h a fun h => do
+        let ex ← if let some q := a.not? then
+            -- `¬ ∀ x, φ x` gives `∃ x, ¬ φ x`
+            let .forallE n t body bi := q | throwError "sk: negated forall expected"
+            let p := mkLambda n bi t body
+            let iff := mkApp2 (Lean.mkConst ``Classical.not_forall [← getLevel t]) t p
+            mkAppM ``Iff.mp #[iff, h]
+          else pure h
+        let spec ← mkAppM ``Classical.epsilon_spec #[ex]
+        if !(← propEq (← inferType spec) b) then throwError "sk: skolem mismatch"
+        mkLambdaFVars #[h] spec
+      record step.rule "exact"
+      return r
   | _ => replayByTactic step concl
 
 /-- `lemma`: the premise derives `false` under hypotheses; the conclusion is the disjunction of the
@@ -429,6 +451,28 @@ partial def replayBind (step : Step) : ReplayM Expr := do
   record step.rule "exact"
   return r
 
+/-- Congruence (`monotonicity`): from premises `aᵢ = bᵢ`, prove `L = R` by abstracting the
+    occurrences of each `aᵢ` in `L` and applying `congrArg` (premises not occurring are ignored). -/
+partial def replayCongr (step : Step) (concl : Expr) : ReplayM Expr := do
+  let some (ty, l, r) := concl.eq? | throwError "monotonicity: equality expected"
+  let ps ← premises step
+  let mut cur := l
+  let mut pf ← mkEqRefl l
+  for (t, p) in ps do
+    let some (_, a, b) := t.eq? | throwError "monotonicity: equality premise expected"
+    let abst ← kabstract cur a
+    if !abst.hasLooseBVars then continue
+    let motive := mkLambda `x .default (← inferType a) abst
+    let next := abst.instantiate1 b
+    let u ← getLevel ty
+    let v ← getLevel (← inferType a)
+    let c := mkApp6 (Lean.mkConst ``congrArg [v, u]) (← inferType a) ty a b motive p
+    pf := mkApp6 (Lean.mkConst ``Eq.trans [u]) ty l cur next pf c
+    cur := next
+  if !(← propEq cur r) then throwError "monotonicity: congruence mismatch"
+  record step.rule "exact"
+  return pf
+
 /-- Resolution steps: unit propagation on the premise clauses (see `rupProof`). -/
 partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
   let ctx ← read
@@ -449,6 +493,10 @@ where
 /-- Prove `p₁ → ... → pₙ → c` with tactics and apply it to the premise proofs. -/
 partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   let ps ← premises step
+  -- propositional steps (e.g., `def-axiom`, `not-or-elim`, propositional rewrites): exact proof
+  if let some p ← PropEngine.prove ps concl then
+    record step.rule "prop"
+    return p
   -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
   let some (pf, method) ← (← read).cfg.proveStep step.rule stmt | throwError "tactics failed"

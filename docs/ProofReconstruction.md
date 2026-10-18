@@ -190,6 +190,40 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
 When tracking is off (`reconstruct: 0`), the proof run is skipped, so the optimizer's behavior and cost
 are unchanged.
 
+## Replaying SMT proofs
+
+Goals left to the SMT solver can also be proved by replaying a proof produced by an SMT backend,
+instead of (or in addition to) re-proving them with Lean tactics. This is implemented in
+`Blaster/Reconstruct/SmtProof/` and works with several backends through a common representation:
+
+1. **Query.** The residual goal is translated again with Blaster's translation, after introducing its
+   leading variables as Lean free variables, such that the SMT constants `$k` can be mapped back to them.
+   Definitional axioms of recursive functions over `Nat` (`∀ x, f x = f_LRec x`) are guarded with `0 ≤ x`
+   (this only weakens the query).
+2. **Backends** (`BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`): Z3 with legacy proof objects
+   (`:produce-proofs true`, `pp.simplify_implies false`), and cvc5 with Alethe proofs (`--parsing-mode=lenient`,
+   `--proof-granularity=dsl-rewrite`). Each adapter translates the proof into a DAG of steps (`IR.lean`):
+   rule, premises, arguments (e.g., quantifier instantiations) and conclusion (clauses as disjunctions).
+   The Alethe adapter also serves veriT.
+3. **Interpretation** (`Interp.lean`). SMT terms are interpreted as Lean terms: `Int` arithmetic on Lean
+   `Int`, with casts (`↑n`, `Int.toNat`) where Lean terms of type `Nat` occur (arguments and results of
+   Lean functions, constructor fields); `Bool` formulas as propositions; datatype constructors, selectors and
+   testers as Lean constructors and case analyses; Blaster's function values (`@@ArrowT`, `@apply`) as Lean
+   functions; Blaster's type predicates (`@isNat`, ...) as `True` (Lean values always satisfy them);
+   skolem constants as `Classical.epsilon` terms.
+4. **Replay** (`Replay.lean`). Each step yields a Lean proof of the interpretation of its conclusion:
+   explicit proof terms for resolution (a unit propagation procedure building the proof), modus ponens,
+   equality reasoning, quantifier instantiation, skolemization, hypotheses and lemmas; and small tactic
+   calls (`simp`, `omega`, `grind`, unfolding of user definitions) proving `premises → conclusion` for
+   rewriting and theory lemmas. Leaves (input formulas) are proved from the negated goal and from the
+   definitions of the Lean functions (bridge tactics). The proof of `False` is turned into a proof of the
+   goal and checked by the kernel like any other reconstructed proof.
+
+The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a
+`Nat` function instantiated with a negative integer) simply fails to replay. Soundness only relies on the
+kernel. `BLASTER_SMT_PROOF` selects when the replay is tried for SMT residuals: `last` (default, after the
+tactic strategies), `first`, `only` (no tactic strategies, to measure the replay), or `off`.
+
 ## Findings
 
 Reconstruction checks every individual rewrite, so it surfaces problems in the trusted pipeline:

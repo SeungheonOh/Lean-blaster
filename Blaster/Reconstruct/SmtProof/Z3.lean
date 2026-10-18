@@ -67,16 +67,23 @@ partial def convert (t : STerm) : ConvM Nat := do
   modify fun s => { s with cache := s.cache.insert addr i }
   return i
 
+/-- The proof term `p` of the first `(proof p)` occurring in `e`. -/
+partial def findProof? (e : SExpr) : Option SExpr :=
+  match e with
+  | .list #[.atom "proof", x] => some x
+  | .list xs => xs.findSome? findProof?
+  | _ => none
+
 /-- Parse the output of `(get-proof)`, e.g., `((proof p))` or `(proof p)` or `p`. -/
 def parseProof (out : String) : Except String Proof := do
   let es ← parseSExprs out
-  let some e := es.back? | throw "empty proof output"
-  let rec unwrap (e : SExpr) : SExpr :=
-    match e with
-    | .list #[x] => unwrap x
-    | .list #[.atom "proof", x] => x
-    | e => e
-  let pt ← STerm.ofSExpr {} (unwrap e)
+  -- the proof term `(proof p)`, possibly preceded by declarations (e.g., skolem constants,
+  -- `define-funs-rec` of recursive functions) and wrapped in a list
+  let some p := es.findSome? findProof? <|> (es.back?.bind fun e => match e with
+      | .list #[x] => some x
+      | e => some e)
+    | throw "empty proof output"
+  let pt ← STerm.ofSExpr {} p
   let (root, st) ← (convert pt).run {}
   return { backend := "z3", steps := st.steps, root }
 

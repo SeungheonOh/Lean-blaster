@@ -314,7 +314,17 @@ partial def interp (t : STerm) : InterpM Expr := do
       let ety ← inferType e
       if ← isDefEq ety ty then return e
       coerce e ety ty
-  | .iapp f _ _ => throwError "smt proof: unsupported indexed symbol {f}"
+  | .iapp f idx args =>
+      -- testers: `((_ is C) x)` and `((_ is-C C is-C) x)` (Z3)
+      if f == "is" || f.startsWith "is-" then
+        let ctorSym := if f == "is" then (match idx[0]? with | some (STerm.sym c) => c | _ => "") else f.drop 3
+        let some x := args[0]? | throwError "smt proof: tester without argument"
+        match (← read).table.syms.get? ctorSym with
+        | some (.ctor c) => mkTester c (← interp x)
+        | _ => throwError "smt proof: unknown constructor {ctorSym}"
+      else
+        -- indexed applications of recursive functions (e.g., `((_ @Nat.pow 0) x y)` in Z3 proofs)
+        interpApp f args
   | .quant k vars body => interpQuant k vars body
 
 partial def interpQuant (k : QuantKind) (vars : Array (String × SExpr)) (body : STerm) : InterpM Expr := do
@@ -386,7 +396,13 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         withReader (fun c => { c with locals }) (interp body)
     | some .trueFun => return mkConst ``True
     | some (.ctor n) =>
-        mkAppCoerce (← mkConstWithFreshMVarLevels n) (← args.mapM interp)
+        let c ← mkConstWithFreshMVarLevels n
+        if args.isEmpty then
+          -- nullary constructor (e.g., `List.nil`): parameters are left as metavariables, to be
+          -- assigned by unification with the context (e.g., the other side of an equality)
+          let (ms, _, _) ← forallMetaTelescopeReducing (← inferType c)
+          return mkAppN c ms
+        mkAppCoerce c (← args.mapM interp)
     | some (.selector c i) =>
         let some a := args[0]? | throwError "smt proof: selector without argument"
         let e ← mkSelector c i (← interp a)

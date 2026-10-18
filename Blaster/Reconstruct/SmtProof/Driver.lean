@@ -219,6 +219,45 @@ where
           tbl := { tbl with syms := tbl.syms.insert sel (.selector leanCtor i) }
     return tbl
 
+/-- Interpretation of the skolem constants introduced by `sk` steps (Z3): for
+    `(~ (not (forall ((x S)) φ)) (not φ[x := c]))` (resp. `(~ (exists ((x S)) φ) φ[x := c])`),
+    the constant `c` (named `x!n`) is interpreted as `Classical.epsilon (fun x => ¬ φ)`
+    (resp. `Classical.epsilon (fun x => φ)`). Only steps with a single bound variable are handled. -/
+partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
+  let mut tbl := tbl
+  for step in proof.steps do
+    if step.rule != "sk" then continue
+    let .app _ #[a, b] := step.concl.stripAnnot | continue
+    let (vars, body, neg) := match a.stripAnnot with
+      | .app "not" #[.quant .forall vs φ] => (vs, φ, true)
+      | .quant .exists vs φ => (vs, φ, false)
+      | _ => (#[], .sym "true", false)
+    let #[(x, sort)] := vars | continue
+    -- the skolem constant: a symbol of `b` named `x!n`
+    let some c := findSkolem (x ++ "!") b | continue
+    if tbl.syms.contains c then continue
+    try
+      let e ← (do
+        let ty ← sortToType sort
+        let u ← getLevel ty
+        let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) ty)
+        withLocalDeclD (Name.mkSimple x) ty fun fx => do
+          let φ ← withReader (fun c => { c with locals := c.locals.insert x fx }) (interp body)
+          let p ← mkLambdaFVars #[fx] (if neg then mkNot φ else φ)
+          return mkApp3 (mkConst ``Classical.epsilon [u]) ty inst p : InterpM Expr).run { table := tbl }
+      tbl := { tbl with syms := tbl.syms.insert c (.expr e) }
+    catch _ => pure ()
+  return tbl
+where
+  findSkolem (pre : String) (t : STerm) : Option String :=
+    match t with
+    | .sym s => if s.startsWith pre then some s else none
+    | .app f args => if f.startsWith pre && args.isEmpty then some f else args.findSome? (findSkolem pre)
+    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolem pre)
+    | .quant _ _ b => findSkolem pre b
+    | .annot t _ => findSkolem pre t
+    | _ => none
+
 /-! ## Bridge tactics -/
 
 /-- Introduce the universally quantified variables of the goal, substituting `x := ↑n` for the
@@ -269,6 +308,7 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
 def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) := do
   let arith := #[
     ("omega", ← `(tactic| (intros; omega))),
+    ("propext+omega", ← `(tactic| (intros; apply propext; constructor <;> intro <;> omega))),
     ("split+omega", ← `(tactic| (intros; (repeat' split) <;> omega)))]
   let simp := #[
     ("rfl", ← `(tactic| (intros; rfl))),
@@ -278,15 +318,36 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
   let quant := #[
     ("forall_congr", ← `(tactic| (intro h; exact forall_congr h))),
     ("forall_imp", ← `(tactic| (intro h h' x; exact h x (h' x))))]
+  let unfold := #[
+    ("nat def", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
+                              (try blaster_cases_nat) <;> (try simp only [Int.toNat_natCast] at *) <;>
+                              (try blaster_unfold_user) <;> grind))),
+    ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;> grind)))]
   match rule with
-  | "th-lemma" => return arith ++ simp ++ grind
+  | "th-lemma" => return arith ++ simp ++ grind ++ unfold
   | "quant-intro" => return quant ++ simp ++ grind
   | "def-axiom" | "not-or-elim" | "and-elim" | "iff~" | "nnf-pos" | "nnf-neg" => return simp ++ grind
   | _ => return simp ++ arith ++ grind
 
-def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) : TermElabM (Option (Expr × String)) := do
+/-- Per rule and tactic: number of successes and time spent (ms, including failed attempts), used to
+    order the tactic portfolios by efficiency (adaptive, per process). -/
+initialize tacticStats : IO.Ref (Std.HashMap (String × String) (Nat × Nat)) ← IO.mkRef {}
+
+def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
+  let stats ← tacticStats.get
+  -- most efficient tactics first, i.e., highest number of successes per time unit (with a prior
+  -- favoring the given order)
+  let score (n : String) (i : Nat) : Float :=
+    let (succ, ms) := stats.getD (rule, n) (0, 0)
+    (succ.toFloat + 1.0 / (i.toFloat + 1.0)) / (ms.toFloat + 50.0)
+  let tacs := (tacs.zipIdx.qsort fun ((n₁, _), i₁) ((n₂, _), i₂) => score n₁ i₁ > score n₂ i₂).map (·.1)
   for (name, tac) in tacs do
-    if let some p ← proveWithTactic goal tac then return some (p, name)
+    let start ← IO.monoMsNow
+    let r ← proveWithTactic goal tac
+    let ms := (← IO.monoMsNow) - start
+    let succ := if r.isSome then 1 else 0
+    tacticStats.modify fun m => let (a, b) := m.getD (rule, name) (0, 0); m.insert (rule, name) (a + succ, b + ms)
+    if let some p := r then return some (p, name)
   return none
 
 /-! ## Main entry point -/
@@ -305,13 +366,47 @@ structure SmtProofResult where
   steps : Nat
   stats : ReplayStats
 
+/-- Given `e := ∀ b₁ ... bₙ, C` (leading binders), return `∀ xs, hs → C` where `xs` are the data binders and
+    `hs` the propositions among the `bᵢ` (only when no data binder depends on a proposition), together with
+    a function turning a proof of the latter into a proof of `e`. Blaster declares the data variables of
+    the leading binders as SMT constants, including the ones following hypotheses. -/
+def prenex (e : Expr) : MetaM (Option (Expr × (Expr → MetaM Expr))) := do
+  forallTelescope e fun bs c => do
+    if bs.isEmpty then return none
+    let mut data := #[]
+    let mut hyps := #[]
+    for b in bs do
+      let t ← inferType b
+      if (← isProp t) then hyps := hyps.push b
+      else
+        if hyps.any (fun h => t.containsFVar h.fvarId!) then return none
+        data := data.push b
+    if hyps.isEmpty || data.isEmpty then return none
+    -- already in prenex form
+    if bs == data ++ hyps then return none
+    let e' ← mkForallFVars (data ++ hyps) c
+    let back (p : Expr) : MetaM Expr :=
+      forallTelescope e fun bs' _ => do
+        -- bs' follow the order of `bs`
+        let m := (bs.zip bs').toList
+        let get (x : Expr) := (m.find? (·.1 == x)).map (·.2) |>.getD x
+        mkLambdaFVars bs' (mkAppN p ((data ++ hyps).map get))
+    return some (e', back)
+
 /-- Try to prove `e` (a closed proposition proved valid by the SMT solver) by replaying a proof of the
     SMT backend. -/
-def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Except String SmtProofResult) :=
+partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Except String SmtProofResult) := do
+  if let some (e', back) ← prenex e then
+    match ← proveBySmtProof e' sOpts with
+    | .ok r => return .ok { r with proof := ← back r.proof }
+    | .error msg => return .error msg
   -- NOTE: each tactic attempt has its own heartbeat budget (see `proveWithTactic`)
   withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) do
   dataBinders e fun xs body => do
   try
+    -- NOTE: polymorphic goals (Blaster's `@Type`/`@Instance` encoding) are not supported yet
+    if let .forallE _ t _ _ := body then
+      if (← whnfR t).isSort then throwError "smt proof: polymorphic goals are not supported"
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
@@ -344,11 +439,14 @@ def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Except Stri
           | .error msg => errors := errors.push s!"{backend.name}: {msg}"
     let some (backend, sproof) := res | throwError "no proof: {errors}"
     -- 3. interpretation
+    -- SMT constants of the free variables of the goal (the introduced variables, as well as the
+    -- variables of the local context, e.g., section variables)
     let mut consts : Std.HashMap String Expr := {}
-    for x in xs do
-      if let some idx := tenv.smtEnv.fvarsCache.get? x.fvarId! then
-        consts := consts.insert s!"${idx}" x
+    let lctx ← getLCtx
+    for (v, idx) in tenv.smtEnv.fvarsCache.toList do
+      if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
     let tbl ← buildSymTable cmds tenv consts
+    let tbl ← addSkolems sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
@@ -356,13 +454,20 @@ def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Except Stri
         proveDirect := fun c => do
           if ← isDefEq c (mkNot body) then return some hneg
           if ← isDefEq c (mkNot body') then return some hneg
-          let r ← portfolio bridge c
+          let r ← portfolio bridge c "bridge"
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
             logInfo m!"bridge failed: {c}"
           return r.map (·.1)
-        proveStep := fun rule stmt => do portfolio (← stepTactics rule) stmt }
+        proveStep := fun rule stmt => do portfolio (← stepTactics rule) stmt rule }
       let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl }, cfg }
-      let (p, st) ← (replay sproof.root |>.run ctx).run {}
+      let (p?, st) ← ((do try return Except.ok (← replay sproof.root)
+                            catch ex => return Except.error ex) |>.run ctx).run {}
+      let p ← match p? with
+        | .ok p => pure p
+        | .error ex =>
+            -- report the first steps that could not be replayed (i.e., the deepest failures)
+            let fs := st.stats.failures.extract 0 3
+            throwError "{ex.toMessageData}; first failures: {fs}"
       let pt ← inferType p
       if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
       return (← mkLambdaFVars #[hneg] p, st.stats)
