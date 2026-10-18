@@ -224,8 +224,13 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    rewriting and theory lemmas. Large equalities (e.g., Z3 `rewrite`s inside big formulas) are related by
    congruence on their common structure, and only their differences are given to tactics, with the
    subterms common to both sides generalized (`Local.lean`); arithmetic lemmas over large atoms are
-   generalized the same way, with facts on `div`/`mod` for `omega`. The proof of `False` is turned into a
-   proof of the goal and checked by the kernel like any other reconstructed proof.
+   generalized the same way, with facts on `div`/`mod` for `omega`; nonlinear integer lemmas are proved by
+   `blaster_nlarith` (`NlArith.lean`: case splits, products of hypotheses, polynomials normalized with the
+   commutative ring lemmas of `grind`, then `omega` with the monomials as atoms). Tactics run on the statement of
+   the step closed over the variables it mentions, in an empty local context: a step holds by itself (its
+   premises are hypotheses of the statement), and the hypotheses of the context (e.g., the negated goal of a CEK
+   evaluation) only slowed down `simp_all` and case analyses, by one to two orders of magnitude. The proof of
+   `False` is turned into a proof of the goal and checked by the kernel like any other reconstructed proof.
 5. **Bridge** (`Bridge.lean`). The asserted formula is the translation of the negated goal, interpreted
    back. It is related to the negated goal by a simultaneous traversal of both terms: congruence on their
    common structure, and a lemma for each encoding of the translation where they differ: `match` as `ite`
@@ -237,9 +242,14 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    definitions of the other functions are bridged by tactics. The traversal is linear in the size of the
    (shared) terms, which matters for goals such as the CEK evaluation of validators.
 
-Blaster's polymorphic encoding is interpreted when the goal has a single sort variable `α`: the sort
-`@Instance` (of the values of all types denoted by sort variables) is interpreted as `α`, `@Type` as `Unit`,
-membership predicates as `True`. Lambda terms of the translation (`@lambda`, `@global_lambda` with their
+Blaster's polymorphic encoding (`@Type` for the types denoted by sort variables, `@Instance` for their
+values, membership predicates `@isInstance v t`) is interpreted in two ways. With a single sort variable `α`
+of an inhabited type, `@Instance` is interpreted as `α`, `@Type` as `Unit` and membership predicates as `True`.
+Otherwise (several, possibly empty, or quantified sort variables; `Poly.lean`), `@Type` is interpreted as
+`Sort u`, `@Instance` as the always inhabited universe `Option (PSigma fun α : Sort u => α)`, values as their
+injections (lifted through lists, options, pairs and functions), and membership predicates as "lies in the
+image of the injection"; the bridge relates the goal to the asserted formula with an additional world for
+these injections. Lambda terms of the translation (`@lambda`, `@global_lambda` with their
 definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as Lean `Nat` variables.
 
 The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a
@@ -259,12 +269,16 @@ by the SMT solver.
 
 The replay also scales to the validators of
 [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
-evaluation of UPLC programs by the CEK machine. With `BLASTER_SMT_PROOF=only`, the residual goals of
-`HelloWorld` (927 Z3 proof steps, replayed in 33 s), `UnlockPIN` (917 steps, 34 s) and `ParamFeed` (108 steps,
-0.3 s) are proved by replay: the bridge relates the CEK evaluation (with its `match` expressions on `Data`) to
-the asserted formula, and most `rewrite`s are proved by congruence and by the propositional engine on their
-generalized differences. `ParamFeed`, `HelloWorld` and `UnlockPIN` are fully reconstructed (`HelloWorld` and
-`UnlockPIN` in about 26 s each, including the discharge of the 162 proof obligations of the optimizer). `MintingPolicy` and `SellNFT` time out in Z3 with proof production.
+evaluation of UPLC programs by the CEK machine. With `BLASTER_SMT_PROOF=only` (SMT residuals proved by replay
+only), `HelloWorld` (1 theorem), `UnlockPIN` (2), `ParamFeed` (1) and `Auction` (26) are fully reconstructed
+and kernel checked. The residual of `HelloWorld` is a 927-step Z3 proof replayed in 1.8 s (step time; 33 s before
+the tactics were run on statements closed over their variables, see below), `UnlockPIN` 917 steps in 1.8 s,
+the `Auction` residuals 44 to 197 steps in at most 0.2 s each; the optimizer's evidence for the rewrites of
+`match` alternatives (case of case, functions pushed into `match`es) completes the proofs (about 26 s of
+reconstruction for `HelloWorld`). `MintingPolicy`, `SellNFT` and 19 of the 20 `Governance` theorems are proved
+by Z3 without proofs but time out with proof production: Z3's `recfun-finder` simplifier, which turns the
+definitional axioms of recursive functions into recursive definitions, is disabled under `produce-proofs`;
+rewriting the query into `define-funs-rec` at the SMT-LIB level yields a proof in seconds (work in progress).
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
@@ -422,8 +436,10 @@ a matcher whose body is `sorry`, which the kernel accepts.
 - Match equations and splitters are generated by Lean on demand (`Match.getEquationsFor`). For
   matchers with many overlapping patterns, the generation can exceed Lean's fixed heartbeat
   budget. These matchers fall back to coarse obligations.
-- Goals proved by the SMT solver rely on Lean decision procedures. The next step is to replay Z3
-  proofs, or at least use unsat cores and quantifier instantiations from Z3 as hints.
+- Goals proved by the SMT solver are reconstructed with Lean decision procedures and by the replay of SMT
+  proofs (see above); the replay fails on Z3 proofs that need Blaster's `recfun-finder` (disabled under proof
+  production), on polymorphic user datatypes and polymorphic Lean functions in the universe interpretation, and
+  on cvc5 proofs whose Alethe export contains skolems (e.g., division by zero).
 - Equivalences between recursive functions that need a generalized induction hypothesis or mutual
   induction still fail.
 - Arithmetic (`Nat`/`Int`) constant folding and `match` normalization rules still rely on tactic
