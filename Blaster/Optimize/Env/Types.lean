@@ -56,6 +56,12 @@ structure IndTypeDeclaration where
  /-- unique @apply function generated for each HOF/quantified function or lambda term. -/
  applyInstName : Option SmtSymbol
 
+ /-- Flag set to `true` only for function instances with a possibly empty domain (see `generateFunInstDeclAux`).
+     The predicate qualifier `instName` is then a membership predicate that is not implied by the co-domain
+     constraint and has to be asserted for lambda terms.
+ -/
+ isMembership : Bool := false
+
 deriving Inhabited
 
 instance : Repr IndTypeDeclaration where
