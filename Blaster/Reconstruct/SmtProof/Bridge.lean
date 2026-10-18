@@ -18,9 +18,12 @@ simultaneous traversal of both terms: congruence on their common structure, and 
 encoding at the points where they differ. The proven statement is `W(a) = b` where `W` is the
 mapping to the SMT world: `(↑a : Int)` for `Nat` terms, `a = true` for `Bool` terms, `a` otherwise.
 
-`match` expressions are related to their `ite` encoding by auxiliary lemmas stated for abstract
-discriminants and alternatives (i.e., small statements, proved once per matcher instance by the
-tactics given by the caller).
+`match` expressions are related to their `ite` encoding by auxiliary theorems stated for abstract
+discriminants and alternatives (i.e., small statements, proved once per matcher instance by `proveMatchIte`,
+which splits the matcher and evaluates the conditions of the encoding with case analyses). Functions
+translated as SMT macros (e.g., `Nat.sub` as `@Nat.sub`, expanded by the backends) are related to the
+interpretation of their macros by auxiliary theorems proved once per function (by the tactics given by the
+caller).
 -/
 
 open Lean Meta Elab
