@@ -74,6 +74,33 @@ partial def findProof? (e : SExpr) : Option SExpr :=
   | .list xs => xs.findSome? findProof?
   | _ => none
 
+/-- Sorted variables `((x S) ...)`. -/
+def sortedVars (e : SExpr) : Except String (Array (String × SExpr)) := do
+  let some vs := e.list? | throw s!"ill-formed parameters: {e}"
+  vs.mapM fun v => match v with
+    | .list #[.atom x, s] => pure (x, s)
+    | _ => throw s!"ill-formed sorted variable: {v}"
+
+/-- Function definitions of the proof output: `(define-funs-rec ((f params sort) ...) (body ...))`,
+    `(define-fun-rec f params sort body)` and `(define-fun f params sort body)`, at the top level or in the
+    list wrapping the proof (e.g., the recursive functions of the query and Z3's auxiliary `fold-rec-n`
+    functions, which name subterms of their bodies). -/
+def parseDefs (es : Array SExpr) : Except String (Array FunDef) := do
+  let items := es.foldl (fun acc e => match e with
+    | .list xs => if (xs[0]?.bind SExpr.list?).isSome then acc ++ xs else acc.push e
+    | e => acc.push e) #[]
+  let mut defs := #[]
+  for c in items do
+    match c with
+    | .list #[.atom "define-funs-rec", .list decls, .list bodies] =>
+        for (d, b) in decls.zip bodies do
+          let .list #[.atom f, ps, s] := d | throw s!"ill-formed declaration: {d}"
+          defs := defs.push { name := f, params := ← sortedVars ps, sort := s, body := ← STerm.ofSExpr {} b }
+    | .list #[.atom "define-fun-rec", .atom f, ps, s, b] | .list #[.atom "define-fun", .atom f, ps, s, b] =>
+        defs := defs.push { name := f, params := ← sortedVars ps, sort := s, body := ← STerm.ofSExpr {} b }
+    | _ => pure ()
+  return defs
+
 /-- Parse the output of `(get-proof)`, e.g., `((proof p))` or `(proof p)` or `p`. -/
 def parseProof (out : String) : Except String Proof := do
   let es ← parseSExprs out
@@ -85,6 +112,8 @@ def parseProof (out : String) : Except String Proof := do
     | throw "empty proof output"
   let pt ← STerm.ofSExpr {} p
   let (root, st) ← (convert pt).run {}
-  return { backend := "z3", steps := st.steps, root }
+  -- NOTE: definitions that can't be parsed are ignored (their symbols are then unknown to the replay)
+  let defs := (parseDefs es).toOption.getD #[]
+  return { backend := "z3", steps := st.steps, root, defs }
 
 end Blaster.Reconstruct.SmtProof.Z3

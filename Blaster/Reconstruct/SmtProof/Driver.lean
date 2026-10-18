@@ -5,6 +5,7 @@ import Blaster.Reconstruct.SmtProof.Z3
 import Blaster.Reconstruct.SmtProof.Alethe
 import Blaster.Reconstruct.SmtProof.Replay
 import Blaster.Reconstruct.SmtProof.Bridge
+import Blaster.Reconstruct.SmtProof.RecFun
 
 /-!
 # Proof reconstruction from SMT proofs
@@ -718,19 +719,26 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     -- (`z3+`: Z3 with the simplifiers of the query, tried after `z3`)
     let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3+").splitOn ","
     let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
+    -- `z3rec`: Z3 on the query with its recursive functions defined by `define-funs-rec` (see `RecFun`), skipped
+    -- when the query has no recursive function
+    let recQuery := if names.any (·.trim == "z3rec") then (RecFun.rewriteQuery cmds).toOption else none
     let mut res : Option (Backend × Proof) := none
+    let mut recPairs : Array RecFun.Pair := #[]
     let mut errors := #[]
     for n in names do
+      if n.trim == "z3rec" && recQuery.isNone then continue
       let backend ← match n.trim with
         | "z3" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout)
         | "z3+" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout (simplifiers := true))
+        | "z3rec" => pure { z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout with name := "z3rec" }
         | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
         | b => throwError "unknown proof backend {b}"
-      match ← runBackend backend cmds with
+      let (query, pairs) := if n.trim == "z3rec" then recQuery.getD (cmds, #[]) else (cmds, #[])
+      match ← runBackend backend query with
       | .error msg => errors := errors.push msg
       | .ok out =>
           match backend.parseProof out with
-          | .ok p => res := some (backend, p); break
+          | .ok p => res := some (backend, p); recPairs := pairs; break
           | .error msg => errors := errors.push s!"{backend.name}: {msg}"
     let some (backend, sproof) := res | throwError "no proof: {errors}"
     -- 3. interpretation
@@ -742,6 +750,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
     let tbl ← buildSymTable cmds tenv consts sortVars[0]?
     let tbl ← addSkolems sproof tbl
+    -- auxiliary functions and case predicates of recursive functions (Z3)
+    let tbl := RecFun.addProofDefs sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
     -- matcher instances optimized by Blaster (whose patterns are the translated ones)
@@ -763,6 +773,11 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       matchInst := insts.get?, macroOf
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
+    -- definitional equations of the recursive functions (`z3rec`), proved with the bridge tactics in the empty
+    -- local context when closed (see `proveClosed`)
+    let recCtx ← RecFun.mkCtx tbl recPairs fun stmt => do
+      let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
+      if stmt.hasFVar then run else withLCtx {} {} run
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -796,7 +811,11 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           let tacs ← match (← tacCache.get).get? rule with
             | some t => pure t
             | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
-          portfolio tacs stmt rule }
+          portfolio tacs stmt rule
+        proveRecFun := fun c n => do
+          let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
+          if r.isNone then debugLog m!"recfun lemma failed: {c}"
+          return r }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
       let global := (scopedSteps sproof).map (!·)

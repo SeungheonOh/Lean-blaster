@@ -43,6 +43,9 @@ structure ReplayConfig where
   proveDirect : Expr → TermElabM (Option Expr)
   /-- tactic proving `p₁ → ... → pₙ → c` for a step of the given rule -/
   proveStep : String → Expr → TermElabM (Option (Expr × String))
+  /-- proof of a lemma of Z3's theory of recursive functions (`th-lemma recfun`), given the interpretation
+      of its clause and its number of literals (see `RecFun.lean`) -/
+  proveRecFun : Expr → Nat → TermElabM (Option Expr) := fun _ _ => pure none
 
 structure ReplayCtx where
   proof : Proof
@@ -851,6 +854,11 @@ partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
 /-- Prove `p₁ → ... → pₙ → c` with tactics and apply it to the premise proofs. -/
 partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   let cfg := (← read).cfg
+  -- unfoldings of recursive functions by cases (Z3)
+  if step.rule == "th-lemma" && step.premises.isEmpty && step.attrs[0]? == some (.atom "recfun") then
+    if let some p ← timed "recfun" (cfg.proveRecFun concl step.clauseSize) then
+      record step.rule "recfun"
+      return p
   if step.rule == "th-lemma" && step.premises.isEmpty then
     if let some p ← (try replayDatatype concl catch _ => pure none) then
       if ← propEq (← inferType p) concl then
