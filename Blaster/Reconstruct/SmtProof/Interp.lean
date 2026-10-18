@@ -419,6 +419,15 @@ def fillDefaults (e : Expr) : MetaM Expr := do
     if let some v ← mkSelector.inhabitant? t 8 then m.assign v
   instantiateMVars e
 
+/-- Assign the remaining type metavariables of `e` with `Unit`: the type parameters that nothing determines (e.g.,
+    of `Option.none` under a tester, whose instance Z3 doesn't print), then the default values of selectors. -/
+def defaultTypes (e : Expr) : MetaM Expr := do
+  if !e.hasExprMVar then return e
+  for m in (← getMVars e) do
+    if ← m.isAssigned then continue
+    if (← instantiateMVars (← m.getType)) == mkSort levelOne then m.assign (mkConst ``Unit)
+  fillDefaults (← instantiateMVars e)
+
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"

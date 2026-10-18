@@ -97,7 +97,7 @@ def stepConcl (i : Nat) : ReplayM Expr := do
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
   let t0 ← IO.monoMsNow
-  let e ← fillDefaults (← instantiateMVars (← liftInterp (interpProp c)))
+  let e ← defaultTypes (← fillDefaults (← instantiateMVars (← liftInterp (interpProp c))))
   let t1 ← IO.monoMsNow
   modify fun s => { s with stats := s.stats.addTime "(interpretation)" (t1 - t0) }
   if e.hasExprMVar then
