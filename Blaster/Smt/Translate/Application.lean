@@ -1217,13 +1217,17 @@ def translateLambda
  let pInfo ← getFunEnvInfo e
  Optimize.lambdaTelescope e fun fvars b => do
    let mut svars := (#[] : SortedVars)
+   -- membership predicates of the parameters, guarding the definition of the lambda term
+   let mut guards := #[]
    for h1 : i in [:fvars.size] do
      let fv := fvars[i]
      let decl ← getFVarLocalDecl fv
      updateQuantifiedFVarsCache fv.fvarId! false
      if pInfo.paramsInfo[i]!.isExplicit then
        let st ← translateFunLambdaParamType decl.type termTranslator
-       svars := svars.push (← fvarIdToSmtSymbol fv.fvarId!, st)
+       let sym ← fvarIdToSmtSymbol fv.fvarId!
+       svars := svars.push (sym, st)
+       if let some g ← paramGuard? sym decl.type then guards := guards.push g
    let bodyType ← inferTypeEnv b
    let rt ← translateFunLambdaParamType bodyType termTranslator
    let v ← mkFreshId
@@ -1245,16 +1249,19 @@ def translateLambda
      let lamId := smtSimpleVarId lambdaName
      let applyArgs := Array.foldl (λ acc s => acc.push (smtSimpleVarId s.1)) #[lamId] svars
      let applyTerm := mkSimpleSmtAppN applyName applyArgs
-     let forallBody := eqSmt applyTerm sb
+     let forallBody := guards.foldr impliesSmt (eqSmt applyTerm sb)
      assertTerm (mkForallTerm none svars forallBody (some #[mkPattern #[applyTerm], mkQid qidName]))
      return lamId
    else
     let mut gvars := (#[] : SortedVars)
+    let mut gguards := #[]
     for h2 : i in [:lvars.size] do
      let fv := lvars[i]
      let decl ← getFVarLocalDecl fv
      let st ← translateFunLambdaParamType decl.type termTranslator
-     gvars := gvars.push (← fvarIdToSmtSymbol fv.fvarId!, st)
+     let sym ← fvarIdToSmtSymbol fv.fvarId!
+     gvars := gvars.push (sym, st)
+     if let some g ← paramGuard? sym decl.type then gguards := gguards.push g
     let arrowT ← declareArrowTypeSort (lvars.size + 1)
     let globalArrowType := paramSort arrowT ((Array.map (λ s => s.2) gvars).push funArrowType)
     -- wrapping lamType within `outParam` to properly generate function instance
@@ -1275,10 +1282,45 @@ def translateLambda
     let qidName := appendSymbol globalName "def_cstr"
     let g_patterns := some #[mkPattern #[applyTerm], mkQid qidName]
     gvars := Array.foldl (λ acc s => acc.push s) gvars svars
-    assertTerm (mkForallTerm none gvars (eqSmt applyTerm sb) g_patterns)
+    assertTerm (mkForallTerm none gvars ((gguards ++ guards).foldr impliesSmt (eqSmt applyTerm sb)) g_patterns)
     return globalAppTerm
 
  where
+   /-- The membership predicate of a parameter `x : t` of a lambda term (or of a variable it captures), which
+       guards its definition: the definition must only constrain the values of the Lean type `t` among the
+       values of its sort (e.g., the values of all types for a sort variable, the negative integers for `Nat`).
+       Otherwise two lambda terms equal in Lean would be equal on all the values of their sort, which is
+       inconsistent when they differ outside `t` (e.g., `fun n : Nat => n - 1 + 1` and
+       `fun n => if n = 0 then 1 else n`).
+       NOTE: parameters whose type has sort variables that are not top level are not guarded (their
+       predicates would refer to locally quantified sort variables, see `hasGlobalSortVarsOnly`).
+   -/
+   paramGuard? (x : SmtSymbol) (t : Expr) : TranslateEnvT (Option SmtTerm) := do
+     if isTypeUniverse t || (← isClassConstraintExpr t) then return none
+     let t ← removeTypeAbbrev t
+     let genArgs ← retrieveGenericArgs (retrieveArrowTypes t)
+     for h : i in [:genArgs.size] do
+       let v := genArgs[i]
+       if isTypeUniverse (← inferTypeEnv v) && !(v.isFVar && (← isTopLevelFVar v.fvarId!)) then return none
+     try return some (← createPredQualifierApp x t)
+     catch _ => return none
+
+   /-- Return `true` when all the parameters of `e` are explicit and all the sort variables in
+       `lamType` are globally declared (i.e., top level), such that the membership predicate
+       of `lamType` can be asserted at the top level for lambda term `e`.
+       NOTE: A lambda term polymorphic in a locally quantified sort variable (e.g., `∀ β, ... (λ (x : β) => x) ...`)
+       is translated to a single smt term for all instantiations of `β` and must not be asserted as a member
+       of every instance of its function type (e.g., closed lambdas would otherwise be identified via
+       extensionality whenever an instance has an empty domain).
+   -/
+   hasGlobalSortVarsOnly (lamType : Expr) (pInfo : FunEnvInfo) : TranslateEnvT Bool := do
+     if pInfo.paramsInfo.any (λ p => !p.isExplicit) then return false
+     let genArgs ← retrieveGenericArgs (retrieveArrowTypes lamType)
+     for h : i in [:genArgs.size] do
+       let v := genArgs[i]
+       if isTypeUniverse (← inferTypeEnv v) && !(← isTopLevelFVar v.fvarId!) then return false
+     return true
+
    retrieveLocalFVars (b : Expr) : TranslateEnvT (Array Expr) := do
      -- Need to ensure that fvars are unique
      let (fvars, _) ← updateGenericArgs b #[] Std.HashSet.emptyWithCapacity
