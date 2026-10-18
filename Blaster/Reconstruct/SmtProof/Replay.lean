@@ -561,6 +561,11 @@ partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
 
 /-- Prove `p₁ → ... → pₙ → c` with tactics and apply it to the premise proofs. -/
 partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
+  -- identical sides (e.g., rewrites of Z3 normalizing the n-ary connectives folded by the interpretation)
+  if let some (_, a, b) := concl.eq? then
+    if a == b then
+      record step.rule "refl"
+      return ← mkEqRefl a
   let ps ← premises step
   -- propositional steps (e.g., `def-axiom`, `not-or-elim`, propositional rewrites): exact proof
   if let some p ← PropEngine.prove ps concl then
