@@ -285,6 +285,10 @@ partial def replay (i : Nat) : ReplayM Expr := do
       -- NOTE: premises are replayed before their consumers, i.e., the first failures are the deepest ones
       let step := ctx.proof.steps[i]!
       let msg := s!"step {i} ({step.rule}): {toString step.concl |>.take 300}: {(← ex.toMessageData.toString).take 300}"
+      if let some f ← IO.getEnv "BLASTER_SMTPROOF_FAILDUMP" then
+        let h ← IO.FS.Handle.mk f .append
+        let c ← try pure (toString (← ppExpr (← stepConcl i))) catch _ => pure "?"
+        h.putStrLn s!"=== step {i} ({step.rule}) premises {step.premises}: {(← ex.toMessageData.toString).take 500}\n{c.take 30000}\n"
       modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
       throw ex
   if (← IO.getEnv "BLASTER_SMTPROOF_CHECK").isSome then
@@ -678,14 +682,19 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       if ← propEq (← inferType p) concl then
         record step.rule "datatype"
         return p
+  -- large statements (e.g., the CEK evaluation of validators): tactics are only applied to their local
+  -- differences (see `Local`)
+  let large := !(Local.sizeLe concl 20000)
+  let unfoldable := Local.sizeLe concl 2000
   -- identical sides (e.g., rewrites of Z3 normalizing the n-ary connectives folded by the interpretation)
   if let some (_, a, b) := concl.eq? then
     if a == b then
       record step.rule "refl"
       return ← mkEqRefl a
     -- definitional rewrites (e.g., testers of single-constructor types, by structure eta), with a budget
+    -- (only reducible definitions for large terms)
     if (← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
-            withCurrHeartbeats <| withDefault <| isDefEq a b catch _ => pure false) then
+            withCurrHeartbeats <| (if unfoldable then withDefault else withReducible) <| isDefEq a b catch _ => pure false) then
       record step.rule "defeq"
       return ← mkExpectedTypeHint (← mkEqRefl a) concl
   let ps ← premises step
@@ -698,13 +707,20 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   if ps.isEmpty then
     if let some (_, a, b) := concl.eq? then
       if a.approxDepth.toNat > 8 || b.approxDepth.toNat > 8 then
-        let budget ← IO.mkRef 3
+        let budget ← IO.mkRef 6
         let rule := step.rule
         let cfg := (← read).cfg
         let prove (eq : Expr) : TermElabM (Option Expr) := do
           let some (_, l, r) := eq.eq? | return none
+          -- definitional differences (e.g., testers of constructor applications)
+          let small := Local.sizeLe eq 2000
+          if (← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
+                  withCurrHeartbeats <| (if small then withDefault else withReducible) <| isDefEq l r catch _ => pure false) then
+            return some (← mkExpectedTypeHint (← mkEqRefl l) eq)
           if let some (g, vals) ← Local.generalizeCommon eq l r then
             if let some (pf, _) ← cfg.proveStep rule g then return some (mkAppN pf vals)
+          else if small then
+            if let some (pf, _) ← cfg.proveStep rule eq then return some pf
           return none
         if let some p ← Local.diffEq prove budget a b then
           record step.rule "local"
@@ -717,6 +733,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       if let some (pf, method) ← (← read).cfg.proveStep step.rule g then
         record step.rule s!"{method} (atoms)"
         return mkAppN (mkAppN pf vals) (ps.map (·.2))
+  if large then throwError "tactics are not applied to large statements"
   let some (pf, method) ← (← read).cfg.proveStep step.rule stmt | throwError "tactics failed"
   record step.rule method
   return mkAppN pf (ps.map (·.2))

@@ -16,6 +16,19 @@ open Lean Meta Elab Term
 
 namespace Blaster.Reconstruct.SmtProof.Local
 
+/-- Whether `e` has at most `n` nodes (as a tree), without traversing more than `n` nodes. -/
+def sizeLe (e : Expr) (n : Nat) : Bool :=
+  (go e n).isSome
+where
+  go (e : Expr) (fuel : Nat) : Option Nat :=
+    if fuel == 0 then none else
+    match e with
+    | .app f a => go f (fuel - 1) >>= go a
+    | .lam _ t b _ | .forallE _ t b _ => go t (fuel - 1) >>= go b
+    | .letE _ t v b _ => go t (fuel - 1) >>= go v >>= go b
+    | .mdata _ b | .proj _ _ b => go b (fuel - 1)
+    | _ => some (fuel - 1)
+
 /-- Subterms of `e` without loose bound variables (traversal of the DAG, with sharing). -/
 partial def closedSubterms (e : Expr) (acc : Std.HashSet Expr) : Std.HashSet Expr :=
   if acc.contains e then acc else
