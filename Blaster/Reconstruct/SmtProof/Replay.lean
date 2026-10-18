@@ -482,6 +482,36 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       let r ← mkEqTrans p q
       if ← propEq (← inferType r) concl then record step.rule "exact"; return r
       throwError "trans: conclusion mismatch"
+  | "trans*" =>
+      -- transitivity of possibly symmetric equalities: a path between the sides of the conclusion
+      let ps ← premises step
+      let some (_, l, r) := concl.eq? | throwError "trans*: equality expected"
+      let edges ← ps.filterMapM fun (t, p) => do
+        let some (_, a, b) := t.eq? | return none
+        return some (a, b, p)
+      -- breadth-first search from `l`
+      let mut frontier : Array (Expr × Expr) := #[(l, ← mkEqRefl l)]
+      let mut seen : Array Expr := #[l]
+      let mut found : Option Expr := none
+      for _ in [0:edges.size + 1] do
+        if found.isSome || frontier.isEmpty then break
+        let mut next := #[]
+        for (x, px) in frontier do
+          if x == r then found := some px; break
+          for (a, b, p) in edges do
+            let step? ← if a == x then pure (some (b, ← mkEqTrans px p))
+              else if b == x then pure (some (a, ← mkEqTrans px (← mkEqSymm p)))
+              else pure none
+            if let some (y, py) := step? then
+              if !seen.contains y then
+                seen := seen.push y
+                next := next.push (y, py)
+        if found.isNone then
+          if let some (_, py) := next.find? (·.1 == r) then found := some py
+        frontier := next
+      let some pf := found | throwError "trans*: no path"
+      if ← propEq (← inferType pf) concl then record step.rule "exact"; return pf
+      throwError "trans*: conclusion mismatch"
   | "iff-true" =>
       let ps ← premises step
       let #[(_, p)] := ps | throwError "iff-true: one premise expected"
