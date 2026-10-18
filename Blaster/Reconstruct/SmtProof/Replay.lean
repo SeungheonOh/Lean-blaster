@@ -760,7 +760,9 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
               | some p => some <$> mkLambdaFVars zs p
               | none => pure none
             if let some pp := pp? then return some (mkAppN pp vals)
-            let r ← cfg.proveStep rule g
+            -- NOTE: generalized statements are closed: proved in the empty local context (e.g., such that case
+            -- analyses don't split the variables of the goal)
+            let r ← if g.hasFVar then cfg.proveStep rule g else withLCtx {} {} (cfg.proveStep rule g)
             if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
               let t2 ← IO.monoMsNow
               if t2 - t0 > 100 then
@@ -783,13 +785,15 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     if parts.size ≥ 2 then
       let restE := (parts.extract 1 parts.size).foldl (fun acc l => mkAnd acc l) (mkConst ``True)
       if let some (g, vals) ← Local.generalizeCommon stmt restE parts[0]! then
-        if let some (pf, method) ← timed "datatype" ((← read).cfg.proveStep "datatype" g) then
+        let cfg := (← read).cfg
+        if let some (pf, method) ← timed "datatype" (if g.hasFVar then cfg.proveStep "datatype" g else withLCtx {} {} (cfg.proveStep "datatype" g)) then
           record step.rule s!"{method} (common)"
           return mkAppN (mkAppN pf vals) (ps.map (·.2))
   -- arithmetic lemmas over large atoms: the atoms are generalized
   if step.rule == "th-lemma" && (stmt.approxDepth.toNat > 8) then
     if let some (g, vals) ← Local.generalizeAtoms stmt then
-      if let some (pf, method) ← (← read).cfg.proveStep step.rule g then
+      let cfg := (← read).cfg
+      if let some (pf, method) ← (if g.hasFVar then cfg.proveStep step.rule g else withLCtx {} {} (cfg.proveStep step.rule g)) then
         record step.rule s!"{method} (atoms)"
         return mkAppN (mkAppN pf vals) (ps.map (·.2))
   if large then throwError "tactics are not applied to large statements"
