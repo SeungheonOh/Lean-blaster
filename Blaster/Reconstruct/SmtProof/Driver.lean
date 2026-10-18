@@ -39,14 +39,27 @@ def isZ3SpecificCommand (c : SExpr) : Bool :=
       | _, _ => false
   | _ => false
 
-/-- Z3 with legacy proof objects. -/
-def z3Backend (cmd : String) (timeoutSec : Nat) : Backend where
-  name := "z3"
+/-- Commands of Blaster's query that are set by the backend preamble or version specific (the simplifiers
+    of the query, e.g., `recfun-finder`, are kept). -/
+def isZ3PreambleCommand (c : SExpr) : Bool :=
+  match c with
+  | .list xs =>
+      match xs[0]?, xs[1]? with
+      | some (SExpr.atom "set-option"), some (SExpr.atom o) =>
+          o == ":print-success" || o == ":produce-models" || o == ":produce-proofs" || o == ":timeout" ||
+          o.startsWith ":smt.arith.nl"
+      | _, _ => false
+  | _ => false
+
+/-- Z3 with legacy proof objects. With `simplifiers`, the simplifiers of Blaster's query (e.g., `recfun-finder`,
+    `macro_finder`) are kept, which may be needed to find a proof, but produce coarser proofs. -/
+def z3Backend (cmd : String) (timeoutSec : Nat) (simplifiers := false) : Backend where
+  name := if simplifiers then "z3+" else "z3"
   cmd := cmd
   args := #["-smt2", s!"-T:{timeoutSec}"]
   -- NOTE: `pp.simplify_implies` prints `(=> a (=> b c))` as `(=> (and a b) c)` by default
   preamble := #["(set-option :produce-proofs true)", "(set-option :pp.simplify_implies false)"]
-  dropCommand := isZ3SpecificCommand
+  dropCommand := if simplifiers then isZ3PreambleCommand else isZ3SpecificCommand
   parseProof := Z3.parseProof
 
 /-- Guard the top-level universally quantified assertions over `Nat` (e.g., the definitions of recursive
@@ -641,13 +654,15 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let cmds := cmds.map guardNatQuantifiers
     -- 2. backend
     -- backends tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`)
-    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3").splitOn ","
-    let timeout := sOpts.timeout.getD 20
+    -- (`z3+`: Z3 with the simplifiers of the query, tried after `z3`)
+    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3+").splitOn ","
+    let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
     let mut res : Option (Backend × Proof) := none
     let mut errors := #[]
     for n in names do
       let backend ← match n.trim with
         | "z3" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout)
+        | "z3+" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout (simplifiers := true))
         | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
         | b => throwError "unknown proof backend {b}"
       match ← runBackend backend cmds with
