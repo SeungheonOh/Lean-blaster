@@ -51,6 +51,10 @@ structure ReplayCtx where
   facts : Array (Expr × Expr) := #[]
   /-- nesting depth of scopes (hypotheses, bound variables) -/
   depth : Nat := 0
+  /-- time (`IO.monoMsNow`) after which the replay is abandoned -/
+  deadline : Nat := 0
+  /-- maximal number of direct proof attempts (see `replayCore`) -/
+  maxDirect : Nat := 32
 
 structure ReplayState where
   /-- proofs of steps replayed at depth 0 -/
@@ -63,6 +67,7 @@ structure ReplayState where
   failed : Std.HashSet Nat := {}
   /-- steps that could not be replayed in the current scope -/
   scopeFailed : Std.HashSet Nat := {}
+  directAttempts : Nat := 0
   stats : ReplayStats := {}
 
 abbrev ReplayM := ReaderT ReplayCtx (StateRefT ReplayState TermElabM)
@@ -82,7 +87,7 @@ def stepConcl (i : Nat) : ReplayM Expr := do
   let c := match step.rule, step.concl with
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
-  let e ← instantiateMVars (← liftInterp (interp c))
+  let e ← instantiateMVars (← liftInterp (interpProp c))
   if e.hasExprMVar then throwError "smt proof: can't infer the types of {e}"
   if ctx.depth == 0 then modify fun s => { s with conclCache := s.conclCache.insert i e }
   return e
@@ -109,6 +114,12 @@ def clauseSize (t : STerm) : Nat :=
   | .app "or" args => args.size
   | .sym "false" => 0
   | _ => 1
+
+/-- Number of literals of the conclusion of `s` (explicit clause literals take precedence). -/
+def Step.clauseSize (s : Step) : Nat :=
+  match s.clause? with
+  | some lits => lits.size
+  | none => SmtProof.clauseSize s.concl
 
 def clauseLits (t : STerm) : Array STerm :=
   match t.stripAnnot with
@@ -230,6 +241,13 @@ partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr
     mkLambdaFVars #[hn] pf
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) goal r
 
+/-- Run `x` in a new scope (hypotheses or bound variables): the proofs (and failures) of the
+    current scope are saved and restored, also when `x` fails. -/
+def withScope (x : ReplayM α) : ReplayM α := do
+  let saved := ((← get).scopeCache, (← get).scopeFailed)
+  modify fun s => { s with scopeCache := {}, scopeFailed := {} }
+  try x finally modify fun s => { s with scopeCache := saved.1, scopeFailed := saved.2 }
+
 mutual
 
 /-- Proof of the interpretation of the conclusion of step `i`. -/
@@ -258,9 +276,10 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
   let step := ctx.proof.steps[i]!
   -- premises are replayed first, such that the time of the step only accounts for the step itself
   -- NOTE: premises of `lemma` (resp. `proof-bind`) are replayed under hypotheses (resp. bound variables)
-  if !(["lemma", "proof-bind", "subproof", "bind"].contains step.rule) then
+  if !(["lemma", "proof-bind", "subproof", "bind", "sko_ex", "sko_forall"].contains step.rule) then
     for j in step.premises do
       try discard <| replay j catch _ => pure ()
+  if (← IO.monoMsNow) > ctx.deadline then throwError "smt proof: replay deadline exceeded"
   let start ← IO.monoMsNow
   try replayCore' i step
   finally
@@ -289,9 +308,12 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   -- without the proof of the backend)
   if concl.isConstOf ``False then
     throwError "smt proof: could not replay step {i} ({step.rule}) concluding false"
-  if let some p ← ctx.cfg.proveDirect concl then
-    record step.rule "direct"
-    return p
+  -- NOTE: direct proofs are costly; they are attempted a bounded number of times
+  if (← get).directAttempts < ctx.maxDirect then
+    modify fun s => { s with directAttempts := s.directAttempts + 1 }
+    if let some p ← ctx.cfg.proveDirect concl then
+      record step.rule "direct"
+      return p
   throwError "smt proof: could not replay step {i} ({step.rule})"
 
 /-- Premise proofs with their propositions. -/
@@ -309,7 +331,7 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       for (t, p) in ctx.facts do
         if ← propEq t concl then record step.rule "exact"; return p
       throwError "hypothesis not found"
-  | "lemma" => replayLemma step concl
+  | "lemma" | "subproof" => replayLemma step concl
   | "true-axiom" => record step.rule "exact"; return Lean.mkConst ``True.intro
   | "mp" | "mp~" =>
       let ps ← premises step
@@ -325,8 +347,9 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       let some (p, r) := r | throwError "mp: unexpected premises"
       if ← propEq r concl (deep := true) then record step.rule "exact"; return p
       throwError "mp: conclusion mismatch"
-  | "refl" =>
-      if let some (_, a, _) := concl.eq? then
+  | "refl" | "intro-def" =>
+      if let some (_, a, b) := concl.eq? then
+        if !(← propEq a b (deep := true)) then throwError "refl: sides differ"
         record step.rule "exact"; return ← mkEqRefl a
       if concl.isArrow then
         record step.rule "exact"
@@ -340,7 +363,10 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       throwError "symm: conclusion mismatch"
   | "trans" =>
       let ps ← premises step
-      let #[(_, p), (_, q)] := ps | throwError "trans: two premises expected"
+      let #[(tp, p), (tq, q)] := ps | throwError "trans: two premises expected"
+      let some (_, _, m₁) := tp.eq? | throwError "trans: equality expected"
+      let some (_, m₂, _) := tq.eq? | throwError "trans: equality expected"
+      if !(← propEq m₁ m₂) then throwError "trans: middle terms differ"
       let r ← mkEqTrans p q
       if ← propEq (← inferType r) concl then record step.rule "exact"; return r
       throwError "trans: conclusion mismatch"
@@ -362,14 +388,14 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       let some (c, pc) := ps[0]? | throwError "unit-resolution: premises expected"
       let units := ps.extract 1 ps.size
       -- the clause premise is `(or l₁ ... lₙ)`
-      let n := clauseSize ctx.proof.steps[step.premises[0]!]!.concl
+      let n := ctx.proof.steps[step.premises[0]!]!.clauseSize
       let lits := disjuncts c n
       -- NOTE: the conclusion may be a single literal of the clause which is a disjunction
       let single ← lits.anyM fun l => propEq l concl
       let targetLits :=
-        if clauseSize step.concl == 0 then #[]
+        if step.clauseSize == 0 then #[]
         else if single then #[concl]
-        else disjuncts concl (clauseSize step.concl)
+        else disjuncts concl step.clauseSize
       let r ← weakenClause lits pc (refuteBy units) targetLits
       record step.rule "exact"
       return r
@@ -411,21 +437,26 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
 partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let ctx ← read
   let some j := step.premises[0]? | throwError "lemma: premise expected"
-  let n := clauseSize step.concl
+  let n := step.clauseSize
   let lits := disjuncts concl n
   let r ← withLocalDeclD `hn (mkNot concl) fun hn => do
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
-    let mut facts := ctx.facts
+    let mut facts := ctx.facts.push (mkNot concl, hn)
     for k in [:lits.size] do
       let l := lits[k]!
       let nl ← withLocalDeclD `h l fun h => do mkLambdaFVars #[h] (mkApp hn (← mkOrInj lits k h))
       facts := facts.push (mkNot l, nl)
       if let some a := l.not? then
         facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
-    let saved := ((← get).scopeCache, (← get).scopeFailed)
-    modify fun s => { s with scopeCache := {}, scopeFailed := {} }
-    let pf ← withReader (fun c => { c with facts, depth := c.depth + 1 }) (replay j)
-    modify fun s => { s with scopeCache := saved.1, scopeFailed := saved.2 }
+    let pf ← withScope (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
+      let pj ← replay j
+      -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
+      let cj ← stepConcl j
+      if cj.isConstOf ``False then return pj
+      for (t, p) in facts do
+        if let some a := t.not? then
+          if ← propEq a cj then return mkApp p pj
+      throwError "lemma: the premise is not refuted by the hypotheses")
     mkLambdaFVars #[hn] pf
   record step.rule "exact"
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) concl r
@@ -442,10 +473,7 @@ partial def replayBind (step : Step) : ReplayM Expr := do
         withReader (fun c => { c with interp := { c.interp with locals := c.interp.locals.insert vars[k].1 x } })
           (go (k + 1) (fvars.push x))
     else
-      let saved := ((← get).scopeCache, (← get).scopeFailed)
-      modify fun s => { s with scopeCache := {}, scopeFailed := {} }
-      let pf ← withReader (fun c => { c with depth := c.depth + 1 }) (replay j)
-      modify fun s => { s with scopeCache := saved.1, scopeFailed := saved.2 }
+      let pf ← withScope (withReader (fun c => { c with depth := c.depth + 1 }) (replay j))
       mkLambdaFVars fvars pf
   let r ← go 0 #[]
   record step.rule "exact"
@@ -479,16 +507,16 @@ partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
   let mut clauses := #[]
   for j in step.premises do
     let c ← stepConcl j
-    let n := clauseSize ctx.proof.steps[j]!.concl
+    let n := ctx.proof.steps[j]!.clauseSize
     let lits := if n == 0 then #[] else disjuncts c n
-    clauses := clauseLitsWith clauses lits (← replay j)
-  let n := clauseSize step.concl
+    clauses := clauses.push (lits, ← replay j)
+    -- NOTE: a clause whose single literal is a disjunction is also given as is
+    if n > 1 then clauses := clauses.push (#[c], ← replay j)
+  let n := step.clauseSize
   let target := if n == 0 then #[] else disjuncts concl n
   let r ← rupProof clauses target
   record step.rule "exact"
   return r
-where
-  clauseLitsWith (cs : Array (Array Expr × Expr)) (lits : Array Expr) (p : Expr) := cs.push (lits, p)
 
 /-- Prove `p₁ → ... → pₙ → c` with tactics and apply it to the premise proofs. -/
 partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do

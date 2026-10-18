@@ -123,7 +123,18 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
         let mode := (← IO.getEnv "BLASTER_SMT_PROOF").getD "last"
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
-          match ← SmtProof.proveBySmtProof e {} with
+          let st ← saveState
+          let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof e {})
+            (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
+          -- the proof is checked before being used, such that the other strategies can be tried otherwise
+          let res ← match res with
+            | .ok r =>
+                match ← kernelCheck e r.proof with
+                | none => pure (.ok r)
+                | some msg => pure (.error s!"kernel: {← msg.toString}")
+            | err => pure err
+          if let .error _ := res then st.restore
+          match res with
           | .ok r =>
               if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
                 let h ← IO.FS.Handle.mk f .append

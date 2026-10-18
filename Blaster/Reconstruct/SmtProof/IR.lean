@@ -28,6 +28,9 @@ structure Step where
   /-- steps whose conclusion is assumed in the derivation of this step's premises and
       discharged by this step (e.g., Z3's `lemma`, Alethe's `subproof`) -/
   discharged : Array Nat := #[]
+  /-- literals of the conclusion when it is a clause given explicitly (e.g., Alethe's `(cl l₁ ... lₙ)`),
+      which disambiguates a unit clause whose literal is a disjunction -/
+  clause? : Option (Array STerm) := none
   deriving Inhabited
 
 structure Proof where

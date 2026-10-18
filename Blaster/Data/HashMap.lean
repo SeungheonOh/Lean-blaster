@@ -145,8 +145,8 @@ private unsafe def toListImpl (m : HashMap α β) : List (α × β) := Id.run do
   return r
 
 /-- Entries of the map (in no particular order). `O(capacity)`. -/
-@[implemented_by toListImpl]
-def toList (_m : HashMap α β) : List (α × β) := []
+@[inline] def toList (m : HashMap α β) : List (α × β) :=
+  unsafe toListImpl m
 
 /-! ## `insert` -/
 

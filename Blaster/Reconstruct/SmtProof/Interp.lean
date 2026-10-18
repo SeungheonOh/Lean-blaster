@@ -57,6 +57,9 @@ structure InterpCtx where
   table : SymTable
   /-- bound variables (quantifiers, `proof-bind`, fresh definitions) -/
   locals : Std.HashMap String Expr := {}
+  /-- interpretation of the (closed) terms already interpreted, on term object addresses: terms are
+      shared DAGs (e.g., after the expansion of `let`), which must not be traversed as trees -/
+  cache : Option (IO.Ref (TermCache Expr)) := none
 
 abbrev InterpM := ReaderT InterpCtx MetaM
 
@@ -139,19 +142,20 @@ def mkAppCoerce (f : Expr) (args : Array Expr) : MetaM Expr := do
     let expected ← instantiateMVars (← inferType m)
     if expected.isMVar then
       -- no constraint on the type: keep the SMT type
+      if !(← isDefEq expected types[j]!) then throwError "smt proof: ill-typed argument for {f}"
       m.mvarId!.assign args[j]!
-      discard <| isDefEq expected types[j]!
     else
       m.mvarId!.assign (← coerce args[j]! types[j]! expected)
-  -- remaining implicit arguments: instances
-  for h : i in [:mvars.size] do
-    let m := mvars[i]
+  -- remaining implicit arguments: instances (of the used prefix)
+  let used := if args.size = explicit.size then mvars.size else explicit[args.size]!
+  for h : i in [:used] do
+    let m := mvars[i]!
     if (← instantiateMVars m).isMVar then
       if bis[i]!.isInstImplicit then
         let inst ← synthInstance (← instantiateMVars (← inferType m))
         m.mvarId!.assign inst
-  let r ← instantiateMVars (mkAppN f (mvars.extract 0 (if args.size = explicit.size then mvars.size else explicit[args.size]!)))
-  if r.hasExprMVar then throwError "smt proof: can't infer implicit arguments of {f}"
+  let r ← instantiateMVars (mkAppN f (mvars.extract 0 used))
+  if r.hasMVar then throwError "smt proof: can't infer implicit arguments of {f}"
   return r
 
 /-! ## Sorts -/
@@ -178,22 +182,55 @@ partial def sortToType (s : SExpr) : InterpM Expr := do
     | .atom a =>
         if let some s' := tbl.aliases.get? a then return ← sortToType s'
         match tbl.sorts.get? a with
+        | some (.const n _) =>
+            let info ← getConstInfo n
+            return mkConst n (info.levelParams.map fun _ => levelZero)
         | some t => return t
         | none => throwError "smt proof: unknown sort {a}"
     | .list xs =>
         let some (SExpr.atom a) := xs[0]? | throwError "smt proof: unsupported sort {s}"
-        -- NOTE: in the sort arguments of the query, `Nat` stands for Lean `Nat` (e.g., `List Nat`)
-        let args ← (xs.extract 1 xs.size).mapM fun s => if s == .atom "Nat" then pure natType else sortToType s
+        -- NOTE: in the sort arguments of the query, `Nat` stands for Lean `Nat` (e.g., `List Nat`) and
+        -- `Bool` for Lean `Bool` (e.g., `List Bool`)
+        let args ← (xs.extract 1 xs.size).mapM fun s =>
+          if s == .atom "Nat" then pure natType
+          else if s == .atom "Bool" then pure (mkConst ``Bool)
+          else sortToType s
         -- arrow sorts of Blaster's encoding of function values
         if a.startsWith "@@ArrowT" then
           let some r := args.back? | throwError "smt proof: ill-formed arrow sort {s}"
           return args.pop.foldr (fun d acc => mkForall `x .default d acc) r
         let some t := tbl.sorts.get? a | throwError "smt proof: unknown sort {a}"
-        -- NOTE: `Int` arguments may stand for `Nat` (aliases are expanded in proofs)
+        -- NOTE: universe levels are inferred from the arguments
+        if let .const n _ := t then return ← mkAppM n args
         return mkAppN t args
     | _ => throwError "smt proof: unsupported sort {s}"
 
 /-! ## Terms -/
+
+/-- Decode the escape sequences `\u{h...}` and `\uhhhh` of SMT-LIB string literals. -/
+partial def decodeSmtString (s : String) : String := Id.run do
+  let cs := s.toList.toArray
+  let mut out := ""
+  let mut i := 0
+  while i < cs.size do
+    if cs[i]! == '\\' && i + 1 < cs.size && cs[i+1]! == 'u' then
+      let hexVal (ds : List Char) : Option Nat :=
+        if ds.isEmpty then none else ds.foldlM (fun acc d =>
+          if d.isDigit then some (16 * acc + (d.toNat - '0'.toNat))
+          else if 'a' ≤ d && d ≤ 'f' then some (16 * acc + (d.toNat - 'a'.toNat + 10))
+          else if 'A' ≤ d && d ≤ 'F' then some (16 * acc + (d.toNat - 'A'.toNat + 10))
+          else none) 0
+      if i + 2 < cs.size && cs[i+2]! == '{' then
+        let mut j := i + 3
+        while j < cs.size && cs[j]! != '}' do j := j + 1
+        if let some v := hexVal (cs.extract (i+3) j).toList then
+          out := out.push (Char.ofNat v); i := j + 1; continue
+      else if i + 5 < cs.size then
+        if let some v := hexVal (cs.extract (i+2) (i+6)).toList then
+          out := out.push (Char.ofNat v); i := i + 6; continue
+    out := out.push cs[i]!
+    i := i + 1
+  return out
 
 def mkIntLit (n : Nat) : Expr :=
   mkApp3 (mkConst ``OfNat.ofNat [levelZero]) (mkConst ``Int) (mkRawNatLit n) (mkApp (mkConst ``instOfNat) (mkRawNatLit n))
@@ -250,13 +287,18 @@ def mkEqSmt (a b : Expr) : MetaM Expr := do
     `default` for the other constructors). -/
 def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"
-  let xt ← whnfR (← inferType x)
+  let xt ← whnfD (← inferType x)
+  if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: selector {ctor} applied to {xt}"
+  let lvls := xt.getAppFn.constLevels!
   let some (.inductInfo iinfo) := (← getEnv).find? cinfo.induct | throwError "smt proof: unknown inductive {cinfo.induct}"
   let params := xt.getAppArgs.extract 0 iinfo.numParams
-  -- structure: projection
+  -- structure: projection (a proof field is interpreted as its proposition)
   if iinfo.ctors.length == 1 && iinfo.numIndices == 0 && !iinfo.isRec then
-    return mkProj cinfo.induct idx x
-  let fieldTy ← forallTelescopeReducing (← instantiateForall cinfo.type params) fun fs _ => do
+    let p := mkProj cinfo.induct idx x
+    if ← isProof p then return ← inferType p
+    return p
+  let ctorType (c : ConstantInfo) := c.instantiateTypeLevelParams lvls
+  let fieldTy ← forallTelescopeReducing (← instantiateForall (ctorType (.ctorInfo cinfo)) params) fun fs _ => do
     let t ← inferType fs[idx]!
     if t.hasAnyFVar (fs.contains <| .fvar ·) then throwError "smt proof: dependent field selector not supported"
     return t
@@ -264,13 +306,13 @@ def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
   let motive := mkLambda `x .default xt fieldTy
   let mut minors := #[]
   for c in iinfo.ctors do
-    let some (.ctorInfo ci) := (← getEnv).find? c | unreachable!
-    let minor ← forallTelescopeReducing (← instantiateForall ci.type params) fun fs _ => do
+    let some ci := (← getEnv).find? c | unreachable!
+    let minor ← forallTelescopeReducing (← instantiateForall (ctorType ci) params) fun fs _ => do
       if c == ctor then mkLambdaFVars fs fs[idx]! else mkLambdaFVars fs dflt
     minors := minors.push minor
   let u ← getLevel fieldTy
-  -- NOTE: universe levels of the inductive are taken from the type of `x`
-  let lvls := xt.getAppFn.constLevels!
+  let casesOn ← getConstInfo (cinfo.induct ++ `casesOn)
+  if casesOn.levelParams.length != lvls.length + 1 then throwError "smt proof: no large elimination for {cinfo.induct}"
   return mkAppN (mkConst (cinfo.induct ++ `casesOn) (u :: lvls)) (params ++ #[motive, x] ++ minors)
 where
   mkDefault (t : Expr) : MetaM Expr := do
@@ -285,26 +327,51 @@ where
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"
-  let xt ← whnfR (← inferType x)
+  let xt ← whnfD (← inferType x)
+  if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: tester {ctor} applied to {xt}"
+  let lvls := xt.getAppFn.constLevels!
   let some (.inductInfo iinfo) := (← getEnv).find? cinfo.induct | throwError "smt proof: unknown inductive {cinfo.induct}"
   let params := xt.getAppArgs.extract 0 iinfo.numParams
   let motive := mkLambda `x .default xt (mkSort levelZero)
   let mut minors := #[]
   for c in iinfo.ctors do
-    let some (.ctorInfo ci) := (← getEnv).find? c | unreachable!
-    let minor ← forallTelescopeReducing (← instantiateForall ci.type params) fun fs _ =>
+    let some ci := (← getEnv).find? c | unreachable!
+    let minor ← forallTelescopeReducing (← instantiateForall (ci.instantiateTypeLevelParams lvls) params) fun fs _ =>
       mkLambdaFVars fs (if c == ctor then mkConst ``True else mkConst ``False)
     minors := minors.push minor
-  let lvls := xt.getAppFn.constLevels!
+  let casesOn ← getConstInfo (cinfo.induct ++ `casesOn)
+  if casesOn.levelParams.length != lvls.length + 1 then throwError "smt proof: no large elimination for {cinfo.induct}"
   return mkAppN (mkConst (cinfo.induct ++ `casesOn) (levelOne :: lvls)) (params ++ #[motive, x] ++ minors)
+
+/-- Interpret `e` as a proposition (a Lean `Bool` term `b` is interpreted as `b = true`). -/
+def asProp (e : Expr) : MetaM Expr := do
+  let t ← whnfR (← inferType e)
+  if isBoolType t then return mkBoolTrue e
+  return e
 
 mutual
 /-- Interpret the SMT term `t` as a Lean term. -/
 partial def interp (t : STerm) : InterpM Expr := do
+  let ctx ← read
+  -- NOTE: terms are memoized when no local variable is in scope (closed terms)
+  if let some ref := ctx.cache then
+    if ctx.locals.isEmpty then
+      let addr := termAddr t
+      if let some e := (← ref.get).get? addr then return e
+      let e ← interpCore t
+      if !e.hasMVar then ref.modify (·.insert addr e)
+      return e
+  interpCore t
+
+/-- Interpret the SMT formula `t` as a proposition. -/
+partial def interpProp (t : STerm) : InterpM Expr := do
+  asProp (← interp t)
+
+partial def interpCore (t : STerm) : InterpM Expr := do
   match t with
   | .num n => return mkIntLit n
   | .lit s => throwError "smt proof: unsupported literal {s}"
-  | .str s => return mkStrLit s
+  | .str s => return mkStrLit (decodeSmtString s)
   | .annot t _ => interp t
   | .sym s => interpApp s #[]
   | .app f args => interpApp f args
@@ -353,21 +420,21 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   match f, args.size with
   | "true", 0 => return mkConst ``True
   | "false", 0 => return mkConst ``False
-  | "not", 1 => return mkNot (← interp args[0]!)
-  | "and", _ => if args.isEmpty then return mkConst ``True else foldBinRight mkAnd (← args.mapM interp)
-  | "or", _ => if args.isEmpty then return mkConst ``False else foldBinRight mkOr (← args.mapM interp)
-  | "=>", _ => foldBinRight (fun a b => mkForall `h .default a b) (← args.mapM interp)
-  | "xor", 2 => return mkNot (← mkEq (← interp args[0]!) (← interp args[1]!))
+  | "not", 1 => return mkNot (← interpProp args[0]!)
+  | "and", _ => if args.isEmpty then return mkConst ``True else foldBinRight mkAnd (← args.mapM interpProp)
+  | "or", _ => if args.isEmpty then return mkConst ``False else foldBinRight mkOr (← args.mapM interpProp)
+  | "=>", _ => foldBinRight (fun a b => mkForall `h .default a b) (← args.mapM interpProp)
+  | "xor", 2 => return mkNot (← mkEq (← interpProp args[0]!) (← interpProp args[1]!))
   | "=", _ => chain mkEqSmt (← args.mapM interp)
   -- equisatisfiability (Z3): interpreted as an implication
-  | "~", 2 => return mkForall `h .default (← interp args[0]!) (← interp args[1]!)
+  | "~", 2 => return mkForall `h .default (← interpProp args[0]!) (← interpProp args[1]!)
   | "distinct", _ =>
       let es ← args.mapM interp
       let mut cs := #[]
       for i in [:es.size] do
         for j in [i+1:es.size] do cs := cs.push (mkNot (← mkEqSmt es[i]! es[j]!))
       if cs.isEmpty then return mkConst ``True else foldBinRight mkAnd cs
-  | "ite", 3 => mkClassicalIte (← interp args[0]!) (← interpInt? args[1]!) (← interpInt? args[2]!)
+  | "ite", 3 => mkClassicalIte (← interpProp args[0]!) (← interpInt? args[1]!) (← interpInt? args[2]!)
   | "+", _ => foldBin mkIntAdd (← args.mapM interpInt)
   | "-", 1 => return mkIntNeg (← interpInt args[0]!)
   | "-", _ => foldBin mkIntSub (← args.mapM interpInt)
@@ -392,7 +459,8 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
           return ← interpQuant .lambda params body
         if params.size != args.size then throwError "smt proof: wrong number of arguments for {f}"
         let vals ← args.mapM interp
-        let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) ctx.locals
+        -- NOTE: macro bodies only refer to their parameters
+        let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) {}
         withReader (fun c => { c with locals }) (interp body)
     | some .trueFun => return mkConst ``True
     | some (.ctor n) =>

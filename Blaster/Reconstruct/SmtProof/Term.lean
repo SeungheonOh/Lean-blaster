@@ -87,6 +87,9 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
   | .atom a =>
       if let some t := env.get? a then return t
       if let some n := a.toNat? then return .num n
+      -- negative numerals (printed as `-n` by cvc5)
+      if a.startsWith "-" && a.length > 1 then
+        if let some n := (a.drop 1).toNat? then return .app "-" #[.num n]
       if a.startsWith "#" || (a.any (· == '.') && (a.get 0).isDigit) then return .lit a
       return .sym a
   | .list xs =>

@@ -17,7 +17,7 @@ def proofRules : Std.HashSet String := Std.HashSet.ofList [
   "quant-intro", "bind", "distributivity", "and-elim", "not-or-elim", "rewrite", "rewrite*",
   "pull-quant", "pull-quant*", "push-quant", "elim-unused", "der", "quant-inst", "hypothesis",
   "lemma", "unit-resolution", "iff-true", "iff-false", "commutativity", "def-axiom",
-  "assumption-add", "lemma-add", "redundant-del", "clause-trail", "def-intro", "apply-def",
+  "assumption-add", "lemma-add", "redundant-del", "clause-trail", "def-intro", "intro-def", "apply-def",
   "iff~", "nnf-pos", "nnf-neg", "nnf*", "cnf*", "sk", "mp~", "th-lemma", "hyper-res",
   "proof-bind"]
 

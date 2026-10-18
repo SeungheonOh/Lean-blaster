@@ -42,7 +42,7 @@ def isZ3SpecificCommand (c : SExpr) : Bool :=
 def z3Backend (cmd : String) (timeoutSec : Nat) : Backend where
   name := "z3"
   cmd := cmd
-  args := #["-in", "-smt2", s!"-T:{timeoutSec}"]
+  args := #["-smt2", s!"-T:{timeoutSec}"]
   -- NOTE: `pp.simplify_implies` prints `(=> a (=> b c))` as `(=> (and a b) c)` by default
   preamble := #["(set-option :produce-proofs true)", "(set-option :pp.simplify_implies false)"]
   dropCommand := isZ3SpecificCommand
@@ -78,28 +78,31 @@ def cvc5Backend (cmd : String) (timeoutSec : Nat) : Backend where
   cmd := cmd
   args := #["--lang=smt2", "--parsing-mode=lenient", s!"--tlimit={timeoutSec * 1000}", "--proof-format-mode=alethe",
             "--proof-granularity=dsl-rewrite"]
-  preamble := #["(set-logic ALL)", "(set-option :produce-proofs true)"]
+  preamble := #["(set-option :produce-proofs true)", "(set-logic ALL)"]
   dropCommand := isZ3OnlyCommand
   parseProof := Alethe.parseProof
 
-/-- Run `backend` on the query `cmds`, returning the raw proof output. -/
+/-- Run `backend` on the query `cmds`, returning the raw proof output. The query is written to a
+    temporary file (no interaction with the solver's pipes during the run). -/
 def runBackend (backend : Backend) (cmds : Array SExpr) : IO (Except String String) := do
   let query := String.intercalate "\n" (backend.preamble.toList ++
     (cmds.filter (!backend.dropCommand ·)).toList.map toString ++ ["(check-sat)", "(get-proof)", "(exit)"])
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_DUMP" then IO.FS.writeFile f query
-  let child ← IO.Process.spawn { cmd := backend.cmd, args := backend.args, stdin := .piped, stdout := .piped, stderr := .piped }
-  let (stdin, child) ← child.takeStdin
-  stdin.putStr query
-  stdin.flush
-  let (_, child) := ((), child)
-  -- NOTE: closing stdin by dropping the handle
-  let out ← IO.asTask child.stdout.readToEnd
-  let err ← child.stderr.readToEnd
-  let _ ← child.wait
-  let out ← IO.ofExcept out.get
-  let out := out.trimLeft
-  if out.startsWith "unsat" then return .ok (out.drop 5)
-  return .error s!"{backend.name}: {out.take 200} {err.take 200}"
+  let (h, path) ← IO.FS.createTempFile
+  try
+    h.putStr query
+    h.flush
+    let out ← IO.Process.output { cmd := backend.cmd, args := backend.args.push path.toString }
+    -- the first line among `sat`, `unsat` and `unknown` (e.g., after warnings on unsupported options)
+    let lines := out.stdout.splitOn "\n"
+    match lines.findIdx? (fun l => ["sat", "unsat", "unknown"].contains l.trim) with
+    | some i =>
+        if lines[i]!.trim == "unsat" then
+          return .ok (String.intercalate "\n" (lines.drop (i + 1)))
+        return .error s!"{backend.name}: {lines[i]!.trim}"
+    | none => return .error s!"{backend.name}: {out.stdout.take 300} {out.stderr.take 300}"
+  finally
+    IO.FS.removeFile path
 
 /-! ## Interpretation of the query symbols -/
 
@@ -108,21 +111,26 @@ def symbolToName (s : String) : Name :=
   let s := if s.startsWith "|" && s.endsWith "|" then (s.drop 1 |>.dropRight 1) else s
   s.toName
 
-/-- Interpretation of Blaster's auxiliary functions. -/
+/-- Interpretation of Blaster's auxiliary recursive functions (as Lean functions on `Int`). -/
 def auxiliaryInterp (s : String) : MetaM (Option Expr) := do
-  let parse (str : String) : TermElabM Expr := do
-    let stx ← ofExcept (Parser.runParserCategory (← getEnv) `term str)
-    let e ← Term.elabTerm stx none
-    Term.synthesizeSyntheticMVarsNoPostponing
-    instantiateMVars e
-  let src? : Option String := match s with
-    | "@Nat.pow" => some "fun (x y : Int) => ((x.toNat ^ y.toNat : Nat) : Int)"
-    | "@Int.pow" => some "fun (x y : Int) => x ^ y.toNat"
-    | "@Nat.log2" => some "fun (x : Int) => ((Nat.log2 x.toNat : Nat) : Int)"
-    | _ => none
-  let some src := src? | return none
-  let ((e, _), _) ← (parse src).run {} |>.run {}
-  return some e
+  let int := Lean.mkConst ``Int
+  let toNat (x : Expr) := mkApp (Lean.mkConst ``Int.toNat) x
+  let ofNat (n : Expr) := mkApp3 (Lean.mkConst ``Nat.cast [levelZero]) int (Lean.mkConst ``instNatCastInt) n
+  match s with
+  | "@Nat.pow" =>
+      withLocalDeclD `x int fun x => withLocalDeclD `y int fun y => do
+        mkLambdaFVars #[x, y] (ofNat (← mkAppM ``HPow.hPow #[toNat x, toNat y]))
+  | "@Int.pow" =>
+      withLocalDeclD `x int fun x => withLocalDeclD `y int fun y => do
+        mkLambdaFVars #[x, y] (← mkAppM ``HPow.hPow #[x, toNat y])
+  | "@Nat.log2" =>
+      withLocalDeclD `x int fun x => do
+        mkLambdaFVars #[x] (ofNat (mkApp (Lean.mkConst ``Nat.log2) (toNat x)))
+  | _ => return none
+
+/-- Remove the bars of a quoted symbol. -/
+def unquote (s : String) : String :=
+  if s.startsWith "|" && s.endsWith "|" && s.length ≥ 2 then (s.drop 1).dropRight 1 else s
 
 /-- Build the interpretation of the symbols of the query `cmds`, given the translation environment
     and the map from SMT constants (`$k`) to Lean free variables. -/
@@ -167,9 +175,10 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
           tbl := { tbl with syms := tbl.syms.insert n .trueFun }
         else if let some e ← auxiliaryInterp n then
           tbl := { tbl with syms := tbl.syms.insert n (.expr e) }
-        else if n.endsWith "_LRec" then
+        else if (unquote n).endsWith "_LRec" then
           -- the definition of a recursive function: same interpretation as the function
-          if let some e := funs.get? (n.dropRight 5) then
+          let base := (unquote n).dropRight 5
+          if let some e := funs.get? base <|> funs.get? s!"|{base}|" then
             tbl := { tbl with syms := tbl.syms.insert n (.expr e) }
     | some "declare-datatype", some n =>
         tbl ← addDatatype tbl n xs[2]!
@@ -225,6 +234,13 @@ where
     (resp. `Classical.epsilon (fun x => φ)`). Only steps with a single bound variable are handled. -/
 partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
   let mut tbl := tbl
+  -- names introduced by `intro-def` (Z3's Tseitin names): `(= t k)` defines `k` as `t`
+  for step in proof.steps do
+    if step.rule != "intro-def" then continue
+    match step.concl.stripAnnot with
+    | .app "=" #[t, .sym k] | .app "=" #[.sym k, t] =>
+        if !tbl.syms.contains k then tbl := { tbl with syms := tbl.syms.insert k (.macro #[] t) }
+    | _ => pure ()
   for step in proof.steps do
     if step.rule != "sk" then continue
     let .app _ #[a, b] := step.concl.stripAnnot | continue
@@ -233,9 +249,9 @@ partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
       | .quant .exists vs φ => (vs, φ, false)
       | _ => (#[], .sym "true", false)
     let #[(x, sort)] := vars | continue
-    -- the skolem constant: a symbol of `b` named `x!n`
-    let some c := findSkolem (x ++ "!") b | continue
-    if tbl.syms.contains c then continue
+    -- the skolem constant: a symbol of `b` named `x!n`, not occurring in `a` and not yet interpreted
+    let some c := findSkolem (x ++ "!") b fun c => !tbl.syms.contains c && (findSkolem c a fun _ => true).isNone
+      | continue
     try
       let e ← (do
         let ty ← sortToType sort
@@ -249,13 +265,14 @@ partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
     catch _ => pure ()
   return tbl
 where
-  findSkolem (pre : String) (t : STerm) : Option String :=
+  findSkolem (pre : String) (t : STerm) (ok : String → Bool) : Option String :=
     match t with
-    | .sym s => if s.startsWith pre then some s else none
-    | .app f args => if f.startsWith pre && args.isEmpty then some f else args.findSome? (findSkolem pre)
-    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolem pre)
-    | .quant _ _ b => findSkolem pre b
-    | .annot t _ => findSkolem pre t
+    | .sym s => if s.startsWith pre && ok s then some s else none
+    | .app f args =>
+        if f.startsWith pre && args.isEmpty && ok f then some f else args.findSome? (findSkolem pre · ok)
+    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolem pre · ok)
+    | .quant _ _ b => findSkolem pre b ok
+    | .annot t _ => findSkolem pre t ok
     | _ => none
 
 /-! ## Bridge tactics -/
@@ -452,14 +469,16 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
-          if ← isDefEq c (mkNot body) then return some hneg
-          if ← isDefEq c (mkNot body') then return some hneg
+          if ← withReducible (isDefEq c (mkNot body)) then return some hneg
+          if ← withReducible (isDefEq c (mkNot body')) then return some hneg
           let r ← portfolio bridge c "bridge"
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
             logInfo m!"bridge failed: {c}"
           return r.map (·.1)
         proveStep := fun rule stmt => do portfolio (← stepTactics rule) stmt rule }
-      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl }, cfg }
+      let cache ← IO.mkRef {}
+      let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
+      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline }
       let (p?, st) ← ((do try return Except.ok (← replay sproof.root)
                             catch ex => return Except.error ex) |>.run ctx).run {}
       let p ← match p? with

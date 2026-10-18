@@ -54,10 +54,15 @@ def convertCommand (c : SExpr) : ConvM Unit := do
   match xs[0]?, xs[1]? with
   | some (SExpr.atom "assume"), some (SExpr.atom id) =>
       let some φ := xs[2]? | throw s!"ill-formed assume: {c}"
-      addStep id { rule := "assume", concl := ← STerm.ofSExpr {} φ }
+      -- assumptions of a subproof are local hypotheses (discharged by the closing step)
+      let rule := if (← get).anchors.isEmpty then "assume" else "hypothesis"
+      addStep id { rule, concl := ← STerm.ofSExpr {} φ }
   | some (SExpr.atom "step"), some (SExpr.atom id) =>
       let some cl := xs[2]? | throw s!"ill-formed step: {c}"
       let concl ← clauseToTerm cl
+      let clause? ← match cl.list? with
+        | some xs => some <$> (xs.extract 1 xs.size).mapM (fun e => do return (← STerm.ofSExpr {} e))
+        | none => pure none
       let attrs := xs.extract 3 xs.size
       let rule := (attr? attrs ":rule" >>= SExpr.atom?).getD "unknown"
       let premises ← match attr? attrs ":premises" with
@@ -69,7 +74,6 @@ def convertCommand (c : SExpr) : ConvM Unit := do
         | some (SExpr.list as) => as.filterMapM fun a => match a with
             -- `(:= x t)` arguments (e.g., of `forall_inst`): the term `t`
             | .list #[.atom ":=", _, t] => some <$> STerm.ofSExpr {} t
-            | .list #[.atom x, s] => pure (some (.app "_var" #[.sym x, .str (toString s)]))
             | a => some <$> STerm.ofSExpr {} a
         | _ => pure #[]
       let discharged ← match attr? attrs ":discharge" with
@@ -85,7 +89,7 @@ def convertCommand (c : SExpr) : ConvM Unit := do
           -- NOTE: the last step of the subproof is the premise of the closing step
           if premises.isEmpty && start < (← get).steps.size then
             premises := #[(← get).steps.size - 1]
-      addStep id { rule, premises, args, concl, discharged }
+      addStep id { rule, premises, args, concl, discharged, clause? }
   | some (SExpr.atom "anchor"), _ =>
       let some (SExpr.atom sid) := attr? xs ":step" | throw s!"ill-formed anchor: {c}"
       modify fun st => { st with anchors := st.anchors.push (sid, st.steps.size) }
