@@ -335,33 +335,61 @@ partial def iteEq? (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
   let conj := r.isAppOfArity ``And 2 && r.appFn!.appArg! == mkNot c
   if !disj && !conj then return none
   let e := r.appArg!
-  -- `c → a = k` (resp. `c → ¬a = k`): substitution of the equation of `c`, or the difference under `c`
-  let some ha ← withLocalDeclD `h c fun h => do
-      let goal ← if disj then mkEq a k else pure (mkNot (← mkEq a k))
-      let p? ← if disj then do
-          if let some p ← substProof? h a k then pure (some p) else diffEq prove budget a k (hyps.push h)
-        else do
-          -- e.g., `2 + x ≠ 3` under `0 = x`: `a` evaluated by substitution, then decided
-          let some (_, s, t) := (← inferType h).eq? | pure none
-          let (tm, lit, toLit) ← if isNumLit s then pure (t, s, ← mkEqSymm h) else pure (s, t, h)
-          let abst ← kabstract a tm
-          if !abst.hasLooseBVars then pure none else
-          let some d ← decideTrue? (mkNot (← mkEq (abst.instantiate1 lit) k)) | pure none
-          -- `a = a[lit/tm]` by congruence, then `¬ a[lit/tm] = k`
-          let pa ← mkCongrArg (mkLambda `z .default (← inferType tm) abst) toLit
-          withLocalDeclD `h' (← mkEq a k) fun h' => do
-            let p ← mkLambdaFVars #[h'] (mkApp d (← mkEqTrans (← mkEqSymm pa) h'))
-            return some (← mkExpectedTypeHint p goal)
-      match p? with
-      | some p => some <$> mkLambdaFVars #[h] p
-      | none => pure none
-    | return none
+  let some ha ← iteHead? prove budget hyps disj c a k | return none
   let some hb ← withLocalDeclD `h (mkNot c) fun h => do
       let some p ← diffEq prove budget (← mkEq b k) e (hyps.push h) | return none
       some <$> mkLambdaFVars #[h] p
     | return none
   let lem := if disj then ``ite_eq_or else ``ite_eq_and
   return some (mkAppN (mkConst lem [u]) #[α, c, a, b, k, e, ha, hb])
+
+/-- `c → a = k` (resp. `c → ¬a = k` when `!disj`): substitution of the equation of `c`, or the difference under
+    `c` (resp. `a` evaluated by substitution, then decided, e.g., `2 + x ≠ 3` under `0 = x`). -/
+partial def iteHead? (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (hyps : Array Expr)
+    (disj : Bool) (c a k : Expr) : TermElabM (Option Expr) :=
+  withLocalDeclD `h c fun h => do
+    let goal ← if disj then mkEq a k else pure (mkNot (← mkEq a k))
+    let p? ← if disj then do
+        if let some p ← substProof? h a k then pure (some p) else diffEq prove budget a k (hyps.push h)
+      else do
+        let some (_, s, t) := (← inferType h).eq? | pure none
+        let (tm, lit, toLit) ← if isNumLit s then pure (t, s, ← mkEqSymm h) else pure (s, t, h)
+        let abst ← kabstract a tm
+        if !abst.hasLooseBVars then pure none else
+        let some d ← decideTrue? (mkNot (← mkEq (abst.instantiate1 lit) k)) | pure none
+        -- `a = a[lit/tm]` by congruence, then `¬ a[lit/tm] = k`
+        let pa ← mkCongrArg (mkLambda `z .default (← inferType tm) abst) toLit
+        withLocalDeclD `h' (← mkEq a k) fun h' => do
+          let p ← mkLambdaFVars #[h'] (mkApp d (← mkEqTrans (← mkEqSymm pa) h'))
+          return some (← mkExpectedTypeHint p goal)
+    match p? with
+    | some p => some <$> mkLambdaFVars #[h] p
+    | none => pure none
+
+/-- A leaf `ite c a b = k` (or `k = ite c a b`) of a tree of `op` applications rewritten by Z3 into the leaves
+    `¬c`, `b = k` of a conjunction (resp. `c`, `b = k` of a disjunction) flattened with the tree, where `rs` are
+    the leaves of the rewritten tree: `(leaf = (¬c ∧ b = k), ¬c ∧ b = k)` (resp. with `c ∨ b = k`). -/
+partial def expandIteEq? (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (hyps : Array Expr)
+    (op : Name) (rs : Array Expr) (leaf : Expr) : TermElabM (Option (Expr × Expr)) := do
+  let some (α, x, y) := leaf.eq? | return none
+  let isIte (e : Expr) := e.isAppOfArity ``ite 5 && (e.getArg! 2).isAppOfArity ``Classical.propDecidable 1
+  let u ← getLevel α
+  let (i, k, sym?) ← if isIte x then pure (x, y, none)
+    else if isIte y then pure (y, x, some (mkApp3 (mkConst ``eq_comm_eq [u]) α x y))
+    else return none
+  let args := i.getAppArgs
+  let (c, a, b) := (args[1]!, args[3]!, args[4]!)
+  let disj := op == ``Or
+  if !(if disj then rs.contains c else rs.contains (mkNot c)) then return none
+  let some ha ← iteHead? prove budget hyps disj c a k | return none
+  let bk ← mkEq b k
+  let tree := if disj then mkOr c bk else mkAnd (mkNot c) bk
+  let hb ← withLocalDeclD `h (mkNot c) fun h => do mkLambdaFVars #[h] (← mkEqRefl bk)
+  let p := mkAppN (mkConst (if disj then ``ite_eq_or else ``ite_eq_and) [u]) #[α, c, a, b, k, bk, ha, hb]
+  let p ← match sym? with
+    | some s => mkEqTrans s p
+    | none => pure p
+  return some (p, tree)
 
 /-- `l = r` for trees of `op` applications of different shapes: the leaves of `l` (except the unit
     element, and the duplicates) are paired with the leaves of `r` in order and proved equal (`diffEq`),
@@ -372,6 +400,18 @@ partial def acEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat
   let dedup (xs : Array Expr) : Array Expr := xs.foldl (fun acc x => if acc.contains x then acc else acc.push x) #[]
   let ls := dedup ((opLeaves op l).filter (!·.isConstOf unit))
   let rs := (opLeaves op r).filter (!·.isConstOf unit)
+  if ls.size < rs.size then
+    -- leaves of `l` rewritten by Z3 into several leaves (see `expandIteEq?`)
+    let mut proofs : Std.HashMap Expr Expr := {}
+    let mut trees : Std.HashMap Expr Expr := {}
+    for x in ls do
+      if let some (p, t) ← expandIteEq? prove budget hyps op rs x then
+        proofs := proofs.insert x p
+        trees := trees.insert x t
+    if proofs.isEmpty then return none
+    let l' := mapOpLeaves op (fun x => trees.getD x x) l
+    let some p ← acEq prove budget op l' r hyps | return none
+    return some (← mkEqTrans (← congrLeaves op proofs l) p)
   if ls.size != rs.size || ls.isEmpty then return none
   -- leaves of `l` rewritten into the leaves of `r`
   let mut m : Std.HashMap Expr Expr := {}
