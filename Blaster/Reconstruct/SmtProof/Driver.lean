@@ -520,7 +520,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         | .error ex =>
             -- report the first steps that could not be replayed (i.e., the deepest failures)
             let fs := st.stats.failures.extract 0 3
-            throwError "{ex.toMessageData}; first failures: {fs}"
+            let ms := (st.stats.msByRule.toArray.qsort (·.2 > ·.2)).extract 0 6
+            let methods := st.stats.byRule.toList.map fun (r, m) => (r, m.toList)
+            throwError "{ex.toMessageData}; first failures: {fs}; time per rule: {ms}; methods: {methods}"
       let pt ← inferType p
       if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
       -- NOTE: the proofs of the steps are instantiated once (see `replay`)

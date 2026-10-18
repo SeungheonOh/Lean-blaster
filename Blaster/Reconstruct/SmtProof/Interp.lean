@@ -318,7 +318,7 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
   return mkAppN (mkConst (cinfo.induct ++ `casesOn) (u :: lvls)) (params ++ #[motive, x] ++ minors)
 where
   mkDefault (t : Expr) : MetaM Expr := do
-    if let some v ← inhabitant? t 3 then return v
+    if let some v ← inhabitant? t 8 then return v
     throwError "smt proof: no inhabitant found for {t}"
   /-- An inhabitant of `t`: from an instance, or a constructor application with inhabited fields. -/
   inhabitant? (t : Expr) (depth : Nat) : MetaM (Option Expr) := do
@@ -410,6 +410,10 @@ partial def interpCore (t : STerm) : InterpM Expr := do
       coerce e ety ty
   | .iapp f idx args =>
       -- testers: `((_ is C) x)` and `((_ is-C C is-C) x)` (Z3)
+      -- character literals `(_ Char n)`
+      if f == "Char" && args.isEmpty then
+        let some (STerm.num n) := idx[0]? | throwError "smt proof: ill-formed character {t}"
+        return mkApp (mkConst ``Char.ofNat) (mkRawNatLit n)
       if f == "is" || f.startsWith "is-" then
         let ctorSym := if f == "is" then (match idx[0]? with | some (STerm.sym c) => c | _ => "") else f.drop 3
         let some x := args[0]? | throwError "smt proof: tester without argument"
@@ -473,8 +477,11 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   | "<", _ => chain (fun a b => pure (mkIntLt a b)) (← args.mapM interpInt)
   | ">=", _ => chain (fun a b => pure (mkIntLe b a)) (← args.mapM interpInt)
   | ">", _ => chain (fun a b => pure (mkIntLt b a)) (← args.mapM interpInt)
-  | "str.++", _ => foldBin (fun a b => mkApp2 (mkConst ``String.append) a b) (← args.mapM interp)
-  | "str.len", 1 => return mkIntOfNat (mkApp (mkConst ``String.length) (← interp args[0]!))
+  | "str.++", _ | "seq.++", _ => foldBin (fun a b => mkApp2 (mkConst ``String.append) a b) (← args.mapM interp)
+  | "str.len", 1 | "seq.len", 1 => return mkIntOfNat (mkApp (mkConst ``String.length) (← interp args[0]!))
+  -- strings as sequences of characters (Z3 proofs): `(seq.unit (_ Char n))`
+  | "seq.unit", 1 => return mkApp (mkConst ``String.singleton) (← interp args[0]!)
+  | "seq.empty", 0 => return mkStrLit ""
   | _, _ =>
     match ctx.table.syms.get? f with
     | some (.expr e) =>
