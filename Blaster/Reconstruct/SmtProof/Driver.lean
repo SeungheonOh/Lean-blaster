@@ -430,9 +430,27 @@ syntax (name := blasterUnfoldLhs) "blaster_unfold_lhs" : tactic
 @[tactic blasterUnfoldLhs] def evalBlasterUnfoldLhs : Tactic := fun _ => withMainContext do
   let some (_, lhs, _) := (← whnfR (← instantiateMVars (← getMainTarget))).eq?
     | throwError "blaster_unfold_lhs: equality expected"
+  -- NOTE: through the casts of the interpretation (e.g., `↑(f x)` for a function `f` returning `Nat`)
+  let lhs := if lhs.isAppOfArity ``Nat.cast 3 then lhs.appArg! else lhs
   let .const f _ := lhs.getAppFn | throwError "blaster_unfold_lhs: application of a constant expected"
   if !isUserDefinition (← getEnv) f then throwError "blaster_unfold_lhs: {f} is not a user definition"
   evalTactic (← `(tactic| rw [$(mkIdent f):ident]))
+
+syntax (name := blasterUnfoldNonRec) "blaster_unfold_nonrec" : tactic
+
+/-- Unfold the non-recursive user definitions occurring in the main goal and its hypotheses (e.g., the
+    functions called by a recursive function whose definitional axiom is proved). -/
+@[tactic blasterUnfoldNonRec] def evalBlasterUnfoldNonRec : Tactic := fun _ => withMainContext do
+  let env ← getEnv
+  let mut t ← instantiateMVars (← getMainTarget)
+  for d in ← getLCtx do
+    if !d.isImplementationDetail then t := mkApp t (← instantiateMVars d.type)
+  let mut defs := #[]
+  for n in t.getUsedConstants do
+    if isUserDefinition env n && !(← isInstance n) && !(← isRecursiveDefinition n) then defs := defs.push n
+  if defs.isEmpty then throwError "blaster_unfold_nonrec: no definition to unfold"
+  let lemmas ← defs.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+  evalTactic (← `(tactic| simp only [$lemmas,*] at *))
 
 /-- Tactics proving the interpretation of asserted formulas (and conclusions of steps that can't be
     replayed) from the negated goal and the definitions of user functions. -/
@@ -461,6 +479,12 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("grind", ← `(tactic| (intros; grind))),
     -- definitional axioms of recursive functions (e.g., by well-founded recursion): one unfolding
     ("unfold lhs", ← `(tactic| (intros; blaster_unfold_lhs <;> first | rfl | grind | ((repeat' split) <;> omega)))),
+    ("nat unfold lhs", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;> blaster_unfold_lhs <;>
+                                   first | rfl | grind | ((repeat' split) <;> (try simp_all) <;> first | done | omega | grind)))),
+    -- definitional axioms by case analysis on datatype arguments (with the non-recursive callees unfolded)
+    ("nat cases unfold lhs", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
+                                   (try blaster_cases_vars) <;> blaster_unfold_lhs <;> (try blaster_unfold_nonrec) <;>
+                                   (try simp_all) <;> (try split) <;> first | done | omega | grind))),
     ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;>
                             (try split) <;> (try split) <;> first | done | omega | grind))),
     ("cases", ← `(tactic| (intros; blaster_cases_vars <;> blaster_unfold_user <;>
@@ -498,6 +522,12 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
                               (try blaster_unfold_user) <;> grind))),
     -- definitional axioms of recursive functions (e.g., by well-founded recursion): one unfolding
     ("unfold lhs", ← `(tactic| (intros; blaster_unfold_lhs <;> first | rfl | grind | ((repeat' split) <;> omega)))),
+    ("nat unfold lhs", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;> blaster_unfold_lhs <;>
+                                   first | rfl | grind | ((repeat' split) <;> (try simp_all) <;> first | done | omega | grind)))),
+    -- definitional axioms by case analysis on datatype arguments (with the non-recursive callees unfolded)
+    ("nat cases unfold lhs", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
+                                   (try blaster_cases_vars) <;> blaster_unfold_lhs <;> (try blaster_unfold_nonrec) <;>
+                                   (try simp_all) <;> (try split) <;> first | done | omega | grind))),
     ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;> grind)))]
   match rule with
   | "th-lemma" => return arith ++ simp ++ grind ++ unfold
