@@ -1,6 +1,7 @@
 import Lean
 import Blaster.Optimize.Decidable
 import Blaster.Reconstruct.SmtProof.Interp
+import Blaster.Reconstruct.Discharge
 
 /-!
 # Bridge between goals and the interpretation of their translation
@@ -45,6 +46,20 @@ theorem ite_congr' {α : Sort u} {c c' : Prop} [h : Decidable c] {x x' y y' : α
     (hc : c = c') (hx : x = x') (hy : y = y') :
     @ite α c h x y = @ite α c' (Classical.propDecidable c') x' y' := by
   subst hc hx hy; by_cases hc : c <;> simp [hc]
+
+theorem ite_congr_dep {α : Sort u} {c c' : Prop} [h : Decidable c] {x x' y y' : α}
+    (hc : c = c') (hx : c → x = x') (hy : ¬ c → y = y') :
+    @ite α c h x y = @ite α c' (Classical.propDecidable c') x' y' := by
+  subst hc; by_cases hc : c
+  · rw [if_pos hc, if_pos hc]; exact hx hc
+  · rw [if_neg hc, if_neg hc]; exact hy hc
+
+theorem nat_sub_bridge {x y : Nat} {x' y' : Int} (h : y ≤ x) (hx : (x : Int) = x') (hy : (y : Int) = y') :
+    ((x - y : Nat) : Int) = x' - y' := by
+  subst hx hy; omega
+
+theorem toNat_bridge {x x' : Int} (h : 0 ≤ x) (hx : x = x') : ((Int.toNat x : Nat) : Int) = x' := by
+  subst hx; omega
 
 theorem dite'_ite {α : Sort u} (c : Prop) (x y : α) :
     Blaster.dite' c (fun _ => x) (fun _ => y) = @ite α c (Classical.propDecidable c) x y := by
@@ -204,6 +219,48 @@ def isLiteral (e : Expr) : Bool :=
   ((e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1) && natLit e.appArg!) ||
   (e.isAppOfArity ``OfNat.ofNat 3 && (e.getArg! 1).isRawNatLit)
 
+/-- `N + q` patterns on `Nat` (Blaster's `Nat.add N q`, `q + N`, `Nat.succ q`): `(N, q)`. -/
+partial def natOffset? (p : Expr) : Option (Nat × Expr) :=
+  let lit? (e : Expr) : Option Nat :=
+    match e with
+    | .lit (.natVal n) => some n
+    | _ => if e.isAppOfArity ``OfNat.ofNat 3 then (match e.getArg! 1 with | .lit (.natVal n) => some n | _ => none) else none
+  let rec go (p : Expr) (acc : Nat) : Option (Nat × Expr) :=
+    if p.isAppOfArity ``Nat.succ 1 then go p.appArg! (acc + 1)
+    else if p.isAppOfArity ``Nat.add 2 then
+      match lit? (p.getArg! 0) with
+      | some n => go (p.getArg! 1) (acc + n)
+      | none => (match lit? (p.getArg! 1) with
+          | some n => go (p.getArg! 0) (acc + n)
+          | none => if acc == 0 then none else some (acc, p))
+    else if p.isAppOfArity ``HAdd.hAdd 6 then
+      match lit? (p.getArg! 5) with
+      | some n => go (p.getArg! 4) (acc + n)
+      | none => if acc == 0 then none else some (acc, p)
+    else if acc == 0 then none else some (acc, p)
+  go p 0
+
+def mkNatLe (a b : Expr) : Expr := mkApp4 (mkConst ``LE.le [levelZero]) (mkConst ``Nat) (mkConst ``instLENat) a b
+
+/-- Conditions and values of the `Nat`/`Int` patterns with variables (see `mkCond` and `mkLet` in
+    `Blaster.Smt.Translate.Match`): `N + n` (`N ≤ x`, `n := x - N`), `Int.ofNat n` (`0 ≤ x`, `n := x.toNat`),
+    `Int.ofNat (N + n)` (`N ≤ x`, `n := (x - N).toNat`), `Int.negSucc n` (`x ≤ -1`, `n := (-x - 1).toNat`).
+    Returns the condition and the pattern of the variable with its value. -/
+def numPattern? (x p : Expr) : Option (Expr × Expr × Expr) := Id.run do
+  let natLit (n : Nat) : Expr := mkRawNatLit n
+  if let some (n, q) := natOffset? p then
+    return some (mkNatLe (natLit n) x, q,
+      mkApp6 (mkConst ``HSub.hSub [levelZero, levelZero, levelZero]) (mkConst ``Nat) (mkConst ``Nat) (mkConst ``Nat)
+        (mkApp2 (mkConst ``instHSub [levelZero]) (mkConst ``Nat) (mkConst ``instSubNat)) x (natLit n))
+  if p.isAppOfArity ``Int.ofNat 1 then
+    let q := p.appArg!
+    if let some (n, q') := natOffset? q then
+      return some (mkIntLe (mkIntLit n) x, q', mkApp (mkConst ``Int.toNat) (mkIntSub x (mkIntLit n)))
+    return some (mkIntLe (mkIntLit 0) x, q, mkApp (mkConst ``Int.toNat) x)
+  if p.isAppOfArity ``Int.negSucc 1 then
+    return some (mkIntLe x (mkIntNeg (mkIntLit 1)), p.appArg!, mkApp (mkConst ``Int.toNat) (mkIntSub (mkIntNeg x) (mkIntLit 1)))
+  return none
+
 /-- Conditions of pattern `p` on the discriminant `x` (see `mkCond` in `Blaster.Smt.Translate.Match`).
     Returns `none` for unsupported patterns. -/
 partial def patCond (x p : Expr) (acc : Array Expr) : MetaM (Option (Array Expr)) := do
@@ -211,6 +268,10 @@ partial def patCond (x p : Expr) (acc : Array Expr) : MetaM (Option (Array Expr)
   -- literals
   if isLiteral p then return some (acc.push (← mkEq p x))
   if p.isFVar then return some acc
+  if let some (c, q, _) := numPattern? x p then
+    -- NOTE: the variable of the pattern has no condition
+    if q.isFVar then return some (acc.push c)
+    return none
   let .const c _ := p.getAppFn | return none
   let some (.ctorInfo info) := (← getEnv).find? c | return none
   let args := p.getAppArgs
@@ -237,6 +298,9 @@ partial def patVals (x p : Expr) (acc : Std.HashMap FVarId Expr) : MetaM (Option
     return ← patVals x args[2]! (acc.insert n x)
   if let .fvar v := p then return some (acc.insert v x)
   if isLiteral p then return some acc
+  if let some (_, q, v) := numPattern? x p then
+    if let .fvar n := q then return some (acc.insert n v)
+    return none
   let .const c _ := p.getAppFn | return none
   let some (.ctorInfo info) := (← getEnv).find? c | return none
   if info.induct == ``Nat || info.induct == ``Int then return none
@@ -355,7 +419,7 @@ def stuckMajor? (e : Expr) : MetaM (Option FVarId) := do
       return some f
   | _ => return none
 
-partial def evalCond (c : Expr) : MetaM CondVal := do
+partial def evalCond (c : Expr) : Term.TermElabM CondVal := do
   let c := c.consumeMData
   if c.isAppOfArity ``And 2 then
     let a := c.appFn!.appArg!
@@ -398,6 +462,11 @@ partial def evalCond (c : Expr) : MetaM CondVal := do
       return .splitProp (← mkEq v lit)
     return .unknown
   if let some x ← stuckMajor? c' then return .splitFVar x
+  -- arithmetic conditions (e.g., of `n + 1` patterns): decided by `omega` in the context of the case analysis
+  let arith := c'.isAppOfArity ``LE.le 4 || c'.isAppOfArity ``LT.lt 4
+  if arith then
+    if let some p ← Blaster.Reconstruct.proveWithTactic c (← `(tactic| omega)) then return .isTrue p
+    if let some p ← Blaster.Reconstruct.proveWithTactic (mkNot c) (← `(tactic| omega)) then return .isFalse p
   dbg m!"bridge: unknown atom {c'}"
   return .unknown
 
@@ -431,7 +500,7 @@ def closeByOverlap (g : MVarId) (base : Nat) : MetaM Bool := g.withContext do
 
 /-- Prove `lhs = rhs`, where `rhs` is an `ite` chain over conditions decided by case analysis, by
     evaluating the conditions (with case analyses on the variables and literal equalities blocking them). -/
-partial def solveIte (g : MVarId) (fuel : Nat) (base : Nat) : MetaM Bool := g.withContext do
+partial def solveIte (g : MVarId) (fuel : Nat) (base : Nat) : Term.TermElabM Bool := g.withContext do
   if fuel == 0 then return false
   if ← closeByOverlap g base then return true
   let tgt ← instantiateMVars (← g.getType)
@@ -470,7 +539,7 @@ partial def solveIte (g : MVarId) (fuel : Nat) (base : Nat) : MetaM Bool := g.wi
       return false
 
 /-- Prove a matcher equation `∀ xs alts, M params motive xs alts = ite ...` (see `iteOf`). -/
-def proveMatchIte (stmt : Expr) (fuel := 256) : MetaM (Option Expr) := do
+def proveMatchIte (stmt : Expr) (fuel := 256) : Term.TermElabM (Option Expr) := do
   let m ← mkFreshExprMVar stmt
   let base := (← getLCtx).decls.size
   let s ← saveState
@@ -502,6 +571,9 @@ structure Cfg where
   macroOf : Name → Option (Array Expr → MetaM Expr) := fun _ => none
   /-- prover of the auxiliary lemmas relating functions and their macros -/
   proveLemma : Expr → Term.TermElabM (Option Expr) := fun _ => pure none
+  /-- hypotheses of the current branch (free variables), e.g., the conditions of the `ite` encoding of a
+      `match` on `Nat`/`Int` patterns -/
+  facts : Array Expr := #[]
 
 structure State where
   cache : Std.HashMap (Expr × Expr) (Option Expr) := {}
@@ -658,8 +730,18 @@ partial def walk (a b : Expr) : BridgeM (Option Expr) := do
     return some (← mkExpectedTypeHint p (← mkEq (← inferType p >>= fun t => pure (t.getArg! 1)) b))
   let r ← try walkCore a b catch _ => pure none
   if r.isNone then modify fun s => { s with failures := s.failures.push (a, b) }
-  modify fun s => { s with cache := s.cache.insert (a, b) r }
+  -- NOTE: proofs using the hypotheses of a branch are not cached (they are only valid in the branch)
+  let facts := (← read).facts
+  let local? := match r with
+    | some p => !facts.isEmpty && p.hasAnyFVar (fun f => facts.any (·.fvarId! == f))
+    | none => !facts.isEmpty
+  if !local? then modify fun s => { s with cache := s.cache.insert (a, b) r }
   return r
+
+/-- Proof of the proposition `p` from the hypotheses of the branch (`omega`). -/
+partial def byFacts (p : Expr) : BridgeM (Option Expr) := do
+  if (← read).facts.isEmpty then return none
+  Blaster.Reconstruct.proveWithTactic p (← `(tactic| omega))
 
 partial def walkCore (a b : Expr) : BridgeM (Option Expr) := do
   let ta ← inferType a
@@ -685,8 +767,15 @@ partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
   let some (α, c, inst, x, y, pa) ← iteView? a | return none
   let some (c', x', y', _) := classicalIte? b | return none
   let some pc ← walk c c' | return none
-  let some px ← walk x x' | return none
-  let some py ← walk y y' | return none
+  -- the branches are related under the condition (resp. its negation)
+  let some px ← withLocalDeclD `hc c fun h => withReader (fun cfg => { cfg with facts := cfg.facts.push h }) do
+      let some p ← walk x x' | return none
+      some <$> mkLambdaFVars #[h] p
+    | return none
+  let some py ← withLocalDeclD `hc (mkNot c) fun h => withReader (fun cfg => { cfg with facts := cfg.facts.push h }) do
+      let some p ← walk y y' | return none
+      some <$> mkLambdaFVars #[h] p
+    | return none
   -- `W(a) = W(ite c x y) = ite c W(x) W(y)`
   let pLift ← match w with
     | .same => mkEqRefl a
@@ -701,7 +790,7 @@ partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
     | .nat => (mkConst ``Int, natCast x, natCast y)
     | .bool => (mkSort levelZero, boolTrue x, boolTrue y)
   let u ← getLevel α'
-  let pIte := mkAppN (mkConst ``ite_congr' [u]) #[α', c, c', inst, x₀, x', y₀, y', pc, px, py]
+  let pIte := mkAppN (mkConst ``ite_congr_dep [u]) #[α', c, c', inst, x₀, x', y₀, y', pc, px, py]
   match w with
   | .same => return some (← mkEqTrans pa pIte)
   | _ => return some (← mkEqTrans pLift pIte)
@@ -952,6 +1041,20 @@ partial def walkNat (a b : Expr) : BridgeM (Option Expr) := do
     if let some p ← binop ``nat_add then return some p
   if (a.isAppOfArity ``Nat.mul 2 || a.isAppOfArity ``HMul.hMul 6) && b.isAppOfArity ``HMul.hMul 6 then
     if let some p ← binop ``nat_mul then return some p
+  -- subtraction (resp. `Int.toNat`) under the hypotheses of the branch (e.g., the variables of `n + 1` patterns)
+  if (a.isAppOfArity ``Nat.sub 2 || a.isAppOfArity ``HSub.hSub 6) && b.isAppOfArity ``HSub.hSub 6 then
+    let aa := a.getAppArgs
+    let (x, y) := (aa[aa.size - 2]!, aa[aa.size - 1]!)
+    if let some h ← byFacts (← mkAppM ``LE.le #[y, x]) then
+      let ba := b.getAppArgs
+      let some px ← walk x ba[4]! | return none
+      let some py ← walk y ba[5]! | return none
+      return some (← mkExpectedTypeHint (mkAppN (mkConst ``nat_sub_bridge) #[x, y, ba[4]!, ba[5]!, h, px, py]) (← mkEq la b))
+  if a.isAppOfArity ``Int.toNat 1 && !(← read).facts.isEmpty then
+    let x := a.appArg!
+    if let some h ← byFacts (← mkAppM ``LE.le #[mkIntLit 0, x]) then
+      if let some px ← walk x b then
+        return some (← mkExpectedTypeHint (mkApp4 (mkConst ``toNat_bridge) x b h px) (← mkEq la b))
   if let some p ← walkMacro .nat a b then return some p
   byDefEq la b
 
