@@ -316,9 +316,10 @@ def instantiateEq (stmt pf t : Expr) : MetaM (Option (Expr × Expr)) := do
   let some (_, l, r) := body.eq? | return none
   if !(← withReducible (isDefEq l t)) then return none
   let r ← instantiateMVars r
-  let p ← instantiateMVars (mkAppN pf ms)
-  if r.hasExprMVar || p.hasExprMVar then return none
-  return some (r, p)
+  -- NOTE: the proof of the equation (an assigned metavariable) is not instantiated
+  let as ← ms.mapM instantiateMVars
+  if r.hasExprMVar || as.any (·.hasExprMVar) then return none
+  return some (r, mkAppN pf as)
 
 /-- Facts (propositions with their proofs), with the consequences of conjunctions, negated disjunctions and
     double negations. -/
@@ -492,7 +493,11 @@ def proveLemma (ctx : Ctx) (concl : Expr) (n : Nat) : TermElabM (Option Expr) :=
   if lits.size ≥ 1 then
     for j in (List.range lits.size).reverse do
       if let some p ← proveByLit ctx lits concl j then return some p
-  if lits.size ≥ 2 then
+  -- disjunctions of case predicates (no equality between data)
+  let isDataEq (l : Expr) : TermElabM Bool := do
+    let some (ty, _, _) := l.eq? | return false
+    return !ty.isProp
+  if lits.size ≥ 2 && !(← lits.anyM isDataEq) then
     let atoms := guardAtoms lits
     if atoms.size ≤ 16 then
       return ← splitProve #[] concl atoms.toList (← IO.mkRef 512)
