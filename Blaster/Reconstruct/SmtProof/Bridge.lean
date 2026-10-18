@@ -287,7 +287,7 @@ def numPattern? (x p : Expr) : Option (Expr × Expr × Expr) := Id.run do
 partial def patCond (x p : Expr) (acc : Array Expr) : MetaM (Option (Array Expr)) := do
   let p := removeNamed p
   -- NOTE: the named patterns below the root are removed (see `removeNamedPatternExpr`)
-  let p := p.replace fun e => if e.isAppOfArity ``namedPattern 4 then some (removeNamed e) else none
+  let p := stripNamed p
   -- literals
   if isLiteral p then return some (acc.push (← mkEq p x))
   if p.isFVar then return some acc
@@ -311,6 +311,8 @@ partial def patCond (x p : Expr) (acc : Array Expr) : MetaM (Option (Array Expr)
 where
   removeNamed (p : Expr) : Expr :=
     if p.isAppOfArity ``namedPattern 4 then removeNamed p.getAppArgs[2]! else p
+  stripNamed (p : Expr) : Expr :=
+    p.replace fun e => if e.isAppOfArity ``namedPattern 4 then some (stripNamed e.getAppArgs[2]!) else none
 
 /-- Values of the variables of pattern `p` matched against `x` (see `mkLet` in
     `Blaster.Smt.Translate.Match`), as a substitution of the variables. -/

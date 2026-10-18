@@ -78,6 +78,9 @@ def finishProof
   (fallback : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) : TermElabM ReconOutcome := do
   let finish (o : ReconOutcome) : TermElabM ReconOutcome := do
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
+  -- NOTE: deeply nested subproofs are shared through `let` declarations such that the depth of the
+  -- proof term checked by the kernel (and traversed when discharging proof obligations) is bounded.
+  let proof ← shareDeepProofs proof
   let (proof, stats) ← dischargeHoles proof holes equivs fallback
   let out := { out with stats }
   if !stats.failures.isEmpty || hasHoles proof then
@@ -99,7 +102,7 @@ def reconstructRewrite (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermE
   let goal ← mkEq e optExpr
   let proof ← match pf with
     | .defeq => mkEqRefl e
-    | .proof p => pure p
+    | .proof p => alignEnds e optExpr p
     | _ => mkTopHole e optExpr
   finishProof out goal proof startTime recon.holes recon.recFunEquivs
 
@@ -117,7 +120,7 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   -- Evidence for `fullGoal = optExpr`
   let optPf? ← match task.optPf with
     | .defeq => pure none
-    | .proof p => pure (some p)
+    | .proof p => some <$> alignEnds task.fullGoal task.optExpr p
     | _ => some <$> mkTopHole task.fullGoal task.optExpr
   -- Proof of the residual goal
   let (residual, residualMethod) ← match task.optExpr with

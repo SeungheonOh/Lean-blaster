@@ -94,6 +94,350 @@ def EqPf.close (pf : EqPf) (lhs rhs : Expr) (kind := HoleKind.frame) (label := "
       mkHole lhs rhs kind label
   | _ => return pf
 
+/-! ## Balanced transitivity chains
+
+The evidence of a long sequence of rewrites (e.g., the evaluation of a recursive function on concrete
+arguments, which may involve tens of thousands of steps) is a chain of `Eq.trans` applications.
+Built naively, i.e., `Eq.trans p₁ (Eq.trans p₂ (... pₙ))`, the depth of such a proof term is linear
+in the number of steps, which overflows the stack of the kernel type checker and of the recursive
+traversals performed on proof terms (e.g., `instantiate`, `abstract` or `Expr.replace`, which are not
+protected against stack overflows).
+
+Transitivity chains are instead kept as height-balanced (AVL) trees of `Eq.trans` nodes, whose height
+is logarithmic in the number of steps. Each node is annotated with its height (see `chainKey`),
+the leaves being the individual rewrite steps (i.e., any other equality proof). Two chains are
+concatenated via the standard AVL join, whose cost is proportional to the difference of their heights.
+Since `Eq.trans` is associative up to the grouping of the steps, the proof only differs by the order in
+which the kernel checks the steps, i.e., the end points of each step are unchanged.
+-/
+
+/-- Key used to tag a node of a balanced transitivity chain, i.e.,
+    `mdata {blaster.chain := height} (Eq.trans α a b c p q)`.
+-/
+def chainKey : Name := `blaster.chain
+
+/-- Return the height of the balanced transitivity chain `e` (`0` for a leaf, i.e., a single step). -/
+def chainHeight (e : Expr) : Nat :=
+  match e with
+  | .mdata d _ => match d.find chainKey with
+                  | some (.ofNat h) => h
+                  | _ => 0
+  | _ => 0
+
+/-- Return the components `(u, α, a, b, c, p, q)` of a chain node `mdata _ (Eq.trans.{u} α a b c p q)`. -/
+def chainNode? (e : Expr) : Option (Level × Expr × Expr × Expr × Expr × Expr × Expr) :=
+  if chainHeight e == 0 then none else
+  match e with
+  | .mdata _ (.app (.app (.app (.app (.app (.app (.const ``Eq.trans [u]) α) a) b) c) p) q) =>
+      some (u, α, a, b, c, p, q)
+  | _ => none
+
+/-- Return `(u, α, a, b)` such that `p : @Eq.{u} α a b`. -/
+def eqProofEnds (p : Expr) : MetaM (Level × Expr × Expr × Expr) := do
+  if let some (u, α, a, _, c, _, _) := chainNode? p then return (u, α, a, c)
+  let t ← whnfD (← inferType p)
+  let some (α, a, b) := t.eq? | throwError "eqProofEnds: equality proof expected{indentExpr p}"
+  let u ← match t.getAppFn with
+          | .const _ [u] => pure u
+          | _ => getLevel α
+  return (u, α, a, b)
+
+/-- Return the chain node `Eq.trans l r` (see `chainKey`). -/
+def mkChainNode (l r : Expr) : MetaM Expr := do
+  let (u, α, a, b) ← eqProofEnds l
+  let (_, _, _, c) ← eqProofEnds r
+  let h := max (chainHeight l) (chainHeight r) + 1
+  return mkMData (KVMap.empty.insert chainKey (.ofNat h)) (mkApp6 (mkConst ``Eq.trans [u]) α a b c l r)
+
+/-- Return the children of chain node `e`. -/
+@[inline] private def chainChildren (e : Expr) : Option (Expr × Expr) :=
+  (chainNode? e).map fun (_, _, _, _, _, p, q) => (p, q)
+
+/-- Concatenation of the balanced transitivity chains `l : a = b` and `r : b = c` (AVL join), i.e.,
+    the resulting chain has the steps of `l` followed by the steps of `r`, and its height is at most
+    `max (chainHeight l) (chainHeight r) + 1`.
+-/
+partial def joinChains (l r : Expr) : MetaM Expr := do
+  let hl := chainHeight l
+  let hr := chainHeight r
+  if hl > hr + 1 then
+    let some (ll, lr) := chainChildren l | mkChainNode l r
+    let t ← joinChains lr r
+    if chainHeight t ≤ chainHeight ll + 1 then return ← mkChainNode ll t
+    let some (tl, tr) := chainChildren t | mkChainNode ll t
+    if chainHeight tl ≤ chainHeight tr then
+      -- single rotation
+      mkChainNode (← mkChainNode ll tl) tr
+    else
+      -- double rotation
+      let some (x, y) := chainChildren tl | mkChainNode ll t
+      mkChainNode (← mkChainNode ll x) (← mkChainNode y tr)
+  else if hr > hl + 1 then
+    let some (rl, rr) := chainChildren r | mkChainNode l r
+    let t ← joinChains l rl
+    if chainHeight t ≤ chainHeight rr + 1 then return ← mkChainNode t rr
+    let some (tl, tr) := chainChildren t | mkChainNode t rr
+    if chainHeight tr ≤ chainHeight tl then
+      mkChainNode tl (← mkChainNode tr rr)
+    else
+      let some (x, y) := chainChildren tr | mkChainNode t rr
+      mkChainNode (← mkChainNode tl x) (← mkChainNode y rr)
+  else
+    mkChainNode l r
+
+/-- Same as `mkEqTrans` but the resulting proof is a balanced transitivity chain (see `joinChains`). -/
+def mkEqTransBalanced (p q : Expr) : MetaM Expr := do
+  if p.isAppOf ``Eq.refl then return q
+  if q.isAppOf ``Eq.refl then return p
+  joinChains p q
+
+/-! ## Bridging definitional gaps
+
+The evidence produced by the optimizer for `lhs = rhs` is a proof of `lhs' = rhs'` such that `lhs'`
+(resp. `rhs'`) is only definitionally equal to `lhs` (resp. `rhs`), e.g., up to the normalization of
+numerals and of structure projections performed by the optimizer (see `EqPf.proof`). The kernel then
+has to check `lhs ≡ lhs'`, and its heuristics may evaluate the whole computation described by `lhs`
+when doing so, e.g., `S.fst (f 1000) ≡ (f 1000).1` (or even `S.fst (f 1000) ≡ S.fst (f (OfNat.ofNat 1000))`)
+is checked by unfolding the projection function `S.fst` and reducing the projection, i.e., by reducing
+`f 1000` to a constructor application, which overflows the stack on long computations.
+
+Such gaps are bridged with an explicit proof of `lhs = lhs'`: a congruence over the common structure of
+both terms, whose leaves (i.e., differing subterms) are justified by reflexivity over their maximal common
+subterms abstracted as variables, i.e., `(fun xs => (rfl : u[xs] = v[xs])) as` for `u[as] ≡ v[as]`.
+Hence, the kernel only checks the definitional equality of the differing parts, without unfolding the
+common subterms. Each leaf is checked with the kernel beforehand, such that a gap that cannot be
+decomposed (e.g., `f a ≡ f b` with `a ≢ b`) is justified as a whole, and each bridge is checked with the
+kernel before being used (see `bridgeEnds`).
+Gaps are bridged wherever the evidence for a term is embedded in a proof referring to the term itself
+(see `alignEnds`), i.e., for the whole goal and for the bodies of binders (e.g., `forall_congr`).
+-/
+
+/-- Outcome of the bridging of a definitional gap `u ≡ v`. -/
+inductive Bridge where
+  /-- `u` and `v` are syntactically equal. -/
+  | same
+  /-- `p : u = v`. -/
+  | proof (p : Expr)
+  /-- `u ≡ v` cannot be justified locally (e.g., `u` and `v` are not definitionally equal). -/
+  | fail
+
+/-- Return `true` if `e` is a candidate for abstraction when bridging definitional gaps (see `mkDefEqBridge`). -/
+private def isBridgeAbstractable (e : Expr) : Bool :=
+  !e.hasLooseBVars && !e.hasMVar &&
+  match e with
+  | .app .. => !(e.isAppOfArity ``OfNat.ofNat 3)
+  | .proj .. => true
+  | _ => false
+
+/-- Check `u ≡ v` with the kernel. An exception is thrown when the kernel fails (e.g., deep recursion),
+    i.e., bridging is abandoned altogether (see `bridgeEnds`).
+-/
+private def kernelDefEq (u v : Expr) : MetaM Bool := do
+  match Kernel.isDefEq (← getEnv) (← getLCtx) u v with
+  | .ok b => return b
+  | .error _ => throwError "kernelDefEq: kernel failure"
+
+/-- Return a proof of `u = v` such that the kernel only checks the definitional equality of `u[as]` and
+    `v[as]` with `as` the maximal common subterms of `u` and `v` abstracted as variables, or a proof of
+    `u = v` by reflexivity when the abstracted terms are not definitionally equal.
+    Return `Bridge.fail` when `u` and `v` are not definitionally equal (according to the kernel).
+-/
+def mkDefEqLeaf (u v : Expr) : MetaM Bridge := do
+  let eq ← mkEq u v
+  let plain : MetaM Bridge := do
+    if !(← kernelDefEq u v) then return .fail
+    return .proof (← mkExpectedTypeHint (← mkEqRefl u) eq)
+  -- subterms of `v` (outside binders)
+  let mut vSubterms : Std.HashSet Expr := {}
+  let mut todo : Array Expr := #[v]
+  while !todo.isEmpty do
+    let s := todo.back!
+    todo := todo.pop
+    if vSubterms.contains s then continue
+    vSubterms := vSubterms.insert s
+    match s with
+    | .app f a => todo := todo.push a |>.push f
+    | .proj _ _ b | .mdata _ b => todo := todo.push b
+    | _ => pure ()
+  -- maximal common subterms (excluding types)
+  let mut common : Std.HashMap Expr Nat := {}
+  let mut commonArr : Array Expr := #[]
+  let mut visited : Std.HashSet Expr := {}
+  todo := #[u]
+  while !todo.isEmpty do
+    let s := todo.back!
+    todo := todo.pop
+    if visited.contains s then continue
+    visited := visited.insert s
+    if !Blaster.Optimize.exprEq s u && isBridgeAbstractable s && vSubterms.contains s then
+      if !(← isTypeLike s) then
+        common := common.insert s commonArr.size
+        commonArr := commonArr.push s
+        continue
+    match s with
+    | .app f a => todo := todo.push a |>.push f
+    | .proj _ _ b | .mdata _ b => todo := todo.push b
+    | _ => pure ()
+  if commonArr.isEmpty then return ← plain
+  let r? ← observing? do
+    let types ← commonArr.mapM inferType
+    withLocalDeclsDND (types.mapIdx fun i t => (Name.mkSimple s!"_x{i}", t)) fun xs => do
+      let subst (e : Expr) : Expr := e.replace fun s =>
+        if s.hasLooseBVars then none else
+        match common.get? s with
+        | some i => some xs[i]!
+        | none => none
+      let u' := subst u
+      let v' := subst v
+      let env ← getEnv
+      let lctx ← getLCtx
+      let .ok true := Kernel.isDefEq env lctx u' v' | throwError "mkDefEqLeaf: not definitionally equal"
+      let lam ← mkLambdaFVars xs (← mkExpectedTypeHint (← mkEqRefl u') (← mkEq u' v'))
+      let .ok _ := Kernel.check env lctx lam | throwError "mkDefEqLeaf: ill-typed abstraction"
+      return mkAppN lam commonArr
+  match r? with
+  | some r => return .proof r
+  | none => plain
+where
+  isTypeLike (e : Expr) : MetaM Bool := do
+    try return (← whnfR (← inferType e)).isSort
+    catch _ => return true
+
+/-- Return `(S, i, f, x)` when `e := f x` with `f` the (non-class) projection function of field `i` of
+    structure `S` applied to the parameters of `S`.
+-/
+def projFnApp? (env : Environment) (e : Expr) : Option (Name × Nat × Expr × Expr) := do
+  let .const fn _ := e.getAppFn | none
+  let info ← env.getProjectionFnInfo? fn
+  if info.fromClass || e.getAppNumArgs != info.numParams + 1 then none
+  return (info.ctorName.getPrefix, info.i, e.appFn!, e.appArg!)
+
+/-- Maximum depth of the common structure of two terms traversed when bridging a definitional gap
+    (see `mkDefEqBridge`), i.e., differing subterms nested more deeply are justified as a whole.
+-/
+def maxBridgeDepth : Nat := 512
+
+mutual
+/-- Return a proof of `u = v` for definitionally equal `u` and `v` built as a congruence over the common
+    structure of `u` and `v` (up to depth `fuel`, see `mkDefEqLeaf`).
+-/
+partial def mkDefEqBridge (u v : Expr) (fuel := maxBridgeDepth) : MetaM Bridge := do
+  if u == v then return .same
+  if fuel == 0 then return ← mkDefEqLeaf u v
+  let bridge (u v : Expr) : MetaM Bridge := mkDefEqBridge u v (fuel - 1)
+  let env ← getEnv
+  match u, v with
+  | .app f a, .app g b =>
+      if f.getAppNumArgs == g.getAppNumArgs && f.getAppFn == g.getAppFn then
+        let rf ← bridge f g
+        let ra ← if rf matches .fail then pure .fail else bridge a b
+        -- NOTE: the congruence fails when the function type is dependent
+        let r? ← observing? do
+          match rf, ra with
+          | .fail, _ | _, .fail => return none
+          | .same, .same => return some Bridge.same
+          | .proof pf, .same => return some (.proof (← mkCongrFun pf a))
+          | .same, .proof pa => return some (.proof (← mkCongrArg f pa))
+          | .proof pf, .proof pa => return some (.proof (← mkCongr pf pa))
+        if let some (some r) := r? then return r
+      mkDefEqLeaf u v
+  | .proj s i x, .proj s' i' y =>
+      if s == s' && i == i' then
+        if let .proof p ← bridge x y then
+          let r? ← observing? do
+            let motive ← withLocalDeclD `x (← inferType y) fun z => mkLambdaFVars #[z] (.proj s i z)
+            mkCongrArg motive p
+          if let some r := r? then return .proof r
+      mkDefEqLeaf u v
+  | .forallE n t b bi, .forallE _ t' b' _ =>
+      let rt ← bridge t t'
+      if rt matches .fail then return ← mkDefEqLeaf u v
+      if !b.hasLooseBVars && !b'.hasLooseBVars then
+        -- implication: `(t → b) = (t' → b')`
+        let rb ← bridge b b'
+        if rb matches .fail then return ← mkDefEqLeaf u v
+        let r? ← observing? do
+          let pt ← match rt with | .proof p => pure p | _ => mkEqRefl t
+          let pb ← match rb with | .proof p => pure p | _ => mkEqRefl b
+          mkAppM ``implies_congr #[pt, pb]
+        if let some r := r? then return .proof r
+        return ← mkDefEqLeaf u v
+      if !(rt matches .same) then return ← mkDefEqLeaf u v
+      -- `(∀ x : t, b) = (∀ x : t, b')`
+      let r ← withLocalDecl n bi t fun x => do
+        match ← bridge (b.instantiate1 x) (b'.instantiate1 x) with
+        | .proof p =>
+            let r? ← observing? do
+              let u ← getLevel t
+              let body := b.instantiate1 x
+              let β ← mkLambdaFVars #[x] body
+              let β' ← mkLambdaFVars #[x] (b'.instantiate1 x)
+              let h ← mkLambdaFVars #[x] p
+              if ← isProp body then return mkApp4 (mkConst ``forall_congr [u]) t β β' h
+              let v ← getLevel body
+              return mkApp4 (mkConst ``pi_congr [u, v]) t β β' h
+            return r?.map Bridge.proof |>.getD .fail
+        | r => return r
+      if r matches .fail then mkDefEqLeaf u v else return r
+  | _, .proj s i y =>
+      -- `S.f x = y.i` with `S.f` the projection function of field `i`
+      if let some (s', i', f, x) := projFnApp? env u then
+        if s == s' && i == i' then
+          if let .proof r ← projBridge f x y v false (fuel - 1) then return .proof r
+      mkDefEqLeaf u v
+  | .proj s i x, _ =>
+      if let some (s', i', f, y) := projFnApp? env v then
+        if s == s' && i == i' then
+          if let .proof r ← projBridge f y x u true (fuel - 1) then return .proof r
+      mkDefEqLeaf u v
+  | _, _ => mkDefEqLeaf u v
+
+/-- Return a proof of `f x = p` (or `p = f x` when `symm` is set) with `f` a projection function and
+    `p := y.i` the corresponding projection.
+-/
+partial def projBridge (f x y p : Expr) (symm : Bool) (fuel : Nat) : MetaM Bridge := do
+  -- `f y = y.i`, i.e., the structure is abstracted
+  let .proof unfold ← mkDefEqLeaf (mkApp f y) p | return .fail
+  let rxy ← mkDefEqBridge x y fuel
+  let r? ← observing? do
+    let r ← match rxy with
+      | .proof pxy => some <$> mkEqTrans (← mkCongrArg f pxy) unfold
+      | .same => pure (some unfold)
+      | .fail => pure none
+    r.mapM fun r => if symm then mkEqSymm r else pure r
+  match r? with
+  | some (some r) => return .proof r
+  | _ => return .fail
+end
+
+/-- Given `p : lhs' = rhs'` with `lhs'` (resp. `rhs'`) definitionally equal to `lhs` (resp. `rhs`), return a
+    proof of `lhs = rhs` whose end points are syntactically `lhs` and `rhs` (see `mkDefEqBridge`).
+    Each bridge is checked with the kernel beforehand, i.e., `p` is returned unchanged (and the kernel
+    checks the definitional equality of the end points by itself) when a gap cannot be bridged.
+-/
+def bridgeEnds (lhs rhs : Expr) (p : Expr) : MetaM Expr := do
+  let (_, _, lhs', rhs') ← eqProofEnds p
+  let mut p := p
+  if let some b ← bridge lhs lhs' then p ← mkEqTransBalanced b p
+  if let some b ← bridge rhs' rhs then p ← mkEqTransBalanced p b
+  return p
+where
+  bridge (u v : Expr) : MetaM (Option Expr) := do
+    let .proof b ← mkDefEqBridge u v | return none
+    let env ← getEnv
+    let lctx ← getLCtx
+    let .ok type := Kernel.check env lctx b | return none
+    let .ok true := Kernel.isDefEq env lctx type (← mkEq u v) | return none
+    return some b
+
+/-- Same as `bridgeEnds` but `p` is returned unchanged on failure.
+    Used whenever the evidence `p : lhs' = rhs'` obtained for `lhs` is embedded in a term referring to
+    `lhs` itself, e.g., the top-level goal or the body of a binder in a congruence such as `forall_congr`.
+    The kernel would otherwise check `lhs ≡ lhs'` by itself, which may require evaluating `lhs`.
+-/
+def alignEnds (lhs rhs p : Expr) : MetaM Expr := do
+  tryCatchRuntimeEx (bridgeEnds lhs rhs p) fun _ => return p
+
 /-- Transitivity: given `p : a = b` and `q : b = c` return evidence for `a = c`. -/
 def EqPf.trans (p q : EqPf) : TranslateEnvT EqPf := do
   match p.simplify, q.simplify with
@@ -101,7 +445,7 @@ def EqPf.trans (p q : EqPf) : TranslateEnvT EqPf := do
   | .defeq, q => return q
   | p, .defeq => return p
   | .proof a, .proof b =>
-      match ← tryInLocalContext (mkEqTrans a b) with
+      match ← tryInLocalContext (mkEqTransBalanced a b) with
       | some r => return .proof r
       | none => return .unknown
   | _, _ => return .unknown
@@ -188,7 +532,7 @@ def funextCongr (x : Expr) (b b' : Expr) (pf : EqPf) : TranslateEnvT EqPf := do
         let β ← mkLambdaFVars #[x] bType
         let f ← mkLambdaFVars #[x] b
         let g ← mkLambdaFVars #[x] b'
-        let h ← mkLambdaFVars #[x] p
+        let h ← mkLambdaFVars #[x] (← alignEnds b b' p)
         return mkApp5 (mkConst ``funext [u, v]) xType β f g h
       match r with
       | some r => return .proof r
@@ -239,6 +583,7 @@ def forallCongr (x : Expr) (t t' b b' : Expr) (pt pb : EqPf) : TranslateEnvT EqP
   | .defeq, .defeq => return .defeq
   | .defeq, .proof p =>
       let r ← tryInLocalContext do
+        let p ← alignEnds b b' p
         if !(← isProp b) then
           -- `(∀ x : t, b) = (∀ x : t', b')` with `b` not a proposition
           let u ← getLevel t'
@@ -264,7 +609,8 @@ def forallCongr (x : Expr) (t t' b b' : Expr) (pt pb : EqPf) : TranslateEnvT EqP
         let pb ← match pb with
                  | .proof q => pure q
                  | _ => mkEqRefl b
-        let h ← mkLambdaFVars #[x] pb
+        let p ← alignEnds t t' p
+        let h ← mkLambdaFVars #[x] (← alignEnds b b' pb)
         if b'.containsFVar xId then
           let q₂ ← mkLambdaFVars #[x] b'
           -- NOTE: `implies_dep_congr_ctx {p₁ p₂ q₁} (h₁ : p₁ = p₂) {q₂ : p₂ → Prop} (h₂ : ∀ h, q₁ = q₂ h)`
@@ -285,6 +631,7 @@ def forallCongr (x : Expr) (t t' b b' : Expr) (pt pb : EqPf) : TranslateEnvT EqP
 def castForallCongr (x : Expr) (t t' rawBody b' : Expr) (pt pb : EqPf) : TranslateEnvT EqPf := do
   let .proof p := pt | return .unknown
   let r ← tryInLocalContext do
+    let p ← alignEnds t t' p
     let decl ← x.fvarId!.getDecl
     let q₁ := Expr.lam decl.userName t rawBody .default
     let q₂ ← mkLambdaFVars #[x] b'
@@ -293,7 +640,7 @@ def castForallCongr (x : Expr) (t t' rawBody b' : Expr) (pt pb : EqPf) : Transla
       | .defeq => mkEqRefl body
       | .proof q => pure q
       | _ => throwError "castForallCongr: unknown evidence"
-    let h₂ ← mkLambdaFVars #[x] pbody
+    let h₂ ← mkLambdaFVars #[x] (← alignEnds body b' pbody)
     return mkAppN (mkConst ``forall_prop_domain_congr) #[t, t', q₁, q₂, p, h₂]
   match r with
   | some r => return .proof r
