@@ -564,6 +564,26 @@ def prenex (e : Expr) : MetaM (Option (Expr × (Expr → MetaM Expr))) := do
         mkLambdaFVars bs' (mkAppN p ((data ++ hyps).map get))
     return some (e', back)
 
+/-- Closed quantifications over sorts `∀ (α : Sort u), b` (`u ≠ 0`) in `e` (traversal with sharing). -/
+partial def sortQuantifiers (e : Expr) : Array Expr := Id.run do
+  let mut acc := #[]
+  let mut stack := #[e]
+  let mut seen : Std.HashSet Expr := {}
+  while !stack.isEmpty do
+    let s := stack.back!
+    stack := stack.pop
+    if seen.contains s then continue
+    seen := seen.insert s
+    if let .forallE _ (.sort u) _ _ := s then
+      if !u.isZero && !s.hasLooseBVars then acc := acc.push s
+    match s with
+    | .app f a => stack := stack.push f |>.push a
+    | .lam _ t b _ | .forallE _ t b _ => stack := stack.push t |>.push b
+    | .letE _ t v b _ => stack := stack.push t |>.push v |>.push b
+    | .mdata _ b | .proj _ _ b => stack := stack.push b
+    | _ => pure ()
+  return acc
+
 /-- Try to prove `e` (a closed proposition proved valid by the SMT solver) by replaying a proof of the
     SMT backend. -/
 partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Except String SmtProofResult) := do
@@ -586,12 +606,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         if body.containsFVar d.fvarId || (← xs.anyM fun x => do return (← inferType x).containsFVar d.fvarId) then
           sortVars := sortVars.push d.toExpr
     if sortVars.size > 1 then throwError "smt proof: polymorphic goals with several sort variables are not supported"
-    -- quantifiers over sorts below the leading binders
-    let nestedSort := body.find? fun s => match s with
-      | .forallE _ (.sort u) _ _ => !u.isZero
-      | .lam _ (.sort u) _ _ => !u.isZero
-      | _ => false
-    if nestedSort.isSome then throwError "smt proof: polymorphic goals with quantified sort variables are not supported"
+    -- propositions quantifying over sorts (below the leading binders)
+    for s in sortQuantifiers body do
+      if ← isProp s then throwError "smt proof: polymorphic goals with quantified sort variables are not supported"
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
@@ -600,10 +617,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         -- recursive functions); `body` being already optimized, `body'` is expected to be `body` (up to
         -- definitional equality, which the bridge requires).
         let (body', _) ← Optimize.mainPf body (track := false)
-        let reopt ← if body' == body then pure true else
-          try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 200000 * 1000 }) <|
-              withCurrHeartbeats <| isDefEq body body'
-          catch _ => pure false
+        -- NOTE: when the optimizer is not idempotent on `body`, `body` itself is translated, such that the
+        -- asserted formula is the translation of the negated goal (see the bridge)
+        let reopt := body' == body
         setBlasterProcess
         -- sort variables introduced as free variables: declared as Blaster does for top-level quantifiers
         for α in sortVars do
@@ -616,7 +632,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         if !sortVars.isEmpty then
           for x in xs do
             if !sortVars.contains x && !(← isProp (← inferType x)) then discard <| translateExpr x
-        let st ← translateExpr body'
+        let st ← translateExpr (if reopt then body' else body)
         assertTerm (notSmt st)
         return (body', reopt) : TranslateEnvT (Expr × Bool)).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
@@ -669,7 +685,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       matchInst := insts.get?, macroOf
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
-    let goalTerm := body'
+    let goalTerm := body
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -683,7 +699,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
             if ← defeq c (mkNot body) then return some (← mkExpectedTypeHint hneg c)
           -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
           -- NOTE: the translated goal is definitionally equal to the goal (see the translation above)
-          let (r, fails) ← if reopt then Bridge.prove bcfg (mkNot goalTerm) c else pure (none, #[])
+          let (r, fails) ← Bridge.prove bcfg (mkNot goalTerm) c
           if let some p := r then
             return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot goalTerm)))
           if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
