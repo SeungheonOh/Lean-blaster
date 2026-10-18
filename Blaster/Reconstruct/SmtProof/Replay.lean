@@ -97,10 +97,13 @@ def stepConcl (i : Nat) : ReplayM Expr := do
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
   let t0 ← IO.monoMsNow
-  let e ← instantiateMVars (← liftInterp (interpProp c))
+  let e ← fillDefaults (← instantiateMVars (← liftInterp (interpProp c)))
   let t1 ← IO.monoMsNow
   modify fun s => { s with stats := s.stats.addTime "(interpretation)" (t1 - t0) }
-  if e.hasExprMVar then throwError "smt proof: can't infer the types of {e}"
+  if e.hasExprMVar then
+    -- an application with a metavariable argument (e.g., a constructor of an unknown instance)
+    let site := (e.find? fun s => s.isApp && s.getAppArgs.any (·.isMVar)).getD e
+    throwError "smt proof: can't infer the types of {site}"
   if isGlobal then modify fun s => { s with conclCache := s.conclCache.insert i e }
   return e
 
@@ -611,7 +614,7 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       -- `(or (not (forall xs. P)) P[ts])`
       let some (nq, inst) := orArgs? concl | throwError "quant-inst: disjunction expected"
       let some q := nq.not? | throwError "quant-inst: negated quantifier expected"
-      let ts ← liftInterp (step.args.mapM interpInt?)
+      let ts ← liftInterp (step.args.mapM interpInt?) >>= (·.mapM fun t => liftM (fillDefaults t))
       let r ← withLocalDeclD `h q fun h => do
         let hi ← instantiateWithCoercion h ts
         if !(← propEq (← inferType hi) inst (deep := true)) then throwError "quant-inst: instance mismatch"

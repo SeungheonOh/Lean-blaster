@@ -325,9 +325,12 @@ def mkEqSmt (a b : Expr) : MetaM Expr := do
   try return ← mkEq (← coerce a ta tb) b
   catch _ => mkEq a (← coerce b tb ta)
 
+/-- User name of the metavariables standing for the default values of selectors (see `mkSelector`). -/
+def defaultMVarName : Name := `_blaster_selector_default
+
 /-- Selector of field `idx` of constructor `ctor` applied to `x`, defined by case analysis (with
     `default` for the other constructors). -/
-partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
+partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := false) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"
   let xt ← whnfD (← inferType x)
   if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: selector {ctor} applied to {xt}"
@@ -346,7 +349,11 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
     return t
   -- default value for the other constructors: `x` itself when the field has the type of `x` (e.g., the
   -- argument of a recursive constructor), an inhabitant of the field type otherwise
-  let dflt ← if ← isDefEq fieldTy xt then pure x else mkDefault fieldTy
+  -- NOTE: when the field type is not known yet (e.g., `List.nil` of an unknown instance), the inhabitant can be
+  -- chosen after the interpretation of the whole term (`deferDefault`, see `fillDefaults`)
+  let dflt ← if ← isDefEq fieldTy xt then pure x
+    else if deferDefault && (← instantiateMVars fieldTy).hasExprMVar then mkFreshExprMVar fieldTy (userName := defaultMVarName)
+    else mkDefault fieldTy
   let motive := mkLambda `x .default xt fieldTy
   let mut minors := #[]
   for c in iinfo.ctors do
@@ -392,6 +399,17 @@ where
         return some (mkAppN (mkAppN (mkConst c lvls) params) vals)
       if r.isSome then return r
     return none
+
+/-- Assign the metavariables of `e` standing for default values of selectors (see `mkSelector`) whose type is
+    known, with inhabitants of their types. -/
+def fillDefaults (e : Expr) : MetaM Expr := do
+  if !e.hasExprMVar then return e
+  for m in (← getMVars e) do
+    if (← m.isAssigned) || (← m.getDecl).userName != defaultMVarName then continue
+    let t ← instantiateMVars (← m.getType)
+    if t.hasExprMVar || (← isProp t) then continue
+    if let some v ← mkSelector.inhabitant? t 8 then m.assign v
+  instantiateMVars e
 
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
@@ -567,7 +585,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         mkAppCoerce c (← args.mapM interp) (allowMVars := true)
     | some (.selector c i) =>
         let some a := args[0]? | throwError "smt proof: selector without argument"
-        let e ← mkSelector c i (← interp a)
+        let e ← mkSelector c i (← interp a) (deferDefault := true)
         toSmtWorld e
     | some (.tester c) =>
         let some a := args[0]? | throwError "smt proof: tester without argument"
