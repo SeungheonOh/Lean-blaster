@@ -224,6 +224,30 @@ The interpretation is a *choice*: a step whose conclusion does not hold for it (
 kernel. `BLASTER_SMT_PROOF` selects when the replay is tried for SMT residuals: `last` (default, after the
 tactic strategies), `first`, `only` (no tactic strategies, to measure the replay), or `off`.
 
+### Results
+
+On the SMT tests of the suite (`Tests/Smt`, `Tests/FixedIssues`), with `BLASTER_SMT_PROOF=only` (no tactic
+strategy for SMT residuals), the replay of Z3 proofs proves **89.0%** of the residual goals (276/310); 22 of
+the 34 failures are polymorphic goals (Blaster's `@Type`/`@Instance` encoding, not interpreted yet), i.e.,
+95.8% of the monomorphic goals. With the default mode (`last`), the replay complements the tactic
+strategies.
+
+Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
+`commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
+engine (`def-axiom`, `not-or-elim`, `and-elim`, propositional `rewrite`s, Alethe's Tseitin rules); tactics are
+used for arithmetic (`th-lemma`, arithmetic `rewrite`s: `omega`, `simp`, `grind`), with a portfolio ordered
+adaptively by success rate per time unit for each rule and goal shape. Performance notes:
+ - proofs of the top-level steps are held by assigned metavariables and binders are abstracted syntactically,
+   such that the construction of a step does not traverse the proofs of the previous ones (it was quadratic);
+ - SMT terms are interpreted once (memoization on shared terms);
+ - steps that don't depend on a scope are replayed in increasing order (bounded recursion on deep proofs).
+For instance, a 245-step Z3 proof involving a recursive function replays in ~6 s, and a 2458-step cvc5
+(Alethe) proof of the same goal in ~30 s.
+
+Limitations: polymorphic goals; cvc5's native CPC format (whose steps often leave their conclusion
+implicit) is not supported; Z3 may not find a proof without Blaster's `recfun-finder` tactic (incompatible
+with proof production), and proof production may time out where the verdict did not.
+
 ## Findings
 
 Reconstruction checks every individual rewrite, so it surfaces problems in the trusted pipeline:
