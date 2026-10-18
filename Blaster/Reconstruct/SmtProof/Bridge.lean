@@ -810,17 +810,65 @@ def matcherEquation (m : Name) (lvls : List Level) (info : MatcherInfo) (inst? :
     let some pf := pf? | dbg m!"bridge: matcher equation not proved: {stmt}"; return none
     return some (stmt, pf)
 
+/-- An auxiliary theorem of the environment branch of a command (e.g., the `_proof_i` lemmas of tactics). -/
+structure AuxThm where
+  name : Name
+  levelParams : List Name
+  type : Expr
+  value : Expr
+
+/-- A closed matcher equation (statement and proof), with the auxiliary theorems of the environment branch it
+    refers to (in dependency order). -/
+structure SharedEquation where
+  stmt : Expr
+  proof : Expr
+  aux : Array AuxThm
+
+/-- The auxiliary theorems of the current module referenced by `es` (transitively), in dependency order. -/
+partial def auxTheorems (es : Array Expr) : MetaM (Array AuxThm) := do
+  let env ← getEnv
+  let visited ← IO.mkRef ({} : NameSet)
+  let out ← IO.mkRef (#[] : Array AuxThm)
+  let rec visit (e : Expr) : MetaM Unit := do
+    for n in e.getUsedConstants do
+      if !n.isInternal || (env.getModuleIdxFor? n).isSome || (← visited.get).contains n then continue
+      visited.modify (·.insert n)
+      let some (.thmInfo info) := env.find? n | continue
+      visit info.type
+      visit info.value
+      out.modify (·.push { name := n, levelParams := info.levelParams, type := info.type, value := info.value })
+  for e in es do visit e
+  out.get
+
+/-- Add the auxiliary theorems `aux` of another environment branch to the environment (under new names, unless
+    the current branch has a theorem of the same name and type), and rename the references to them in `es`. -/
+def transplant (aux : Array AuxThm) (es : Array Expr) : MetaM (Array Expr) := do
+  let mut ren : Std.HashMap Name Name := {}
+  for a in aux do
+    let rename (e : Expr) : Expr := if ren.isEmpty then e else
+      e.replace fun e => match e with
+        | .const n us => (ren.get? n).map (mkConst · us)
+        | _ => none
+    let ty := rename a.type
+    if let some (.thmInfo info) := (← getEnv).find? a.name then
+      if info.type == ty && info.levelParams == a.levelParams then continue
+    let n ← mkAuxLemma a.levelParams ty (rename a.value)
+    ren := ren.insert a.name n
+  return es.map fun e => if ren.isEmpty then e else
+    e.replace fun e => match e with
+      | .const n us => (ren.get? n).map (mkConst · us)
+      | _ => none
+
 /-- Matcher equations shared by the commands (`#blaster` commands are elaborated concurrently, in their own
     environment branches): per matcher instance closed over its free variables (with Blaster's optimized
-    instance), the task computing the closed statement and proof of its equation (`none` when the computation
-    was aborted). -/
-initialize sharedEquations : IO.Ref (Std.HashMap (Expr × Option Expr) (Task (Option (Option (Expr × Expr))))) ←
+    instance), the task computing its equation (`none` when the computation was aborted). -/
+initialize sharedEquations : IO.Ref (Std.HashMap (Expr × Option Expr) (Task (Option (Option SharedEquation)))) ←
   IO.mkRef {}
 
 /-- `compute` once per `key` across the commands: the other commands wait for its result (and compute it
     themselves when the computation was aborted, e.g., by an exception). -/
-def shareEquation (key : Expr × Option Expr) (compute : Term.TermElabM (Option (Expr × Expr))) :
-    Term.TermElabM (Option (Expr × Expr)) := do
+def shareEquation (key : Expr × Option Expr) (compute : Term.TermElabM (Option SharedEquation)) :
+    Term.TermElabM (Option SharedEquation) := do
   let p ← IO.Promise.new
   let existing? ← sharedEquations.modifyGet fun m => match m.get? key with
     | some t => (some t, m)
@@ -847,20 +895,26 @@ def matcherLemma (m : Name) (lvls : List Level) (info : MatcherInfo) (params : A
   let inst? := (← read).matchInst m
   let l ← try
       let xs ← fvarClosure #[head]
-      let compute : Term.TermElabM (Option (Expr × Expr)) := withRestrictedLCtx xs do
+      let compute : Term.TermElabM (Option SharedEquation) := withRestrictedLCtx xs do
         let some (stmt, pf) ← matcherEquation m lvls info inst? params motive resTy | return none
         let stmt ← mkForallFVars xs stmt
         let pf ← mkLambdaFVars xs pf
         if stmt.hasFVar || pf.hasFVar || stmt.hasMVar || pf.hasMVar then return none
-        return some (stmt, pf)
+        -- NOTE: the statement contains the proofs of the equations of named patterns
+        return some { stmt, proof := pf, aux := ← auxTheorems #[stmt, pf] }
       let key := (← mkLambdaFVars xs head, inst?)
       let r ← if key.1.hasLevelParam || key.1.hasFVar then compute else shareEquation key compute
-      let some (stmt, pf) := r | pure none
-      -- NOTE: the proof of another command is checked in the environment of this command (it may refer to
-      -- auxiliary declarations of its environment branch, in which case the equation is proved again)
-      let c ← try mkAuxTheorem stmt pf catch _ => do
-        let some (stmt, pf) ← compute | return none
-        mkAuxTheorem stmt pf
+      let some eqn := r | pure none
+      -- NOTE: the equation (computed by another command) is checked in the environment of this command, where
+      -- the equations of the matcher (e.g., its splitter) are realized, and the auxiliary theorems are added
+      let c ← try
+          try discard <| Match.getEquationsFor m catch _ => pure ()
+          let #[stmt, pf] ← transplant eqn.aux #[eqn.stmt, eqn.proof] | unreachable!
+          mkAuxTheorem stmt pf
+        catch ex => do
+          dbg m!"bridge: shared equation of {m} rejected: {ex.toMessageData}"
+          let some eqn ← compute | return none
+          mkAuxTheorem eqn.stmt eqn.proof
       pure (some (mkAppN c xs))
     catch ex => dbg m!"bridge: matcher lemma {m}: {ex.toMessageData}"; pure none
   modify fun s => { s with lemmas := s.lemmas.insert head l }
