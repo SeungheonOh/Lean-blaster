@@ -520,6 +520,10 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           let r ← portfolio bridge c "bridge"
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
             logInfo m!"bridge failed: {c}"
+          if r.isNone then
+            if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
+              let h ← IO.FS.Handle.mk f .append
+              h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot body')}\n"
           return r.map (·.1)
         proveStep := fun rule stmt => do
           -- NOTE: the tactic syntax of each rule is built once per replay
@@ -529,7 +533,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           portfolio tacs stmt rule }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
-      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline }
+      let global := (scopedSteps sproof).map (!·)
+      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global }
       let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
                             catch ex => return Except.error ex) |>.run ctx).run {}
       let p ← match p? with

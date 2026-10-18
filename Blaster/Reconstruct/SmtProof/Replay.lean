@@ -57,6 +57,8 @@ structure ReplayCtx where
   maxDirect : Nat := 32
   /-- set during `prepass` (no direct proof attempts) -/
   prepass : Bool := false
+  /-- steps that don't depend on a scope (see `scopedSteps`): their proofs are valid at depth 0 -/
+  global : Array Bool := #[]
 
 structure ReplayState where
   /-- proofs of steps replayed at depth 0 -/
@@ -81,7 +83,8 @@ def liftInterp (x : InterpM α) : ReplayM α := do
 /-- Interpretation of the conclusion of step `i`. -/
 def stepConcl (i : Nat) : ReplayM Expr := do
   let ctx ← read
-  if ctx.depth == 0 then
+  let isGlobal := ctx.depth == 0 || ctx.global.getD i false
+  if isGlobal then
     if let some e := (← get).conclCache.get? i then return e
   let step := ctx.proof.steps[i]!
   -- NOTE: the conclusion of `proof-bind` is a lambda over the conclusion of its premise, i.e.,
@@ -89,9 +92,12 @@ def stepConcl (i : Nat) : ReplayM Expr := do
   let c := match step.rule, step.concl with
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
+  let t0 ← IO.monoMsNow
   let e ← instantiateMVars (← liftInterp (interpProp c))
+  let t1 ← IO.monoMsNow
+  modify fun s => { s with stats := s.stats.addTime "(interpretation)" (t1 - t0) }
   if e.hasExprMVar then throwError "smt proof: can't infer the types of {e}"
-  if ctx.depth == 0 then modify fun s => { s with conclCache := s.conclCache.insert i e }
+  if isGlobal then modify fun s => { s with conclCache := s.conclCache.insert i e }
   return e
 
 def record (rule method : String) : ReplayM Unit :=
@@ -255,20 +261,22 @@ mutual
 partial def replay (i : Nat) : ReplayM Expr := do
   let ctx ← read
   if let some p := (← get).cache.get? i then return p
-  if ctx.depth == 0 && (← get).failed.contains i then throwError "smt proof: step {i} already failed"
-  if ctx.depth > 0 then
+  -- steps not depending on a scope are cached globally, also when first replayed in a scope
+  let isGlobal := ctx.depth == 0 || ctx.global.getD i false
+  if isGlobal && (← get).failed.contains i then throwError "smt proof: step {i} already failed"
+  if !isGlobal then
     if let some p := (← get).scopeCache.get? i then return p
     if (← get).scopeFailed.contains i then throwError "smt proof: step {i} already failed"
   let p ← try replayCore i
     catch ex =>
-      if ctx.depth == 0 then modify fun s => { s with failed := s.failed.insert i }
+      if isGlobal then modify fun s => { s with failed := s.failed.insert i }
       else modify fun s => { s with scopeFailed := s.scopeFailed.insert i }
       -- NOTE: premises are replayed before their consumers, i.e., the first failures are the deepest ones
       let step := ctx.proof.steps[i]!
       let msg := s!"step {i} ({step.rule}): {toString step.concl |>.take 300}: {(← ex.toMessageData.toString).take 300}"
       modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
       throw ex
-  if ctx.depth == 0 then
+  if isGlobal then
     -- the proof is represented by an assigned metavariable, such that the proofs using it stay small
     -- (they are instantiated once, at the end of the replay)
     let p ← if p.isFVar || p.isMVar then pure p else do
@@ -489,11 +497,47 @@ partial def replayBind (step : Step) : ReplayM Expr := do
   record step.rule "exact"
   return r
 
+/-- Proof of `l = r` from equalities `eqs` (`aᵢ = bᵢ` with proof `pᵢ`) by congruence, descending in the
+    applications whose heads are equal. -/
+partial def congrDescent (eqs : Array (Expr × Expr × Expr)) (l r : Expr) (fuel : Nat) : MetaM (Option Expr) := do
+  if l == r then return some (← mkEqRefl l)
+  for (a, b, p) in eqs do
+    if l == a && r == b then return some p
+    if l == b && r == a then return some (← mkEqSymm p)
+  if fuel == 0 then return none
+  if !l.isApp || !r.isApp then return none
+  let lf := l.getAppFn
+  let rf := r.getAppFn
+  let las := l.getAppArgs
+  let ras := r.getAppArgs
+  if lf != rf || las.size != ras.size then return none
+  -- congruence on each argument (dependent arguments must be equal)
+  let mut pf ← mkEqRefl (mkAppN lf #[])
+  let mut cur := lf
+  let mut changed := false
+  for i in [:las.size] do
+    if las[i]! == ras[i]! then
+      pf ← if changed then mkCongrFun pf las[i]! else pure pf
+      cur := mkApp cur las[i]!
+      if !changed then pf ← mkEqRefl cur
+      continue
+    let some pi ← congrDescent eqs las[i]! ras[i]! (fuel - 1) | return none
+    pf ← if changed then mkCongr pf pi else mkCongrArg cur pi
+    cur := mkApp cur ras[i]!
+    changed := true
+  return some pf
+
 /-- Congruence (`monotonicity`): from premises `aᵢ = bᵢ`, prove `L = R` by abstracting the
     occurrences of each `aᵢ` in `L` and applying `congrArg` (premises not occurring are ignored). -/
 partial def replayCongr (step : Step) (concl : Expr) : ReplayM Expr := do
   let some (ty, l, r) := concl.eq? | throwError "monotonicity: equality expected"
   let ps ← premises step
+  -- structural descent: linear in the size of the paths to the differences (no traversal of the shared
+  -- subterms, unlike `kabstract`)
+  let eqs := ps.filterMap fun (t, p) => (t.eq?).map fun (_, a, b) => (a, b, p)
+  if let some pf ← congrDescent eqs l r 64 then
+    record step.rule "exact"
+    return pf
   let mut cur := l
   let mut pf ← mkEqRefl l
   for (t, p) in ps do
@@ -587,17 +631,37 @@ partial def instantiateWithCoercion (h : Expr) (ts : Array Expr) : MetaM Expr :=
 
 end
 
-/-- Steps that can only be replayed in a scope: steps depending on hypotheses (discharged by `lemma` or
-    `subproof`), and steps below binders (premises of `proof-bind`, `bind`, `sko_ex`, `sko_forall`). -/
+/-- Steps that can only be replayed in a scope: steps depending on hypotheses that are not discharged
+    (by `lemma` or `subproof`), and steps below binders (premises of `proof-bind`, `bind`, `sko_ex`,
+    `sko_forall`). A Z3 `lemma` discharges the hypotheses whose negation is one of its literals (matched on
+    shared term objects), an Alethe `subproof` the assumptions it lists. -/
 def scopedSteps (p : Proof) : Array Bool := Id.run do
   let n := p.steps.size
-  let mut inScope := Array.replicate n false
-  -- NOTE: `lemma`/`subproof` steps (and the steps using them) are also excluded, as they may be nested
-  -- in the scope of another one
+  -- open hypotheses of each step (indices of `hypothesis` steps)
+  let mut hyps : Array (Array Nat) := Array.replicate n #[]
   for i in [:n] do
     let s := p.steps[i]!
-    if ["hypothesis", "lemma", "subproof"].contains s.rule then inScope := inScope.set! i true
-    else if s.premises.any (fun j => inScope[j]!) then inScope := inScope.set! i true
+    if s.rule == "hypothesis" then hyps := hyps.set! i #[i]
+    else
+      let mut hs : Array Nat := #[]
+      for j in s.premises do
+        for h in hyps[j]! do
+          if !hs.contains h then hs := hs.push h
+      if s.rule == "subproof" then
+        hs := hs.filter (!s.discharged.contains ·)
+      else if s.rule == "lemma" then
+        let lits := match s.concl.stripAnnot with
+          | .app "or" ls => ls
+          | l => #[l]
+        let negated : Array USize := lits.filterMap fun l => (STerm.not? l).map termAddr
+        let plain : Array USize := lits.map fun l => termAddr l.stripAnnot
+        hs := hs.filter fun h =>
+          let φ := p.steps[h]!.concl
+          -- discharged: `¬ φ` is a literal, or `φ = ¬ a` and `a` is a literal
+          !(negated.contains (termAddr φ) || negated.contains (termAddr φ.stripAnnot) ||
+            ((STerm.not? φ).map (fun a => plain.contains (termAddr a.stripAnnot))).getD false)
+      hyps := hyps.set! i hs
+  let mut inScope := hyps.map (!·.isEmpty)
   -- subtrees below binders
   let mut todo : Array Nat := #[]
   for i in [:n] do

@@ -121,6 +121,10 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
       | .atom "as" =>
           let some f := xs[1]? >>= SExpr.atom? | throw s!"ill-formed qualified identifier: {e}"
           return .qual f xs[2]! #[]
+      -- indexed identifier as a term, e.g., `(_ Char 67)`
+      | .atom "_" =>
+          let some f := xs[1]? >>= SExpr.atom? | throw s!"ill-formed indexed identifier: {e}"
+          return .iapp f (← (xs.extract 2 xs.size).mapM (ofSExpr env)) #[]
       | .atom f =>
           let args ← (xs.extract 1 xs.size).mapM (ofSExpr env)
           -- a let-bound symbol can't be applied
