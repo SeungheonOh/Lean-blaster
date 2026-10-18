@@ -11,7 +11,9 @@ SMT terms occurring in a proof are interpreted as Lean terms:
  - `Bool`-sorted terms are interpreted as propositions, and converted with `decide` (resp. `= true`)
    when a Lean `Bool` is expected (resp. given);
  - other sorts (e.g., datatypes, `String`, uninterpreted sorts) are interpreted as the corresponding
-   Lean types.
+   Lean types; the sorts `@Instance` and `@Type` of Blaster's polymorphic encoding are interpreted as a
+   sort variable and `Unit`, or as the universe `Poly.Univ.{u}` of the values of `Sort u` and `Sort u`
+   (see `Poly.lean`).
 
 The interpretation of the symbols of the query is given by a `SymTable`. Each step of an SMT proof is
 then replayed as a Lean proof of the interpretation of its conclusion. Since the Lean proof is checked by

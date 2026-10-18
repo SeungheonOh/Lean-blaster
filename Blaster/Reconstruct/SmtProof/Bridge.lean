@@ -18,7 +18,9 @@ of the translation:
 This module proves the equality of a goal term `a` with the interpretation `b` of its translation by a
 simultaneous traversal of both terms: congruence on their common structure, and lemmas for each
 encoding at the points where they differ. The proven statement is `W(a) = b` where `W` is the
-mapping to the SMT world: `(↑a : Int)` for `Nat` terms, `a = true` for `Bool` terms, `a` otherwise.
+mapping to the SMT world: `(↑a : Int)` for `Nat` terms, `a = true` for `Bool` terms, the world of the
+type of `a` for the terms of the polymorphic encoding (e.g., `Poly.inj α a` for `a : α`, see `Poly.lean`),
+`a` otherwise.
 
 `match` expressions are related to their `ite` encoding by auxiliary theorems stated for abstract
 discriminants and alternatives (i.e., small statements, proved once per matcher instance by `proveMatchIte`,

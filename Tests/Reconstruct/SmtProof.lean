@@ -60,4 +60,12 @@ def nested (d : D) : Bool :=
 -- polymorphism (a single sort variable)
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (α : Type) (o : Option α), o.isSome = true → o ≠ none]
 
+-- polymorphism: several sort variables, possibly empty sort variables (skolem constants of their sort),
+-- quantified sort variables
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α β : Type) (_f : α → β), (∀ (_y : β), False) → ∀ (_x : α), False]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α β : Type) (f g : α → β), (∀ (x : α), f x = g x) → f = g]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α : Type) (f : α → α), (∀ x, f x = x) → f = (fun x => x)]
+#blaster (reconstruct: 2) (smt-proof: 3)
+  [(∀ (β : Type) (xs : List β) (f : List β → Nat), f xs > 10) → ∀ (α : Type) (xs : List α) (f : List α → Nat), f xs > 5]
+
 end Tests.Reconstruct.SmtProof
