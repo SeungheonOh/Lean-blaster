@@ -57,7 +57,9 @@ partial def commonSubterms (l r : Expr) : MetaM (Array Expr) := do
     if (← visited.get).contains e then return
     visited.modify (·.insert e)
     if !e.hasLooseBVars && !isAtomic e && inR.contains e then
-      if !(← isType e) then
+      -- values and propositions (not types, nor partial applications)
+      let ty ← whnfR (← inferType e)
+      if !(ty.isSort && !ty.isProp) && !ty.isForall then
         found.modify (·.push e)
         return
     match e with
@@ -241,7 +243,8 @@ partial def arithAtoms (e : Expr) : MetaM (Array Expr) := do
     | .forallE _ t b _ => go t; go b
     | .mdata _ b => go b
     | _ =>
-      if !(← isType e) && !(← isProof e) then found.modify (·.push e)
+      let ty ← whnfR (← inferType e)
+      if !(ty.isSort && !ty.isProp) && !ty.isForall && !(← isProof e) then found.modify (·.push e)
   go e
   found.get
 
