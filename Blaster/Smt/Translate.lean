@@ -77,7 +77,7 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
       match r with
       | some ((optExprP, optPf), envP) =>
           return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr := optExprP, optPf,
-                        bySmt, recon := envP.recon }
+                        bySmt, recon := envP.recon, smtProof := sOpts.smtProof }
       | none =>
           return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr, optPf := .unknown, bySmt }
     match (toResult optExpr) with

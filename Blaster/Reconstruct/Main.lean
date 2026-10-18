@@ -120,7 +120,9 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | e => do
         -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
         -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
-        let mode := (← IO.getEnv "BLASTER_SMT_PROOF").getD "last"
+        let mode ← match task.smtProof with
+          | some m => pure m
+          | none => pure ((← IO.getEnv "BLASTER_SMT_PROOF").getD "last")
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
           let st ← saveState

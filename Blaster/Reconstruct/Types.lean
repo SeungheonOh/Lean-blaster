@@ -147,6 +147,8 @@ structure ReconTask where
   bySmt : Bool
   /-- The reconstruction environment obtained when optimizing `fullGoal` while tracking proof terms. -/
   recon : ReconEnv := {}
+  /-- When to replay a proof of the SMT backend (see `BlasterOptions.smtProof`). -/
+  smtProof : Option String := none
 deriving Inhabited
 
 end Blaster.Reconstruct
