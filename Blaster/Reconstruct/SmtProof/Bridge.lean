@@ -1084,12 +1084,12 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
         let some pt ← walk t t' | return none
         let some pb ← walk body body' | return none
         return some (← mkAppM ``implies_congr #[pt, pb])
-      if t != t' then return none
+      if t != t' && !(← isDefEq t t') then return none
       return ← withLocalDecl n bi t fun x => do
         let some pb ← walk (body.instantiate1 x) (body'.instantiate1 x) | return none
         return some (← mkAppM ``forall_congr #[← mkLambdaFVars #[x] pb])
   | .lam n t body bi, .lam _ t' body' _ =>
-      if t != t' then return none
+      if t != t' && !(← isDefEq t t') then return none
       return ← withLocalDecl n bi t fun x => do
         let some pb ← walk (body.instantiate1 x) (body'.instantiate1 x) | return none
         return some (← mkFunExt (← mkLambdaFVars #[x] pb))

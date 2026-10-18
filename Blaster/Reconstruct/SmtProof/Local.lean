@@ -170,7 +170,7 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
   if !l.isApp || !r.isApp || fl != fr || l.getAppNumArgs != r.getAppNumArgs then
     match l, r with
     | .forallE n t b bi, .forallE _ t' b' _ =>
-        if t == t' && (b.hasLooseBVars || b'.hasLooseBVars) && (← isProp l) then
+        if (t == t' || (← isDefEq t t')) && (b.hasLooseBVars || b'.hasLooseBVars) && (← isProp l) then
           let r? ← withLocalDecl n bi t fun x => do
             let some p ← diffEq prove budget (b.instantiate1 x) (b'.instantiate1 x) | return none
             return some (← mkAppM ``forall_congr #[← mkLambdaFVars #[x] p])
@@ -180,7 +180,7 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
           let some pb ← diffEq prove budget b b' | return ← whole
           return some (← mkAppM ``implies_congr #[pt, pb])
       | .lam n t b bi, .lam _ t' b' _ =>
-        if t == t' then
+        if t == t' || (← isDefEq t t') then
           let r? ← withLocalDecl n bi t fun x => do
             let some p ← diffEq prove budget (b.instantiate1 x) (b'.instantiate1 x) | return none
             return some (← mkFunExt (← mkLambdaFVars #[x] p))
