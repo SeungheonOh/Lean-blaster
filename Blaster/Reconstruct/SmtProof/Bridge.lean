@@ -341,6 +341,9 @@ partial def evalCond (c : Expr) : MetaM CondVal := do
       return .isFalse (← mkExpectedTypeHint pf (mkNot c))
     let (v, lit) := if isLiteral l then (r, l) else (l, r)
     if let some x ← stuckMajor? v then return .splitFVar x
+    -- field of a structure variable
+    if let .proj _ _ st := v then
+      if let .fvar x ← whnfD st then return .splitFVar x
     if v.isFVar && isLiteral lit then
       -- hypothesis `¬ v = lit` (resp. `¬ lit = v`) of a previous case analysis
       for d in ← getLCtx do

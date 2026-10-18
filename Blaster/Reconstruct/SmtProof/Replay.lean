@@ -2,6 +2,7 @@ import Lean
 import Blaster.Reconstruct.SmtProof.IR
 import Blaster.Reconstruct.SmtProof.Interp
 import Blaster.Reconstruct.SmtProof.Prop
+import Blaster.Reconstruct.SmtProof.Local
 
 /-!
 # Replay of SMT proofs
@@ -679,8 +680,30 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   if let some p ← PropEngine.prove ps concl then
     record step.rule "prop"
     return p
+  -- large equalities without premises (e.g., rewrites): congruence on the common structure, and tactics
+  -- on the differences with their common subterms generalized
+  if ps.isEmpty then
+    if let some (_, a, b) := concl.eq? then
+      if a.approxDepth.toNat > 8 || b.approxDepth.toNat > 8 then
+        let budget ← IO.mkRef 3
+        let rule := step.rule
+        let cfg := (← read).cfg
+        let prove (eq : Expr) : TermElabM (Option Expr) := do
+          let some (_, l, r) := eq.eq? | return none
+          if let some (g, vals) ← Local.generalizeCommon eq l r then
+            if let some (pf, _) ← cfg.proveStep rule g then return some (mkAppN pf vals)
+          return none
+        if let some p ← Local.diffEq prove budget a b then
+          record step.rule "local"
+          return ← mkExpectedTypeHint p concl
   -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
+  -- arithmetic lemmas over large atoms: the atoms are generalized
+  if step.rule == "th-lemma" && (stmt.approxDepth.toNat > 8) then
+    if let some (g, vals) ← Local.generalizeAtoms stmt then
+      if let some (pf, method) ← (← read).cfg.proveStep step.rule g then
+        record step.rule s!"{method} (atoms)"
+        return mkAppN (mkAppN pf vals) (ps.map (·.2))
   let some (pf, method) ← (← read).cfg.proveStep step.rule stmt | throwError "tactics failed"
   record step.rule method
   return mkAppN pf (ps.map (·.2))
