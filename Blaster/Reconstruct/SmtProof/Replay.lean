@@ -321,6 +321,11 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
   finally
     let ms := (← IO.monoMsNow) - start
     modify fun s => { s with stats := s.stats.addTime step.rule ms }
+    -- profiling (environment variable `BLASTER_SMTPROOF_TRACE`: file receiving the steps taking more than 100 ms)
+    if ms > 100 then
+      if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
+        let h ← IO.FS.Handle.mk f .append
+        h.putStrLn s!"step {i} {step.rule} depth {ctx.depth}: {ms} ms; {(toString step.concl).take 200}"
 
 partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   let ctx ← read
