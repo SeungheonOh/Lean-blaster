@@ -37,6 +37,8 @@ inductive SymInterp where
   | selector (ctor : Name) (idx : Nat)
   /-- a datatype tester -/
   | tester (ctor : Name)
+  /-- application of a function value (Blaster's `@apply` functions for higher-order arguments) -/
+  | apply
   deriving Inhabited
 
 /-- Interpretation of the symbols and sorts of an SMT query. -/
@@ -180,8 +182,13 @@ partial def sortToType (s : SExpr) : InterpM Expr := do
         | none => throwError "smt proof: unknown sort {a}"
     | .list xs =>
         let some (SExpr.atom a) := xs[0]? | throwError "smt proof: unsupported sort {s}"
+        -- NOTE: in the sort arguments of the query, `Nat` stands for Lean `Nat` (e.g., `List Nat`)
+        let args ← (xs.extract 1 xs.size).mapM fun s => if s == .atom "Nat" then pure natType else sortToType s
+        -- arrow sorts of Blaster's encoding of function values
+        if a.startsWith "@@ArrowT" then
+          let some r := args.back? | throwError "smt proof: ill-formed arrow sort {s}"
+          return args.pop.foldr (fun d acc => mkForall `x .default d acc) r
         let some t := tbl.sorts.get? a | throwError "smt proof: unknown sort {a}"
-        let args ← (xs.extract 1 xs.size).mapM sortToType
         -- NOTE: `Int` arguments may stand for `Nat` (aliases are expanded in proofs)
         return mkAppN t args
     | _ => throwError "smt proof: unsupported sort {s}"
@@ -387,6 +394,10 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
     | some (.tester c) =>
         let some a := args[0]? | throwError "smt proof: tester without argument"
         mkTester c (← interp a)
+    | some .apply =>
+        let some fn := args[0]? | throwError "smt proof: apply without argument"
+        let r ← mkAppCoerce (← interp fn) (← (args.extract 1 args.size).mapM interp)
+        toSmtWorld r
     | none => throwError "smt proof: unknown symbol {f}"
 
 /-- Interpret `t` as an `Int` term (casting `Nat` terms). -/

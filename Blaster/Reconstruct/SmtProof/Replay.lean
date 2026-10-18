@@ -23,12 +23,17 @@ namespace Blaster.Reconstruct.SmtProof
 structure ReplayStats where
   /-- per rule: number of steps replayed by each method -/
   byRule : Std.HashMap String (Std.HashMap String Nat) := {}
+  /-- per rule: time (ms) spent in replay attempts, including failed ones -/
+  msByRule : Std.HashMap String Nat := {}
   failures : Array String := #[]
   deriving Inhabited
 
 def ReplayStats.record (s : ReplayStats) (rule method : String) : ReplayStats :=
   let m := s.byRule.getD rule {}
   { s with byRule := s.byRule.insert rule (m.insert method (m.getD method 0 + 1)) }
+
+def ReplayStats.addTime (s : ReplayStats) (rule : String) (ms : Nat) : ReplayStats :=
+  { s with msByRule := s.msByRule.insert rule (s.msByRule.getD rule 0 + ms) }
 
 structure ReplayConfig where
   /-- tactic proving a closed formula directly (used for asserted formulas and as fallback);
@@ -229,7 +234,7 @@ mutual
 partial def replay (i : Nat) : ReplayM Expr := do
   let ctx ← read
   if let some p := (← get).cache.get? i then return p
-  if (← get).failed.contains i then throwError "smt proof: step {i} already failed"
+  if ctx.depth == 0 && (← get).failed.contains i then throwError "smt proof: step {i} already failed"
   if ctx.depth > 0 then
     if let some p := (← get).scopeCache.get? i then return p
     if (← get).scopeFailed.contains i then throwError "smt proof: step {i} already failed"
@@ -245,6 +250,19 @@ partial def replay (i : Nat) : ReplayM Expr := do
 partial def replayCore (i : Nat) : ReplayM Expr := do
   let ctx ← read
   let step := ctx.proof.steps[i]!
+  -- premises are replayed first, such that the time of the step only accounts for the step itself
+  -- NOTE: premises of `lemma` (resp. `proof-bind`) are replayed under hypotheses (resp. bound variables)
+  if !(["lemma", "proof-bind", "subproof", "bind"].contains step.rule) then
+    for j in step.premises do
+      try discard <| replay j catch _ => pure ()
+  let start ← IO.monoMsNow
+  try replayCore' i step
+  finally
+    let ms := (← IO.monoMsNow) - start
+    modify fun s => { s with stats := s.stats.addTime step.rule ms }
+
+partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
+  let ctx ← read
   let concl ← stepConcl i
   let attempt : ReplayM (Option Expr) := do
     try some <$> replayRule i step concl

@@ -150,6 +150,8 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
     | some "declare-fun", some n =>
         if let some e := funs.get? n then
           tbl := { tbl with syms := tbl.syms.insert n (.expr e) }
+        else if n.startsWith "@apply" then
+          tbl := { tbl with syms := tbl.syms.insert n .apply }
         else if n.startsWith "@is" then
           tbl := { tbl with syms := tbl.syms.insert n .trueFun }
     | some "define-fun", some n =>

@@ -125,11 +125,16 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
           if mode == "off" || !task.bySmt then return none
           match ← SmtProof.proveBySmtProof e {} with
           | .ok r => return some (r.proof, s!"smt residual by {r.backend} proof replay")
-          | .error _ => return none
-        let first? ← if mode == "first" then bySmtProof else pure none
+          | .error msg =>
+              if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
+                let h ← IO.FS.Handle.mk f .append
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("error", toJson (msg.take 2000))]))
+              return none
+        let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
         match first? with
         | some (p, m) => pure (some p, m)
         | none =>
+        if mode == "only" then pure (none, "none") else
         match ← proveResidual e with
         | some (p, m) => pure (some p, s!"smt residual by {m}")
         | none =>
