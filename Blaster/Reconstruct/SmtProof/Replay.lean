@@ -104,6 +104,16 @@ def stepConcl (i : Nat) : ReplayM Expr := do
   if isGlobal then modify fun s => { s with conclCache := s.conclCache.insert i e }
   return e
 
+/-- Time of a phase of the replay of a step (written to `BLASTER_SMTPROOF_TRACE` when above 100 ms). -/
+def timed (phase : String) (x : ReplayM α) : ReplayM α := do
+  let start ← IO.monoMsNow
+  try x finally
+    let ms := (← IO.monoMsNow) - start
+    if ms > 100 then
+      if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
+        let h ← IO.FS.Handle.mk f .append
+        h.putStrLn s!"  phase {phase}: {ms} ms"
+
 def record (rule method : String) : ReplayM Unit :=
   modify fun s => { s with stats := s.stats.record rule method }
 
@@ -693,13 +703,13 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       return ← mkEqRefl a
     -- definitional rewrites (e.g., testers of single-constructor types, by structure eta), with a budget
     -- (only reducible definitions for large terms)
-    if (← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
+    if ← timed "defeq" (try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
             withCurrHeartbeats <| (if unfoldable then withDefault else withReducible) <| isDefEq a b catch _ => pure false) then
       record step.rule "defeq"
       return ← mkExpectedTypeHint (← mkEqRefl a) concl
   let ps ← premises step
   -- propositional steps (e.g., `def-axiom`, `not-or-elim`, propositional rewrites): exact proof
-  if let some p ← PropEngine.prove ps concl then
+  if let some p ← timed "prop" (PropEngine.prove ps concl) then
     record step.rule "prop"
     return p
   -- large equalities without premises (e.g., rewrites): congruence on the common structure, and tactics
@@ -717,12 +727,21 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
           if (← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
                   withCurrHeartbeats <| (if small then withDefault else withReducible) <| isDefEq l r catch _ => pure false) then
             return some (← mkExpectedTypeHint (← mkEqRefl l) eq)
-          if let some (g, vals) ← Local.generalizeCommon eq l r then
-            if let some (pf, _) ← cfg.proveStep rule g then return some (mkAppN pf vals)
+          let t0 ← IO.monoMsNow
+          let gen ← Local.generalizeCommon eq l r
+          let t1 ← IO.monoMsNow
+          if let some (g, vals) := gen then
+            let r ← cfg.proveStep rule g
+            if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
+              let t2 ← IO.monoMsNow
+              if t2 - t0 > 100 then
+                let h ← IO.FS.Handle.mk f .append
+                h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 300}"
+            if let some (pf, _) := r then return some (mkAppN pf vals)
           else if small then
             if let some (pf, _) ← cfg.proveStep rule eq then return some pf
           return none
-        if let some p ← Local.diffEq prove budget a b then
+        if let some p ← timed "local" (Local.diffEq prove budget a b) then
           record step.rule "local"
           return ← mkExpectedTypeHint p concl
   -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
@@ -734,7 +753,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
         record step.rule s!"{method} (atoms)"
         return mkAppN (mkAppN pf vals) (ps.map (·.2))
   if large then throwError "tactics are not applied to large statements"
-  let some (pf, method) ← (← read).cfg.proveStep step.rule stmt | throwError "tactics failed"
+  let some (pf, method) ← timed "tactics" ((← read).cfg.proveStep step.rule stmt) | throwError "tactics failed"
   record step.rule method
   return mkAppN pf (ps.map (·.2))
 
