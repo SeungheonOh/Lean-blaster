@@ -356,7 +356,35 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
     order the tactic portfolios by efficiency (adaptive, per process). -/
 initialize tacticStats : IO.Ref (Std.HashMap (String × String) (Nat × Nat)) ← IO.mkRef {}
 
+/-- Coarse shape of a goal, refining the statistics of the adaptive ordering: `arith` for (in)equalities
+    and propositional combinations of linear arithmetic atoms, `nat` for universally quantified formulas
+    guarded by `0 ≤ x` (definitions of `Nat` functions), `data` for formulas with constructors or case
+    analyses, `other` otherwise. -/
+partial def goalShape (e : Expr) : MetaM String := do
+  let some kind ← go e 0 | return "other"
+  return kind
+where
+  go (e : Expr) (depth : Nat) : MetaM (Option String) := do
+    if depth > 64 then return none
+    if e.isForall then
+      if let .forallE _ t b _ := e then
+        if (← whnfR t).isConstOf ``Int then
+          if let .forallE _ g _ _ := b then
+            if g.isAppOfArity ``LE.le 4 then return some "nat"
+      return none
+    let env ← getEnv
+    let isData (s : Expr) : Bool := match s with
+      | .const n _ =>
+          (n.isStr && n.getString!.endsWith "casesOn") ||
+          (isCtorName env n && n != ``Int.ofNat && n != ``True && n != ``False && n != ``Int.negSucc)
+      | _ => false
+    if (e.find? isData).isSome then return some "data"
+    let arith := e.find? (fun s => s.isAppOfArity ``LE.le 4 || s.isAppOfArity ``LT.lt 4 || s.isAppOfArity ``HAdd.hAdd 6 || s.isAppOfArity ``HMul.hMul 6) |>.isSome
+    return some (if arith then "arith" else "other")
+  isCtorName (env : Environment) (n : Name) : Bool := (env.find? n).any (·.isCtor)
+
 def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
+  let rule := s!"{rule}/{← goalShape goal}"
   let stats ← tacticStats.get
   -- most efficient tactics first, i.e., highest number of successes per time unit (with a prior
   -- favoring the given order)

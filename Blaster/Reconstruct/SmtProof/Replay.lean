@@ -413,6 +413,7 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       return mkApp6 (Lean.mkConst ``Or.elim) q nq concl (mkApp (Lean.mkConst ``Classical.em) q) r rn
   | "proof-bind" => replayBind step
   | "monotonicity" => replayCongr step concl
+  | "commutativity" => replayComm concl
   | "sk" =>
       -- `(¬ ∀ x, φ) → ¬ φ[ε]` or `(∃ x, φ) → φ[ε]` (see the interpretation of skolem constants)
       let some (a, b) := (if concl.isArrow then some (concl.bindingDomain!, concl.bindingBody!) else none)
@@ -499,6 +500,25 @@ partial def replayCongr (step : Step) (concl : Expr) : ReplayM Expr := do
     cur := next
   if !(← propEq cur r) then throwError "monotonicity: congruence mismatch"
   record step.rule "exact"
+  return pf
+
+/-- `commutativity`: `f a b = f b a` for commutative operations (equality, `∧`, `∨`, `+`, `*` on `Int`). -/
+partial def replayComm (concl : Expr) : ReplayM Expr := do
+  let some (_, l, r) := concl.eq? | throwError "commutativity: equality expected"
+  let swapped (op : Name) (n : Nat) : Option (Expr × Expr) :=
+    if l.isAppOfArity op n && r.isAppOfArity op n then
+      let la := l.getAppArgs; let ra := r.getAppArgs
+      if la[n-2]! == ra[n-1]! && la[n-1]! == ra[n-2]! then some (la[n-2]!, la[n-1]!) else none
+    else none
+  let pf ← do
+    if let some (a, b) := swapped ``Or 2 then mkAppM ``propext #[← mkAppOptM ``or_comm #[a, b]]
+    else if let some (a, b) := swapped ``And 2 then mkAppM ``propext #[← mkAppOptM ``and_comm #[a, b]]
+    else if let some (a, b) := swapped ``Eq 3 then mkAppM ``propext #[← mkAppOptM ``eq_comm #[none, a, b]]
+    else if let some (a, b) := swapped ``HAdd.hAdd 6 then mkAppM ``Int.add_comm #[a, b]
+    else if let some (a, b) := swapped ``HMul.hMul 6 then mkAppM ``Int.mul_comm #[a, b]
+    else throwError "commutativity: unsupported operation"
+  if !(← propEq (← inferType pf) concl) then throwError "commutativity: mismatch"
+  record "commutativity" "exact"
   return pf
 
 /-- Resolution steps: unit propagation on the premise clauses (see `rupProof`). -/
