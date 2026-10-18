@@ -2,6 +2,7 @@ import Lean
 import Blaster.Optimize.Decidable
 import Blaster.Reconstruct.SmtProof.Interp
 import Blaster.Reconstruct.Discharge
+import Blaster.Reconstruct.SmtProof.Local
 
 /-!
 # Bridge between goals and the interpretation of their translation
@@ -821,6 +822,8 @@ structure Cfg where
   /-- hypotheses of the current branch (free variables), e.g., the conditions of the `ite` encoding of a
       `match` on `Nat`/`Int` patterns -/
   facts : Array Expr := #[]
+  /-- maximal number of nested unfoldings of the functions inlined by Blaster's optimizer (see `walkUnfold`) -/
+  unfoldDepth : Nat := 2
 
 structure State where
   cache : Std.HashMap (Expr × Expr) (Option Expr) := {}
@@ -962,6 +965,34 @@ def matcherLemma (m : Name) (lvls : List Level) (info : MatcherInfo) (params : A
   modify fun s => { s with lemmas := s.lemmas.insert head l }
   return l
 
+/-- `(b, app = b)` where `b` is the right-hand side of the unfolding equation of the function `f` of `app`
+    (`f.eq_def`, with the arguments of `app`). -/
+def unfoldEqn? (app : Expr) : MetaM (Option (Expr × Expr)) := do
+  let .const f us := app.getAppFn | return none
+  let some eqDef ← (try getUnfoldEqnFor? f (nonRec := true) catch _ => pure none) | return none
+  let some (_, app', b) := (← instantiateForall (← inferType (mkConst eqDef us)) app.getAppArgs).eq? | return none
+  if app' != app then return none
+  return some (b.headBeta, mkAppN (mkConst eqDef us) app.getAppArgs)
+
+/-- `W(a) = W(b)` from `a = b`. -/
+def World.liftEq (w : World) (p : Expr) : MetaM Expr :=
+  match w with
+  | .same => pure p
+  | .nat => mkCongrArg (mkApp2 (mkConst ``Nat.cast [levelZero]) (mkConst ``Int) (mkConst ``instNatCastInt)) p
+  | .bool => mkCongrArg (mkLambda `z .default (mkConst ``Bool) (boolTrue (.bvar 0))) p
+
+/-- Whether `f` is a function of the user, which Blaster's optimizer may inline (not a definition of the
+    libraries, which are translated by dedicated rules). -/
+def isUserFunction (f : Name) : MetaM Bool := do
+  let env ← getEnv
+  let some (.defnInfo _) := env.find? f | return false
+  if (← isMatcher f) || isInstanceCore env f || (env.getProjectionFnInfo? f).isSome then return false
+  match env.getModuleIdxFor? f with
+  | none => return true
+  | some idx =>
+      let m := env.header.moduleNames[idx.toNat]!
+      return !(m.getRoot == `Init || m.getRoot == `Std || m.getRoot == `Lean || m.getRoot == `Blaster)
+
 /-- `(i, a = i)` where `i` is the `ite` encoding of the matcher application `a` (with β-reduced alternatives). -/
 def matcherIte? (a : Expr) : BridgeM (Option (Expr × Expr)) := do
   let .const m lvls := a.getAppFn | return none
@@ -1052,6 +1083,20 @@ where
     | .letE _ t v b _ => go t (fuel - 1) >>= go v >>= go b
     | .mdata _ b | .proj _ _ b => go b (fuel - 1)
     | _ => some (fuel - 1)
+
+/-- Blaster's normal forms of the standard notations of the arithmetic operations on `Nat` and `Int`
+    (definitionally equal, see `standardForm`). -/
+def blasterForm (e : Expr) : Expr := Id.run do
+  let ops := #[(``HAdd.hAdd, ``Nat.add, ``Int.add), (``HSub.hSub, ``Nat.sub, ``Int.sub),
+    (``HMul.hMul, ``Nat.mul, ``Int.mul), (``HDiv.hDiv, ``Nat.div, ``Int.ediv), (``HMod.hMod, ``Nat.mod, ``Int.emod)]
+  for (op, natOp, intOp) in ops do
+    if e.isAppOfArity op 6 then
+      let ty := e.getArg! 0
+      if ty.isConstOf ``Nat && e.getArg! 1 == ty && e.getArg! 2 == ty then
+        return mkApp2 (mkConst natOp) (e.getArg! 4) (e.getArg! 5)
+      if ty.isConstOf ``Int && e.getArg! 1 == ty && e.getArg! 2 == ty then
+        return mkApp2 (mkConst intOp) (e.getArg! 4) (e.getArg! 5)
+  return e
 
 /-- Standard notation of Blaster's normal forms (definitionally equal). -/
 def standardForm (e : Expr) : MetaM Expr := do
@@ -1216,6 +1261,9 @@ partial def walkApp (a b : Expr) : BridgeM (Option Expr) := do
 /-- Applications of functions translated as SMT macros: `W(f xs) = M(W(xs))` (an auxiliary lemma proved once
     per function) where `b` is an instance of the interpretation of the body `M` of the macro. -/
 partial def walkMacro (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  -- NOTE: the standard notations (e.g., `x - y` on `Nat`) as Blaster's normal forms (`Nat.sub x y`)
+  let a₀ := a
+  let a := blasterForm a
   let .const f lvls := a.getAppFn | return none
   let some mk := (← read).macroOf f | return none
   let args := a.getAppArgs
@@ -1269,7 +1317,7 @@ partial def walkMacro (w : World) (a b : Expr) : BridgeM (Option Expr) := do
     let ctx ← withLocalDeclD `z (← worldTy doms[i]!) fun z => do mkLambdaFVars #[z] (← mk (cur.set! i z))
     pf ← mkEqTrans pf (← mkCongrArg ctx pi)
     cur := cur.set! i bargs[i]!
-  return some (← mkExpectedTypeHint pf (← mkEq (w.lift a) b))
+  return some (← mkExpectedTypeHint pf (← mkEq (w.lift a₀) b))
 
 partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
   if a == b then return some (← mkEqRefl a)
@@ -1303,17 +1351,23 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
           let some p ← walk l b.appArg! | return none
           return some (mkApp3 (mkConst ``eq_false') l b.appArg! p)
   -- relations whose arguments are in different worlds
+  -- NOTE: the sides of equations may be swapped by Blaster's normalization (e.g., `0 = x` for `x = 0`)
   if a.isAppOfArity ``Eq 3 && b.isAppOfArity ``Eq 3 then
     let aa := a.getAppArgs
     let ba := b.getAppArgs
     if aa[0]! != ba[0]! then
       let some w ← worldOf aa[0]! ba[0]! | return none
-      let some px ← walk aa[1]! ba[1]! | return none
-      let some py ← walk aa[2]! ba[2]! | return none
-      match w with
-      | .nat => return some (mkApp6 (mkConst ``nat_eq) aa[1]! aa[2]! ba[1]! ba[2]! px py)
-      | .bool => return some (mkApp6 (mkConst ``bool_eq) aa[1]! aa[2]! ba[1]! ba[2]! px py)
-      | .same => pure ()
+      let eqOf (x y : Expr) : BridgeM (Option Expr) := do
+        let some px ← walk aa[1]! x | return none
+        let some py ← walk aa[2]! y | return none
+        match w with
+        | .nat => return some (mkApp6 (mkConst ``nat_eq) aa[1]! aa[2]! x y px py)
+        | .bool => return some (mkApp6 (mkConst ``bool_eq) aa[1]! aa[2]! x y px py)
+        | .same => return none
+      if let some p ← eqOf ba[1]! ba[2]! then return some p
+      if let some p ← eqOf ba[2]! ba[1]! then
+        return some (← mkEqTrans p (mkApp3 (mkConst ``Local.eq_comm_eq [levelOne]) ba[0]! ba[2]! ba[1]!))
+      return none
   for (op, lem) in [(``LE.le, ``nat_le), (``LT.lt, ``nat_lt)] do
     if a.isAppOfArity op 4 && b.isAppOfArity op 4 then
       let aa := a.getAppArgs
@@ -1361,6 +1415,13 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
   | _, _ => pure ()
   if a.isApp && b.isApp then
     if let some p ← walkApp a b then return some p
+  -- equations of the same world with swapped sides
+  if a.isAppOfArity ``Eq 3 && b.isAppOfArity ``Eq 3 && a.getArg! 0 == b.getArg! 0 then
+    if let some px ← walk (a.getArg! 1) (b.getArg! 2) then
+      if let some py ← walk (a.getArg! 2) (b.getArg! 1) then
+        let u ← getLevel (a.getArg! 0)
+        let p ← mkCongr (← mkCongrArg (mkApp (mkConst ``Eq [u]) (a.getArg! 0)) px) py
+        return some (← mkEqTrans p (mkApp3 (mkConst ``Local.eq_comm_eq [u]) (b.getArg! 0) (b.getArg! 2) (b.getArg! 1)))
   -- `Int` terms in `Nat` positions (`Int.toNat`)
   if b.isAppOfArity ``Int.toNat 1 then
     if (← whnfR (← inferType a)).isConstOf ``Nat then
@@ -1368,6 +1429,8 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
         if (← inferType p).isAppOfArity ``Eq 3 && ((← inferType p).getArg! 0).isConstOf ``Int then
           return some (mkApp3 (mkConst ``nat_toNat) a b.appArg! p)
   if let some p ← walkMacro .same a b then return some p
+  if let some p ← walkUnfold .same a b then return some p
+  if let some p ← walkArith .same a b then return some p
   byDefEq a b
 
 /-- `∀ n : Nat, p n` (resp. `∃ n : Nat, p n`) and `∀ x : Int, 0 ≤ x → q x` (resp. `∃ x : Int, 0 ≤ x ∧ q x`). -/
@@ -1399,6 +1462,40 @@ partial def walkNatBinder (a b : Expr) : BridgeM (Option Expr) := do
     let ql := mkLambda n .default (mkConst ``Int) q
     let pf := mkApp3 (mkConst lem) pl ql (← mkLambdaFVars #[x] h)
     return some (← mkExpectedTypeHint pf (← mkEq a b))
+
+/-- Functions of the user inlined by Blaster's optimizer: `W(f xs) = W(b)` by the unfolding equation of `f`,
+    then `W(b) = b'` (at most `Cfg.unfoldDepth` nested unfoldings). -/
+partial def walkUnfold (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  if (← read).unfoldDepth == 0 then return none
+  let .const f _ := a.getAppFn | return none
+  if b.getAppFn.isConstOf f || !(← isUserFunction f) then return none
+  let some (u, eqn) ← unfoldEqn? a | return none
+  let some p ← withReader (fun c => { c with unfoldDepth := c.unfoldDepth - 1 }) (walk u b) | return none
+  return some (← mkEqTrans (← w.liftEq eqn) p)
+
+/-- Arithmetic terms equal modulo the normalizations of Blaster's optimizer (e.g., the reordering of the operands
+    of `+` in the definitions of functions): the arithmetic atoms of `a` are related to atoms of `b` (`walk`),
+    then `W(a) = b` is proved by `omega` from these equations (and the hypotheses of the branch). -/
+partial def walkArith (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  if !(Local.isArithHead a && Local.isArithHead b) then return none
+  if !(w == .nat || (w == .same && (← whnfR (← inferType a)).isConstOf ``Int)) then return none
+  let as ← Local.arithAtoms a
+  let bs ← Local.arithAtoms b
+  if as.isEmpty || as.size > 8 || bs.size > 8 then return none
+  let mut eqs : Array (Expr × Expr) := #[]
+  for x in as do
+    let mut found := false
+    for y in bs do
+      if let some p ← walk x y then
+        eqs := eqs.push (← inferType p, p)
+        found := true
+        break
+    if !found then return none
+  let goal ← mkEq (w.lift a) b
+  let decls := eqs.mapIdx fun i (t, _) => (Name.mkSimple s!"e{i}", fun (_ : Array Expr) => pure t)
+  withLocalDeclsD decls fun hs => do
+    let some pf ← withRestrictedLCtx ((hs ++ (← read).facts).push goal) (omegaProof? goal) | return none
+    return some (mkAppN (← mkLambdaFVars hs pf) (eqs.map (·.2)))
 
 /-- `(↑a : Int) = b` -/
 partial def walkNat (a b : Expr) : BridgeM (Option Expr) := do
@@ -1435,6 +1532,8 @@ partial def walkNat (a b : Expr) : BridgeM (Option Expr) := do
       if let some px ← walk x b then
         return some (← mkExpectedTypeHint (mkApp4 (mkConst ``toNat_bridge) x b h px) (← mkEq la b))
   if let some p ← walkMacro .nat a b then return some p
+  if let some p ← walkUnfold .nat a b then return some p
+  if let some p ← walkArith .nat a b then return some p
   byDefEq la b
 
 /-- `(a = true) = b` -/
@@ -1486,6 +1585,7 @@ partial def walkBool (a b : Expr) : BridgeM (Option Expr) := do
   if let some p ← walkMatcher .bool a b then return some p
   if let some p ← walkIte .bool a b then return some p
   if let some p ← walkMacro .bool a b then return some p
+  if let some p ← walkUnfold .bool a b then return some p
   byDefEq la b
 
 end
@@ -1501,22 +1601,15 @@ def proveDefinition? (cfg : Cfg) (c : Expr) : Term.TermElabM (Option Expr) :=
       else if lhs.isAppOfArity ``Eq 3 && (lhs.getArg! 2).isConstOf ``Bool.true then (World.bool, lhs.getArg! 1)
       else (World.same, lhs)
     if w.lift app != lhs then return none
-    let .const f us := app.getAppFn | return none
-    let some eqDef ← (try getUnfoldEqnFor? f (nonRec := true) catch _ => pure none)
-      | dbg m!"bridge: no unfolding equation for {f}"; return none
-    let eqn := mkAppN (mkConst eqDef us) app.getAppArgs
-    let some (_, app', unfolded) := (← instantiateForall (← inferType (mkConst eqDef us)) app.getAppArgs).eq?
-      | return none
-    if app' != app then return none
+    let .const f _ := app.getAppFn | return none
+    let some (unfolded, eqn) ← unfoldEqn? app | dbg m!"bridge: no unfolding equation for {f}"; return none
     -- NOTE: the hypotheses of the definition (e.g., `0 ≤ x` for the `Int` variables of `Nat` arguments) are facts
     let facts ← xs.filterM fun x => do isProp (← inferType x)
-    let (r, st) ← (walk unfolded.headBeta rhs |>.run { cfg with facts := cfg.facts ++ facts }).run {}
-    let some p := r | dbg m!"bridge: definition of {f} not proved: {st.failures.extract 0 1}"; return none
-    let pl ← match w with
-      | .same => pure eqn
-      | .nat => mkCongrArg (mkApp2 (mkConst ``Nat.cast [levelZero]) (mkConst ``Int) (mkConst ``instNatCastInt)) eqn
-      | .bool => mkCongrArg (mkLambda `z .default (mkConst ``Bool) (boolTrue (.bvar 0))) eqn
-    mkLambdaFVars xs (← mkExpectedTypeHint (← mkEqTrans pl p) body)
+    let (r, st) ← (walk unfolded rhs |>.run { cfg with facts := cfg.facts ++ facts }).run {}
+    let some p := r | do
+      for (a, b) in st.failures.extract (st.failures.size - 4) st.failures.size do dbg m!"bridge: definition of {f} not proved: {← ppExpr a}\n  ≠ {← ppExpr b}"
+      return none
+    mkLambdaFVars xs (← mkExpectedTypeHint (← mkEqTrans (← w.liftEq eqn) p) body)
 
 /-- Proof of `a = b` (resp. `a → b` when `imp`) for a goal term `a` and the interpretation `b` of its
     translation, with the failed pairs of subterms (deepest first) when it fails. -/
