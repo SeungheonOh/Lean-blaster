@@ -589,17 +589,25 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
-    let reopt := (← IO.getEnv "BLASTER_SMTPROOF_REOPT").isSome
-    let (body', tenv) ← (do
+    let ((body', reopt), tenv) ← (do
         -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
-        -- recursive functions); `body` being already optimized, `body'` is expected to be `body`.
+        -- recursive functions); `body` being already optimized, `body'` is expected to be `body`. The
+        -- optimized term is translated (as in Blaster's verdict run) when it is definitionally equal to `body`
+        -- (which the bridge requires), `body` itself otherwise.
         let (body', _) ← Optimize.mainPf body (track := false)
+        let reopt ← if body' == body then pure true else
+          try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 200000 * 1000 }) <|
+              withCurrHeartbeats <| isDefEq body body'
+          catch _ => pure false
         setBlasterProcess
-        -- NOTE: `body` is translated (rather than `body'`), such that the asserted formula is the translation
-        -- of the negated goal itself
+        -- sort variables introduced as free variables: declared as Blaster does for top-level quantifiers
+        for α in sortVars do
+          updateQuantifiedFVarsCache α.fvarId! true
+          let decl ← generateSortInstDecl (← inferType α)
+          declareConst (← typeParamNameToSmtSymbol α.fvarId!) decl.instSort
         let st ← translateExpr (if reopt then body' else body)
         assertTerm (notSmt st)
-        return body' : TranslateEnvT Expr).run env
+        return (body', reopt) : TranslateEnvT (Expr × Bool)).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
     let cmds := cmds.map guardNatQuantifiers
     -- 2. backend
@@ -651,11 +659,6 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
     let goalTerm := if reopt then body' else body
-    let bodyDefEq ← IO.mkRef (body == goalTerm)
-    if body != goalTerm then
-      let ok ← try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 200000 * 1000 }) <|
-          withCurrHeartbeats <| isDefEq body goalTerm catch _ => pure false
-      bodyDefEq.set ok
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -668,9 +671,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           if c.isAppOfArity ``Not 1 then
             if ← defeq c (mkNot body) then return some (← mkExpectedTypeHint hneg c)
           -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
-          -- NOTE: with `BLASTER_SMTPROOF_REOPT`, the translated goal is the goal optimized again, which is
-          -- expected to be definitionally equal to it
-          let (r, fails) ← if ← bodyDefEq.get then Bridge.prove bcfg (mkNot goalTerm) c else pure (none, #[])
+          -- NOTE: the translated goal is definitionally equal to the goal (see the translation above)
+          let (r, fails) ← Bridge.prove bcfg (mkNot goalTerm) c
           if let some p := r then
             return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot goalTerm)))
           if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
