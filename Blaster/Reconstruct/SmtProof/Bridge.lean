@@ -1502,13 +1502,16 @@ def proveDefinition? (cfg : Cfg) (c : Expr) : Term.TermElabM (Option Expr) :=
       else (World.same, lhs)
     if w.lift app != lhs then return none
     let .const f us := app.getAppFn | return none
-    let some eqDef ← (try getUnfoldEqnFor? f (nonRec := true) catch _ => pure none) | return none
+    let some eqDef ← (try getUnfoldEqnFor? f (nonRec := true) catch _ => pure none)
+      | dbg m!"bridge: no unfolding equation for {f}"; return none
     let eqn := mkAppN (mkConst eqDef us) app.getAppArgs
     let some (_, app', unfolded) := (← instantiateForall (← inferType (mkConst eqDef us)) app.getAppArgs).eq?
       | return none
     if app' != app then return none
-    let (r, _) ← (walk unfolded.headBeta rhs |>.run cfg).run {}
-    let some p := r | return none
+    -- NOTE: the hypotheses of the definition (e.g., `0 ≤ x` for the `Int` variables of `Nat` arguments) are facts
+    let facts ← xs.filterM fun x => do isProp (← inferType x)
+    let (r, st) ← (walk unfolded.headBeta rhs |>.run { cfg with facts := cfg.facts ++ facts }).run {}
+    let some p := r | dbg m!"bridge: definition of {f} not proved: {st.failures.extract 0 1}"; return none
     let pl ← match w with
       | .same => pure eqn
       | .nat => mkCongrArg (mkApp2 (mkConst ``Nat.cast [levelZero]) (mkConst ``Int) (mkConst ``instNatCastInt)) eqn
