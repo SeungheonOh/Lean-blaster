@@ -711,7 +711,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       return ← mkExpectedTypeHint (← mkEqRefl a) concl
   let ps ← premises step
   -- propositional steps (e.g., `def-axiom`, `not-or-elim`, propositional rewrites): exact proof
-  if let some p ← timed "prop" (PropEngine.prove ps concl) then
+  if let some p ← timed "prop" (PropEngine.prove ps concl (splits := if Local.sizeLe concl 2000 then 2 else 0)) then
     record step.rule "prop"
     return p
   -- propositional steps over large atoms (e.g., atoms in different but definitionally equal forms are
