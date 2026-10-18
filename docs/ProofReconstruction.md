@@ -293,6 +293,17 @@ Reconstruction checks every individual rewrite, so it surfaces problems in the t
   Reconstruction refuses the goal and pinpoints `(∀ (_x : α), False) = False`; see
   `Tests/Reconstruct/Unsound.lean`. The same holds for `∃ (x : α), e ⟶ e`. These refusals are counted
   separately in the coverage measurements.
+- **Unguarded definitions of lambda terms (soundness bug, fixed).** The definitional axioms of lambda terms
+  (`@lambda_n_def_cstr`, `@global_lambda_n_def_cstr`) constrained their applications on all the values of the
+  sorts of their parameters: the values of all the types denoted by sort variables (`@Instance`), and the
+  negative integers for `Nat` parameters. Function equality being translated as SMT equality, two lambda terms
+  equal in Lean were equal on all the values of their sorts, which is inconsistent when they differ outside
+  their domain: `∀ (α β : Type) (c : α) (b1 b2 : β), (∀ x : α, x = c) → (fun x : α => x) = (fun _ => c) →
+  b1 ≠ b2 → False` and `∀ (b : Bool), (fun n : Nat => n - 1 + 1) = (fun n : Nat => if n = 0 then 1 else n) →
+  b = true` were reported `Valid`. The definitions are now guarded by the membership predicates of the
+  parameters (`Tests/FixedIssues/LambdaDefGuard.lean`). The replay of SMT proofs could not prove these goals
+  (the axioms have no model in its interpretation), which is how the bug was found. Two induction steps of
+  `Tests/FixedIssues/Issue26.lean` are no longer proved by Blaster.
 - **Ill-typed optimizer output.** The proof run avoids the following issues; the verdict run is unchanged.
   - The else branch of `Blaster.dite'` received the *normalized* type of `¬ c` (e.g. `false = c`
     instead of `¬ (true = c)`), so `dite'` applications were ill-typed. When tracking proofs, the
