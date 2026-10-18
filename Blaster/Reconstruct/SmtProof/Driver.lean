@@ -608,8 +608,14 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         -- sort variables introduced as free variables: declared as Blaster does for top-level quantifiers
         for α in sortVars do
           updateQuantifiedFVarsCache α.fvarId! true
-          let decl ← generateSortInstDecl (← inferType α)
+          -- NOTE: the declarations of sorts are cached on (hash-consed) sort objects
+          let decl ← generateSortInstDecl (← hashcons (← inferType α))
           declareConst (← typeParamNameToSmtSymbol α.fvarId!) decl.instSort
+        -- with sort variables, the data variables are declared with their membership predicates also when they
+        -- don't occur in the goal (e.g., `a : α` witnessing that `α` is inhabited)
+        if !sortVars.isEmpty then
+          for x in xs do
+            if !sortVars.contains x && !(← isProp (← inferType x)) then discard <| translateExpr x
         let st ← translateExpr body'
         assertTerm (notSmt st)
         return (body', reopt) : TranslateEnvT (Expr × Bool)).run env
