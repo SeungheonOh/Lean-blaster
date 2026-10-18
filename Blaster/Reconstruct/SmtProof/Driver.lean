@@ -423,6 +423,17 @@ syntax (name := blasterCasesNat) "blaster_cases_nat" : tactic
       else gs' := gs'.push g
     setGoals gs'.toList
 
+syntax (name := blasterUnfoldLhs) "blaster_unfold_lhs" : tactic
+
+/-- Unfold once the user function at the head of the left-hand side of the equality to prove (e.g., the
+    definitional axiom `f x = body[x]` of a recursive function, whose recursive calls must not be unfolded). -/
+@[tactic blasterUnfoldLhs] def evalBlasterUnfoldLhs : Tactic := fun _ => withMainContext do
+  let some (_, lhs, _) := (← whnfR (← instantiateMVars (← getMainTarget))).eq?
+    | throwError "blaster_unfold_lhs: equality expected"
+  let .const f _ := lhs.getAppFn | throwError "blaster_unfold_lhs: application of a constant expected"
+  if !isUserDefinition (← getEnv) f then throwError "blaster_unfold_lhs: {f} is not a user definition"
+  evalTactic (← `(tactic| rw [$(mkIdent f):ident]))
+
 /-- Tactics proving the interpretation of asserted formulas (and conclusions of steps that can't be
     replayed) from the negated goal and the definitions of user functions. -/
 def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
@@ -448,6 +459,8 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
                             Int.toNat_natCast, Int.ediv_zero, Int.emod_zero] at * <;> (try split) <;> (try split) <;>
                             first | omega | (simp_all; done) | grind))),
     ("grind", ← `(tactic| (intros; grind))),
+    -- definitional axioms of recursive functions (e.g., by well-founded recursion): one unfolding
+    ("unfold lhs", ← `(tactic| (intros; blaster_unfold_lhs <;> first | rfl | grind | ((repeat' split) <;> omega)))),
     ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;>
                             (try split) <;> (try split) <;> first | done | omega | grind))),
     ("cases", ← `(tactic| (intros; blaster_cases_vars <;> blaster_unfold_user <;>
@@ -483,6 +496,8 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
     ("nat def", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
                               (try blaster_cases_nat) <;> (try simp only [Int.toNat_natCast] at *) <;>
                               (try blaster_unfold_user) <;> grind))),
+    -- definitional axioms of recursive functions (e.g., by well-founded recursion): one unfolding
+    ("unfold lhs", ← `(tactic| (intros; blaster_unfold_lhs <;> first | rfl | grind | ((repeat' split) <;> omega)))),
     ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;> grind)))]
   match rule with
   | "th-lemma" => return arith ++ simp ++ grind ++ unfold
