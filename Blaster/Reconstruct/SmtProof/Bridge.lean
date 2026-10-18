@@ -231,6 +231,48 @@ def worldOf (ta tb : Expr) : MetaM (Option World) := do
 def omegaTac : MetaM (TSyntax `tactic) :=
   `(tactic| ((try simp only [Int.ofNat_eq_coe, Int.negSucc_eq] at *) <;> omega))
 
+/-- `Int.ofNat n` (resp. `Int.negSucc n`) in the notation of `omega`: `↑n` (resp. `-(↑n + 1)`), and raw `Nat`
+    literals as `OfNat` literals (definitionally equal). -/
+partial def omegaNotation (e : Expr) : Expr :=
+  e.replace fun e =>
+    if e.isAppOfArity ``OfNat.ofNat 3 then some e
+    else if let .lit (.natVal n) := e then some (mkNatLit n)
+    else if e.isAppOfArity ``Int.ofNat 1 then
+      match e.appArg! with
+      | .lit (.natVal n) => some (mkIntLit n)
+      | a => some (natCast (omegaNotation a))
+    else if e.isAppOfArity ``Int.negSucc 1 then
+      match e.appArg! with
+      | .lit (.natVal n) => some (mkIntNeg (mkIntLit (n + 1)))
+      | a => some (mkIntNeg (mkIntAdd (natCast (omegaNotation a)) (mkIntLit 1)))
+    else none
+
+/-- `e` with the case analyses on constructors reduced (e.g., the selectors of the interpretation applied to
+    constructor applications in the cases of a matcher). -/
+def reduceCases (e : Expr) : MetaM Expr := do
+  let env ← getEnv
+  Meta.transform e (post := fun e => do
+    let .const n _ := e.getAppFn | return .done e
+    if isCasesOnRecursor env n then return .done (← whnfCore e) else return .done e)
+
+/-- Proof of `p` by `omega` from the hypotheses of the local context (in the notation of `omega`, see
+    `omegaNotation`, with the case analyses on constructors reduced), without the tactic framework and the
+    auxiliary theorems of the `omega` tactic. -/
+def omegaProof? (p : Expr) : MetaM (Option Expr) :=
+  Blaster.Reconstruct.attempt Blaster.Reconstruct.dischargeHeartbeats do
+    let m ← mkFreshExprSyntheticOpaqueMVar (omegaNotation (← reduceCases p))
+    let some g ← m.mvarId!.falseOrByContra | return none
+    g.withContext do
+      let hyps ← (← getLocalHyps).toList.mapM fun h => do
+        let t ← inferType h
+        let t' := omegaNotation (← reduceCases t)
+        if t' == t then pure h else mkExpectedTypeHint h t'
+      Lean.Elab.Tactic.Omega.omega hyps g
+    let pf ← instantiateMVars m
+    if pf.hasExprMVar then return none
+    -- NOTE: as the `omega` tactic, the proof (typically large) is an auxiliary theorem
+    return some (← mkAuxTheorem p (← mkExpectedTypeHint pf p) (zetaDelta := true))
+
 /-- The free variables of `es` and, transitively, of their types and values, in the order of the local context. -/
 def fvarClosure (es : Array Expr) : MetaM (Array Expr) := do
   let mut todo := es.foldl (fun acc e => (collectFVars {} e).fvarIds ++ acc) #[]
@@ -529,8 +571,8 @@ where
   stripNamed (e : Expr) : Expr :=
     e.replace fun e => if e.isAppOfArity ``namedPattern 4 then some (stripNamed e.getAppArgs[2]!) else none
   proveEquation' (p : Expr) : Term.TermElabM (Option Expr) := do
-    for tac in [← `(tactic| (subst_vars; rfl)), ← omegaTac,
-                ← `(tactic| (simp_all; done)),
+    if let some pf ← omegaProof? p then return some pf
+    for tac in [← `(tactic| (subst_vars; rfl)), ← `(tactic| (simp_all; done)),
                 ← `(tactic| (rename_i h; cases h; subst_vars; simp_all))] do
       if let some pf ← Blaster.Reconstruct.proveWithTactic p tac then return some pf
     return none
@@ -645,9 +687,9 @@ partial def evalCond (c : Expr) : Term.TermElabM CondVal := do
     | none => pure false
   let arith := c.isAppOfArity ``LE.le 4 || c.isAppOfArity ``LT.lt 4 || numEq
   if arith then
-    let omega ← omegaTac
-    if let some p ← Blaster.Reconstruct.proveWithTactic c omega then return .isTrue p
-    if let some p ← Blaster.Reconstruct.proveWithTactic (mkNot c) omega then return .isFalse p
+    -- NOTE: the conditions of the alternatives preceding the alternative of a case are false
+    if let some p ← omegaProof? (mkNot c) then return .isFalse p
+    if let some p ← omegaProof? c then return .isTrue p
   dbg m!"bridge: unknown atom {c'}"
   return .unknown
 
@@ -1051,7 +1093,7 @@ partial def byFacts (p : Expr) : BridgeM (Option Expr) := do
   let facts := (← read).facts
   if facts.isEmpty then return none
   withRestrictedLCtx (facts.push p) do
-    if let some pf ← Blaster.Reconstruct.proveWithTactic p (← omegaTac) then return some pf
+    if let some pf ← omegaProof? p then return some pf
     -- hypotheses on datatype testers (e.g., the negated conditions of the previous alternatives of a matcher, in
     -- the last alternative): case analyses on the variables of non-recursive datatypes
     Blaster.Reconstruct.proveWithTactic p (← `(tactic| (blaster_cases_nonrec <;>
