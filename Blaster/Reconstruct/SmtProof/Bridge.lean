@@ -29,7 +29,12 @@ namespace Blaster.Reconstruct.SmtProof.Bridge
 
 /-- Debugging output (environment variable `BLASTER_BRIDGE_DEBUG`). -/
 def dbg (msg : MessageData) : MetaM Unit := do
-  if (← IO.getEnv "BLASTER_BRIDGE_DEBUG").isSome then IO.eprintln (← msg.toString)
+  match ← IO.getEnv "BLASTER_BRIDGE_DEBUG" with
+  | none => pure ()
+  | some "1" => IO.eprintln (← msg.toString)
+  | some f =>
+      let h ← IO.FS.Handle.mk f .append
+      h.putStrLn (← msg.toString)
 
 /-! ## Lemmas -/
 
@@ -92,6 +97,9 @@ theorem bool_not {x : Bool} {x' : Prop} (hx : (x = true) = x') : ((!x) = true) =
 
 theorem bool_decide {a : Bool} {p : Prop} (h : (a = true) = p) : a = @decide p (Classical.propDecidable p) := by
   subst h; cases a <;> simp
+
+theorem nat_toNat {a : Nat} {b : Int} (h : (a : Int) = b) : a = Int.toNat b := by
+  subst h; simp
 
 theorem bool_true : (true = true) = True := by simp
 theorem bool_false : (false = true) = False := by simp
@@ -188,8 +196,9 @@ structure AltView where
   vals : Array Expr
 
 def isLiteral (e : Expr) : Bool :=
+  let natLit (n : Expr) : Bool := n.isRawNatLit || (n.isAppOfArity ``OfNat.ofNat 3 && (n.getArg! 1).isRawNatLit)
   e.isRawNatLit || e.isStringLit || e.isConstOf ``Bool.true || e.isConstOf ``Bool.false ||
-  ((e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1) && e.appArg!.isRawNatLit) ||
+  ((e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1) && natLit e.appArg!) ||
   (e.isAppOfArity ``OfNat.ofNat 3 && (e.getArg! 1).isRawNatLit)
 
 /-- Conditions of pattern `p` on the discriminant `x` (see `mkCond` in `Blaster.Smt.Translate.Match`).
@@ -386,7 +395,7 @@ partial def evalCond (c : Expr) : MetaM CondVal := do
       return .splitProp (← mkEq v lit)
     return .unknown
   if let some x ← stuckMajor? c' then return .splitFVar x
-  if (← IO.getEnv "BLASTER_BRIDGE_DEBUG").isSome then IO.eprintln (← (m!"bridge: unknown atom {c'}").toString)
+  dbg m!"bridge: unknown atom {c'}"
   return .unknown
 
 /-- Close `g` with an overlap hypothesis of the splitter (`∀ ys, x = p → False`) whose equalities hold by
@@ -440,7 +449,7 @@ partial def solveIte (g : MVarId) (fuel : Nat) (base : Nat) : MetaM Bool := g.wi
         solveIte g'.mvarId! (fuel - 1) base
     | .splitFVar x =>
         let gs ← try g.cases x catch ex =>
-          if (← IO.getEnv "BLASTER_BRIDGE_DEBUG").isSome then IO.eprintln (← (m!"bridge: cases failed {ex.toMessageData} in {g}").toString)
+          dbg m!"bridge: cases failed {ex.toMessageData} in {g}"
           return false
         gs.allM fun s => solveIte s.mvarId (fuel - 1) base
     | .splitProp p =>
@@ -449,12 +458,12 @@ partial def solveIte (g : MVarId) (fuel : Nat) (base : Nat) : MetaM Bool := g.wi
         if !(← solveIte g₁ (fuel - 1) base) then return false
         solveIte s₂.mvarId (fuel - 1) base
     | .unknown =>
-        if (← IO.getEnv "BLASTER_BRIDGE_DEBUG").isSome then IO.eprintln (← (m!"bridge: unknown condition {c} ⟶ {← whnfD c} in {g}").toString)
+        dbg m!"bridge: unknown condition {c} ⟶ {← whnfD c} in {g}"
         return false
   else
     try g.refl; return true
     catch _ =>
-      if (← IO.getEnv "BLASTER_BRIDGE_DEBUG").isSome then IO.eprintln (← (m!"bridge: leaf {g}").toString)
+      dbg m!"bridge: leaf {g}"
       return false
 
 /-- Prove a matcher equation `∀ xs alts, M params motive xs alts = ite ...` (see `iteOf`). -/
@@ -474,7 +483,7 @@ def proveMatchIte (stmt : Expr) (fuel := 256) : MetaM (Option Expr) := do
     if pf.hasExprMVar then s.restore; return none
     return some pf
   catch ex =>
-    if (← IO.getEnv "BLASTER_BRIDGE_DEBUG").isSome then IO.eprintln (← (m!"bridge: {ex.toMessageData}").toString)
+    dbg m!"bridge: {ex.toMessageData}"
     s.restore; return none
 
 /-! ## Traversal -/
@@ -639,6 +648,11 @@ mutual
 /-- Proof of `W(a) = b` where `W` is given by the types of `a` and `b` (see `World`). -/
 partial def walk (a b : Expr) : BridgeM (Option Expr) := do
   if let some r := (← get).cache.get? (a, b) then return r
+  -- β-redexes of the interpretation (e.g., applications of the interpretations of auxiliary functions)
+  if b.isHeadBetaTarget then
+    let b' := b.headBeta
+    let some p ← walk a b' | return none
+    return some (← mkExpectedTypeHint p (← mkEq (← inferType p >>= fun t => pure (t.getArg! 1)) b))
   let r ← try walkCore a b catch _ => pure none
   if r.isNone then modify fun s => { s with failures := s.failures.push (a, b) }
   modify fun s => { s with cache := s.cache.insert (a, b) r }
@@ -876,6 +890,12 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
   | _, _ => pure ()
   if a.isApp && b.isApp then
     if let some p ← walkApp a b then return some p
+  -- `Int` terms in `Nat` positions (`Int.toNat`)
+  if b.isAppOfArity ``Int.toNat 1 then
+    if (← whnfR (← inferType a)).isConstOf ``Nat then
+      if let some p ← walk a b.appArg! then
+        if (← inferType p).isAppOfArity ``Eq 3 && ((← inferType p).getArg! 0).isConstOf ``Int then
+          return some (mkApp3 (mkConst ``nat_toNat) a b.appArg! p)
   if let some p ← walkMacro .same a b then return some p
   byDefEq a b
 
