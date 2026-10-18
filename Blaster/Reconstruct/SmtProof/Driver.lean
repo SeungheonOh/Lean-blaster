@@ -830,8 +830,13 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- their fields (e.g., the function fields of structures, applied in the body); with sort variables, they
         -- are declared with their membership predicates also when they don't occur in the goal (e.g., `a : α`
         -- witnessing that `α` is inhabited)
+        -- NOTE: variables that can't be translated by themselves (e.g., instances of classes) are left to the
+        -- translation of the body
         for x in xs do
-          if !sortVars.contains x && !(← isProp (← inferType x)) then discard <| translateExpr x
+          let t ← inferType x
+          if sortVars.contains x || (← isProp t) || (← isClass? t).isSome then continue
+          let saved ← get
+          try discard <| translateExpr x catch _ => set saved
         -- NOTE: the unoptimized goal may not be translatable (e.g., terms that only the optimizer normalizes):
         -- its optimized form is then translated, when definitionally equal to it
         let saved ← get
