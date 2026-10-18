@@ -216,6 +216,18 @@ def weakenClause (lits : Array Expr) (d : Expr) (refute : Expr → MetaM (Option
       if ← propEq targetLits[j]! l then return ← mkOrInj targetLits j h
     throwError "smt proof: literal {l} is neither refuted nor in the conclusion"
 
+/-- Proof built by `k` from the premises `ps` (propositions and proofs), given local hypotheses standing for the
+    proofs of the premises: the construction does not traverse these proofs (e.g., the large proofs of the steps
+    replayed in a scope, which are not shared through metavariables, see `replay`). -/
+def withPremiseVars (ps : Array (Expr × Expr)) (k : Array (Expr × Expr) → MetaM Expr) : MetaM Expr := do
+  let rec go (i : Nat) (hs : Array Expr) : MetaM Expr := do
+    if h : i < ps.size then
+      withLocalDeclD (Name.mkSimple s!"p{i}") ps[i].1 fun x => go (i + 1) (hs.push x)
+    else
+      let body ← k ((ps.zip hs).map fun ((t, _), x) => (t, x))
+      return mkAppN (← mkLambdaFVars hs body) (ps.map (·.2))
+  go 0 #[]
+
 /-- Refutation of `l` by one of the unit proofs: `u : ¬ l` or `u : a` with `l = ¬ a`. -/
 def refuteBy (units : Array (Expr × Expr)) (l : Expr) : MetaM (Option Expr) := do
   -- NOTE: syntactic matches first (the definitional ones are costly on large literals)
@@ -608,8 +620,7 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
   | "resolution" | "th_resolution" | "reordering" | "contraction" => replayRup step concl
   | "unit-resolution" =>
       let ps ← timed "premises" (premises step)
-      let some (c, pc) := ps[0]? | throwError "unit-resolution: premises expected"
-      let units := ps.extract 1 ps.size
+      let some (c, _) := ps[0]? | throwError "unit-resolution: premises expected"
       -- the clause premise is `(or l₁ ... lₙ)`
       let n := ctx.proof.steps[step.premises[0]!]!.clauseSize
       let lits := disjuncts c n
@@ -619,7 +630,8 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
         if step.clauseSize == 0 then #[]
         else if single then #[concl]
         else disjuncts concl step.clauseSize
-      let r ← timed "weaken" (weakenClause lits pc (refuteBy units) targetLits)
+      let r ← timed "weaken" <| withPremiseVars ps fun vs =>
+        weakenClause lits vs[0]!.2 (refuteBy (vs.extract 1 vs.size)) targetLits
       record step.rule "exact"
       return r
   | "quant-inst" | "forall_inst" =>
@@ -844,20 +856,22 @@ partial def replayDatatype (concl : Expr) : MetaM (Option Expr) := do
 partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
   let ctx ← read
   let t0 ← IO.monoMsNow
-  let mut clauses := #[]
-  for j in step.premises do
-    let c ← stepConcl j
-    let n := ctx.proof.steps[j]!.clauseSize
-    let lits := if n == 0 then #[] else disjuncts c n
-    clauses := clauses.push (lits, ← replay j)
-    -- NOTE: a clause whose single literal is a disjunction is also given as is
-    if n > 1 then clauses := clauses.push (#[c], ← replay j)
+  let mut ps := #[]
+  for j in step.premises do ps := ps.push (← stepConcl j, ← replay j)
   let t1 ← IO.monoMsNow
   modify fun s => { s with stats := s.stats.addTime "rup-premises" (t1 - t0) }
   let n := step.clauseSize
   let target := if n == 0 then #[] else disjuncts concl n
   let t0 ← IO.monoMsNow
-  let r ← rupProof clauses target
+  let sizes := step.premises.map (ctx.proof.steps[·]!.clauseSize)
+  let r ← withPremiseVars ps fun vs => do
+    let mut clauses := #[]
+    for ((c, pc), n) in vs.zip sizes do
+      let lits := if n == 0 then #[] else disjuncts c n
+      clauses := clauses.push (lits, pc)
+      -- NOTE: a clause whose single literal is a disjunction is also given as is
+      if n > 1 then clauses := clauses.push (#[c], pc)
+    rupProof clauses target
   let t1 ← IO.monoMsNow
   modify fun s => { s with stats := s.stats.addTime "rup-core" (t1 - t0) }
   record step.rule "exact"
