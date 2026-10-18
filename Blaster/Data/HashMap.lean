@@ -134,6 +134,20 @@ def getD (_m : HashMap α β) (_a : α) (fallback : β) : β :=
 @[always_inline, inline] def get? (m : HashMap α β) (a : α) : Option β :=
   unsafe get?Impl m a
 
+private unsafe def toListImpl (m : HashMap α β) : List (α × β) := Id.run do
+  let mut r := []
+  if m.slots.isEmpty then return r
+  for i in [:m.ctrl.size] do
+    if m.ctrl[i]! >= 0x80 then
+      let x : α := unsafeCast m.slots[2 * i]!
+      let y : β := unsafeCast m.slots[2 * i + 1]!
+      r := (x, y) :: r
+  return r
+
+/-- Entries of the map (in no particular order). `O(capacity)`. -/
+@[implemented_by toListImpl]
+def toList (_m : HashMap α β) : List (α × β) := []
+
 /-! ## `insert` -/
 
 /-- Rehash all *live* entries (tombstones are dropped). If the live load
