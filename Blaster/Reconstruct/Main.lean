@@ -126,7 +126,7 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
           let st ← saveState
-          let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof e {})
+          let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof e { randomSeed := task.randomSeed, timeout := task.timeout })
             (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
           -- the proof is checked before being used, such that the other strategies can be tried otherwise
           let res ← match res with
