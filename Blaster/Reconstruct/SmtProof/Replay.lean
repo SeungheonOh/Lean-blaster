@@ -287,6 +287,14 @@ partial def replay (i : Nat) : ReplayM Expr := do
       let msg := s!"step {i} ({step.rule}): {toString step.concl |>.take 300}: {(← ex.toMessageData.toString).take 300}"
       modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
       throw ex
+  if (← IO.getEnv "BLASTER_SMTPROOF_CHECK").isSome then
+    let lctx ← getLCtx
+    let p' ← instantiateMVars p
+    if p'.hasAnyFVar (fun f => !lctx.contains f) then
+      let bad := ((collectFVars {} p').fvarIds).filter (!lctx.contains ·)
+      let sub? := p'.find? fun e => e.isApp && e.getAppFn.isConst && e.getAppArgs.any (fun a => a.isFVar && bad.contains a.fvarId!)
+      IO.eprintln s!"unknown fvar in step {i} ({ctx.proof.steps[i]!.rule}) depth {ctx.depth}: {bad.map (·.name)} in {← (MessageData.ofExpr (sub?.getD p')).toString}"
+      throwError "smt proof: step {i} ({ctx.proof.steps[i]!.rule}) has a proof with an unknown free variable: {p'}"
   if isGlobal then
     -- the proof is represented by an assigned metavariable, such that the proofs using it stay small
     -- (they are instantiated once, at the end of the replay)

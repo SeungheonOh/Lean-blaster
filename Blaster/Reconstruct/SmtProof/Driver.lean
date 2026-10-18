@@ -283,6 +283,49 @@ where
 macro "blaster_nat_intros" : tactic =>
   `(tactic| repeat (first | (intro x hx; obtain ⟨n, hn⟩ := Int.eq_ofNat_of_zero_le hx; subst hn) | intro _))
 
+syntax (name := blasterDivMod) "blaster_divmod" : tactic
+
+/-- Facts on the `Int` divisions and modulos by non-literal divisors of the goal (for `omega`, which treats
+    them as atoms): `y * (x / y) + x % y = x`, `y ≠ 0 → 0 ≤ x % y`, `0 < y → x % y < y`, `y < 0 → x % y < -y`. -/
+@[tactic blasterDivMod] def evalBlasterDivMod : Tactic := fun _ => withMainContext do
+  let tgt ← instantiateMVars (← getMainTarget)
+  let mut pairs : Array (Expr × Expr) := #[]
+  let mut todo := #[tgt]
+  for d in ← getLCtx do
+    if !d.isImplementationDetail then todo := todo.push (← instantiateMVars d.type)
+  let found := todo.foldl (fun acc e => acc ++ (collect e)) #[]
+  for s in found do
+    let p := (s.getArg! 4, s.getArg! 5)
+    if !(pairs.any fun q => q.1 == p.1 && q.2 == p.2) then pairs := pairs.push p
+  if pairs.isEmpty then throwError "blaster_divmod: no division"
+  for (x, y) in pairs do
+    let xs ← Term.exprToSyntax x
+    let ys ← Term.exprToSyntax y
+    evalTactic (← `(tactic| have := Int.mul_ediv_add_emod $xs $ys))
+    evalTactic (← `(tactic| have : $ys ≠ 0 → 0 ≤ $xs % $ys := fun h => Int.emod_nonneg $xs h))
+    evalTactic (← `(tactic| have : 0 < $ys → $xs % $ys < $ys := fun h => Int.emod_lt_of_pos $xs h))
+    evalTactic (← `(tactic| have : $ys < 0 → $xs % $ys < -$ys := fun h => by
+      have := Int.emod_lt_of_pos $xs (Int.neg_pos.mpr h); rwa [Int.emod_neg] at this))
+where
+  collect (e : Expr) : Array Expr := Id.run do
+    let mut acc := #[]
+    let mut stack := #[e]
+    let mut seen : Std.HashSet Expr := {}
+    while !stack.isEmpty do
+      let s := stack.back!
+      stack := stack.pop
+      if seen.contains s then continue
+      seen := seen.insert s
+      if (s.isAppOfArity ``HDiv.hDiv 6 || s.isAppOfArity ``HMod.hMod 6) && (s.getArg! 0).isConstOf ``Int &&
+          !(s.getArg! 5).isAppOfArity ``OfNat.ofNat 3 && !s.hasLooseBVars then
+        acc := acc.push s
+      match s with
+      | .app f a => stack := stack.push f |>.push a
+      | .lam _ t b _ | .forallE _ t b _ => stack := stack.push t |>.push b
+      | .mdata _ b | .proj _ _ b => stack := stack.push b
+      | _ => pure ()
+    return acc
+
 syntax (name := blasterCasesNat) "blaster_cases_nat" : tactic
 
 /-- Case analysis (`0` / `n + 1`) on the local variables of type `Nat`. -/
@@ -333,9 +376,19 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
                             (try simp_all [Int.toNat_natCast]) <;> first | done | omega | grind)))
   ]
 
+/-- Tactics proving the equations of the SMT macros of Lean functions (e.g., `↑(x - y) = if x < y then 0 else x - y`). -/
+def macroTactics : TermElabM (Array (String × TSyntax `tactic)) := do
+  return #[
+    ("rfl", ← `(tactic| (intros; rfl))),
+    ("split+omega", ← `(tactic| (intros; (repeat' split) <;> omega))),
+    ("simp+omega", ← `(tactic| (intros; (repeat' split) <;> simp_all [Int.natCast_ediv, Int.natCast_emod] <;> omega))),
+    ("simp", ← `(tactic| (intros; simp [Int.natCast_ediv, Int.natCast_emod]; done))),
+    ("grind", ← `(tactic| (intros; grind)))]
+
 def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) := do
   let arith := #[
     ("omega", ← `(tactic| (intros; omega))),
+    ("divmod+omega", ← `(tactic| (intros; blaster_divmod; omega))),
     ("propext+omega", ← `(tactic| (intros; apply propext; constructor <;> intro <;> omega))),
     ("split+omega", ← `(tactic| (intros; (repeat' split) <;> omega)))]
   let simp := #[
@@ -508,7 +561,21 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     -- matcher instances optimized by Blaster (whose patterns are the translated ones)
     let mut insts : Std.HashMap Name Expr := {}
     for (k, v) in tenv.optEnv.memCache.isMatcherCache.toList do insts := insts.insert k.name v.instApp
-    let bcfg : Bridge.Cfg := { matchInst := insts.get? }
+    -- SMT macros of Lean functions (e.g., `@Nat.sub`), expanded by the backends in asserted formulas
+    let mut macros : Std.HashMap Name (Array (String × SExpr) × STerm) := {}
+    for (k, v) in tenv.smtEnv.funInstCache.toList do
+      let nm := match v with
+        | .SimpleIdent s => toString s
+        | .QualifiedIdent s _ => toString s
+      if let .const n _ := k.expr then
+        if let some (.macro params body) := tbl.syms.get? nm then macros := macros.insert n (params, body)
+    let macroOf (n : Name) : Option (Array Expr → MetaM Expr) := (macros.get? n).map fun (params, body) vals => do
+      let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) {}
+      (interp body).run { table := tbl, locals }
+    let macroTacs ← macroTactics
+    let bcfg : Bridge.Cfg := {
+      matchInst := insts.get?, macroOf
+      proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
