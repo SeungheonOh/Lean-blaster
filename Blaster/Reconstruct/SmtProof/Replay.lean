@@ -714,6 +714,25 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   if let some p ← timed "prop" (PropEngine.prove ps concl) then
     record step.rule "prop"
     return p
+  -- propositional steps over large atoms (e.g., atoms in different but definitionally equal forms are
+  -- identified by generalization): exact proof on the generalized statement
+  if ["def-axiom", "not-or-elim", "and-elim", "iff~", "nnf-pos", "nnf-neg", "rewrite", "unit-resolution"].contains step.rule then
+    let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
+    if !(Local.sizeLe stmt 200) then
+      if let some p ← timed "prop atoms" (do
+          let some (g, vals) ← Local.generalizePropAtoms stmt | return none
+          forallTelescope g fun zs body => do
+            -- `p₁ → ... → pₙ → c` (premises as hypotheses)
+            let r ← forallTelescope body fun hs c => do
+              let hyps ← hs.mapM fun h => do return (← inferType h, h)
+              match ← PropEngine.prove hyps c with
+              | some p => some <$> mkLambdaFVars hs p
+              | none => pure none
+            match r with
+            | some p => some <$> (do return mkAppN (← mkLambdaFVars zs p) vals)
+            | none => pure none) then
+        record step.rule "prop atoms"
+        return mkAppN p (ps.map (·.2))
   -- large equalities without premises (e.g., rewrites): congruence on the common structure, and tactics
   -- on the differences with their common subterms generalized
   if ps.isEmpty then

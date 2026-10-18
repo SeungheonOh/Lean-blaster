@@ -282,3 +282,45 @@ def generalizeAtoms (stmt : Expr) : MetaM (Option (Expr × Array Expr)) := do
     return some (g, ss)
 
 end Blaster.Reconstruct.SmtProof.Local
+
+namespace Blaster.Reconstruct.SmtProof.Local
+
+/-- Propositional structure, traversed by `propAtoms`. -/
+def isPropHead (e : Expr) : Bool :=
+  e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 || e.isAppOfArity ``Not 1 || e.isAppOfArity ``Iff 2 ||
+  e.isConstOf ``True || e.isConstOf ``False ||
+  (e.isAppOfArity ``Eq 3 && (e.getArg! 0).isProp) || (e.isAppOfArity ``ite 5 && (e.getArg! 0).isProp)
+
+/-- Maximal subterms of `e` that are not propositional structure (propositional atoms). -/
+partial def propAtoms (e : Expr) : MetaM (Array Expr) := do
+  let visited ← IO.mkRef ({} : Std.HashSet Expr)
+  let found ← IO.mkRef (#[] : Array Expr)
+  let rec go (e : Expr) : MetaM Unit := do
+    if (← visited.get).contains e then return
+    visited.modify (·.insert e)
+    if e.hasLooseBVars then return
+    if isPropHead e then
+      if e.isAppOfArity ``ite 5 then go (e.getArg! 1); go (e.getArg! 3); go (e.getArg! 4)
+      else if e.isAppOfArity ``Eq 3 then go (e.getArg! 1); go (e.getArg! 2)
+      else for a in e.getAppArgs do go a
+      return
+    match e with
+    | .forallE _ t b _ => if !b.hasLooseBVars then go t; go b else found.modify (·.push e)
+    | .mdata _ b => go b
+    | _ => if (← isProp e) then found.modify (·.push e)
+  go e
+  found.get
+
+/-- `(∀ zs, stmt[zs/atoms], atoms)` for the propositional atoms of `stmt` (see `propAtoms`). -/
+def generalizePropAtoms (stmt : Expr) : MetaM (Option (Expr × Array Expr)) := do
+  let ss ← propAtoms stmt
+  if ss.isEmpty then return none
+  let decls := ss.mapIdx fun i _ => (Name.mkSimple s!"p{i}", fun (_ : Array Expr) => pure (mkSort levelZero))
+  withLocalDeclsD decls fun zs => do
+    let m : Std.HashMap Expr Expr := (ss.zip zs).foldl (fun m (s, z) => m.insert s z) {}
+    let (stmt', _) := (replaceAll m stmt).run {}
+    let g ← mkForallFVars zs stmt'
+    if !(← isTypeCorrect g) then return none
+    return some (g, ss)
+
+end Blaster.Reconstruct.SmtProof.Local
