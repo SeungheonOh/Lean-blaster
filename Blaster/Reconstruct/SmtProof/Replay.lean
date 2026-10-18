@@ -560,6 +560,11 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     if a == b then
       record step.rule "refl"
       return ← mkEqRefl a
+    -- definitional rewrites (e.g., testers of single-constructor types, by structure eta), with a budget
+    if (← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
+            withCurrHeartbeats <| withDefault <| isDefEq a b catch _ => pure false) then
+      record step.rule "defeq"
+      return ← mkExpectedTypeHint (← mkEqRefl a) concl
   let ps ← premises step
   -- propositional steps (e.g., `def-axiom`, `not-or-elim`, propositional rewrites): exact proof
   if let some p ← PropEngine.prove ps concl then
