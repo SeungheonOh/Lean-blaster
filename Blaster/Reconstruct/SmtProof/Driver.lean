@@ -725,8 +725,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
             for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 3 else #[] do
               h.putStrLn s!"=== bridge mismatch:\n{← ppExpr a}\n--- interpretation:\n{← ppExpr b}\n"
           let r ← portfolio bridge c "bridge"
-          if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
-            logInfo m!"bridge failed: {c}"
+          if r.isNone then debugLog m!"bridge failed: {c}"
           if r.isNone then
             if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
               let h ← IO.FS.Handle.mk f .append

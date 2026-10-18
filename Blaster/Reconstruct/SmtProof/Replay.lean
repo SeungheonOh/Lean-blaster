@@ -114,6 +114,13 @@ def timed (phase : String) (x : ReplayM α) : ReplayM α := do
         let h ← IO.FS.Handle.mk f .append
         h.putStrLn s!"  phase {phase}: {ms} ms"
 
+/-- Debugging output (environment variable `BLASTER_SMTPROOF_DEBUG`: file receiving the failures of the steps;
+    messages would be discarded with the state restored after a failed replay). -/
+def debugLog (msg : MessageData) : MetaM Unit := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_DEBUG" | return
+  let h ← IO.FS.Handle.mk f .append
+  h.putStrLn s!"{← msg.toString}"
+
 def record (rule method : String) : ReplayM Unit :=
   modify fun s => { s with stats := s.stats.record rule method }
 
@@ -293,10 +300,36 @@ def propOnAtoms (stmt : Expr) : MetaM (Option Expr) := do
     | some p => return some (mkAppN (← mkLambdaFVars zs p) vals)
     | none => return none
 
-/-- Tactics on a generalized statement: closed statements are proved in the empty local context (e.g., such
-    that case analyses don't split the variables of the goal). -/
-def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Option (Expr × String)) :=
-  if g.hasFVar then cfg.proveStep rule g else withLCtx {} {} (cfg.proveStep rule g)
+/-- The free variables of `e` and, transitively, of their types and values, in the order of the local context. -/
+def usedFVars (e : Expr) : MetaM (Array Expr) := do
+  let mut todo := (collectFVars {} e).fvarIds
+  let mut seen : FVarIdSet := {}
+  let mut decls := #[]
+  while !todo.isEmpty do
+    let f := todo.back!
+    todo := todo.pop
+    if seen.contains f then continue
+    seen := seen.insert f
+    let d ← f.getDecl
+    decls := decls.push d
+    let s := collectFVars {} d.type
+    let s := match d.value? with | some v => collectFVars s v | none => s
+    todo := todo ++ s.fvarIds
+  return (decls.qsort (·.index < ·.index)).map (·.toExpr)
+
+/-- Tactics on a statement, closed over the free variables it uses and proved in the empty local context:
+    a step is valid by itself (its premises are hypotheses of the statement), and the hypotheses of the
+    context (e.g., the negated goal) would only slow down the tactics (e.g., `simp_all` on the negated goal,
+    case analyses splitting the variables of the goal). -/
+def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Option (Expr × String)) := do
+  if !g.hasFVar then return ← withLCtx {} {} (cfg.proveStep rule g)
+  let fvs ← usedFVars g
+  let g' ← mkForallFVars fvs g
+  if g'.hasFVar then return ← cfg.proveStep rule g
+  let some (pf, m) ← withLCtx {} {} (cfg.proveStep rule g') | return none
+  -- NOTE: let-bound variables are abstracted as `let`s (not applied)
+  let args ← fvs.filterM fun x => return !(← x.fvarId!.getDecl).isLet
+  return some (mkAppN pf args, m)
 
 /-- Proof of a local difference `l = r` of a step (see `Local.diffEq`): definitional equality, then the
     propositional engine and tactics on the statement with the subterms common to `l` and `r` generalized. -/
@@ -308,7 +341,7 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
     return some (← mkExpectedTypeHint (← mkEqRefl l) eq)
   let t0 ← IO.monoMsNow
   let some (g, vals) ← Local.generalizeCommon eq l r
-    | if small then return (← cfg.proveStep rule eq).map (·.1) else return none
+    | if small then return (← proveClosed cfg rule eq).map (·.1) else return none
   let t1 ← IO.monoMsNow
   -- propositional differences (e.g., associativity of connectives, `ite` on propositions): exact proof
   let pp? ← forallTelescope g fun zs body => do
@@ -323,7 +356,7 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
     let t2 ← IO.monoMsNow
     if t2 - t0 > 100 then
       let h ← IO.FS.Handle.mk f .append
-      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 300}"
+      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 1500}"
   return r.map fun (pf, _) => mkAppN pf vals
 
 /-- `quant-intro` (Z3): from `h : ∀ xs, a xs = b xs` (resp. `∀ xs, a xs → b xs`), a proof of
@@ -440,8 +473,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   let attempt : ReplayM (Option Expr) := do
     try some <$> replayRule step concl
     catch ex =>
-      if (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
-        logInfo m!"step {i} ({step.rule}) failed: {ex.toMessageData}"
+      debugLog m!"step {i} ({step.rule}) failed: {ex.toMessageData}"
       return none
   if let some p ← attempt then return p
   -- fallback: unit propagation (e.g., for clauses whose literals are disjunctions)
@@ -451,7 +483,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   -- fallback: tactics on `premises → conclusion` (e.g., when an explicit construction fails due to casts)
   if !(["asserted", "goal", "hypothesis", "lemma", "proof-bind"].contains step.rule) then
     try return ← replayByTactic step concl
-    catch _ => pure ()
+    catch ex => debugLog m!"step {i} ({step.rule}) by tactics failed: {ex.toMessageData}"
   -- fallback: direct proof of the conclusion (except for `False`, which amounts to proving the goal
   -- without the proof of the backend)
   if concl.isConstOf ``False then
@@ -880,9 +912,15 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
           record step.rule s!"{method} (atoms)"
           return applyPremises (mkAppN pf vals)
   if large then throwError "tactics are not applied to large statements"
-  let some (pf, method) ← timed "tactics" (cfg.proveStep step.rule stmt) | throwError "tactics failed"
-  record step.rule method
-  return applyPremises pf
+  if let some (pf, method) ← timed "tactics" (proveClosed cfg step.rule stmt) then
+    record step.rule method
+    return applyPremises pf
+  -- datatype lemmas over variables (e.g., `x = C (C.0 x) ∨ ¬ is-C x`): case analyses
+  if step.rule == "th-lemma" then
+    if let some (pf, method) ← timed "datatype" (proveClosed cfg "datatype" stmt) then
+      record step.rule s!"{method} (datatype)"
+      return applyPremises pf
+  throwError "tactics failed"
 
 /-- Instantiate the universally quantified proof `h` with `ts`, coercing arguments when necessary. -/
 partial def instantiateWithCoercion (h : Expr) (ts : Array Expr) : MetaM Expr := do

@@ -75,7 +75,14 @@ def isAtomic (e : Expr) : Bool :=
     e.isAppOfArity ``OfNat.ofNat 3 || e.isAppOfArity ``Nat.cast 3 && (e.getArg! 2).isRawNatLit ||
     e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1 || e.isAppOfArity ``Neg.neg 3 && (e.getArg! 2).isAppOfArity ``OfNat.ofNat 3
 
-/-- Maximal subterms of `l` that also occur in `r` (and are neither atomic nor types). -/
+/-- Comparisons of integers and natural numbers, kept visible to the arithmetic tactics (e.g., the conditions
+    of conditionals rewritten under these conditions, such as `if 0 = x then 2 + x else ...` into `2`). -/
+def isArithComparison (e : Expr) : Bool :=
+  let numeric (t : Expr) := t.isConstOf ``Int || t.isConstOf ``Nat
+  (e.isAppOfArity ``Eq 3 && numeric (e.getArg! 0)) || (e.isAppOfArity ``LE.le 4 && numeric (e.getArg! 0)) ||
+  (e.isAppOfArity ``LT.lt 4 && numeric (e.getArg! 0))
+
+/-- Maximal subterms of `l` that also occur in `r` (and are neither atomic, types nor arithmetic comparisons). -/
 partial def commonSubterms (l r : Expr) : MetaM (Array Expr) := do
   let inR := closedSubterms r {}
   let visited ← IO.mkRef ({} : Std.HashSet Expr)
@@ -83,10 +90,10 @@ partial def commonSubterms (l r : Expr) : MetaM (Array Expr) := do
   let rec go (e : Expr) : MetaM Unit := do
     if (← visited.get).contains e then return
     visited.modify (·.insert e)
-    if !e.hasLooseBVars && !isAtomic e && inR.contains e then
-      -- values and propositions (not types, nor partial applications)
+    if !e.hasLooseBVars && !isAtomic e && !isArithComparison e && inR.contains e then
+      -- values and propositions (not types, partial applications, nor instances, which tactics must see)
       let ty ← whnfR (← inferType e)
-      if !(ty.isSort && !ty.isProp) && !ty.isForall then
+      if !(ty.isSort && !ty.isProp) && !ty.isForall && (← isClass? ty).isNone then
         found.modify (·.push e)
         return
     match e with
@@ -151,6 +158,12 @@ partial def congrLeaves (op : Name) (proofs : Std.HashMap Expr Expr) (e : Expr) 
   | some p => return p
   | none => mkEqRefl e
 
+/-- Arithmetic operations, whose arguments are reordered and combined by the arithmetic normalizations
+    of the solvers (e.g., Z3 sorting the summands and folding the constants). -/
+def isArithOp (e : Expr) : Bool :=
+  e.isAppOfArity ``HAdd.hAdd 6 || e.isAppOfArity ``HSub.hSub 6 || e.isAppOfArity ``HMul.hMul 6 ||
+  e.isAppOfArity ``Neg.neg 3
+
 mutual
 /-- Proof of `l = r` by congruence on the common structure of `l` and `r`, proving the remaining
     differences with `prove` (given the equality to prove, returns a proof). At most `budget` calls of
@@ -165,6 +178,8 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
     if (← budget.get) == 0 then return none
     budget.modify (· - 1)
     prove (← mkEq l r)
+  -- normalized arithmetic: the congruence on the arguments would mostly produce false differences
+  if isArithOp l && isArithOp r && sizeLe l 400 && sizeLe r 400 then return ← whole
   let fl := l.getAppFn
   let fr := r.getAppFn
   if !l.isApp || !r.isApp || fl != fr || l.getAppNumArgs != r.getAppNumArgs then
@@ -273,7 +288,8 @@ partial def arithAtoms (e : Expr) : MetaM (Array Expr) := do
     | .mdata _ b => go b
     | _ =>
       let ty ← whnfR (← inferType e)
-      if !(ty.isSort && !ty.isProp) && !ty.isForall && !(← isProof e) then found.modify (·.push e)
+      if !(ty.isSort && !ty.isProp) && !ty.isForall && !(← isProof e) && (← isClass? ty).isNone then
+        found.modify (·.push e)
   go e
   found.get
 

@@ -71,6 +71,58 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
   | .ok _ => return none
   | .error ex => return some m!"kernel rejected the reconstructed proof: {ex.toMessageData (← getOptions)}"
 
+/-- Record the outcome of the replay of an SMT proof (`kind`: `residual` or `obligation`) in the file given by
+    `BLASTER_SMTPROOF_LOG` (JSON lines). -/
+def logSmtProof (kind : String) (res : Except String SmtProof.SmtProofResult) : TermElabM Unit := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" | return
+  let h ← IO.FS.Handle.mk f .append
+  let fm ← getFileMap
+  let line := ((← getRef).getPos?.map fun pos => (fm.toPosition pos).line).getD 0
+  let fields := match res with
+    | .ok r =>
+        let ms := Json.mkObj (r.stats.msByRule.toList.map fun (k, v) => (k, toJson v))
+        let methods := Json.mkObj (r.stats.byRule.toList.map fun (k, m) =>
+          (k, Json.mkObj (m.toList.map fun (k', v) => (k', toJson v))))
+        [("ok", toJson true), ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]
+    | .error msg => [("error", toJson (msg.take 2000))]
+  h.putStrLn (Json.compress (Json.mkObj ([("file", toJson (← getFileName)), ("line", toJson line),
+    ("kind", toJson kind)] ++ fields)))
+
+/-- Proof of the closed proposition `goal` by the replay of a proof of the SMT backend, checked by the
+    kernel such that the other strategies can be tried otherwise (the state is restored on failure). -/
+def bySmtProofReplay (task : ReconTask) (kind : String) (goal : Expr) : TermElabM (Option (Expr × String)) := do
+  let st ← saveState
+  let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
+    (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
+  let res ← match res with
+    | .ok r =>
+        match ← kernelCheck goal r.proof with
+        | none => pure (.ok r)
+        | some msg => pure (.error s!"kernel: {← msg.toString}")
+    | err => pure err
+  logSmtProof kind res
+  match res with
+  | .ok r => return some (r.proof, s!"{r.backend} proof replay")
+  | .error _ => st.restore; return none
+
+/-- Proof of a proof obligation `type` of the optimizer (in the local context of the evidence) by the replay
+    of an SMT proof: the obligation is closed over the variables it mentions and the hypotheses on them
+    (e.g., the conditions under which the optimizer rewrote). -/
+def obligationBySmtProof (task : ReconTask) (type : Expr) : TermElabM (Option (Expr × String)) := do
+  let type ← zetaReduce (← instantiateMVars type)
+  let fvs ← SmtProof.usedFVars type
+  let vars : FVarIdSet := fvs.foldl (fun s x => s.insert x.fvarId!) {}
+  let mut hyps := #[]
+  for d in ← getLCtx do
+    if d.isImplementationDetail || d.isLet || vars.contains d.fvarId then continue
+    if (← isProp d.type) && !(d.type.hasAnyFVar (!vars.contains ·)) then hyps := hyps.push d
+  let xs := (← fvs.mapM (·.fvarId!.getDecl)) ++ hyps |>.qsort (·.index < ·.index) |>.map (·.toExpr)
+  if ← xs.anyM fun x => return (← x.fvarId!.getDecl).isLet then return none
+  let goal ← mkForallFVars xs type
+  if goal.hasFVar || goal.hasMVar then return none
+  let some (pf, method) ← bySmtProofReplay task "obligation" goal | return none
+  return some (mkAppN pf xs, method)
+
 /-- Discharge the proof obligations in `proof` and check it against `goal` with the Lean kernel. -/
 def finishProof
   (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) (holes : Array HoleInfo)
@@ -130,36 +182,8 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
         -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
-          let st ← saveState
-          let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof e { randomSeed := task.randomSeed, timeout := task.timeout })
-            (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
-          -- the proof is checked before being used, such that the other strategies can be tried otherwise
-          let res ← match res with
-            | .ok r =>
-                match ← kernelCheck e r.proof with
-                | none => pure (.ok r)
-                | some msg => pure (.error s!"kernel: {← msg.toString}")
-            | err => pure err
-          if let .error _ := res then st.restore
-          match res with
-          | .ok r =>
-              if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
-                let h ← IO.FS.Handle.mk f .append
-                let ms := Json.mkObj (r.stats.msByRule.toList.map fun (k, v) => (k, toJson v))
-                let methods := Json.mkObj (r.stats.byRule.toList.map fun (k, m) =>
-                  (k, Json.mkObj (m.toList.map fun (k', v) => (k', toJson v))))
-                let fm ← getFileMap
-                let line := ((← getRef).getPos?.map fun pos => (fm.toPosition pos).line).getD 0
-                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("line", toJson line), ("ok", toJson true),
-                  ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]))
-              return some (r.proof, s!"smt residual by {r.backend} proof replay")
-          | .error msg =>
-              if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
-                let h ← IO.FS.Handle.mk f .append
-                let fm ← getFileMap
-                let line := ((← getRef).getPos?.map fun pos => (fm.toPosition pos).line).getD 0
-                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("line", toJson line), ("error", toJson (msg.take 2000))]))
-              return none
+          let some (p, m) ← bySmtProofReplay task "residual" e | return none
+          return some (p, s!"smt residual by {m}")
         let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
         match first? with
         | some (p, m) => pure (some p, m)
@@ -194,13 +218,8 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   -- proof obligations of the optimizer that the tactics can't discharge: replay of SMT proofs (e.g., the
   -- unfolding of user definitions in large computations)
   let smtFallback (type : Expr) : TermElabM (Option (Expr × String)) := do
-    if mode == "off" || !(← isProp type) || type.hasMVar then return none
-    let st ← saveState
-    let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof type { randomSeed := task.randomSeed, timeout := task.timeout })
-      (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
-    match res with
-    | .ok r => return some (r.proof, s!"{r.backend} proof replay")
-    | .error _ => st.restore; return none
+    if mode == "off" || !(← isProp type) then return none
+    obligationBySmtProof task type
   finishProof out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes recon.recFunEquivs smtFallback
 
 where
