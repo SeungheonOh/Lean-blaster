@@ -243,11 +243,19 @@ tactic strategies), `first`, `only` (no tactic strategies, to measure the replay
 
 ### Results
 
-On the SMT tests of the suite (`Tests/Smt`, `Tests/FixedIssues`), with `BLASTER_SMT_PROOF=only` (no tactic
-strategy for SMT residuals), the replay of Z3 proofs proves **89.0%** of the residual goals (276/310); 22 of
-the 34 failures are polymorphic goals (Blaster's `@Type`/`@Instance` encoding, not interpreted yet), i.e.,
-95.8% of the monomorphic goals. With the default mode (`last`), the replay complements the tactic
-strategies.
+On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=only` (no tactic strategy for
+SMT residuals), the replay of Z3 proofs proves **88.9%** of the goals closed by the SMT solver (248/279, nightly
+Z3). Most of the remaining failures are polymorphic goals with several sort variables, `match` patterns on
+`Nat`/`Int` with variables and named patterns (`Tests/Smt/SmtMatch.lean`), and non-linear arithmetic lemmas
+on `div`/`mod` (`Tests/Smt/SmtNat/SmtNatDiv.lean`). With the default mode (`last`), the replay complements the
+tactic strategies: 99.7% of all the reconstruction attempts succeed (3895/3905), 367/368 for the goals closed
+by the SMT solver.
+
+The replay also scales to the validators of
+[CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
+evaluation of UPLC programs by the CEK machine (e.g., `HelloWorld`, `UnlockPIN`): the Z3 proofs (≈900 steps
+over formulas of tens of thousands of nodes) are replayed with the bridge and the local proofs above (most
+`rewrite`s are proved by congruence and the propositional engine on generalized differences).
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
