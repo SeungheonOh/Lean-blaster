@@ -646,11 +646,12 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           -- NOTE: the declarations of sorts are cached on (hash-consed) sort objects
           let decl ← generateSortInstDecl (← hashcons (← inferType α))
           declareConst (← typeParamNameToSmtSymbol α.fvarId!) decl.instSort
-        -- with sort variables, the data variables are declared with their membership predicates also when they
-        -- don't occur in the goal (e.g., `a : α` witnessing that `α` is inhabited)
-        if !sortVars.isEmpty then
-          for x in xs do
-            if !sortVars.contains x && !(← isProp (← inferType x)) then discard <| translateExpr x
+        -- the data variables are declared first: their datatypes are then declared before the body refers to
+        -- their fields (e.g., the function fields of structures, applied in the body); with sort variables, they
+        -- are declared with their membership predicates also when they don't occur in the goal (e.g., `a : α`
+        -- witnessing that `α` is inhabited)
+        for x in xs do
+          if !sortVars.contains x && !(← isProp (← inferType x)) then discard <| translateExpr x
         let st ← translateExpr (if reopt then body' else body)
         assertTerm (notSmt st) : TranslateEnvT Unit).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
