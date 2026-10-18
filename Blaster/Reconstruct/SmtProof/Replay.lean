@@ -1009,7 +1009,13 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     record step.rule method
     return applyPremises pf
   -- datatype lemmas over variables (e.g., `x = C (C.0 x) ∨ ¬ is-C x`): case analyses
-  if step.rule == "th-lemma" then
+  -- NOTE: only for statements with testers or selectors (case analyses of the interpretation); the other
+  -- tactics of the portfolio were tried above
+  let env ← getEnv
+  let hasCases := (stmt.find? fun s => match s.getAppFn with
+    | .const n _ => isCasesOnRecursor env n
+    | _ => false).isSome
+  if step.rule == "th-lemma" && hasCases then
     if let some (pf, method) ← timed "datatype" (proveClosed cfg "datatype" stmt) then
       record step.rule s!"{method} (datatype)"
       return applyPremises pf
