@@ -331,14 +331,18 @@ def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Opt
   let args ← fvs.filterM fun x => return !(← x.fvarId!.getDecl).isLet
   return some (mkAppN pf args, m)
 
-/-- Proof of a local difference `l = r` of a step (see `Local.diffEq`): definitional equality, then the
-    propositional engine and tactics on the statement with the subterms common to `l` and `r` generalized. -/
+/-- Proof of a local difference `∀ hs, l = r` of a step (see `Local.diffEq`, `hs` are hypotheses of the
+    context of the difference): definitional equality, then the propositional engine and tactics on the
+    statement with the subterms common to `l` and `r` generalized. -/
 def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Option Expr) := do
-  let some (_, l, r) := eq.eq? | return none
+  -- NOTE: `l` and `r` don't depend on the hypotheses
+  let some (l, r) ← forallTelescope eq fun _ body => pure (body.eq?.map fun (_, l, r) => (l, r)) | return none
+  if l.hasLooseBVars || r.hasLooseBVars then return none
   -- definitional differences (e.g., testers of constructor applications)
   let small := Local.sizeLe eq 2000
   if ← defeqBudget l r 5000 small then
-    return some (← mkExpectedTypeHint (← mkEqRefl l) eq)
+    return some (← forallTelescope eq fun hs body => do
+      mkLambdaFVars hs (← mkExpectedTypeHint (← mkEqRefl l) body))
   let t0 ← IO.monoMsNow
   let some (g, vals) ← Local.generalizeCommon eq l r
     | if small then return (← proveClosed cfg rule eq).map (·.1) else return none
