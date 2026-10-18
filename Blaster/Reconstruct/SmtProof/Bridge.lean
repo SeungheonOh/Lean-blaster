@@ -917,6 +917,8 @@ partial def byDefEq (lhs b : Expr) : BridgeM (Option Expr) := do
 
 /-- `ite` on the goal side: `W(ite c x y) = ite c' x' y'`. -/
 partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  -- NOTE: `ite` in the world of the polymorphic encoding is handled by `walkPoly`
+  if let .poly .. := w then return none
   if a.isAppOfArity ``dite 5 then
     if let some p ← walkDite w a b then return some p
   let some (α, c, inst, x, y, pa) ← iteView? a | return none
@@ -932,7 +934,6 @@ partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
       some <$> mkLambdaFVars #[h] p
     | return none
   -- `W(a) = W(ite c x y) = ite c W(x) W(y)`
-  if let .poly .. := w then return none
   let pLift ← match w with
     | .same | .poly .. => mkEqRefl a
     | .nat =>
