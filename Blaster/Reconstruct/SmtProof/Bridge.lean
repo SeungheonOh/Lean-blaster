@@ -27,6 +27,10 @@ open Lean Meta Elab
 
 namespace Blaster.Reconstruct.SmtProof.Bridge
 
+/-- Debugging output (environment variable `BLASTER_BRIDGE_DEBUG`). -/
+def dbg (msg : MessageData) : MetaM Unit := do
+  if (← IO.getEnv "BLASTER_BRIDGE_DEBUG").isSome then IO.eprintln (← msg.toString)
+
 /-! ## Lemmas -/
 
 theorem ite_congr' {α : Sort u} {c c' : Prop} [h : Decidable c] {x x' y y' : α}
@@ -85,6 +89,9 @@ theorem bool_or {x y : Bool} {x' y' : Prop} (hx : (x = true) = x') (hy : (y = tr
 
 theorem bool_not {x : Bool} {x' : Prop} (hx : (x = true) = x') : ((!x) = true) = ¬ x' := by
   subst hx; cases x <;> simp
+
+theorem bool_decide {a : Bool} {p : Prop} (h : (a = true) = p) : a = @decide p (Classical.propDecidable p) := by
+  subst h; cases a <;> simp
 
 theorem bool_true : (true = true) = True := by simp
 theorem bool_false : (false = true) = False := by simp
@@ -271,22 +278,22 @@ def iteOf (ty : Expr) (mv : Expr) (altTys : Array Expr) (discrs alts : Array Exp
   for j in [:altTys.size] do
     let r ← forallTelescope altTys[j]! fun ys concl => do
       -- patterns: the arguments of the motive
-      if !concl.isApp || concl.getAppFn != mv then return none
+      if !concl.isApp || concl.getAppFn != mv then dbg m!"bridge: unexpected alternative type {altTys[j]!}"; return none
       let pats := concl.getAppArgs
-      if pats.size != discrs.size then return none
+      if pats.size != discrs.size then dbg m!"bridge: unexpected patterns {pats}"; return none
       let mut conds := #[]
       let mut vals : Std.HashMap FVarId Expr := {}
       for (d, p) in discrs.zip pats do
-        let some cs ← patCond d p conds | return none
+        let some cs ← patCond d p conds | dbg m!"bridge: unsupported pattern {p}"; return none
         conds := cs
-        let some vs ← patVals d p vals | return none
+        let some vs ← patVals d p vals | dbg m!"bridge: unsupported pattern {p}"; return none
         vals := vs
       -- arguments of the alternative: the values of the pattern variables (`()` for `Unit`)
       let mut args := #[]
       for y in ys do
         if let some v := vals.get? y.fvarId! then args := args.push v
         else if (← inferType y).isConstOf ``Unit then args := args.push (mkConst ``Unit.unit)
-        else return none
+        else dbg m!"bridge: no value for the pattern variable {y} of {altTys[j]!}"; return none
       let app := mkAppN alts[j]! args
       let app := if beta then app.headBeta else app
       let cond ← if conds.isEmpty then pure none else some <$> foldAnd conds
@@ -511,11 +518,11 @@ def matcherLemma (m : Name) (lvls : List Level) (info : MatcherInfo) (params : A
             iteOf resTy mv tys xd fs false
           | return none
         let stmt ← mkForallFVars xs (← mkEq (mkAppN head xs) rhs)
-        let some pf ← proveMatchIte stmt | return none
+        let some pf ← proveMatchIte stmt | dbg m!"bridge: matcher equation not proved: {stmt}"; return none
         -- NOTE: the statement may refer to free variables of the goal (e.g., in the parameters of the
         -- matcher), but not the proof
         some <$> mkAuxTheorem stmt pf
-    catch _ => pure none
+    catch ex => dbg m!"bridge: matcher lemma {m}: {ex.toMessageData}"; pure none
   modify fun s => { s with lemmas := s.lemmas.insert head l }
   return l
 
@@ -524,8 +531,8 @@ def matcherIte? (a : Expr) : BridgeM (Option (Expr × Expr)) := do
   let .const m lvls := a.getAppFn | return none
   let some info ← getMatcherInfo? m | return none
   let args := a.getAppArgs
-  if args.size != info.arity then return none
-  if info.discrInfos.any (·.hName?.isSome) then return none
+  if args.size != info.arity then dbg m!"bridge: over-applied matcher {m}"; return none
+  if info.discrInfos.any (·.hName?.isSome) then dbg m!"bridge: matcher with discriminant equations {m}"; return none
   let np := info.numParams
   let params := args.extract 0 np
   let motive := args[np]!
@@ -534,7 +541,7 @@ def matcherIte? (a : Expr) : BridgeM (Option (Expr × Expr)) := do
   -- non-dependent motive
   let some resTy ← lambdaTelescope motive fun xs b => do
       if xs.any (fun x => b.containsFVar x.fvarId!) then return none else return some b
-    | return none
+    | dbg m!"bridge: dependent motive {motive}"; return none
   let some lem ← matcherLemma m lvls info params motive resTy | return none
   let inst? := (← read).matchInst m
   let some i ← withLocalDeclD `m (← inferType motive) fun mv => do
@@ -781,6 +788,11 @@ partial def walkMacro (w : World) (a b : Expr) : BridgeM (Option Expr) := do
 
 partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
   if a == b then return some (← mkEqRefl a)
+  -- `Bool` terms interpreted as formulas, converted back with `decide`
+  if b.isAppOfArity ``Decidable.decide 2 && (b.getArg! 1).isAppOfArity ``Classical.propDecidable 1 then
+    if (← whnfR (← inferType a)).isConstOf ``Bool then
+      let p := b.getArg! 0
+      if let some h ← walk a p then return some (mkApp3 (mkConst ``bool_decide) a p h)
   -- `Int.ofNat x` is `↑x`
   if a.isAppOfArity ``Int.ofNat 1 && !a.appArg!.isRawNatLit then
     if let some p ← walk a.appArg! b then return some (← mkExpectedTypeHint p (← mkEq a b))
@@ -790,7 +802,7 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
   if a.isAppOfArity ``Eq 3 && (a.getArg! 0).isConstOf ``Bool then
     let (l, r) := (a.getArg! 1, a.getArg! 2)
     -- same orientation: congruence
-    let same := b.isAppOfArity ``Eq 3 && (b.getArg! 0).isConstOf ``Bool && (b.getArg! 1 == l || b.getArg! 2 == r)
+    let same := b.isAppOfArity ``Eq 3
     if !same then
       if l.isConstOf ``Bool.true then
         let some p ← walk r b | return none

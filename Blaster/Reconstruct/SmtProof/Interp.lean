@@ -99,7 +99,7 @@ def mkBoolTrue (b : Expr) : Expr :=
   | _ => mkApp3 (mkConst ``Eq [levelOne]) (mkConst ``Bool) b (mkConst ``Bool.true)
 
 /-- Coerce `e : actual` to `expected` (Nat ↔ Int, Bool ↔ Prop). -/
-def coerce (e actual expected : Expr) : MetaM Expr := do
+partial def coerce (e actual expected : Expr) : MetaM Expr := do
   if ← isDefEq actual expected then return e
   let actual ← whnfR actual
   let expected' ← whnfR expected
@@ -107,6 +107,21 @@ def coerce (e actual expected : Expr) : MetaM Expr := do
   if isIntType actual && isNatType expected' then return mkIntToNat e
   if actual.isProp && isBoolType expected' then return mkClassicalDecide e
   if isBoolType actual && expected'.isProp then return mkBoolTrue e
+  -- constructor applications of another instance of the datatype (e.g., `some (x + y) : Option Int` where
+  -- `Option Nat` is expected): the arguments are coerced
+  if let .const c _ := e.getAppFn then
+    if let some (.ctorInfo info) := (← getEnv).find? c then
+      if actual.getAppFn.isConstOf info.induct && expected'.getAppFn.isConstOf info.induct then
+        let args := e.getAppArgs
+        if args.size == info.numParams + info.numFields then
+          let k ← mkConstWithFreshMVarLevels c
+          let (ms, _, rt) ← forallMetaTelescopeReducing (← inferType k)
+          if ms.size == args.size && (← isDefEq rt expected) then
+            for i in [info.numParams:args.size] do
+              let fty ← instantiateMVars (← inferType ms[i]!)
+              ms[i]!.mvarId!.assign (← coerce args[i]! (← inferType args[i]!) fty)
+            let r ← instantiateMVars (mkAppN k ms)
+            if !r.hasExprMVar then return r
   throwError "smt proof: can't coerce {e} : {actual} to {expected}"
 
 /-- Normalize the type of an interpreted term for the SMT world: `Nat` terms are cast to `Int`,
@@ -120,7 +135,7 @@ def toSmtWorld (e : Expr) : MetaM Expr := do
 /-- Apply `f` to `args`, instantiating implicit arguments by unification and coercing explicit
     arguments when necessary. Arguments whose type is `Int` or `Prop` (i.e., flexible w.r.t. coercions)
     are unified last. -/
-def mkAppCoerce (f : Expr) (args : Array Expr) : MetaM Expr := do
+def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) : MetaM Expr := do
   let fty ← inferType f
   let (mvars, bis, _) ← forallMetaTelescopeReducing fty
   let explicit := (List.range mvars.size).toArray.filter fun i => bis[i]!.isExplicit
@@ -141,7 +156,12 @@ def mkAppCoerce (f : Expr) (args : Array Expr) : MetaM Expr := do
     let m := mvars[explicit[j]!]!
     let expected ← instantiateMVars (← inferType m)
     if expected.isMVar then
-      -- no constraint on the type: keep the SMT type
+      -- no constraint on the type: keep the SMT type, except for formulas (e.g., `(Option.some true)`),
+      -- interpreted as Lean `Bool` terms
+      if types[j]!.isProp then
+        if ← isDefEq expected (mkConst ``Bool) then
+          m.mvarId!.assign (mkClassicalDecide args[j]!)
+          continue
       if !(← isDefEq expected types[j]!) then throwError "smt proof: ill-typed argument for {f}"
       m.mvarId!.assign args[j]!
     else
@@ -155,7 +175,9 @@ def mkAppCoerce (f : Expr) (args : Array Expr) : MetaM Expr := do
         let inst ← synthInstance (← instantiateMVars (← inferType m))
         m.mvarId!.assign inst
   let r ← instantiateMVars (mkAppN f (mvars.extract 0 used))
-  if r.hasMVar then throwError "smt proof: can't infer implicit arguments of {f}"
+  -- NOTE: the remaining implicit arguments (e.g., the type parameter `α` of `Sum.inr (b : β) : α ⊕ β`) may be
+  -- assigned by unification with the context
+  if r.hasMVar && !allowMVars then throwError "smt proof: can't infer implicit arguments of {f}"
   return r
 
 /-! ## Sorts -/
@@ -278,7 +300,12 @@ def mkEqSmt (a b : Expr) : MetaM Expr := do
   if ← isDefEq ta tb then return ← mkEq a b
   let a ← toSmtWorld a
   let b ← toSmtWorld b
-  mkEq a b
+  let ta ← inferType a
+  let tb ← inferType b
+  if ← isDefEq ta tb then return ← mkEq a b
+  -- e.g., constructor applications of different instances of a datatype
+  try return ← mkEq (← coerce a ta tb) b
+  catch _ => mkEq a (← coerce b tb ta)
 
 /-- Selector of field `idx` of constructor `ctor` applied to `x`, defined by case analysis (with
     `default` for the other constructors). -/
@@ -401,6 +428,20 @@ partial def interpCore (t : STerm) : InterpM Expr := do
   | .app f args => interpApp f args
   | .qual f sort args =>
       let ty ← sortToType sort
+      -- constructors: the parameters of the datatype are given by the sort (e.g., `(as Option.some (Option Nat))`
+      -- applied to an `Int` term)
+      if let some (.ctor n) := (← read).table.syms.get? f then
+        if !args.isEmpty then
+          let c ← mkConstWithFreshMVarLevels n
+          let (ms, bis, rt) ← forallMetaTelescopeReducing (← inferType c)
+          let explicit := (List.range ms.size).toArray.filter fun i => bis[i]!.isExplicit
+          if explicit.size == args.size && (← isDefEq rt ty) then
+            for (i, a) in explicit.zip args do
+              let v ← interp a
+              let expected ← instantiateMVars (← inferType ms[i]!)
+              ms[i]!.mvarId!.assign (← coerce v (← inferType v) expected)
+            let r ← instantiateMVars (mkAppN c ms)
+            if !r.hasExprMVar then return r
       let e ← interpApp f args
       let ety ← inferType e
       if ← isDefEq ety ty then return e
@@ -423,11 +464,15 @@ partial def interpCore (t : STerm) : InterpM Expr := do
   | .quant k vars body => interpQuant k vars body
 
 partial def interpQuant (k : QuantKind) (vars : Array (String × SExpr)) (body : STerm) : InterpM Expr := do
-  let types ← vars.mapM fun (_, s) => sortToType s
+  -- NOTE: the parameters of sort `Nat` of lambda terms (e.g., Blaster's translation of Lean lambdas) are
+  -- interpreted as Lean `Nat` variables, i.e., as `↑x` in the body
+  let natParam (s : SExpr) : Bool := k == .lambda && s == .atom "Nat"
+  let types ← vars.mapM fun (_, s) => if natParam s then pure natType else sortToType s
   let rec go (i : Nat) (fvars : Array Expr) : InterpM Expr := do
     if h : i < vars.size then
       withLocalDeclD (Name.mkSimple vars[i].1) types[i]! fun x =>
-        withReader (fun ctx => { ctx with locals := ctx.locals.insert vars[i].1 x }) (go (i + 1) (fvars.push x))
+        let v := if natParam vars[i].2 then mkIntOfNat x else x
+        withReader (fun ctx => { ctx with locals := ctx.locals.insert vars[i].1 v }) (go (i + 1) (fvars.push x))
     else
       let b ← interp body
       match k with
@@ -501,7 +546,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
           -- assigned by unification with the context (e.g., the other side of an equality)
           let (ms, _, _) ← forallMetaTelescopeReducing (← inferType c)
           return mkAppN c ms
-        mkAppCoerce c (← args.mapM interp)
+        mkAppCoerce c (← args.mapM interp) (allowMVars := true)
     | some (.selector c i) =>
         let some a := args[0]? | throwError "smt proof: selector without argument"
         let e ← mkSelector c i (← interp a)

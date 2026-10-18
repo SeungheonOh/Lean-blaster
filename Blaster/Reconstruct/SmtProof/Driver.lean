@@ -135,8 +135,8 @@ def unquote (s : String) : String :=
 
 /-- Build the interpretation of the symbols of the query `cmds`, given the translation environment
     and the map from SMT constants (`$k`) to Lean free variables. -/
-def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMap String Expr) :
-    MetaM SymTable := do
+def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMap String Expr)
+    (instanceType? : Option Expr := none) : MetaM SymTable := do
   let mut tbl : SymTable := {}
   -- Lean functions of the translation
   let mut funs : Std.HashMap String Expr := {}
@@ -149,12 +149,21 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
   for c in cmds do
     let some xs := c.list? | continue
     match xs[0]?.bind SExpr.atom?, xs[1]?.bind SExpr.atom? with
+    | some "declare-sort", some n =>
+        -- polymorphic encoding (see `proveBySmtProof`)
+        if n.startsWith "@Type" then
+          tbl := { tbl with sorts := tbl.sorts.insert n (mkConst ``Unit) }
+        else if n.startsWith "@Instance" then
+          if let some t := instanceType? then tbl := { tbl with sorts := tbl.sorts.insert n t }
     | some "define-sort", some n =>
         if let some (SExpr.list #[]) := xs[2]? then
           tbl := { tbl with aliases := tbl.aliases.insert n xs[3]! }
     | some "declare-const", some n =>
         if let some e := consts.get? n then
           tbl := { tbl with syms := tbl.syms.insert n (.expr e) }
+        else if let some (SExpr.atom s) := xs[2]? then
+          -- sort variables (polymorphic encoding)
+          if s.startsWith "@Type" then tbl := { tbl with syms := tbl.syms.insert n (.expr (mkConst ``Unit.unit)) }
         if let some s := xs[2]? then datatypeSorts := datatypeSorts.push s
     | some "declare-fun", some n =>
         if let some e := funs.get? n then
@@ -181,6 +190,12 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
           let base := (unquote n).dropRight 5
           if let some e := funs.get? base <|> funs.get? s!"|{base}|" then
             tbl := { tbl with syms := tbl.syms.insert n (.expr e) }
+    | some "assert", _ =>
+        -- definitions of lambda terms (see `Blaster.Smt.translateLambda`):
+        -- `(forall (xs) (! (= (@apply @lambda_n xs) b) :qid @lambda_n_def_cstr))`, and
+        -- `(forall (ys xs) (! (= (@apply (@apply @global_lambda_n ys) xs) b) :qid @global_lambda_n_def_cstr))`
+        if let some (n, t) := lambdaDef? xs[1]! then
+          if !tbl.syms.contains n then tbl := { tbl with syms := tbl.syms.insert n (.macro #[] t) }
     | some "declare-datatype", some n =>
         tbl ← addDatatype tbl n xs[2]!
     | some "declare-datatypes", _ =>
@@ -207,6 +222,34 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
     if let some t := v then tbl := { tbl with expandedSorts := tbl.expandedSorts.insert k t }
   return tbl
 where
+  lambdaDef? (e : SExpr) : Option (String × STerm) := Id.run do
+    let some #[SExpr.atom "forall", SExpr.list vs, SExpr.list ann] := e.list? | return none
+    if ann[0]? != some (SExpr.atom "!") then return none
+    -- NOTE: the guards `0 ≤ x` of the variables of sort `Nat` (see `guardNatQuantifiers`) are removed
+    let rec unguard (e : SExpr) (fuel : Nat) : SExpr :=
+      match fuel, e with
+      | fuel + 1, .list #[.atom "=>", .list #[.atom "<=", .atom "0", .atom _], b] => unguard b fuel
+      | _, e => e
+    let some #[SExpr.atom "=", SExpr.list lhs, body] := (ann[1]?.map (unguard · vs.size)) >>= SExpr.list? | return none
+    let vars := vs.filterMap fun v => match v with
+      | .list #[.atom x, s] => some (x, s)
+      | _ => none
+    let some (SExpr.atom apply) := lhs[0]? | return none
+    if !apply.startsWith "@apply" then return none
+    let .ok b := STerm.ofSExpr {} body | return none
+    match lhs[1]? with
+    | some (SExpr.atom l) =>
+        if !l.startsWith "@lambda" then return none
+        return some (l, .quant .lambda vars b)
+    | some (SExpr.list inner) =>
+        let some (SExpr.atom g) := inner[1]? | return none
+        if !g.startsWith "@global_lambda" then return none
+        let k := inner.size - 2
+        if k > vars.size then return none
+        let ys := vars.extract 0 k
+        let xs := vars.extract k vars.size
+        return some (g, .quant .lambda ys (if xs.isEmpty then b else .quant .lambda xs b))
+    | _ => return none
   addDatatype (tbl : SymTable) (n : String) (decl : SExpr) : MetaM SymTable := do
     -- `(par (params) (ctors))` or `(ctors)`
     let ctors := match decl with
@@ -352,6 +395,8 @@ syntax (name := blasterCasesNat) "blaster_cases_nat" : tactic
 def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
     ("assumption", ← `(tactic| assumption)),
+    -- definitions of lambda terms (β-reduction)
+    ("rfl", ← `(tactic| (intros; rfl))),
     -- definitions of functions over `Nat` (see `guardNatQuantifiers`)
     ("nat def", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
                               blaster_cases_nat <;> (try simp only [Int.toNat_natCast] at *) <;>
@@ -465,7 +510,8 @@ def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := 
 partial def dataBinders (e : Expr) (k : Array Expr → Expr → TermElabM α) (acc : Array Expr := #[]) : TermElabM α := do
   match e with
   | .forallE n t b bi =>
-      if (← isProp t) || t.isSort || (← whnfR t).isSort then k acc e
+      -- NOTE: sort variables are introduced (see the interpretation of Blaster's polymorphic encoding)
+      if (← isProp t) then k acc e
       else withLocalDecl n bi t fun x => dataBinders (b.instantiate1 x) k (acc.push x)
   | _ => k acc e
 
@@ -513,18 +559,31 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
   withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) do
   dataBinders e fun xs body => do
   try
-    -- NOTE: polymorphic goals (Blaster's `@Type`/`@Instance` encoding) are not supported yet
+    -- Blaster's polymorphic encoding: sort variables are values of the sort `@Type`, and the values of
+    -- the types they denote are values of the sort `@Instance`. With a single sort variable `α`, `@Instance`
+    -- is interpreted as `α` and `@Type` as `Unit` (membership predicates as `True`).
+    let mut sortVars ← xs.filterM fun x => do return (← whnfR (← inferType x)).isSort
+    -- sort variables of the local context (e.g., auto-bound implicit arguments)
+    for d in ← getLCtx do
+      if d.isImplementationDetail || sortVars.contains d.toExpr then continue
+      if (← whnfR d.type).isSort && !d.type.isProp then
+        if body.containsFVar d.fvarId || (← xs.anyM fun x => do return (← inferType x).containsFVar d.fvarId) then
+          sortVars := sortVars.push d.toExpr
+    if sortVars.size > 1 then throwError "smt proof: polymorphic goals with several sort variables are not supported"
     if let .forallE _ t _ _ := body then
       if (← whnfR t).isSort then throwError "smt proof: polymorphic goals are not supported"
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
+    let reopt := (← IO.getEnv "BLASTER_SMTPROOF_REOPT").isSome
     let (body', tenv) ← (do
         -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
         -- recursive functions); `body` being already optimized, `body'` is expected to be `body`.
         let (body', _) ← Optimize.mainPf body (track := false)
         setBlasterProcess
-        let st ← translateExpr body'
+        -- NOTE: `body` is translated (rather than `body'`), such that the asserted formula is the translation
+        -- of the negated goal itself
+        let st ← translateExpr (if reopt then body' else body)
         assertTerm (notSmt st)
         return body' : TranslateEnvT Expr).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
@@ -554,7 +613,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let lctx ← getLCtx
     for (v, idx) in tenv.smtEnv.fvarsCache.toList do
       if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
-    let tbl ← buildSymTable cmds tenv consts
+    let tbl ← buildSymTable cmds tenv consts sortVars[0]?
     let tbl ← addSkolems sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
@@ -577,22 +636,29 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       matchInst := insts.get?, macroOf
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
+    let goalTerm := if reopt then body' else body
+    let bodyDefEq ← IO.mkRef (body == goalTerm)
+    if body != goalTerm then
+      let ok ← try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 200000 * 1000 }) <|
+          withCurrHeartbeats <| isDefEq body goalTerm catch _ => pure false
+      bodyDefEq.set ok
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
-          if ← withReducible (isDefEq c (mkNot body)) then return some hneg
-          if ← withReducible (isDefEq c (mkNot body')) then return some hneg
+          if ← withReducible (isDefEq c (mkNot body)) then return some (← mkExpectedTypeHint hneg c)
           -- e.g., projections vs. case analyses, casts of literals (with a budget)
           let defeq (a b : Expr) : TermElabM Bool := do
             try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
                   withCurrHeartbeats <| withDefault <| isDefEq a b
             catch _ => return false
           if c.isAppOfArity ``Not 1 then
-            if ← defeq c (mkNot body') then return some (← mkExpectedTypeHint hneg c)
+            if ← defeq c (mkNot body) then return some (← mkExpectedTypeHint hneg c)
           -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
-          let (r, fails) ← Bridge.prove bcfg (mkNot body') c
+          -- NOTE: with `BLASTER_SMTPROOF_REOPT`, the translated goal is the goal optimized again, which is
+          -- expected to be definitionally equal to it
+          let (r, fails) ← if ← bodyDefEq.get then Bridge.prove bcfg (mkNot goalTerm) c else pure (none, #[])
           if let some p := r then
-            return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot body')))
+            return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot goalTerm)))
           if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
             let h ← IO.FS.Handle.mk f .append
             -- NOTE: only for the translation of the negated goal
@@ -604,7 +670,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           if r.isNone then
             if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
               let h ← IO.FS.Handle.mk f .append
-              h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot body')}\n"
+              h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot goalTerm)}\n"
           return r.map (·.1)
         proveStep := fun rule stmt => do
           -- NOTE: the tactic syntax of each rule is built once per replay
