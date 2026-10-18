@@ -312,6 +312,10 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("nat def", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
                               blaster_cases_nat <;> (try simp only [Int.toNat_natCast] at *) <;>
                               (try blaster_unfold_user) <;> grind))),
+    -- definitions by case analysis on datatype arguments
+    ("nat def cases", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;>
+                              (try blaster_cases_nat) <;> blaster_cases_vars <;> (try simp only [Int.toNat_natCast] at *) <;>
+                              (try blaster_unfold_user) <;> (try simp_all) <;> first | done | grind))),
     ("omega", ← `(tactic| (intros; omega))),
     -- Blaster's normal forms (e.g., `Nat.add x y`, `Nat.mod x y`) in the negated goal
     ("denorm+omega", ← `(tactic| (intros; blaster_denorm; omega))),
