@@ -215,9 +215,26 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    explicit proof terms for resolution (a unit propagation procedure building the proof), modus ponens,
    equality reasoning, quantifier instantiation, skolemization, hypotheses and lemmas; and small tactic
    calls (`simp`, `omega`, `grind`, unfolding of user definitions) proving `premises → conclusion` for
-   rewriting and theory lemmas. Leaves (input formulas) are proved from the negated goal and from the
-   definitions of the Lean functions (bridge tactics). The proof of `False` is turned into a proof of the
-   goal and checked by the kernel like any other reconstructed proof.
+   rewriting and theory lemmas. Large equalities (e.g., Z3 `rewrite`s inside big formulas) are related by
+   congruence on their common structure, and only their differences are given to tactics, with the
+   subterms common to both sides generalized (`Local.lean`); arithmetic lemmas over large atoms are
+   generalized the same way, with facts on `div`/`mod` for `omega`. The proof of `False` is turned into a
+   proof of the goal and checked by the kernel like any other reconstructed proof.
+5. **Bridge** (`Bridge.lean`). The asserted formula is the translation of the negated goal, interpreted
+   back. It is related to the negated goal by a simultaneous traversal of both terms: congruence on their
+   common structure, and a lemma for each encoding of the translation where they differ: `match` as `ite`
+   chains over testers and selectors (an auxiliary theorem per matcher instance, stated for abstract
+   discriminants and alternatives, and proved by evaluating the conditions with case analyses), `Nat`
+   terms as `Int` terms and quantifiers over `Nat` as guarded quantifiers over `Int`, `Bool` terms as
+   formulas, `dite'`/`ite`, functions translated as SMT macros (e.g., `@Nat.sub`, `@Int.toNat`, expanded by
+   the backends; an auxiliary lemma per function relating it to its macro), Blaster's type predicates. The
+   definitions of the other functions are bridged by tactics. The traversal is linear in the size of the
+   (shared) terms, which matters for goals such as the CEK evaluation of validators.
+
+Blaster's polymorphic encoding is interpreted when the goal has a single sort variable `α`: the sort
+`@Instance` (of the values of all types denoted by sort variables) is interpreted as `α`, `@Type` as `Unit`,
+membership predicates as `True`. Lambda terms of the translation (`@lambda`, `@global_lambda` with their
+definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as Lean `Nat` variables.
 
 The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a
 `Nat` function instantiated with a negative integer) simply fails to replay. Soundness only relies on the
@@ -244,7 +261,8 @@ adaptively by success rate per time unit for each rule and goal shape. Performan
 For instance, a 245-step Z3 proof involving a recursive function replays in ~6 s, and a 2458-step cvc5
 (Alethe) proof of the same goal in ~30 s.
 
-Limitations: polymorphic goals; cvc5's native CPC format (whose steps often leave their conclusion
+Limitations: polymorphic goals with several sort variables; `match` patterns on `Nat`/`Int` with
+variables (e.g., `n + 1`, whose translation needs the conditions of the branch) and named patterns; cvc5's native CPC format (whose steps often leave their conclusion
 implicit) is not supported; Z3 may not find a proof without Blaster's `recfun-finder` tactic (incompatible
 with proof production), and proof production may time out where the verdict did not.
 

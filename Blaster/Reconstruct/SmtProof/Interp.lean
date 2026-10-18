@@ -39,6 +39,9 @@ inductive SymInterp where
   | tester (ctor : Name)
   /-- application of a function value (Blaster's `@apply` functions for higher-order arguments) -/
   | apply
+  /-- skolem function of Z3's `sk` steps: for `¬ ∀ x, φ(ys, x)` (resp. `∃ x, φ(ys, x)`) where `ys` are the
+      variables of the context, `fun ys => ε x, ¬ φ(ys, x)` (resp. `ε x, φ(ys, x)`) -/
+  | skolem (params : Array String) (x : String) (sort : SExpr) (body : STerm) (neg : Bool)
   deriving Inhabited
 
 /-- Interpretation of the symbols and sorts of an SMT query. -/
@@ -107,6 +110,14 @@ partial def coerce (e actual expected : Expr) : MetaM Expr := do
   if isIntType actual && isNatType expected' then return mkIntToNat e
   if actual.isProp && isBoolType expected' then return mkClassicalDecide e
   if isBoolType actual && expected'.isProp then return mkBoolTrue e
+  -- proof arguments (e.g., proof fields of constructors, encoded as `true` by Blaster): a proof by decision
+  -- of the expected proposition
+  if (actual.isProp || isBoolType actual) && (← isProp expected) then
+    try
+      let d ← mkDecide expected
+      if (← withAtLeastTransparency .default (whnf d)).isConstOf ``Bool.true then
+        return ← mkDecideProof expected
+    catch _ => pure ()
   -- constructor applications of another instance of the datatype (e.g., `some (x + y) : Option Int` where
   -- `Option Nat` is expected): the arguments are coerced
   if let .const c _ := e.getAppFn then
@@ -554,6 +565,17 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
     | some (.tester c) =>
         let some a := args[0]? | throwError "smt proof: tester without argument"
         mkTester c (← interp a)
+    | some (.skolem params x sort body neg) =>
+        if params.size != args.size then throwError "smt proof: wrong number of arguments for {f}"
+        let vals ← args.mapM interp
+        let ty ← sortToType sort
+        let u ← getLevel ty
+        let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) ty)
+        withLocalDeclD (Name.mkSimple x) ty fun fx => do
+          let locals := (params.zip vals).foldl (fun m (y, v) => m.insert y v) ctx.locals |>.insert x fx
+          let φ ← withReader (fun c => { c with locals }) (interpProp body)
+          let p ← mkLambdaFVars #[fx] (if neg then mkNot φ else φ)
+          return mkApp3 (mkConst ``Classical.epsilon [u]) ty inst p
     | some .apply =>
         let some fn := args[0]? | throwError "smt proof: apply without argument"
         let r ← mkAppCoerce (← interp fn) (← (args.extract 1 args.size).mapM interp)

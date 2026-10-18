@@ -293,6 +293,10 @@ partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
       | .quant .exists vs φ => (vs, φ, false)
       | _ => (#[], .sym "true", false)
     let #[(x, sort)] := vars | continue
+    -- skolem function applied to the variables of the context: `(x!n y₁ ... yₖ)`
+    if let some (c, ys) := findSkolemApp (x ++ "!") b (fun c => !tbl.syms.contains c) then
+      tbl := { tbl with syms := tbl.syms.insert c (.skolem ys x sort body neg) }
+      continue
     -- the skolem constant: a symbol of `b` named `x!n`, not occurring in `a` and not yet interpreted
     let some c := findSkolem (x ++ "!") b fun c => !tbl.syms.contains c && (findSkolem c a fun _ => true).isNone
       | continue
@@ -309,6 +313,16 @@ partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
     catch _ => pure ()
   return tbl
 where
+  findSkolemApp (pre : String) (t : STerm) (ok : String → Bool) : Option (String × Array String) :=
+    match t with
+    | .app f args =>
+        let syms := args.filterMap fun a => match a with | .sym s => some s | _ => none
+        if f.startsWith pre && !args.isEmpty && syms.size == args.size && ok f then some (f, syms)
+        else args.findSome? (findSkolemApp pre · ok)
+    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolemApp pre · ok)
+    | .quant _ _ b => findSkolemApp pre b ok
+    | .annot t _ => findSkolemApp pre t ok
+    | _ => none
   findSkolem (pre : String) (t : STerm) (ok : String → Bool) : Option String :=
     match t with
     | .sym s => if s.startsWith pre && ok s then some s else none
