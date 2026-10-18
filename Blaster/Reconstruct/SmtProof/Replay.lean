@@ -320,16 +320,29 @@ def usedFVars (e : Expr) : MetaM (Array Expr) := do
     todo := todo ++ s.fvarIds
   return (decls.qsort (·.index < ·.index)).map (·.toExpr)
 
+/-- Debugging output (environment variable `BLASTER_SMTPROOF_GOALDUMP`: file receiving the closed statements on
+    which the step tactics failed, as Lean `example`s). -/
+def dumpGoal (g : Expr) : MetaM Unit := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_GOALDUMP" | return
+  let s ← withOptions (fun o => o.setBool `pp.numericTypes true |>.setBool `pp.coercions.types true
+      |>.setBool `pp.fieldNotation false) do
+    return toString (← ppExpr g)
+  let h ← IO.FS.Handle.mk f .append
+  h.putStrLn s!"example : {s} := by\n  blaster_nlarith\n"
+
 /-- Tactics on a statement, closed over the free variables it uses and proved in the empty local context:
     a step is valid by itself (its premises are hypotheses of the statement), and the hypotheses of the
     context (e.g., the negated goal) would only slow down the tactics (e.g., `simp_all` on the negated goal,
     case analyses splitting the variables of the goal). -/
 def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Option (Expr × String)) := do
-  if !g.hasFVar then return ← withLCtx {} {} (cfg.proveStep rule g)
+  if !g.hasFVar then
+    let r ← withLCtx {} {} (cfg.proveStep rule g)
+    if r.isNone then dumpGoal g
+    return r
   let fvs ← usedFVars g
   let g' ← mkForallFVars fvs g
   if g'.hasFVar then return ← cfg.proveStep rule g
-  let some (pf, m) ← withLCtx {} {} (cfg.proveStep rule g') | return none
+  let some (pf, m) ← withLCtx {} {} (cfg.proveStep rule g') | dumpGoal g'; return none
   -- NOTE: let-bound variables are abstracted as `let`s (not applied)
   let args ← fvs.filterM fun x => return !(← x.fvarId!.getDecl).isLet
   return some (mkAppN pf args, m)
@@ -425,7 +438,7 @@ partial def replay (i : Nat) : ReplayM Expr := do
       if let some f ← IO.getEnv "BLASTER_SMTPROOF_FAILDUMP" then
         let h ← IO.FS.Handle.mk f .append
         let c ← try pure (toString (← ppExpr (← stepConcl i))) catch _ => pure "?"
-        h.putStrLn s!"=== step {i} ({step.rule}) premises {step.premises}: {(← ex.toMessageData.toString).take 500}\n{c.take 30000}\n"
+        h.putStrLn s!"=== step {i} ({step.rule} {step.attrs}) premises {step.premises}: {(← ex.toMessageData.toString).take 500}\n{c.take 30000}\n"
       modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
       throw ex
   if (← IO.getEnv "BLASTER_SMTPROOF_CHECK").isSome then

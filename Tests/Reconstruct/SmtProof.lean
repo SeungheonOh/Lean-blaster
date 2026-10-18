@@ -15,6 +15,12 @@ namespace Tests.Reconstruct.SmtProof
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x t : Int), x = 1 → (Int.toNat t) + 2 ≥ 2]
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y : Nat), x / (y + 1) ≤ x]
 
+-- nonlinear arithmetic (see `blaster_nlarith`), Z3's division and modulo by zero (`div0`, `mod0`)
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y z : Int), x * z = y * x → x ≠ 0 → y = z]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (w x y z : Nat), w ≤ x → y ≤ z → w * y ≤ x * z]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y z : Nat), 0 < x → x * y / (x * z) = y / z]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y : Nat), x % y ≤ x]
+
 -- Bool encodings
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x : Int) (f : Int → Bool), (f x && x == 0) = true → x = 0]
 

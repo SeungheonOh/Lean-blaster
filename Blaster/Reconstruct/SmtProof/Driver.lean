@@ -5,6 +5,7 @@ import Blaster.Reconstruct.SmtProof.Z3
 import Blaster.Reconstruct.SmtProof.Alethe
 import Blaster.Reconstruct.SmtProof.Replay
 import Blaster.Reconstruct.SmtProof.Bridge
+import Blaster.Reconstruct.SmtProof.NlArith
 
 /-!
 # Proof reconstruction from SMT proofs
@@ -508,7 +509,9 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
     ("omega", ← `(tactic| (intros; omega))),
     ("divmod+omega", ← `(tactic| (intros; blaster_divmod; omega))),
     ("propext+omega", ← `(tactic| (intros; apply propext; constructor <;> intro <;> omega))),
-    ("split+omega", ← `(tactic| (intros; (repeat' split) <;> omega)))]
+    ("split+omega", ← `(tactic| (intros; (repeat' split) <;> omega))),
+    -- nonlinear arithmetic (fails quickly on goals without nonlinear terms)
+    ("nlarith", ← `(tactic| blaster_nlarith))]
   let simp := #[
     ("rfl", ← `(tactic| (intros; rfl))),
     ("simp", ← `(tactic| (intros; simp_all <;> done))),
