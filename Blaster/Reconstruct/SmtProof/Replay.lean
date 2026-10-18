@@ -365,9 +365,8 @@ partial def quantIntro (t h concl : Expr) : MetaM (Option Expr) := do
   match t, concl with
   -- equality: `forall_congr` under each binder
   | .forallE n ty body bi, _ =>
-      if let some (_, .forallE _ ty₁ _ _, .forallE _ ty₂ _ _) := concl.eq? then
+      if let some (_, .forallE _ ty₁ b₁ _, .forallE _ ty₂ b₂ _) := concl.eq? then
         if ty == ty₁ && ty == ty₂ then
-          let some (_, .forallE n₁ _ b₁ bi₁, .forallE n₂ _ b₂ bi₂) := concl.eq? | return none
           return ← withLocalDecl n bi ty fun x => do
             let inner := mkApp h x
             let innerTy := body.instantiate1 x
@@ -375,10 +374,9 @@ partial def quantIntro (t h concl : Expr) : MetaM (Option Expr) := do
             -- deeper binders, or the equality itself
             let some p ← (if innerTy.isForall then quantIntro innerTy inner concl'
                           else do if ← isDefEq innerTy concl' then pure (some inner) else pure none) | return none
-            let _ := (n₁, bi₁, n₂, bi₂)
             return some (← mkAppM ``forall_congr #[← mkLambdaFVars #[x] p])
       -- implication (`~` is interpreted as `→`)
-      if let .forallE _ (.forallE _ ty₁ b₁ _) (.forallE _ ty₂ b₂ _) _ := concl then
+      if let .forallE _ (.forallE _ ty₁ b₁ _) (.forallE _ ty₂ _ _) _ := concl then
         if ty == ty₁ && ty == ty₂ then
           return ← withLocalDeclD `h₁ (.forallE n ty₁ b₁ bi) fun h₁ => do
             let r ← withLocalDecl n bi ty fun x => do

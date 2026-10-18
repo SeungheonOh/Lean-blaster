@@ -627,7 +627,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
-    let ((body', reopt), tenv) ← (do
+    let ((), tenv) ← (do
         -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
         -- recursive functions); `body` being already optimized, `body'` is expected to be `body` (up to
         -- definitional equality, which the bridge requires).
@@ -648,8 +648,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           for x in xs do
             if !sortVars.contains x && !(← isProp (← inferType x)) then discard <| translateExpr x
         let st ← translateExpr (if reopt then body' else body)
-        assertTerm (notSmt st)
-        return (body', reopt) : TranslateEnvT (Expr × Bool)).run env
+        assertTerm (notSmt st) : TranslateEnvT Unit).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
     let cmds := cmds.map guardNatQuantifiers
     -- 2. backend
