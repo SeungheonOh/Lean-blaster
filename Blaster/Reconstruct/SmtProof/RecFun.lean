@@ -237,19 +237,23 @@ def addProofDefs (proof : Proof) (tbl : SymTable) : SymTable := Id.run do
 
 /-! ## Lemmas -/
 
-/-- Definitional equation `∀ x⃗, f x⃗ = body` of a recursive function (the interpretation of its axiom), proved on
-    first use. -/
+/-- Definitional equation `∀ x⃗, f x⃗ = body` of a recursive function, proved on first use. The candidate
+    statements are tried in order: the body of the function in the header of Z3's proof (on which Z3's lemmas
+    are expressed), then the body of the query (Blaster's normal form). -/
 structure DefEq where
-  stmt : Expr
+  stmts : Array Expr
   /-- head constant of the left-hand side (see `lhsHead?`) -/
   head : Name
-  /-- proof (`none` when not attempted yet) -/
-  proof : IO.Ref (Option (Option Expr))
+  /-- the proved statement and its proof (`none` when not attempted yet) -/
+  proof : IO.Ref (Option (Option (Expr × Expr)))
 
 structure Ctx where
   eqs : Array DefEq := #[]
   /-- proof of a definitional equation (e.g., with the bridge tactics) -/
   proveDef : Expr → TermElabM (Option Expr) := fun _ => pure none
+  /-- proof of `g₁ → ... → gₙ → l = r` for the rewritten sides `l` and `r` of an unfolding under the guards `gᵢ`
+      when they differ (e.g., in the normal forms of Blaster and Z3, like `0 < x` and `¬ x ≤ 0`) -/
+  proveImp : Expr → TermElabM (Option Expr) := fun _ => pure none
 
 /-- Head constant of an application `f a⃗`, through the conversions of the interpretation (`↑(f a⃗)` for
     functions returning `Nat`, `f a⃗ = true` for functions returning `Bool`). -/
@@ -259,30 +263,50 @@ def lhsHead? (e : Expr) : Option Name :=
   let e := if e.isAppOfArity ``Nat.cast 3 then e.appArg! else e
   e.getAppFn.constName?
 
-/-- Definitional equations of the recursive functions `pairs` (the interpretation of their axioms). -/
-def mkCtx (tbl : SymTable) (pairs : Array Pair) (proveDef : Expr → TermElabM (Option Expr)) : TermElabM Ctx := do
-  let mut eqs := #[]
-  for p in pairs do
+/-- Definitional equations of the recursive functions `pairs`: the interpretation of `∀ x⃗, f x⃗ = body` for the
+    body of `f` in the definitions `defs` of the proof output, and of the axiom of `f` in the query. -/
+def mkCtx (tbl : SymTable) (pairs : Array Pair) (defs : Array FunDef) (proveDef proveImp : Expr → TermElabM (Option Expr)) :
+    TermElabM Ctx := do
+  if !pairs.isEmpty then debugLog m!"recfun: {pairs.size} recursive functions, {defs.size} definitions in the proof"
+  let interpStmt (φ : STerm) : TermElabM (Option (Expr × Name)) := do
     try
-      let φ ← ofExcept (STerm.ofSExpr {} p.formula)
       let stmt ← instantiateMVars (← (interpProp φ).run { table := tbl })
-      if stmt.hasMVar then continue
+      if stmt.hasMVar then return none
       let some head ← forallTelescope stmt fun _ b => do
           let some (_, l, _) := b.eq? | return none
           return lhsHead? l
-        | continue
-      eqs := eqs.push { stmt, head, proof := ← IO.mkRef none }
-    catch _ => pure ()
-  return { eqs, proveDef }
+        | return none
+      return some (stmt, head)
+    catch ex =>
+      debugLog m!"recfun: no definitional equation for {φ}: {ex.toMessageData}"
+      return none
+  let mut eqs := #[]
+  for p in pairs do
+    let mut cands := #[]
+    if let some d := defs.find? (·.name == p.fn) then
+      let lhs := STerm.app p.fn (d.params.map (STerm.sym ·.1))
+      cands := cands.push (STerm.quant .forall d.params (.app "=" #[lhs, d.body]))
+    if let .ok φ := STerm.ofSExpr {} p.formula then cands := cands.push φ
+    let mut stmts := #[]
+    let mut head := Name.anonymous
+    for φ in cands do
+      if let some (stmt, h) ← interpStmt φ then
+        if head.isAnonymous then head := h
+        if h == head then stmts := stmts.push stmt
+    if !stmts.isEmpty then eqs := eqs.push { stmts, head, proof := ← IO.mkRef none }
+  return { eqs, proveDef, proveImp }
 
 /-- Proof of the definitional equation `eq` (attempted once; the proof is shared by the lemmas using it). -/
-def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option Expr) := do
+def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
   if let some r ← eq.proof.get then return r
-  let r ← try ctx.proveDef eq.stmt catch _ => pure none
-  let r ← r.mapM fun p => do
-    let m ← mkFreshExprMVar eq.stmt
-    m.mvarId!.assign p
-    pure m
+  let mut r := none
+  for stmt in eq.stmts do
+    if let some p ← (try ctx.proveDef stmt catch _ => pure none) then
+      let m ← mkFreshExprMVar stmt
+      m.mvarId!.assign p
+      r := some (stmt, m)
+      break
+    debugLog m!"recfun: definitional equation not proved: {stmt}"
   eq.proof.set (some r)
   return r
 
@@ -326,26 +350,47 @@ def rewriteChain (ctx : Ctx) (facts : Std.HashMap Expr Expr) (t : Expr) (fuel :=
     out := out.push (cur, pf)
   return out
 where
+  /-- The truth value of `c` given by the facts (with a proof of `c` or `¬ c`), also through the normal forms of
+      Z3 (`a < b` as `¬ b ≤ a`, equalities up to symmetry). -/
+  decide? (c : Expr) : MetaM (Option (Bool × Expr)) := do
+    if let some p := facts.get? c then return some (true, p)
+    if let some p := facts.get? (mkNot c) then return some (false, p)
+    if c.isAppOfArity ``LT.lt 4 && (c.getArg! 0).isConstOf ``Int then
+      let (a, b) := (c.getArg! 2, c.getArg! 3)
+      if let some p := facts.get? (mkNot (mkIntLe b a)) then return some (true, ← mkAppM ``Int.lt_of_not_ge #[p])
+      if let some p := facts.get? (mkIntLe b a) then return some (false, ← mkAppM ``Int.not_lt_of_ge #[p])
+    if let some (_, a, b) := c.eq? then
+      let c' ← mkEq b a
+      if let some p := facts.get? c' then return some (true, ← mkEqSymm p)
+      if let some p := facts.get? (mkNot c') then
+        return some (false, ← withLam `h c fun h => do return mkApp p (← mkEqSymm h))
+    return none
   step (t : Expr) : TermElabM (Option (Expr × Expr)) := do
     if t.isAppOfArity ``ite 5 then
       let args := t.getAppArgs
       let (α, c, inst, a, b) := (args[0]!, args[1]!, args[2]!, args[3]!, args[4]!)
       let us := t.getAppFn.constLevels!
-      if let some hc := facts.get? c then
-        return some (a, mkAppN (mkConst ``if_pos us) #[c, inst, hc, α, a, b])
-      if let some hn := facts.get? (mkNot c) then
-        return some (b, mkAppN (mkConst ``if_neg us) #[c, inst, hn, α, a, b])
-      return none
+      match ← decide? c with
+      | some (true, hc) => return some (a, mkAppN (mkConst ``if_pos us) #[c, inst, hc, α, a, b])
+      | some (false, hn) => return some (b, mkAppN (mkConst ``if_neg us) #[c, inst, hn, α, a, b])
+      | none => return none
     let some h := lhsHead? t | return none
     for eq in ctx.eqs do
       if eq.head != h then continue
-      let some pf ← eq.get ctx | continue
-      if let some r ← instantiateEq eq.stmt pf t then return some r
+      let some (stmt, pf) ← eq.get ctx | continue
+      if let some r ← instantiateEq stmt pf t then return some r
     return none
 
+/-- Proof of `goal` from the hypotheses `hyps` (propositions and proofs) with `ctx.proveImp`. -/
+def proveUnder (ctx : Ctx) (hyps : Array (Expr × Expr)) (goal : Expr) : TermElabM (Option Expr) := do
+  let stmt := hyps.foldr (fun (t, _) acc => mkForall `h .default t acc) goal
+  return (← ctx.proveImp stmt).map (mkAppN · (hyps.map (·.2)))
+
 /-- Proof of the literal `l` from the facts: the sides of an equality are rewritten to a common term (see
-    `rewriteChain`), a proposition to `True`, a negated proposition to `False`. -/
-def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (l : Expr) : TermElabM (Option Expr) := do
+    `rewriteChain`), a proposition to `True`, a negated proposition to `False`. When the rewritten terms differ,
+    their equality is proved under the guards `hyps`. -/
+def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (hyps : Array (Expr × Expr)) (l : Expr) :
+    TermElabM (Option Expr) := do
   if let some (_, a, b) := l.eq? then
     let ca ← rewriteChain ctx facts a
     let cb ← rewriteChain ctx facts b
@@ -356,25 +401,45 @@ def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (l : Expr) : TermElabM 
     for (x, px) in ca do
       for (y, py) in cb do
         if x.getAppFn == y.getAppFn && (← propEq x y) then return some (← mkEqTrans px (← mkEqSymm py))
+    -- differences of the rewritten sides
+    let (x, px) := ca.back!
+    let (y, py) := cb.back!
+    if let some p ← proveUnder ctx hyps (← mkEq x y) then
+      return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
+    debugLog m!"recfun: no common rewrite of {ca.map (·.1)} and {cb.map (·.1)} (facts {facts.toArray.map (·.1)})"
     return none
   if let some q := l.not? then
     let cq ← rewriteChain ctx facts q
-    let some (_, pq) := cq.find? (·.1.isConstOf ``False) | return none
+    if cq.size == 1 then return none
+    let pq ← match cq.find? (·.1.isConstOf ``False) with
+      | some (_, pq) => pure pq
+      | none =>
+          let (x, px) := cq.back!
+          let some p ← proveUnder ctx hyps (← mkEq x (mkConst ``False)) | return none
+          mkEqTrans px p
     return some (← withLam `h q fun h => mkEqMP pq h)
   let cl ← rewriteChain ctx facts l
-  let some (_, pl) := cl.find? (·.1.isConstOf ``True) | return none
+  if cl.size == 1 then return none
+  let pl ← match cl.find? (·.1.isConstOf ``True) with
+    | some (_, pl) => pure pl
+    | none =>
+        let (x, px) := cl.back!
+        let some p ← proveUnder ctx hyps (← mkEq x (mkConst ``True)) | return none
+        mkEqTrans px p
   return some (← mkEqMPR pl (mkConst ``True.intro))
 
 /-- Proof of the clause `concl` (literals `lits`) from a proof of its `j`-th literal assuming the others false. -/
 def proveByLit (ctx : Ctx) (lits : Array Expr) (concl : Expr) (j : Nat) : TermElabM (Option Expr) := do
   let r ← withLocalDeclD `hn (mkNot concl) fun hn => do
     let mut facts : Std.HashMap Expr Expr := {}
+    let mut hyps := #[]
     for i in [:lits.size] do
       if i == j then continue
       let l := lits[i]!
       let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj lits i h)
       facts ← addFact facts (mkNot l) nl
-    let some p ← proveLit ctx facts lits[j]! | return none
+      hyps := hyps.push (mkNot l, nl)
+    let some p ← proveLit ctx facts hyps lits[j]! | return none
     return some (mkLambda `hn .default (mkNot concl) ((mkApp hn (← mkOrInj lits j p)).abstract #[hn]))
   return r.map (mkApp2 (mkConst ``Classical.byContradiction) concl ·)
 

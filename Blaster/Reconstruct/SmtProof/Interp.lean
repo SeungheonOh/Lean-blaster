@@ -549,8 +549,13 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
       let c ← interpProp args[0]!
       let a ← interpInt? args[1]!
       let b ← interpInt? args[2]!
-      -- NOTE: the parameters of nullary constructors in a branch (e.g., `none`) are given by the other branch
-      if a.hasMVar || b.hasMVar then discard <| isDefEq (← inferType a) (← inferType b)
+      -- NOTE: the parameters of nullary constructors in a branch (e.g., `none`) are given by the other branch, and
+      -- the branches may be interpreted in different instances of a datatype (e.g., `Option Nat` and `Option Int`)
+      let (ta, tb) := (← inferType a, ← inferType b)
+      if !(← isDefEq ta tb) then
+        let b' ← try some <$> coerce b tb ta catch _ => pure none
+        if let some b' := b' then return ← mkClassicalIte c a b'
+        return ← mkClassicalIte c (← coerce a ta tb) b
       mkClassicalIte c a b
   | "+", _ => foldBin mkIntAdd (← args.mapM interpInt)
   | "-", 1 => return mkIntNeg (← interpInt args[0]!)

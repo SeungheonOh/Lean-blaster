@@ -773,11 +773,19 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       matchInst := insts.get?, macroOf
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
-    -- definitional equations of the recursive functions (`z3rec`), proved with the bridge tactics in the empty
-    -- local context when closed (see `proveClosed`)
-    let recCtx ← RecFun.mkCtx tbl recPairs fun stmt => do
-      let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
-      if stmt.hasFVar then run else withLCtx {} {} run
+    let proveStep (rule : String) (stmt : Expr) : TermElabM (Option (Expr × String)) := do
+      -- NOTE: the tactic syntax of each rule is built once per replay
+      let tacs ← match (← tacCache.get).get? rule with
+        | some t => pure t
+        | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+      portfolio tacs stmt rule
+    -- recursive functions (`z3rec`): definitional equations, proved with the bridge tactics in the empty local
+    -- context when closed (see `proveClosed`), and differences of normal forms in their unfoldings
+    let recCtx ← RecFun.mkCtx tbl recPairs sproof.defs
+      (fun stmt => do
+        let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
+        if stmt.hasFVar then run else withLCtx {} {} run)
+      (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -806,12 +814,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
               let h ← IO.FS.Handle.mk f .append
               h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot goalTerm)}\n"
           return r.map (·.1)
-        proveStep := fun rule stmt => do
-          -- NOTE: the tactic syntax of each rule is built once per replay
-          let tacs ← match (← tacCache.get).get? rule with
-            | some t => pure t
-            | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
-          portfolio tacs stmt rule
+        proveStep
         proveRecFun := fun c n => do
           let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
           if r.isNone then debugLog m!"recfun lemma failed: {c}"
