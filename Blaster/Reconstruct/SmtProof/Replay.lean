@@ -77,6 +77,9 @@ structure ReplayState where
   scopeFailed : Std.HashSet Nat := {}
   directAttempts : Nat := 0
   stats : ReplayStats := {}
+  /-- maximal sharing of the interpreted conclusions: structurally equal terms are pointer equal, such that the
+      comparisons of the explicit constructions (e.g., `congrDescent` on large CEK terms) are constant time -/
+  share : ShareCommon.State.{0} Lean.ShareCommon.objectFactory := default
 
 abbrev ReplayM := ReaderT ReplayCtx (StateRefT ReplayState TermElabM)
 
@@ -111,6 +114,7 @@ def stepConcl (i : Nat) : ReplayM Expr := do
     -- an application with a metavariable argument (e.g., a constructor of an unknown instance)
     let site := (e.find? fun s => s.isApp && s.getAppArgs.any (·.isMVar)).getD e
     throwError "smt proof: can't infer the types of {site}"
+  let e ← modifyGet fun s => let (e, share) := s.share.shareCommon e; (e, { s with share })
   if isGlobal then modify fun s => { s with conclCache := s.conclCache.insert i e }
   return e
 
