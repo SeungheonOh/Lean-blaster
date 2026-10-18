@@ -188,6 +188,102 @@ target another Blaster branch.
 When tracking is off (`reconstruct: 0`), the proof run is skipped, so the optimizer's behavior and cost
 are unchanged.
 
+## Replaying SMT proofs
+
+Goals left to the SMT solver can also be proved by replaying a proof produced by an SMT backend,
+instead of (or in addition to) re-proving them with Lean tactics. This is implemented in
+`Blaster/Reconstruct/SmtProof/` and works with several backends through a common representation:
+
+1. **Query.** The residual goal is translated again with Blaster's translation, after introducing its
+   leading variables as Lean free variables, such that the SMT constants `$k` can be mapped back to them.
+   The recursive Lean functions, which this branch translates with `define-fun-rec`, are encoded for the
+   backends as an uninterpreted function `f`, its definition `f_LRec` and the definitional axiom
+   `∀ x, f x = f_LRec x`, such that their unfoldings are quantifier instantiations. The axioms over `Nat`
+   are guarded with `0 ≤ x` (this only weakens the query).
+2. **Backends** (`BLASTER_SMTPROOF_BACKENDS`, `z3,z3+` by default, e.g., `z3,cvc5`): Z3 with legacy proof
+   objects (`:produce-proofs true`, `pp.simplify_implies false`), the same with the simplifier options of
+   the query kept (`z3+`, e.g., `smt.macro_finder`, which may be needed to find a proof but gives coarser
+   proofs), and cvc5 with Alethe proofs (`--parsing-mode=lenient`, `--proof-granularity=dsl-rewrite`).
+   The timeout of a backend is `BLASTER_SMTPROOF_TIMEOUT` (seconds, 20 by default). Each adapter
+   translates the proof into a DAG of steps (`IR.lean`): rule, premises, arguments (e.g., quantifier
+   instantiations) and conclusion (clauses as disjunctions). The Alethe adapter also serves veriT.
+3. **Interpretation** (`Interp.lean`). SMT terms are interpreted as Lean terms: `Int` arithmetic on Lean
+   `Int`, with casts (`↑n`, `Int.toNat`) where Lean terms of type `Nat` occur (arguments and results of
+   Lean functions, constructor fields); `Bool` formulas as propositions; datatype constructors, selectors and
+   testers as Lean constructors and case analyses; Blaster's function values (`@@ArrowT`, `@apply`) as Lean
+   functions; Blaster's type predicates (`@isNat`, ...) as `True` (Lean values always satisfy them);
+   skolem constants as `Classical.epsilon` terms.
+4. **Replay** (`Replay.lean`). Each step yields a Lean proof of the interpretation of its conclusion:
+   explicit proof terms for resolution (a unit propagation procedure building the proof), modus ponens,
+   equality reasoning, quantifier instantiation, skolemization, hypotheses and lemmas; and small tactic
+   calls (`simp`, `omega`, `grind`, unfolding of user definitions) proving `premises → conclusion` for
+   rewriting and theory lemmas. Large equalities (e.g., Z3 `rewrite`s inside big formulas) are related by
+   congruence on their common structure, and only their differences are given to tactics, with the
+   subterms common to both sides generalized (`Local.lean`); arithmetic lemmas over large atoms are
+   generalized the same way, with facts on `div`/`mod` for `omega`. The proof of `False` is turned into a
+   proof of the goal and checked by the kernel like any other reconstructed proof.
+5. **Bridge** (`Bridge.lean`). The asserted formula is the translation of the negated goal, interpreted
+   back. It is related to the negated goal by a simultaneous traversal of both terms: congruence on their
+   common structure, and a lemma for each encoding of the translation where they differ: `match` as `ite`
+   chains over testers and selectors (an auxiliary theorem per matcher instance, stated for abstract
+   discriminants and alternatives, and proved by evaluating the conditions with case analyses), `Nat`
+   terms as `Int` terms and quantifiers over `Nat` as guarded quantifiers over `Int`, `Bool` terms as
+   formulas, `dite'`/`ite`, functions translated as SMT macros (e.g., `@Nat.sub`, `@Int.toNat`, expanded by
+   the backends; an auxiliary lemma per function relating it to its macro), Blaster's type predicates. The
+   definitions of the other functions are bridged by tactics. The traversal is linear in the size of the
+   (shared) terms, which matters for goals such as the CEK evaluation of validators.
+
+Blaster's polymorphic encoding is interpreted when the goal has a single sort variable `α`. On this
+branch, the values of the sort variables are values of the universal sort `@@Type` (a sort variable is an
+alias `@α` of `@@Type`, with a membership predicate `@is@α`): `@@Type` is interpreted as `α` and the
+membership predicates as `True`. Lambda terms of the translation (`@lambda`, `@global_lambda` with their
+definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as Lean `Nat` variables.
+
+The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a
+`Nat` function instantiated with a negative integer) simply fails to replay. Soundness only relies on the
+kernel. The option `(smt-proof: n)` (or, by default, the environment variable `BLASTER_SMT_PROOF`) selects
+when the replay is tried for SMT residuals: `1`/`last` (default, after the tactic strategies), `2`/`first`,
+`3`/`only` (no tactic strategies, to measure the replay), or `0`/`off`. `Tests/Reconstruct/SmtProof.lean`
+tests the replay alone (`(smt-proof: 3)`).
+
+### Results
+
+On this branch, with `BLASTER_SMT_PROOF=only` (no tactic strategy for SMT residuals) on 42 files of `Tests/Smt`
+and `Tests/FixedIssues` (all those with SMT residuals except `SmtNatMod`, `CharBitVec` and `Issue18`), 110 of
+the 220 replays succeed with the system Z3 4.13.3 (82 before the sync with 9b9a511 of `feat/smt-proof-replay`),
+and 149/219 with Z3 5.3.1, in line with the source branch on the same files with Z3 5.3.1 (143/220; the test
+files of both branches differ slightly). Most of the failures with Z3 4.13.3 are in `Tests/Smt/SmtMatch.lean`
+(13/73, 52/73 with Z3 5.3.1): Z3 4.13.3 rewrites the definitional axioms of the derived `BEq` instances under
+their binders, and these large `rewrite` steps (proved by local differences and tactics) exceed the replay
+deadline (`BLASTER_SMTPROOF_DEADLINE`, 300 s by default) when the goals of a file are replayed concurrently on a
+loaded machine. `Tests/Reconstruct/SmtProof.lean` replays the proofs of its 7 goals closed by the SMT solver with
+Z3 5.3.1. With Z3 4.13.3, 5 of them are replayed, and the other two are proved by the direct fallback: the proof
+of `x / (y + 1) ≤ x` needs a non-linear `div` lemma, and the proof of the `Option α` goal a datatype lemma over a
+selector of `Option α`, whose interpretation needs an inhabitant of `α`.
+
+On the `beta-lambda-cache-optimization` port (`feat/smt-proof-replay`, nightly Z3), the replay proves 88.9% of the
+goals closed by the SMT solver on the whole test suite (248/279), and scales to the validators of
+[CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
+evaluation of UPLC programs by the CEK machine (Z3 proofs of ≈900 steps over formulas of tens of thousands of
+nodes). With the default mode (`last`), the replay complements the tactic strategies.
+
+Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
+`commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
+engine (`def-axiom`, `not-or-elim`, `and-elim`, propositional `rewrite`s, Alethe's Tseitin rules); tactics are
+used for arithmetic (`th-lemma`, arithmetic `rewrite`s: `omega`, `simp`, `grind`), with a portfolio ordered
+adaptively by success rate per time unit for each rule and goal shape. Performance notes:
+ - proofs of the top-level steps are held by assigned metavariables and binders are abstracted syntactically,
+   such that the construction of a step does not traverse the proofs of the previous ones (it was quadratic);
+ - SMT terms are interpreted once (memoization on shared terms);
+ - steps that don't depend on a scope are replayed in increasing order (bounded recursion on deep proofs).
+For instance, on the `beta-lambda-cache-optimization` port, a 245-step Z3 proof involving a recursive function
+replays in ~6 s, and a 2458-step cvc5 (Alethe) proof of the same goal in ~30 s.
+
+Limitations: polymorphic goals with several sort variables; `match` patterns on `Nat`/`Int` with
+variables (e.g., `n + 1`, whose translation needs the conditions of the branch) and named patterns; cvc5's
+native CPC format (whose steps often leave their conclusion implicit) is not supported; the proofs depend on
+the version of Z3 (see above), and proof production may time out where the verdict did not.
+
 ## Findings
 
 Reconstruction checks every individual rewrite, so it surfaces problems in the trusted pipeline:
