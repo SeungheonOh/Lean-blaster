@@ -109,6 +109,10 @@ def runBackend (backend : Backend) (cmds : Array SExpr) : IO (Except String Stri
     let out ← IO.Process.output { cmd := backend.cmd, args := backend.args.push path.toString }
     -- the first line among `sat`, `unsat` and `unknown` (e.g., after warnings on unsupported options)
     let lines := out.stdout.splitOn "\n"
+    -- errors on the query (e.g., unsupported declarations): its verdict and proof are not used
+    let errors := lines.filter (·.trimLeft.startsWith "(error")
+    if !errors.isEmpty then
+      return .error s!"{backend.name}: {String.intercalate " " (errors.take 3) |>.take 600}"
     match lines.findIdx? (fun l => ["sat", "unsat", "unknown"].contains l.trim) with
     | some i =>
         if lines[i]!.trim == "unsat" then
