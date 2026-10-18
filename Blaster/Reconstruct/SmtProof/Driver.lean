@@ -586,16 +586,19 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         if body.containsFVar d.fvarId || (← xs.anyM fun x => do return (← inferType x).containsFVar d.fvarId) then
           sortVars := sortVars.push d.toExpr
     if sortVars.size > 1 then throwError "smt proof: polymorphic goals with several sort variables are not supported"
-    if let .forallE _ t _ _ := body then
-      if (← whnfR t).isSort then throwError "smt proof: polymorphic goals are not supported"
+    -- quantifiers over sorts below the leading binders
+    let nestedSort := body.find? fun s => match s with
+      | .forallE _ (.sort u) _ _ => !u.isZero
+      | .lam _ (.sort u) _ _ => !u.isZero
+      | _ => false
+    if nestedSort.isSome then throwError "smt proof: polymorphic goals with quantified sort variables are not supported"
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
     let ((body', reopt), tenv) ← (do
         -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
-        -- recursive functions); `body` being already optimized, `body'` is expected to be `body`. The
-        -- optimized term is translated (as in Blaster's verdict run) when it is definitionally equal to `body`
-        -- (which the bridge requires), `body` itself otherwise.
+        -- recursive functions); `body` being already optimized, `body'` is expected to be `body` (up to
+        -- definitional equality, which the bridge requires).
         let (body', _) ← Optimize.mainPf body (track := false)
         let reopt ← if body' == body then pure true else
           try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 200000 * 1000 }) <|
@@ -607,7 +610,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           updateQuantifiedFVarsCache α.fvarId! true
           let decl ← generateSortInstDecl (← inferType α)
           declareConst (← typeParamNameToSmtSymbol α.fvarId!) decl.instSort
-        let st ← translateExpr (if reopt then body' else body)
+        let st ← translateExpr body'
         assertTerm (notSmt st)
         return (body', reopt) : TranslateEnvT (Expr × Bool)).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
@@ -660,7 +663,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       matchInst := insts.get?, macroOf
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
-    let goalTerm := if reopt then body' else body
+    let goalTerm := body'
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -674,7 +677,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
             if ← defeq c (mkNot body) then return some (← mkExpectedTypeHint hneg c)
           -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
           -- NOTE: the translated goal is definitionally equal to the goal (see the translation above)
-          let (r, fails) ← Bridge.prove bcfg (mkNot goalTerm) c
+          let (r, fails) ← if reopt then Bridge.prove bcfg (mkNot goalTerm) c else pure (none, #[])
           if let some p := r then
             return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot goalTerm)))
           if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
