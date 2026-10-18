@@ -87,6 +87,21 @@ def process (t p : Expr) : M Unit := do
             mkLambdaFVars #[ha] (mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp hna ha))))
         addFact (mkNot b) (← withLocalDeclD `hb b fun hb => do
           mkLambdaFVars #[hb] (mkApp p (← withLocalDeclD `ha a fun ha => mkLambdaFVars #[ha] hb)))
+    -- ¬(ite c a b = t) with `c` (resp. `¬ c`) known and `t` syntactically `a` (resp. `b`)
+    if let some (_, x, y) := na.eq? then
+      for (it, other, flip) in [(x, y, false), (y, x, true)] do
+        if it.isAppOfArity ``ite 5 then
+          let args := it.getAppArgs
+          let (c, a, b) := (args[1]!, args[3]!, args[4]!)
+          let mut eq? : Option Expr := none
+          if other == a then
+            if let some pc ← get? c then eq? := some (← mkAppOptM ``if_pos #[c, args[2]!, pc, args[0]!, a, b])
+          if other == b && eq?.isNone then
+            if let some nc ← getNeg? c then eq? := some (← mkAppOptM ``if_neg #[c, args[2]!, nc, args[0]!, a, b])
+          if let some e := eq? then
+            let e ← if flip then mkEqSymm e else pure e
+            modify fun st => if st.conflict.isNone then { st with conflict := some (mkApp p e) } else st
+            return
     -- ¬(a = b) for propositions
     if let some (ty, a, b) := na.eq? then
       if ty.isProp then
