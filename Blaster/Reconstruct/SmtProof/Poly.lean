@@ -16,6 +16,12 @@ constants of sort `@Instance`). The general interpretation is:
  - Blaster's membership predicates (`@isInstance`, `@isFun`, `@isList`, ...) are the images of the worlds (`Img`),
    such that the extensionality axioms of the encoding hold: the functions of the encoding are determined by their
    values on their domain.
+
+NOTE: the values of the datatypes of the user over sort variables (e.g., `Either α β`) have no world (no `map`
+function), and the Lean functions of the goal applied to values of sort variables (e.g., `natCast : α → Nat` at
+several sort variables) are only interpreted when `@Instance` is interpreted as the sort variable. The lambda terms of
+the encoding are interpreted by their bodies on the whole universe, such that their membership predicates only hold
+when their bodies are `dflt` outside of their domain (e.g., the identity).
 -/
 
 open Lean Meta Elab Tactic
