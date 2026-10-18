@@ -97,6 +97,14 @@ def record (rule method : String) : ReplayM Unit :=
 
 def orArgs? (e : Expr) : Option (Expr × Expr) := e.app2? ``Or
 
+/-- `fun (h : t) => k h`, abstracting `h` syntactically: unlike `mkLambdaFVars`, the metavariables of the body
+    are not instantiated, such that the cost does not depend on the size of the proofs they stand for
+    (see `replay`). The body must not contain metavariables depending on `h`. -/
+def withLam {m : Type → Type} [Monad m] [MonadControlT MetaM m] (n : Name) (t : Expr) (k : Expr → m Expr) : m Expr :=
+  withLocalDeclD n t fun h => do
+    let b ← k h
+    return mkLambda n .default t (b.abstract #[h])
+
 /-- Decompose a right-nested disjunction `l₁ ∨ (l₂ ∨ ... ∨ lₙ)` into its literals, given the
     expected number of literals `n`. -/
 def disjuncts (e : Expr) (n : Nat) : Array Expr := Id.run do
@@ -160,8 +168,8 @@ partial def orElim (lits : Array Expr) (d : Expr) (goal : Expr) (k : Nat → Exp
   if lits.size - start == 1 then return ← k start d
   let a := lits[start]!
   let b := (lits.extract (start+1) lits.size).pop.foldr mkOr lits.back!
-  let left ← withLocalDeclD `h a fun h => do mkLambdaFVars #[h] (← k start h)
-  let right ← withLocalDeclD `h b fun h => do mkLambdaFVars #[h] (← orElim lits h goal k (start+1))
+  let left ← withLam `h a fun h => k start h
+  let right ← withLam `h b fun h => orElim lits h goal k (start+1)
   return mkApp6 (Lean.mkConst ``Or.elim) a b goal d left right
 
 /-- Given a proof `d` of a clause with literals `lits`, refutations of some literals and the target
@@ -191,54 +199,51 @@ def refuteBy (units : Array (Expr × Expr)) (l : Expr) : MetaM (Option Expr) := 
     (e.g., Alethe's `resolution`, Z3's `unit-resolution`) independently of pivot annotations. -/
 partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr) : MetaM Expr := do
   let goal := if target.isEmpty then Lean.mkConst ``False else target.pop.foldr mkOr target.back!
-  let r ← withLocalDeclD `hn (mkNot goal) fun hn => do
-    -- known literals: proposition ↦ proof, and refuted propositions ↦ proof of the negation
-    let mut trues : Std.HashMap Expr Expr := {}
+  let r ← withLam `hn (mkNot goal) fun hn => do
+    -- refuted propositions ↦ proof of their negation (refutations are computed once, when facts are added)
     let mut falses : Std.HashMap Expr Expr := {}
+    let mut trues : Std.HashSet Expr := {}
     for k in [:target.size] do
       let l := target[k]!
-      let nl ← withLocalDeclD `h l fun h => do mkLambdaFVars #[h] (mkApp hn (← mkOrInj target k h))
+      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj target k h)
       falses := falses.insert l nl
-    let refutation (trues falses : Std.HashMap Expr Expr) (l : Expr) : MetaM (Option Expr) := do
-      if let some p := falses.get? l then return some p
-      if let some a := l.not? then
-        if let some pa := trues.get? a then
-          return some (← withLocalDeclD `h l fun h => mkLambdaFVars #[h] (mkApp h pa))
-      return none
-    let mut changed := true
     let mut used := Array.replicate clauses.size false
+    let mut changed := true
     let mut conflict : Option Expr := none
     while changed && conflict.isNone do
       changed := false
       for ci in [:clauses.size] do
         if used[ci]! then continue
         let (lits, pc) := clauses[ci]!
-        let mut unknown := #[]
-        let mut refs := #[]
-        for l in lits do
-          match ← refutation trues falses l with
-          | some r => refs := refs.push (some r)
-          | none => unknown := unknown.push l; refs := refs.push none
-        if unknown.isEmpty then
+        let mut unknown : Option Nat := none
+        let mut nbUnknown := 0
+        for i in [:lits.size] do
+          if !falses.contains lits[i]! then
+            nbUnknown := nbUnknown + 1
+            unknown := some i
+            if nbUnknown > 1 then break
+        if nbUnknown == 0 then
           -- conflict: all literals are refuted
-          let p ← orElim lits pc (Lean.mkConst ``False) fun i h => return mkApp refs[i]!.get! h
-          conflict := some p
+          conflict := some (← orElim lits pc (Lean.mkConst ``False) fun i h => return mkApp falses[lits[i]!]! h)
           break
-        if unknown.size == 1 then
-          let l := unknown[0]!
-          if trues.contains l then
-            used := used.set! ci true
-            continue
-          let p ← orElim lits pc l fun i h => do
-            match refs[i]! with
-            | some r => return mkApp2 (Lean.mkConst ``False.elim [levelZero]) l (mkApp r h)
-            | none => return h
-          trues := trues.insert l p
-          if let some a := l.not? then falses := falses.insert a p
+        if nbUnknown == 1 then
+          let some k := unknown | continue
+          let l := lits[k]!
           used := used.set! ci true
+          if trues.contains l then continue
+          let p ← orElim lits pc l fun i h => do
+            if i == k then return h
+            return mkApp2 (Lean.mkConst ``False.elim [levelZero]) l (mkApp falses[lits[i]!]! h)
+          trues := trues.insert l
+          -- `l` refutes `¬ l`, and `l = ¬ a` refutes `a`
+          let nl := mkNot l
+          if !falses.contains nl then
+            falses := falses.insert nl (← withLam `h nl fun h => return mkApp h p)
+          if let some a := l.not? then
+            if !falses.contains a then falses := falses.insert a p
           changed := true
     let some pf := conflict | throwError "smt proof: unit propagation did not derive a conflict"
-    mkLambdaFVars #[hn] pf
+    return pf
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) goal r
 
 /-- Run `x` in a new scope (hypotheses or bound variables): the proofs (and failures) of the
@@ -267,7 +272,15 @@ partial def replay (i : Nat) : ReplayM Expr := do
       let msg := s!"step {i} ({step.rule}): {toString step.concl |>.take 300}: {(← ex.toMessageData.toString).take 300}"
       modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
       throw ex
-  if ctx.depth == 0 then modify fun s => { s with cache := s.cache.insert i p }
+  if ctx.depth == 0 then
+    -- the proof is represented by an assigned metavariable, such that the proofs using it stay small
+    -- (they are instantiated once, at the end of the replay)
+    let p ← if p.isFVar || p.isMVar then pure p else do
+      let m ← mkFreshExprMVar (← stepConcl i)
+      m.mvarId!.assign p
+      pure m
+    modify fun s => { s with cache := s.cache.insert i p }
+    return p
   else modify fun s => { s with scopeCache := s.scopeCache.insert i p }
   return p
 
@@ -382,7 +395,7 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       let r ← mkAppM ``eq_false #[p]
       if ← propEq (← inferType r) concl then record step.rule "exact"; return r
       throwError "iff-false: conclusion mismatch"
-  | "resolution" | "th_resolution" => replayRup step concl
+  | "resolution" | "th_resolution" | "reordering" | "contraction" => replayRup step concl
   | "unit-resolution" =>
       let ps ← premises step
       let some (c, pc) := ps[0]? | throwError "unit-resolution: premises expected"
@@ -412,7 +425,7 @@ partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := 
       record step.rule "exact"
       return mkApp6 (Lean.mkConst ``Or.elim) q nq concl (mkApp (Lean.mkConst ``Classical.em) q) r rn
   | "proof-bind" => replayBind step
-  | "monotonicity" => replayCongr step concl
+  | "monotonicity" | "cong" => replayCongr step concl
   | "commutativity" => replayComm concl
   | "sk" =>
       -- `(¬ ∀ x, φ) → ¬ φ[ε]` or `(∃ x, φ) → φ[ε]` (see the interpretation of skolem constants)
@@ -440,12 +453,12 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let some j := step.premises[0]? | throwError "lemma: premise expected"
   let n := step.clauseSize
   let lits := disjuncts concl n
-  let r ← withLocalDeclD `hn (mkNot concl) fun hn => do
+  let r ← withLam `hn (mkNot concl) fun hn => do
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
     let mut facts := ctx.facts.push (mkNot concl, hn)
     for k in [:lits.size] do
       let l := lits[k]!
-      let nl ← withLocalDeclD `h l fun h => do mkLambdaFVars #[h] (mkApp hn (← mkOrInj lits k h))
+      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj lits k h)
       facts := facts.push (mkNot l, nl)
       if let some a := l.not? then
         facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
@@ -458,7 +471,7 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
         if let some a := t.not? then
           if ← propEq a cj then return mkApp p pj
       throwError "lemma: the premise is not refuted by the hypotheses")
-    mkLambdaFVars #[hn] pf
+    return pf
   record step.rule "exact"
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) concl r
 
@@ -524,6 +537,7 @@ partial def replayComm (concl : Expr) : ReplayM Expr := do
 /-- Resolution steps: unit propagation on the premise clauses (see `rupProof`). -/
 partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
   let ctx ← read
+  let t0 ← IO.monoMsNow
   let mut clauses := #[]
   for j in step.premises do
     let c ← stepConcl j
@@ -532,9 +546,14 @@ partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
     clauses := clauses.push (lits, ← replay j)
     -- NOTE: a clause whose single literal is a disjunction is also given as is
     if n > 1 then clauses := clauses.push (#[c], ← replay j)
+  let t1 ← IO.monoMsNow
+  modify fun s => { s with stats := s.stats.addTime "rup-premises" (t1 - t0) }
   let n := step.clauseSize
   let target := if n == 0 then #[] else disjuncts concl n
+  let t0 ← IO.monoMsNow
   let r ← rupProof clauses target
+  let t1 ← IO.monoMsNow
+  modify fun s => { s with stats := s.stats.addTime "rup-core" (t1 - t0) }
   record step.rule "exact"
   return r
 

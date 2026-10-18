@@ -523,7 +523,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
             throwError "{ex.toMessageData}; first failures: {fs}"
       let pt ← inferType p
       if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
-      return (← mkLambdaFVars #[hneg] p, st.stats)
+      -- NOTE: the proofs of the steps are instantiated once (see `replay`)
+      return (← mkLambdaFVars #[hneg] (← instantiateMVars p), st.stats)
     let (pf, stats) := pf
     let proofBody := mkApp2 (mkConst ``Classical.byContradiction) body pf
     let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
