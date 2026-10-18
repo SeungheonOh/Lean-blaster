@@ -802,7 +802,9 @@ partial def walkSame (a b : Expr) : BridgeM (Option Expr) := do
   if a.isAppOfArity ``Eq 3 && (a.getArg! 0).isConstOf ``Bool then
     let (l, r) := (a.getArg! 1, a.getArg! 2)
     -- same orientation: congruence
-    let same := b.isAppOfArity ``Eq 3
+    let swapped := b.isAppOfArity ``Eq 3 && (b.getArg! 0).isConstOf ``Bool && (b.getArg! 2).isConstOf ``Bool.true &&
+      l.isConstOf ``Bool.true
+    let same := b.isAppOfArity ``Eq 3 && !swapped
     if !same then
       if l.isConstOf ``Bool.true then
         let some p ← walk r b | return none
