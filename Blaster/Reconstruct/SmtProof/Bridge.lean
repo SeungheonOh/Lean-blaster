@@ -1490,6 +1490,31 @@ partial def walkBool (a b : Expr) : BridgeM (Option Expr) := do
 
 end
 
+/-- Proof of the interpretation `c` of the definition of a Lean function `f` asserted by Blaster
+    (`∀ xs, W(f xs) = b`, see `World`): the unfolding equation of `f` (`f.eq_def`), then the traversal of its
+    right-hand side and `b` (e.g., the `ite` encoding of the `match` defining `f`). -/
+def proveDefinition? (cfg : Cfg) (c : Expr) : Term.TermElabM (Option Expr) :=
+  forallTelescope c fun xs body => do
+    let some (_, lhs, rhs) := body.eq? | return none
+    let (w, app) :=
+      if lhs.isAppOfArity ``Nat.cast 3 then (World.nat, lhs.appArg!)
+      else if lhs.isAppOfArity ``Eq 3 && (lhs.getArg! 2).isConstOf ``Bool.true then (World.bool, lhs.getArg! 1)
+      else (World.same, lhs)
+    if w.lift app != lhs then return none
+    let .const f us := app.getAppFn | return none
+    let some eqDef ← (try getUnfoldEqnFor? f (nonRec := true) catch _ => pure none) | return none
+    let eqn := mkAppN (mkConst eqDef us) app.getAppArgs
+    let some (_, app', unfolded) := (← instantiateForall (← inferType (mkConst eqDef us)) app.getAppArgs).eq?
+      | return none
+    if app' != app then return none
+    let (r, _) ← (walk unfolded.headBeta rhs |>.run cfg).run {}
+    let some p := r | return none
+    let pl ← match w with
+      | .same => pure eqn
+      | .nat => mkCongrArg (mkApp2 (mkConst ``Nat.cast [levelZero]) (mkConst ``Int) (mkConst ``instNatCastInt)) eqn
+      | .bool => mkCongrArg (mkLambda `z .default (mkConst ``Bool) (boolTrue (.bvar 0))) eqn
+    mkLambdaFVars xs (← mkExpectedTypeHint (← mkEqTrans pl p) body)
+
 /-- Proof of `a = b` (resp. `a → b` when `imp`) for a goal term `a` and the interpretation `b` of its
     translation, with the failed pairs of subterms (deepest first) when it fails. -/
 def prove (cfg : Cfg) (a b : Expr) : Term.TermElabM (Option Expr × Array (Expr × Expr)) := do

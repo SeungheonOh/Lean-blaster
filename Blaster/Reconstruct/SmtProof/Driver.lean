@@ -726,6 +726,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
             -- NOTE: only for the translation of the negated goal
             for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 3 else #[] do
               h.putStrLn s!"=== bridge mismatch:\n{← ppExpr a}\n--- interpretation:\n{← ppExpr b}\n"
+          -- definitions of Lean functions (e.g., by `match`): the traversal of their unfolding
+          if !c.isAppOfArity ``Not 1 then
+            if let some p ← (try Bridge.proveDefinition? bcfg c catch _ => pure none) then return some p
           let r ← portfolio bridge c "bridge"
           if r.isNone then debugLog m!"bridge failed: {c}"
           if r.isNone then
