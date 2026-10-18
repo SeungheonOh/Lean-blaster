@@ -20,9 +20,18 @@ theorem classical_ite_congr {α : Sort u} {c c' : Prop} {x x' y y' : α} (hc : c
     @ite α c (Classical.propDecidable c) x y = @ite α c' (Classical.propDecidable c') x' y' := by
   subst hc hx hy; rfl
 
+theorem classical_decide_congr {p p' : Prop} (h : p = p') :
+    @decide p (Classical.propDecidable p) = @decide p' (Classical.propDecidable p') := by
+  subst h; rfl
+
 /-- `ite c x y = ite c' x' y'` (with the classical instances of the interpretation, whose argument depends on
-    the condition), given the proofs of the equalities of the arguments (`sub`). -/
+    the condition), given the proofs of the equalities of the arguments (`sub`); similarly for `decide`. -/
 def iteCongr? [Monad m] [MonadLiftT MetaM m] (l r : Expr) (sub : Expr → Expr → m (Option Expr)) : m (Option Expr) := do
+  if l.isAppOfArity ``Decidable.decide 2 && r.isAppOfArity ``Decidable.decide 2 then
+    if (l.getArg! 1).isAppOfArity ``Classical.propDecidable 1 && (r.getArg! 1).isAppOfArity ``Classical.propDecidable 1 then
+      let some h ← sub (l.getArg! 0) (r.getArg! 0) | return none
+      return some (mkApp3 (mkConst ``classical_decide_congr) (l.getArg! 0) (r.getArg! 0) h)
+    return none
   if !(l.isAppOfArity ``ite 5 && r.isAppOfArity ``ite 5) then return none
   let la := l.getAppArgs
   let ra := r.getAppArgs
