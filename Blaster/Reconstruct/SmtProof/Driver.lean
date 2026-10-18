@@ -513,7 +513,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
       let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline }
-      let (p?, st) ← ((do try return Except.ok (← replay sproof.root)
+      let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
                             catch ex => return Except.error ex) |>.run ctx).run {}
       let p ← match p? with
         | .ok p => pure p

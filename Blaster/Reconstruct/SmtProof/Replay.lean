@@ -55,6 +55,8 @@ structure ReplayCtx where
   deadline : Nat := 0
   /-- maximal number of direct proof attempts (see `replayCore`) -/
   maxDirect : Nat := 32
+  /-- set during `prepass` (no direct proof attempts) -/
+  prepass : Bool := false
 
 structure ReplayState where
   /-- proofs of steps replayed at depth 0 -/
@@ -322,7 +324,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   if concl.isConstOf ``False then
     throwError "smt proof: could not replay step {i} ({step.rule}) concluding false"
   -- NOTE: direct proofs are costly; they are attempted a bounded number of times
-  if (← get).directAttempts < ctx.maxDirect then
+  if !ctx.prepass && (← get).directAttempts < ctx.maxDirect then
     modify fun s => { s with directAttempts := s.directAttempts + 1 }
     if let some p ← ctx.cfg.proveDirect concl then
       record step.rule "direct"
@@ -580,5 +582,43 @@ partial def instantiateWithCoercion (h : Expr) (ts : Array Expr) : MetaM Expr :=
   return p
 
 end
+
+/-- Steps that can only be replayed in a scope: steps depending on hypotheses (discharged by `lemma` or
+    `subproof`), and steps below binders (premises of `proof-bind`, `bind`, `sko_ex`, `sko_forall`). -/
+def scopedSteps (p : Proof) : Array Bool := Id.run do
+  let n := p.steps.size
+  let mut inScope := Array.replicate n false
+  -- NOTE: `lemma`/`subproof` steps (and the steps using them) are also excluded, as they may be nested
+  -- in the scope of another one
+  for i in [:n] do
+    let s := p.steps[i]!
+    if ["hypothesis", "lemma", "subproof"].contains s.rule then inScope := inScope.set! i true
+    else if s.premises.any (fun j => inScope[j]!) then inScope := inScope.set! i true
+  -- subtrees below binders
+  let mut todo : Array Nat := #[]
+  for i in [:n] do
+    let s := p.steps[i]!
+    if ["proof-bind", "bind", "sko_ex", "sko_forall"].contains s.rule then todo := todo ++ s.premises
+  while !todo.isEmpty do
+    let j := todo.back!
+    todo := todo.pop
+    if inScope[j]! && p.steps[j]!.rule != "proof-bind" then continue
+    inScope := inScope.set! j true
+    todo := todo ++ p.steps[j]!.premises
+  return inScope
+
+/-- Replay the reachable steps that don't need a scope in increasing order (premises precede the steps
+    using them), such that the recursion depth of `replay` stays bounded on deep proofs. Failures are
+    recorded (and reported when replaying the root). -/
+def prepass : ReplayM Unit := do
+  let p := (← read).proof
+  let reach := p.reachable
+  let inScope := scopedSteps p
+  withReader (fun c => { c with prepass := true }) do
+    for i in [:p.root] do
+      if reach[i]! && !inScope[i]! then
+        try discard <| replay i catch _ => pure ()
+  -- failures of the prepass are retried by the replay from the root (with direct fallbacks)
+  modify fun s => { s with failed := {} }
 
 end Blaster.Reconstruct.SmtProof
