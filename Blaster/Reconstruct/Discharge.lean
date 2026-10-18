@@ -1169,7 +1169,8 @@ where
     discharged as a whole when one of its proof obligations cannot be discharged.
 -/
 partial def dischargeHoles
-  (p : Expr) (holes : Array HoleInfo := #[]) (equivs : Array (Expr × Expr) := #[]) :
+  (p : Expr) (holes : Array HoleInfo := #[]) (equivs : Array (Expr × Expr) := #[])
+  (fallback : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) :
   TermElabM (Expr × DischargeStats) := do
   let stats ← IO.mkRef ({} : DischargeStats)
   let facts ← IO.mkRef (← proveEquivalences equivs)
@@ -1225,6 +1226,10 @@ partial def dischargeHoles
             let label := labelOf e
             if let some prf ← dischargeWithFacts type facts then
               stats.modify (·.record "induction+facts" label)
+              return some prf
+            -- last resort given by the caller (e.g., the replay of a proof of an SMT solver)
+            if let some (prf, method) ← fallback type then
+              stats.modify (·.record method label)
               return some prf
             -- NOTE: unsound eliminations of unused binders are reported separately
             let unsound ← try isUnsoundBinderElim type catch _ => pure false

@@ -74,10 +74,11 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
 /-- Discharge the proof obligations in `proof` and check it against `goal` with the Lean kernel. -/
 def finishProof
   (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) (holes : Array HoleInfo)
-  (equivs : Array (Expr × Expr) := #[]) : TermElabM ReconOutcome := do
+  (equivs : Array (Expr × Expr) := #[])
+  (fallback : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) : TermElabM ReconOutcome := do
   let finish (o : ReconOutcome) : TermElabM ReconOutcome := do
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
-  let (proof, stats) ← dischargeHoles proof holes equivs
+  let (proof, stats) ← dischargeHoles proof holes equivs fallback
   let out := { out with stats }
   if !stats.failures.isEmpty || hasHoles proof then
     let shown := stats.failures.extract 0 3
@@ -109,6 +110,10 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let startTime ← IO.monoMsNow
   let out : ReconOutcome := { nbExplicit := recon.nbExplicit, nbDefEq := recon.nbDefEq }
   let finish := reconstruct.finish startTime
+  -- when to replay proofs of the SMT backend (see `BlasterOptions.smtProof`)
+  let mode ← match task.smtProof with
+    | some m => pure m
+    | none => pure ((← IO.getEnv "BLASTER_SMT_PROOF").getD "last")
   -- Evidence for `fullGoal = optExpr`
   let optPf? ← match task.optPf with
     | .defeq => pure none
@@ -120,9 +125,6 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | e => do
         -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
         -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
-        let mode ← match task.smtProof with
-          | some m => pure m
-          | none => pure ((← IO.getEnv "BLASTER_SMT_PROOF").getD "last")
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
           let st ← saveState
@@ -186,7 +188,17 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let axioms ← task.axioms.reverse.mapM fun n => do
     let info ← getConstInfo n
     return Lean.mkConst n (info.levelParams.map mkLevelParam)
-  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes recon.recFunEquivs
+  -- proof obligations of the optimizer that the tactics can't discharge: replay of SMT proofs (e.g., the
+  -- unfolding of user definitions in large computations)
+  let smtFallback (type : Expr) : TermElabM (Option (Expr × String)) := do
+    if mode == "off" || !(← isProp type) || type.hasMVar then return none
+    let st ← saveState
+    let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof type { randomSeed := task.randomSeed, timeout := task.timeout })
+      (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
+    match res with
+    | .ok r => return some (r.proof, s!"{r.backend} proof replay")
+    | .error _ => st.restore; return none
+  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes recon.recFunEquivs smtFallback
 
 where
   finish (startTime : Nat) (o : ReconOutcome) : TermElabM ReconOutcome := do

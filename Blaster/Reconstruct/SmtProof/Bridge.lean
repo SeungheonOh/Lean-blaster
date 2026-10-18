@@ -54,6 +54,27 @@ theorem ite_congr_dep {α : Sort u} {c c' : Prop} [h : Decidable c] {x x' y y' :
   · rw [if_pos hc, if_pos hc]; exact hx hc
   · rw [if_neg hc, if_neg hc]; exact hy hc
 
+theorem dite_congr_dep {α : Sort u} {c c' : Prop} [h : Decidable c] {x : c → α} {y : ¬ c → α} {x' y' : α}
+    (hc : c = c') (hx : ∀ h, x h = x') (hy : ∀ h, y h = y') :
+    @dite α c h x y = @ite α c' (Classical.propDecidable c') x' y' := by
+  subst hc; by_cases hc : c
+  · rw [dif_pos hc, if_pos hc]; exact hx hc
+  · rw [dif_neg hc, if_neg hc]; exact hy hc
+
+theorem natCast_dite_congr {c c' : Prop} [h : Decidable c] {x : c → Nat} {y : ¬ c → Nat} {x' y' : Int}
+    (hc : c = c') (hx : ∀ h, ((x h : Nat) : Int) = x') (hy : ∀ h, ((y h : Nat) : Int) = y') :
+    ((@dite Nat c h x y : Nat) : Int) = @ite Int c' (Classical.propDecidable c') x' y' := by
+  subst hc; by_cases hc : c
+  · rw [dif_pos hc, if_pos hc]; exact hx hc
+  · rw [dif_neg hc, if_neg hc]; exact hy hc
+
+theorem boolEq_dite_congr {c c' : Prop} [h : Decidable c] {x : c → Bool} {y : ¬ c → Bool} {x' y' : Prop}
+    (hc : c = c') (hx : ∀ h, (x h = true) = x') (hy : ∀ h, (y h = true) = y') :
+    ((@dite Bool c h x y) = true) = @ite Prop c' (Classical.propDecidable c') x' y' := by
+  subst hc; by_cases hc : c
+  · rw [dif_pos hc, if_pos hc]; exact hx hc
+  · rw [dif_neg hc, if_neg hc]; exact hy hc
+
 theorem nat_sub_bridge {x y : Nat} {x' y' : Int} (h : y ≤ x) (hx : (x : Int) = x') (hy : (y : Int) = y') :
     ((x - y : Nat) : Int) = x' - y' := by
   subst hx hy; omega
@@ -265,6 +286,8 @@ def numPattern? (x p : Expr) : Option (Expr × Expr × Expr) := Id.run do
     Returns `none` for unsupported patterns. -/
 partial def patCond (x p : Expr) (acc : Array Expr) : MetaM (Option (Array Expr)) := do
   let p := removeNamed p
+  -- NOTE: the named patterns below the root are removed (see `removeNamedPatternExpr`)
+  let p := p.replace fun e => if e.isAppOfArity ``namedPattern 4 then some (removeNamed e) else none
   -- literals
   if isLiteral p then return some (acc.push (← mkEq p x))
   if p.isFVar then return some acc
@@ -300,7 +323,12 @@ partial def patVals (x p : Expr) (acc : Std.HashMap FVarId Expr) : MetaM (Option
   if isLiteral p then return some acc
   if let some (_, q, v) := numPattern? x p then
     if let .fvar n := q then return some (acc.insert n v)
+    -- named pattern below the numeric pattern (e.g., `Int.ofNat (n@0)`): `n` and the variables of its pattern
+    if q.isAppOfArity ``namedPattern 4 then return ← patVals v q acc
     return none
+  -- named literal below `Int.ofNat` (e.g., `Int.ofNat (n@0)`): `n := x.toNat`
+  if p.isAppOfArity ``Int.ofNat 1 && p.appArg!.isAppOfArity ``namedPattern 4 then
+    return ← patVals (mkApp (mkConst ``Int.toNat) x) p.appArg! acc
   let .const c _ := p.getAppFn | return none
   let some (.ctorInfo info) := (← getEnv).find? c | return none
   if info.induct == ``Nat || info.induct == ``Int then return none
@@ -348,9 +376,11 @@ def altTypes (m : Name) (lvls : List Level) (info : MatcherInfo) (inst? : Option
     last alternative has no condition, and an alternative without conditions ends the chain. The
     applications of the alternatives are β-reduced when `beta` is set. -/
 def iteOf (ty : Expr) (mv : Expr) (altTys : Array Expr) (discrs alts : Array Expr) (beta : Bool) :
-    MetaM (Option Expr) := do
+    Term.TermElabM (Option Expr) := do
   let u ← getLevel ty
-  let mut branches : Array (Option Expr × Expr) := #[]
+  -- per alternative: the condition and the application of the alternative given a proof of the condition
+  -- (for the proof parameters of named patterns `x@h:p`, whose equations hold under the condition)
+  let mut branches : Array (Option Expr × (Option Expr → Term.TermElabM (Option Expr)) × Bool) := #[]
   for j in [:altTys.size] do
     let r ← forallTelescope altTys[j]! fun ys concl => do
       -- patterns: the arguments of the motive
@@ -364,30 +394,76 @@ def iteOf (ty : Expr) (mv : Expr) (altTys : Array Expr) (discrs alts : Array Exp
         conds := cs
         let some vs ← patVals d p vals | dbg m!"bridge: unsupported pattern {p}"; return none
         vals := vs
-      -- arguments of the alternative: the values of the pattern variables (`()` for `Unit`)
-      let mut args := #[]
+      -- arguments of the alternative: the values of the pattern variables (`()` for `Unit`), proofs of the
+      -- equations of named patterns (`none`)
+      let mut args : Array (Option Expr) := #[]
       for y in ys do
-        if let some v := vals.get? y.fvarId! then args := args.push v
-        else if (← inferType y).isConstOf ``Unit then args := args.push (mkConst ``Unit.unit)
+        if let some v := vals.get? y.fvarId! then args := args.push (some v)
+        else if (← inferType y).isConstOf ``Unit then args := args.push (some (mkConst ``Unit.unit))
+        else if ← isProp (← inferType y) then args := args.push none
         else dbg m!"bridge: no value for the pattern variable {y} of {altTys[j]!}"; return none
-      let app := mkAppN alts[j]! args
-      let app := if beta then app.headBeta else app
+      let dependent := args.any (·.isNone)
+      let alt := alts[j]!
+      let mk (hc? : Option Expr) : Term.TermElabM (Option Expr) := do
+        let mut app := alt
+        for a? in args do
+          match a? with
+          | some v => app := mkApp app v
+          | none =>
+              let some _ := hc? | return none
+              let .forallE _ dom _ _ ← whnf (← inferType app) | return none
+              let some pf ← proveEquation dom | dbg m!"bridge: equation of a named pattern not proved: {dom}"; return none
+              app := mkApp app pf
+        return some (if beta then app.headBeta else app)
       let cond ← if conds.isEmpty then pure none else some <$> foldAnd conds
-      return some (cond, app)
+      return some (cond, mk, dependent)
     let some b := r | return none
     branches := branches.push b
     if b.1.isNone then break
-  let some (_, last) := branches.back? | return none
+  let some (_, mkLast, depLast) := branches.back? | return none
+  if depLast then return none
+  let some last ← mkLast none | return none
   let mut acc := last
-  for (c?, app) in branches.pop.reverse do
+  for (c?, mk, dependent) in branches.pop.reverse do
     let some c := c? | return none
-    acc := mkApp5 (mkConst ``ite [u]) ty c (mkApp (mkConst ``Classical.propDecidable) c) app acc
+    let inst := mkApp (mkConst ``Classical.propDecidable) c
+    if dependent then
+      let some t ← withLocalDeclD `hc c fun hc => do
+          let some app ← mk (some hc) | return none
+          return some (← mkLambdaFVars #[hc] app)
+        | return none
+      acc := mkApp5 (mkConst ``dite [u]) ty c inst t (mkLambda `hc .default (mkNot c) acc)
+    else
+      let some app ← mk none | return none
+      acc := mkApp5 (mkConst ``ite [u]) ty c inst app acc
   return some acc
 where
   foldAnd (cs : Array Expr) : MetaM Expr := do
     let mut acc := cs.back!
     for c in cs.pop.reverse do acc := mkAnd c acc
     return acc
+  /-- Proof of the equation of a named pattern under the condition of its alternative (in the local context). -/
+  proveEquation (p : Expr) : Term.TermElabM (Option Expr) := do
+    for tac in [← `(tactic| (subst_vars; rfl)), ← `(tactic| omega), ← `(tactic| (simp_all; done)),
+                ← `(tactic| (rename_i h; cases h; subst_vars; simp_all))] do
+      if let some pf ← Blaster.Reconstruct.proveWithTactic p tac then return some pf
+    return none
+
+/-- β-reduction of the alternatives of an `ite`/`dite` chain (see `iteOf`). -/
+partial def betaChain (e : Expr) : Expr :=
+  if e.isAppOfArity ``ite 5 then
+    let args := e.getAppArgs
+    mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, args[3]!.headBeta, betaChain args[4]!]
+  else if e.isAppOfArity ``dite 5 then
+    let args := e.getAppArgs
+    let t := match args[3]! with
+      | .lam n ty b bi => Expr.lam n ty b.headBeta bi
+      | t => t
+    let f := match args[4]! with
+      | .lam n ty b bi => Expr.lam n ty (betaChain b) bi
+      | f => f
+    mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t, f]
+  else e.headBeta
 
 /-! ## Proofs of the matcher equations -/
 
@@ -532,6 +608,29 @@ partial def solveIte (g : MVarId) (fuel : Nat) (base : Nat) : Term.TermElabM Boo
     | .unknown =>
         dbg m!"bridge: unknown condition {c} ⟶ {← whnfD c} in {g}"
         return false
+  else if rhs.isAppOfArity ``dite 5 then
+    let args := rhs.getAppArgs
+    let (α, c, inst, t, e) := (args[0]!, args[1]!, args[2]!, args[3]!, args[4]!)
+    match ← evalCond c with
+    | .isTrue pc =>
+        let g' ← mkFreshExprSyntheticOpaqueMVar (← mkEq lhs (mkApp t pc).headBeta)
+        let h ← mkAppOptM ``dif_pos #[c, inst, pc, α, t, e]
+        g.assign (← mkEqTrans g' (← mkEqSymm h))
+        solveIte g'.mvarId! (fuel - 1) base
+    | .isFalse pnc =>
+        let g' ← mkFreshExprSyntheticOpaqueMVar (← mkEq lhs (mkApp e pnc).headBeta)
+        let h ← mkAppOptM ``dif_neg #[c, inst, pnc, α, t, e]
+        g.assign (← mkEqTrans g' (← mkEqSymm h))
+        solveIte g'.mvarId! (fuel - 1) base
+    | .splitFVar x =>
+        let gs ← try g.cases x catch _ => return false
+        gs.allM fun s => solveIte s.mvarId (fuel - 1) base
+    | .splitProp p =>
+        let (s₁, s₂) ← g.byCases p
+        let g₁ : MVarId := (← subst? s₁.mvarId s₁.fvarId).getD s₁.mvarId
+        if !(← solveIte g₁ (fuel - 1) base) then return false
+        solveIte s₂.mvarId (fuel - 1) base
+    | .unknown => return false
   else
     try g.refl; return true
     catch _ =>
@@ -627,12 +726,10 @@ def matcherIte? (a : Expr) : BridgeM (Option (Expr × Expr)) := do
       if xs.any (fun x => b.containsFVar x.fvarId!) then return none else return some b
     | dbg m!"bridge: dependent motive {motive}"; return none
   let some lem ← matcherLemma m lvls info params motive resTy | return none
-  let inst? := (← read).matchInst m
-  let some i ← withLocalDeclD `m (← inferType motive) fun mv => do
-      let tys ← altTypes m lvls info inst? params mv discrs
-      iteOf resTy mv tys discrs alts true
-    | return none
+  -- the encoding of `a`: the right-hand side of the instance of the lemma (with β-reduced alternatives)
   let pf := mkAppN lem (discrs ++ alts)
+  let some (_, _, rhs) := (← instantiateMVars (← inferType pf)).eq? | return none
+  let i := betaChain rhs
   return some (i, ← mkExpectedTypeHint pf (← mkEq a i))
 
 /-- `ite`-like terms of goals: `(α, c, inst, x, y, a = @ite α c inst x y)` for `ite`, `dite` and
@@ -764,6 +861,8 @@ partial def byDefEq (lhs b : Expr) : BridgeM (Option Expr) := do
 
 /-- `ite` on the goal side: `W(ite c x y) = ite c' x' y'`. -/
 partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  if a.isAppOfArity ``dite 5 then
+    if let some p ← walkDite w a b then return some p
   let some (α, c, inst, x, y, pa) ← iteView? a | return none
   let some (c', x', y', _) := classicalIte? b | return none
   let some pc ← walk c c' | return none
@@ -794,6 +893,26 @@ partial def walkIte (w : World) (a b : Expr) : BridgeM (Option Expr) := do
   match w with
   | .same => return some (← mkEqTrans pa pIte)
   | _ => return some (← mkEqTrans pLift pIte)
+
+/-- `dite c x y = ite c' x' y'` where the branches `x`, `y` depend on the condition (e.g., proofs of the equations
+    of named patterns), related under the condition (resp. its negation). -/
+partial def walkDite (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  let args := a.getAppArgs
+  let (α, c, inst, x, y) := (args[0]!, args[1]!, args[2]!, args[3]!, args[4]!)
+  let some (c', x', y', _) := classicalIte? b | return none
+  let some pc ← walk c c' | return none
+  let branch (cond f t : Expr) : BridgeM (Option Expr) :=
+    withLocalDeclD `hc cond fun h => withReader (fun cfg => { cfg with facts := cfg.facts.push h }) do
+      let some p ← walk (mkApp f h).headBeta t | return none
+      some <$> mkLambdaFVars #[h] p
+  let some px ← branch c x x' | return none
+  let some py ← branch (mkNot c) y y' | return none
+  match w with
+  | .same =>
+      let u ← getLevel α
+      return some (mkAppN (mkConst ``dite_congr_dep [u]) #[α, c, c', inst, x, y, x', y', pc, px, py])
+  | .nat => return some (mkAppN (mkConst ``natCast_dite_congr) #[c, c', inst, x, y, x', y', pc, px, py])
+  | .bool => return some (mkAppN (mkConst ``boolEq_dite_congr) #[c, c', inst, x, y, x', y', pc, px, py])
 
 /-- Matchers on the goal side: `W(a) = W(i)` where `i` is the `ite` encoding of `a`, then `W(i) = b`. -/
 partial def walkMatcher (w : World) (a b : Expr) : BridgeM (Option Expr) := do

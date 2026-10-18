@@ -269,6 +269,63 @@ def withScope (x : ReplayM α) : ReplayM α := do
   modify fun s => { s with scopeCache := {}, scopeFailed := {} }
   try x finally modify fun s => { s with scopeCache := saved.1, scopeFailed := saved.2 }
 
+/-- Definitional equality with a heartbeat budget (default transparency when `unfold`, reducible otherwise). -/
+def defeqBudget (a b : Expr) (budget : Nat) (unfold : Bool) : MetaM Bool := do
+  try withTheReader Core.Context (fun c => { c with maxHeartbeats := budget * 1000 }) <|
+      withCurrHeartbeats <| (if unfold then withDefault else withReducible) <| isDefEq a b
+  catch _ => return false
+
+/-- Rules whose steps are propositional reasoning on their atoms. -/
+def propositionalRules : Array String :=
+  #["def-axiom", "not-or-elim", "and-elim", "iff~", "nnf-pos", "nnf-neg", "rewrite", "unit-resolution"]
+
+/-- Proof of `stmt := p₁ → ... → pₙ → c` by the propositional engine, with the propositional atoms generalized. -/
+def propOnAtoms (stmt : Expr) : MetaM (Option Expr) := do
+  let some (g, vals) ← Local.generalizePropAtoms stmt | return none
+  forallTelescope g fun zs body => do
+    -- the premises as hypotheses
+    let r ← forallTelescope body fun hs c => do
+      let hyps ← hs.mapM fun h => do return (← inferType h, h)
+      match ← PropEngine.prove hyps c with
+      | some p => some <$> mkLambdaFVars hs p
+      | none => pure none
+    match r with
+    | some p => return some (mkAppN (← mkLambdaFVars zs p) vals)
+    | none => return none
+
+/-- Tactics on a generalized statement: closed statements are proved in the empty local context (e.g., such
+    that case analyses don't split the variables of the goal). -/
+def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Option (Expr × String)) :=
+  if g.hasFVar then cfg.proveStep rule g else withLCtx {} {} (cfg.proveStep rule g)
+
+/-- Proof of a local difference `l = r` of a step (see `Local.diffEq`): definitional equality, then the
+    propositional engine and tactics on the statement with the subterms common to `l` and `r` generalized. -/
+def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Option Expr) := do
+  let some (_, l, r) := eq.eq? | return none
+  -- definitional differences (e.g., testers of constructor applications)
+  let small := Local.sizeLe eq 2000
+  if ← defeqBudget l r 5000 small then
+    return some (← mkExpectedTypeHint (← mkEqRefl l) eq)
+  let t0 ← IO.monoMsNow
+  let some (g, vals) ← Local.generalizeCommon eq l r
+    | if small then return (← cfg.proveStep rule eq).map (·.1) else return none
+  let t1 ← IO.monoMsNow
+  -- propositional differences (e.g., associativity of connectives, `ite` on propositions): exact proof
+  let pp? ← forallTelescope g fun zs body => do
+    let some (ty, _, _) := body.eq? | return none
+    if !ty.isProp then return none
+    match ← PropEngine.prove #[] body with
+    | some p => some <$> mkLambdaFVars zs p
+    | none => pure none
+  if let some pp := pp? then return some (mkAppN pp vals)
+  let r ← proveClosed cfg rule g
+  if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
+    let t2 ← IO.monoMsNow
+    if t2 - t0 > 100 then
+      let h ← IO.FS.Handle.mk f .append
+      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 300}"
+  return r.map fun (pf, _) => mkAppN pf vals
+
 mutual
 
 /-- Proof of the interpretation of the conclusion of step `i`. -/
@@ -689,6 +746,7 @@ partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
 
 /-- Prove `p₁ → ... → pₙ → c` with tactics and apply it to the premise proofs. -/
 partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
+  let cfg := (← read).cfg
   if step.rule == "th-lemma" && step.premises.isEmpty then
     if let some p ← (try replayDatatype concl catch _ => pure none) then
       if ← propEq (← inferType p) concl then
@@ -705,78 +763,31 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       return ← mkEqRefl a
     -- definitional rewrites (e.g., testers of single-constructor types, by structure eta), with a budget
     -- (only reducible definitions for large terms)
-    if ← timed "defeq" (try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
-            withCurrHeartbeats <| (if unfoldable then withDefault else withReducible) <| isDefEq a b catch _ => pure false) then
+    if ← timed "defeq" (defeqBudget a b 20000 unfoldable) then
       record step.rule "defeq"
       return ← mkExpectedTypeHint (← mkEqRefl a) concl
   let ps ← premises step
+  -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
+  let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
+  let applyPremises (pf : Expr) : Expr := mkAppN pf (ps.map (·.2))
   -- propositional steps (e.g., `def-axiom`, `not-or-elim`, propositional rewrites): exact proof
-  if let some p ← timed "prop" (PropEngine.prove ps concl (splits := if Local.sizeLe concl 2000 then 2 else 0)) then
+  if let some p ← timed "prop" (PropEngine.prove ps concl (splits := if unfoldable then 2 else 0)) then
     record step.rule "prop"
     return p
   -- propositional steps over large atoms (e.g., atoms in different but definitionally equal forms are
   -- identified by generalization): exact proof on the generalized statement
-  if ["def-axiom", "not-or-elim", "and-elim", "iff~", "nnf-pos", "nnf-neg", "rewrite", "unit-resolution"].contains step.rule then
-    let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
-    if !(Local.sizeLe stmt 200) then
-      if let some p ← timed "prop atoms" (do
-          let some (g, vals) ← Local.generalizePropAtoms stmt | return none
-          forallTelescope g fun zs body => do
-            -- `p₁ → ... → pₙ → c` (premises as hypotheses)
-            let r ← forallTelescope body fun hs c => do
-              let hyps ← hs.mapM fun h => do return (← inferType h, h)
-              match ← PropEngine.prove hyps c with
-              | some p => some <$> mkLambdaFVars hs p
-              | none => pure none
-            match r with
-            | some p => some <$> (do return mkAppN (← mkLambdaFVars zs p) vals)
-            | none => pure none) then
-        record step.rule "prop atoms"
-        return mkAppN p (ps.map (·.2))
+  if propositionalRules.contains step.rule && !(Local.sizeLe stmt 200) then
+    if let some p ← timed "prop atoms" (propOnAtoms stmt) then
+      record step.rule "prop atoms"
+      return applyPremises p
   -- large equalities without premises (e.g., rewrites): congruence on the common structure, and tactics
   -- on the differences with their common subterms generalized
   if ps.isEmpty then
     if let some (_, a, b) := concl.eq? then
       if a.approxDepth.toNat > 8 || b.approxDepth.toNat > 8 then
-        let budget ← IO.mkRef 6
-        let rule := step.rule
-        let cfg := (← read).cfg
-        let prove (eq : Expr) : TermElabM (Option Expr) := do
-          let some (_, l, r) := eq.eq? | return none
-          -- definitional differences (e.g., testers of constructor applications)
-          let small := Local.sizeLe eq 2000
-          if (← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
-                  withCurrHeartbeats <| (if small then withDefault else withReducible) <| isDefEq l r catch _ => pure false) then
-            return some (← mkExpectedTypeHint (← mkEqRefl l) eq)
-          let t0 ← IO.monoMsNow
-          let gen ← Local.generalizeCommon eq l r
-          let t1 ← IO.monoMsNow
-          if let some (g, vals) := gen then
-            -- propositional differences (e.g., associativity of connectives, `ite` on propositions): exact proof
-            let pp? ← forallTelescope g fun zs body => do
-              let some (ty, _, _) := body.eq? | return none
-              if !ty.isProp then return none
-              match ← PropEngine.prove #[] body with
-              | some p => some <$> mkLambdaFVars zs p
-              | none => pure none
-            if let some pp := pp? then return some (mkAppN pp vals)
-            -- NOTE: generalized statements are closed: proved in the empty local context (e.g., such that case
-            -- analyses don't split the variables of the goal)
-            let r ← if g.hasFVar then cfg.proveStep rule g else withLCtx {} {} (cfg.proveStep rule g)
-            if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
-              let t2 ← IO.monoMsNow
-              if t2 - t0 > 100 then
-                let h ← IO.FS.Handle.mk f .append
-                h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 300}"
-            if let some (pf, _) := r then return some (mkAppN pf vals)
-          else if small then
-            if let some (pf, _) ← cfg.proveStep rule eq then return some pf
-          return none
-        if let some p ← timed "local" (Local.diffEq prove budget a b) then
+        if let some p ← timed "local" (Local.diffEq (localProof cfg step.rule) (← IO.mkRef 6) a b) then
           record step.rule "local"
           return ← mkExpectedTypeHint p concl
-  -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
-  let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
   -- theory lemmas over large terms: the subterms common to the literals are generalized (e.g., datatype
   -- lemmas `x = C (C.0 x) ∨ ¬ is-C x` over a large term `x`)
   if step.rule == "th-lemma" then
@@ -785,21 +796,19 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     if parts.size ≥ 2 then
       let restE := (parts.extract 1 parts.size).foldl (fun acc l => mkAnd acc l) (mkConst ``True)
       if let some (g, vals) ← Local.generalizeCommon stmt restE parts[0]! then
-        let cfg := (← read).cfg
-        if let some (pf, method) ← timed "datatype" (if g.hasFVar then cfg.proveStep "datatype" g else withLCtx {} {} (cfg.proveStep "datatype" g)) then
+        if let some (pf, method) ← timed "datatype" (proveClosed cfg "datatype" g) then
           record step.rule s!"{method} (common)"
-          return mkAppN (mkAppN pf vals) (ps.map (·.2))
-  -- arithmetic lemmas over large atoms: the atoms are generalized
-  if step.rule == "th-lemma" && (stmt.approxDepth.toNat > 8) then
-    if let some (g, vals) ← Local.generalizeAtoms stmt then
-      let cfg := (← read).cfg
-      if let some (pf, method) ← (if g.hasFVar then cfg.proveStep step.rule g else withLCtx {} {} (cfg.proveStep step.rule g)) then
-        record step.rule s!"{method} (atoms)"
-        return mkAppN (mkAppN pf vals) (ps.map (·.2))
+          return applyPremises (mkAppN pf vals)
+    -- arithmetic lemmas over large atoms: the atoms are generalized
+    if stmt.approxDepth.toNat > 8 then
+      if let some (g, vals) ← Local.generalizeAtoms stmt then
+        if let some (pf, method) ← proveClosed cfg step.rule g then
+          record step.rule s!"{method} (atoms)"
+          return applyPremises (mkAppN pf vals)
   if large then throwError "tactics are not applied to large statements"
-  let some (pf, method) ← timed "tactics" ((← read).cfg.proveStep step.rule stmt) | throwError "tactics failed"
+  let some (pf, method) ← timed "tactics" (cfg.proveStep step.rule stmt) | throwError "tactics failed"
   record step.rule method
-  return mkAppN pf (ps.map (·.2))
+  return applyPremises pf
 
 /-- Instantiate the universally quantified proof `h` with `ts`, coercing arguments when necessary. -/
 partial def instantiateWithCoercion (h : Expr) (ts : Array Expr) : MetaM Expr := do

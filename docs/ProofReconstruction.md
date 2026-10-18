@@ -253,9 +253,13 @@ by the SMT solver.
 
 The replay also scales to the validators of
 [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
-evaluation of UPLC programs by the CEK machine (e.g., `HelloWorld`, `UnlockPIN`): the Z3 proofs (≈900 steps
-over formulas of tens of thousands of nodes) are replayed with the bridge and the local proofs above (most
-`rewrite`s are proved by congruence and the propositional engine on generalized differences).
+evaluation of UPLC programs by the CEK machine. With `BLASTER_SMT_PROOF=only`, the residual goals of
+`HelloWorld` (927 Z3 proof steps, replayed in 33 s), `UnlockPIN` (917 steps, 34 s) and `ParamFeed` (108 steps,
+0.3 s) are proved by replay: the bridge relates the CEK evaluation (with its `match` expressions on `Data`) to
+the asserted formula, and most `rewrite`s are proved by congruence and by the propositional engine on their
+generalized differences. `ParamFeed` is fully reconstructed; for `HelloWorld` and `UnlockPIN`, a few proof
+obligations of the optimizer (the unfolding of the validator in the goal) remain. `MintingPolicy` and
+`SellNFT` time out in Z3 with proof production.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
