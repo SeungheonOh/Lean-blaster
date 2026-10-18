@@ -41,3 +41,4 @@ import Tests.FixedIssues.Issue287
 import Tests.FixedIssues.Issue331
 import Tests.FixedIssues.Issue348
 import Tests.FixedIssues.NatLog2
+import Tests.FixedIssues.CharBitVec
