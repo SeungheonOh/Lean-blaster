@@ -68,6 +68,9 @@ structure InterpCtx where
   /-- interpretation of the (closed) terms already interpreted, on term object addresses: terms are
       shared DAGs (e.g., after the expansion of `let`), which must not be traversed as trees -/
   cache : Option (IO.Ref (TermCache Expr)) := none
+  /-- the type parameters of applications that nothing determines are left as metavariables, to be assigned by
+      unification with the context or defaulted after the interpretation of the whole term (see `defaultTypes`) -/
+  deferTypes : Bool := false
 
 abbrev InterpM := ReaderT InterpCtx MetaM
 
@@ -161,7 +164,7 @@ def defaultMVarName : Name := `_blaster_selector_default
 /-- Apply `f` to `args`, instantiating implicit arguments by unification and coercing explicit
     arguments when necessary. Arguments whose type is `Int` or `Prop` (i.e., flexible w.r.t. coercions)
     are unified last. -/
-def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) : MetaM Expr := do
+def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) (allowTypeMVars := false) : MetaM Expr := do
   let fty ← inferType f
   let (mvars, bis, _) ← forallMetaTelescopeReducing fty
   let explicit := (List.range mvars.size).toArray.filter fun i => bis[i]!.isExplicit
@@ -204,8 +207,12 @@ def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) : MetaM Exp
   -- NOTE: the remaining implicit arguments (e.g., the type parameter `α` of `Sum.inr (b : β) : α ⊕ β`) may be
   -- assigned by unification with the context
   if r.hasMVar && !allowMVars then
-    -- NOTE: the default values of selectors may be chosen later (see `mkSelector`)
-    if r.hasLevelMVar || (← (← getMVars r).anyM fun m => return (← m.getDecl).userName != defaultMVarName) then
+    -- NOTE: the default values of selectors (see `mkSelector`), and type parameters when `allowTypeMVars`, may be
+    -- chosen later
+    let pending (m : MVarId) : MetaM Bool := do
+      if (← m.getDecl).userName == defaultMVarName then return true
+      return allowTypeMVars && (← instantiateMVars (← m.getType)).isSort
+    if r.hasLevelMVar || (← (← getMVars r).anyM fun m => return !(← pending m)) then
       throwError "smt proof: can't infer implicit arguments of {f}"
   return r
 
@@ -419,13 +426,15 @@ def fillDefaults (e : Expr) : MetaM Expr := do
     if let some v ← mkSelector.inhabitant? t 8 then m.assign v
   instantiateMVars e
 
-/-- Assign the remaining type metavariables of `e` with `Unit`: the type parameters that nothing determines (e.g.,
+/-- Assign the remaining type metavariables of `e` with `dflt`: the type parameters that nothing determines (e.g.,
     of `Option.none` under a tester, whose instance Z3 doesn't print), then the default values of selectors. -/
-def defaultTypes (e : Expr) : MetaM Expr := do
+def defaultTypes (e : Expr) (dflt : Expr := mkConst ``Unit) : MetaM Expr := do
   if !e.hasExprMVar then return e
   for m in (← getMVars e) do
     if ← m.isAssigned then continue
-    if (← instantiateMVars (← m.getType)) == mkSort levelOne then m.assign (mkConst ``Unit)
+    let t ← instantiateMVars (← m.getType)
+    -- NOTE: the universe of the parameter may be a metavariable (e.g., `Option.{?u} ?α`)
+    if t.isSort && (← isDefEq t (← inferType dflt)) then m.assign dflt
   fillDefaults (← instantiateMVars e)
 
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
@@ -585,7 +594,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
     match ctx.table.syms.get? f with
     | some (.expr e) =>
         if args.isEmpty then return e
-        mkAppCoerce e (← args.mapM interp)
+        mkAppCoerce e (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)
     | some (.macro params body) =>
         if args.isEmpty && !params.isEmpty then
           -- the function itself (e.g., `(= @isNat (lambda ((x Int)) (<= 0 x)))` in cvc5 proofs)

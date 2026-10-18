@@ -97,7 +97,14 @@ def stepConcl (i : Nat) : ReplayM Expr := do
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
   let t0 ← IO.monoMsNow
-  let e ← defaultTypes (← fillDefaults (← instantiateMVars (← liftInterp (interpProp c))))
+  let e ← instantiateMVars (← liftInterp (withReader (fun c => { c with deferTypes := true }) (interpProp c)))
+  -- NOTE: undetermined type parameters are most likely the sort variable of a polymorphic goal (e.g., `List.nil`
+  -- in a goal on `List α`), and otherwise irrelevant (e.g., `Option.none` under a tester)
+  let instTy := ctx.interp.table.sorts.toList.find? (·.1.startsWith "@Instance") |>.map (·.2)
+  let dflt ← match instTy with
+    | some t => do if (← inferType t).isSort then pure t else pure (Lean.mkConst ``Unit)
+    | none => pure (Lean.mkConst ``Unit)
+  let e ← defaultTypes (← fillDefaults e) dflt
   let t1 ← IO.monoMsNow
   modify fun s => { s with stats := s.stats.addTime "(interpretation)" (t1 - t0) }
   if e.hasExprMVar then
