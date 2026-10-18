@@ -87,6 +87,16 @@ def process (t p : Expr) : M Unit := do
             mkLambdaFVars #[ha] (mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp hna ha))))
         addFact (mkNot b) (← withLocalDeclD `hb b fun hb => do
           mkLambdaFVars #[hb] (mkApp p (← withLocalDeclD `ha a fun ha => mkLambdaFVars #[ha] hb)))
+    -- ¬(ite c a b) (propositions) with `c` (resp. `¬ c`) known: ¬a (resp. ¬b)
+    if na.isAppOfArity ``ite 5 && (na.getArg! 0).isProp then
+      let args := na.getAppArgs
+      let (c, a, b) := (args[1]!, args[3]!, args[4]!)
+      if let some pc ← get? c then
+        let eq ← mkAppOptM ``if_pos #[c, args[2]!, pc, none, a, b]
+        addFact (mkNot a) (← withLocalDeclD `ha a fun ha => do mkLambdaFVars #[ha] (mkApp p (← mkEqMPR eq ha)))
+      if let some nc ← getNeg? c then
+        let eq ← mkAppOptM ``if_neg #[c, args[2]!, nc, none, a, b]
+        addFact (mkNot b) (← withLocalDeclD `hb b fun hb => do mkLambdaFVars #[hb] (mkApp p (← mkEqMPR eq hb)))
     -- ¬(ite c a b = t) with `c` (resp. `¬ c`) known and `t` syntactically `a` (resp. `b`)
     if let some (_, x, y) := na.eq? then
       for (it, other, flip) in [(x, y, false), (y, x, true)] do
@@ -178,25 +188,41 @@ partial def saturate (fuel : Nat := 8) : M (Option Expr) := do
       if (← get).conflict.isSome then break
   return (← get).conflict
 
+/-- Conditions of the `ite` on propositions occurring in `e` that are not known in the facts (candidates for a
+    case split). -/
+partial def iteConds (e : Expr) (acc : Array Expr := #[]) : Array Expr :=
+  if e.isAppOfArity ``ite 5 && (e.getArg! 0).isProp then
+    let c := e.getArg! 1
+    iteConds (e.getArg! 4) (iteConds (e.getArg! 3) (if acc.contains c then acc else acc.push c))
+  else if e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 || e.isAppOfArity ``Iff 2 then
+    iteConds e.appArg! (iteConds e.appFn!.appArg! acc)
+  else if e.isAppOfArity ``Not 1 then iteConds e.appArg! acc
+  else if e.isAppOfArity ``Eq 3 && (e.getArg! 0).isProp then iteConds e.appArg! (iteConds e.appFn!.appArg! acc)
+  else match e with
+    | .forallE _ t b _ => if b.hasLooseBVars then acc else iteConds b (iteConds t acc)
+    | _ => acc
+
 /-- Prove `goal` from `hyps` (propositions and proofs) by refutation, or return `none`. Propositional
-    equalities in the goal are proved with `propext` from both implications. -/
-partial def prove (hyps : Array (Expr × Expr)) (goal : Expr) : MetaM (Option Expr) := do
+    equalities in the goal are proved with `propext` from both implications. When unit propagation does not
+    find a contradiction, the conditions of `ite` on propositions are split (at most `splits` times). -/
+partial def prove (hyps : Array (Expr × Expr)) (goal : Expr) (splits := 2) : MetaM (Option Expr) := do
   -- `a = b` between propositions: both directions
   if let some (ty, a, b) := goal.eq? then
     if ty.isProp then
       let some ab ← withLocalDeclD `h a fun h => do
-          match ← prove (hyps.push (a, h)) b with
+          match ← prove (hyps.push (a, h)) b splits with
           | some p => some <$> mkLambdaFVars #[h] p
           | none => pure none
         | return none
       let some ba ← withLocalDeclD `h b fun h => do
-          match ← prove (hyps.push (b, h)) a with
+          match ← prove (hyps.push (b, h)) a splits with
           | some p => some <$> mkLambdaFVars #[h] p
           | none => pure none
         | return none
       return some (← mkPropext a b ab ba)
   let r ← withLocalDeclD `hn (mkNot goal) fun hn => do
     let act : M (Option Expr) := do
+      addFact (mkConst ``True) (mkConst ``True.intro)
       for (t, p) in hyps do addFact t p
       addFact (mkNot goal) hn
       saturate
@@ -204,6 +230,22 @@ partial def prove (hyps : Array (Expr × Expr)) (goal : Expr) : MetaM (Option Ex
     match c? with
     | some c => some <$> mkLambdaFVars #[hn] c
     | none => pure none
-  return r.map fun r => mkApp2 (mkConst ``Classical.byContradiction) goal r
+  if let some r := r then return some (mkApp2 (mkConst ``Classical.byContradiction) goal r)
+  if splits == 0 then return none
+  -- case split on a condition of an `ite`
+  let conds := hyps.foldl (fun acc (t, _) => iteConds t acc) (iteConds goal)
+  for c in conds.extract 0 2 do
+    let pos ← withLocalDeclD `hc c fun hc => do
+      match ← prove (hyps.push (c, hc)) goal (splits - 1) with
+      | some p => some <$> mkLambdaFVars #[hc] p
+      | none => pure none
+    let some pos := pos | continue
+    let neg ← withLocalDeclD `hc (mkNot c) fun hc => do
+      match ← prove (hyps.push (mkNot c, hc)) goal (splits - 1) with
+      | some p => some <$> mkLambdaFVars #[hc] p
+      | none => pure none
+    let some neg := neg | continue
+    return some (mkApp6 (mkConst ``Or.elim) c (mkNot c) goal (mkApp (mkConst ``Classical.em) c) pos neg)
+  return none
 
 end Blaster.Reconstruct.SmtProof.PropEngine
