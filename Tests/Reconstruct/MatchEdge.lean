@@ -150,4 +150,49 @@ def isPos (n : Int) : Prop :=
 
 #blaster (reconstruct: 2) [∀ (n : Int), isPos n → n > 0]
 
+/-! ## Validator-like goals: matches on projections optimized under the match context, case of case,
+    `· = true` pushed into the alternatives -/
+
+inductive Purpose where
+  | spending (n : Nat)
+  | minting (s : String)
+  | rewarding
+
+structure Ctx where
+  info : Nat
+  purpose : Purpose
+
+structure Input where
+  datum : Option Nat
+  redeemer : Nat
+  ctx : Ctx
+
+def validCtx (d : Option Nat) (r : Nat) (c : Ctx) : Bool :=
+  match c.purpose, d with
+  | .spending n, some x => n == x && r > 0
+  | .minting _, none => true
+  | _, _ => false
+
+def validInput (i : Input) : Bool :=
+  match i.ctx.purpose with
+  | .spending _ => validCtx i.datum i.redeemer i.ctx
+  | _ => false
+
+def step (i : Input) : Option Nat :=
+  match i.ctx.purpose with
+  | .spending n =>
+     match i.datum with
+     | some d => if d = n then some (d + 1) else none
+     | none => none
+  | _ => none
+
+def succeeds (o : Option Nat) : Prop :=
+  match o with
+  | some _ => True
+  | none => False
+
+#blaster (reconstruct: 2) [∀ (i : Input), succeeds (step i) → i.datum.isSome]
+#blaster (reconstruct: 2) [∀ (i : Input), validInput i = true → i.redeemer > 0]
+#blaster (reconstruct: 2) [∀ (i : Input), validInput i = true → succeeds (step i) → i.redeemer > 0]
+
 end Tests.ReconstructMatch

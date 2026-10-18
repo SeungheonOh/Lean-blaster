@@ -54,6 +54,7 @@ inductive OptimizeStack where
  | MatchLhsSkipForallType (e : Expr)
  | MatchLhsForallWaitForBody (e : Expr)
  | MatchAltWaitForExpr (params : Array Expr) (hctx : HypsStackContext) (idx : USize) (matchInst : Expr)
+                       (origBody : Expr) (hyps : Array Expr)
  | LetWaitForValue (body : Expr)
  | MDataRecCallWaitForExpr (data : MData)
  | ProjWaitForExpr (n : Name) (idx : Nat)
@@ -441,14 +442,24 @@ def stackContinuity
         let e ← mkLambdaFVarExpr x optExpr
         stackContinuity xs e
 
-  | .MatchAltWaitForExpr params hctx idx matchInst :: xs =>
+  | .MatchAltWaitForExpr params hctx idx matchInst origBody hyps :: xs =>
        -- optExpr corresponds to the optimized match rhs
        -- continuity with optimizing next expression
-       -- TODO: evidence for match alternatives optimized w.r.t. a match context
+       -- NOTE: `hyps` are the equalities between the discriminants and the patterns of the alternative
+       -- (only when tracking proof terms), such that the evidence for the alternative can be consumed by
+       -- the congruence over the enclosing match application (see `resolveDepArgs`).
        let e ← mkLambdaFVarsExpr params optExpr
+       let pf ←
+         if hyps.isEmpty || !(← isTracking) then pure EqPf.unknown
+         else matchAltCongr params hyps #[] origBody optExpr pf
+       -- NOTE: the equalities are only in scope within the alternative, i.e., cached proofs using them
+       -- can't be reused outside (see `cachedProof`).
+       if !hyps.isEmpty then
+         let ctx := (← get).optEnv.ctx
+         updateLocalContext { ctx with ctx := hyps.foldl (fun lctx h => lctx.erase h.fvarId!) ctx.ctx }
        if ← isCstIteMatch optExpr then updateCtorMatchPropCache e
        resetChoiceContext hctx params matchInst idx
-       stackContinuity xs e
+       stackContinuity xs e pf
 
   | .MatchLhsForallWaitForBody x :: xs =>
        -- optExpr corresponds to the optimized lhs forall body

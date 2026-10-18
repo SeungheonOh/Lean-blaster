@@ -73,6 +73,13 @@ def normChoiceApplication?
         margs ← margs.modifyM i (mkAppInRhs args argInfo.arity args.size alts[altIdx]!.getNumHeadForalls)
       -- update match return type
       margs ← margs.modifyM idxType (updateMatchReturnType retType)
+      -- justified by the match equations, i.e., `(match d with alts) x₁ ... xₙ = match d with (alts · x₁ ... xₙ)`
+      if ← Blaster.Reconstruct.isTracking then
+        let extra := args.extract argInfo.arity args.size
+        Blaster.Reconstruct.recordStepM (← mkAppNExpr f args) (← mkAppNExpr f margs) do
+          let inner := mkAppN f (args.take argInfo.arity)
+          let ctx := Expr.lam `z (← Meta.inferType inner) (mkAppN (.bvar 0) extra) .default
+          Blaster.Reconstruct.mkMatchPushProof ctx inner (mkAppN f margs)
       return some (.AppOptimizeImplicitArgs f margs argInfo.arity 0 argInfo.arity (← getFunEnvInfo f) prevInApp .unknown)
 
 /-- Apply the following propagation rules on any function application `fn e₁ ... eₙ`
@@ -228,6 +235,13 @@ def funPropagation?
             -- NOTE: No need to propagate the reuse context as match name has not changed
             pargs ← pargs.modifyM i (updateRhsWithFun f args idxArg alts[altIdx]!.getNumHeadForalls)
           let fInfo ← getFunEnvInfo argInfo.nameExpr
+          -- justified by the match equations, i.e., `f (match d with alts) = match d with (f ∘ alts)`
+          if ← Blaster.Reconstruct.isTracking then
+            let rhs ← mkAppNExpr argInfo.nameExpr pargs
+            Blaster.Reconstruct.recordStepM (← mkAppNExpr f args) rhs do
+              let inner := args[idxArg]!
+              let ctx := Expr.lam `z (← Meta.inferType inner) (mkAppN f (args.set! idxArg (.bvar 0))) .default
+              Blaster.Reconstruct.mkMatchPushProof ctx inner rhs
           setIsAppArg prevInApp
           if resolveArgs then
             return some (.AppOptimizeImplicitArgs argInfo.nameExpr pargs 0 0 argInfo.arity fInfo prevInApp .unknown)

@@ -132,8 +132,14 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
    non-zero hypotheses, `dite'` propagation, and opaque-constant normalization (`ite`, `dite`,
    `decide`, `Nat.succ`, ...). The lemmas live in `Reconstruct/Lemmas.lean`.
    The `match` rules are justified as follows:
-   - `matchReduction` on constructor discriminants: definitional (iota);
+   - `matchReduction` on constructor discriminants: definitional (iota), once the discriminants resolved
+     with the match context are rewritten with the equalities of the enclosing alternatives
+     (`proveMatchReduction`);
    - `matchReduction` pushing a match over `Blaster.dite'` (`constMatchPropagation?`): `apply_dite'`;
+   - case of case (`constMatchPropagation?`), a function over a match (`funPropagation?`) and a match
+     applied to extra arguments (`normChoiceApplication?`), i.e., `F[match d with alts] = match d with
+     (F[·] ∘ alts)`: a case split over the alternatives of the resulting match, each case being justified
+     by the match equation of the pushed match (`mkMatchPushProof`);
    - `elimMatch` with a common rhs: a case split over the splitter with `rfl` in each case;
    - `elimMatch` with the match context (`matchInHyps?`): the discriminants are rewritten with the
      equalities `h : dⱼ = pⱼ` of the enclosing alternative, then the match is reduced.
@@ -257,9 +263,8 @@ evaluation of UPLC programs by the CEK machine. With `BLASTER_SMT_PROOF=only`, t
 `HelloWorld` (927 Z3 proof steps, replayed in 33 s), `UnlockPIN` (917 steps, 34 s) and `ParamFeed` (108 steps,
 0.3 s) are proved by replay: the bridge relates the CEK evaluation (with its `match` expressions on `Data`) to
 the asserted formula, and most `rewrite`s are proved by congruence and by the propositional engine on their
-generalized differences. `ParamFeed` is fully reconstructed; for `HelloWorld` and `UnlockPIN`, a few proof
-obligations of the optimizer (the unfolding of the validator in the goal) remain. `MintingPolicy` and
-`SellNFT` time out in Z3 with proof production.
+generalized differences. `ParamFeed`, `HelloWorld` and `UnlockPIN` are fully reconstructed (`HelloWorld` and
+`UnlockPIN` in about 26 s each, including the discharge of the 162 proof obligations of the optimizer). `MintingPolicy` and `SellNFT` time out in Z3 with proof production.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
@@ -363,7 +368,12 @@ unresolved (down from 796).
 The reconstruction was ported onto Blaster's `beta-lambda-cache-optimization` branch (hash-consing,
 context reuse, equality maps and metavariable-based beta reduction). When tracking proofs, the proof run
 disables context reuse, equality-map lookups and shared beta reduction, and hash-conses its input in a
-fresh environment. On that branch's test suite (3865 attempts, run with a nightly Z3):
+fresh environment. The match context (i.e., the equalities between the discriminants and the patterns
+declared for each alternative, see above) is kept, such that a `match` whose alternatives are optimized
+under the match context is justified by the splitter congruence instead of a coarse obligation (e.g., the
+`match` expressions on `Data` produced by the CEK evaluation of validators); the equalities are removed
+from the scope when leaving the alternative (cached proofs using them are not reused outside).
+On that branch's test suite (3865 attempts, run with a nightly Z3):
 
 | `#testOptimize` certificates | goals closed by optimizer | goals closed by SMT | all |
 |------------------------------|---------------------------|---------------------|-----|
