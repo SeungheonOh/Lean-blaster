@@ -303,10 +303,12 @@ partial def iteCongrCtx? (prove : Expr → TermElabM (Option Expr)) (budget : IO
   let some pc ← (if c == c' then some <$> mkEqRefl c else diffEq prove budget c c' hyps) | return none
   let branch (cond x x' : Expr) (subst : Bool) : TermElabM (Option Expr) :=
     withLocalDeclD `h cond fun h => do
-      let p? ← if x == x' then some <$> mkEqRefl x else do
-        if subst then
-          if let some p ← substProof? h x x' then return some (← mkLambdaFVars #[h] p)
-        diffEq prove budget x x' (hyps.push h)
+      let p? ← if x == x' then some <$> mkEqRefl x
+        else if subst then do
+          match ← substProof? h x x' with
+          | some p => pure (some p)
+          | none => diffEq prove budget x x' (hyps.push h)
+        else diffEq prove budget x x' (hyps.push h)
       match p? with
       | some p => some <$> mkLambdaFVars #[h] p
       | none => pure none
