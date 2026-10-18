@@ -285,7 +285,7 @@ def mkEqSmt (a b : Expr) : MetaM Expr := do
 
 /-- Selector of field `idx` of constructor `ctor` applied to `x`, defined by case analysis (with
     `default` for the other constructors). -/
-def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
+partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"
   let xt ← whnfD (← inferType x)
   if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: selector {ctor} applied to {xt}"
@@ -302,7 +302,9 @@ def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
     let t ← inferType fs[idx]!
     if t.hasAnyFVar (fs.contains <| .fvar ·) then throwError "smt proof: dependent field selector not supported"
     return t
-  let dflt ← mkDefault fieldTy
+  -- default value for the other constructors: `x` itself when the field has the type of `x` (e.g., the
+  -- argument of a recursive constructor), an inhabitant of the field type otherwise
+  let dflt ← if ← isDefEq fieldTy xt then pure x else mkDefault fieldTy
   let motive := mkLambda `x .default xt fieldTy
   let mut minors := #[]
   for c in iinfo.ctors do
@@ -316,13 +318,38 @@ def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
   return mkAppN (mkConst (cinfo.induct ++ `casesOn) (u :: lvls)) (params ++ #[motive, x] ++ minors)
 where
   mkDefault (t : Expr) : MetaM Expr := do
+    if let some v ← inhabitant? t 3 then return v
+    throwError "smt proof: no inhabitant found for {t}"
+  /-- An inhabitant of `t`: from an instance, or a constructor application with inhabited fields. -/
+  inhabitant? (t : Expr) (depth : Nat) : MetaM (Option Expr) := do
     let u ← getLevel t
     try
       let inst ← synthInstance (mkApp (mkConst ``Inhabited [u]) t)
-      return mkApp2 (mkConst ``Inhabited.default [u]) t inst
-    catch _ =>
+      return some (mkApp2 (mkConst ``Inhabited.default [u]) t inst)
+    catch _ => pure ()
+    try
       let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) t)
-      return mkApp2 (mkConst ``Classical.ofNonempty [u]) t inst
+      return some (mkApp2 (mkConst ``Classical.ofNonempty [u]) t inst)
+    catch _ => pure ()
+    if depth == 0 then return none
+    let t ← whnfD t
+    let .const n lvls := t.getAppFn | return none
+    let some (.inductInfo info) := (← getEnv).find? n | return none
+    let params := t.getAppArgs.extract 0 info.numParams
+    for c in info.ctors do
+      let ci ← getConstInfo c
+      let r ← forallTelescopeReducing (← instantiateForall (ci.instantiateTypeLevelParams lvls) params) fun fs _ => do
+        let mut vals := #[]
+        for f in fs do
+          let ft ← inferType f
+          -- non-dependent fields only
+          if ft.hasAnyFVar (fs.contains <| .fvar ·) then return none
+          match ← inhabitant? ft (depth - 1) with
+          | some v => vals := vals.push v
+          | none => return none
+        return some (mkAppN (mkAppN (mkConst c lvls) params) vals)
+      if r.isSome then return r
+    return none
 
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do

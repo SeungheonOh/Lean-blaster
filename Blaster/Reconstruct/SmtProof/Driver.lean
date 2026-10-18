@@ -313,8 +313,14 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
                               blaster_cases_nat <;> (try simp only [Int.toNat_natCast] at *) <;>
                               (try blaster_unfold_user) <;> grind))),
     ("omega", ← `(tactic| (intros; omega))),
+    -- Blaster's normal forms (e.g., `Nat.add x y`, `Nat.mod x y`) in the negated goal
+    ("denorm+omega", ← `(tactic| (intros; blaster_denorm; omega))),
     ("simp", ← `(tactic| (intros; simp_all [Int.toNat_natCast] <;> done))),
-    ("simp+omega", ← `(tactic| (intros; simp_all [Int.toNat_natCast] <;> omega))),
+    ("simp+omega", ← `(tactic| (intros; blaster_denorm; simp_all [Int.toNat_natCast] <;> omega))),
+    -- casts of `Nat` division and modulo (Blaster's encoding: `ite (0 = y) 0 (div x y)`)
+    ("casts", ← `(tactic| (intros; blaster_denorm; simp only [Int.natCast_ediv, Int.natCast_emod, Int.natCast_add, Int.natCast_mul,
+                            Int.toNat_natCast, Int.ediv_zero, Int.emod_zero] at * <;> (try split) <;> (try split) <;>
+                            first | omega | (simp_all; done) | grind))),
     ("grind", ← `(tactic| (intros; grind))),
     ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;>
                             (try split) <;> (try split) <;> first | done | omega | grind))),
