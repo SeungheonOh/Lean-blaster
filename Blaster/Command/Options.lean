@@ -87,6 +87,13 @@ structure BlasterOptions where
       used as hypotheses (i.e., no `sorryAx`). Implies `reconstruct := 2`.
   -/
   genProof : Bool := false
+
+  /-- When proofs are reconstructed for goals proved by the SMT solver, when to replay a proof of an SMT
+      backend (see `Blaster.Reconstruct.SmtProof`): `off`, `last` (after the tactic based strategies),
+      `first` (before them) or `only`. When not set, given by the environment variable `BLASTER_SMT_PROOF`
+      (`last` by default).
+  -/
+  smtProof : Option String := none
  deriving Repr
 
 instance : Inhabited BlasterOptions where

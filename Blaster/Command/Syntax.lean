@@ -25,6 +25,9 @@ Options:
                    0 for no reconstruction, 1 for best effort and 2 for required. (default: 0)
   - `gen-proof`: require a kernel-checked proof depending only on Lean's standard axioms
                  (no `sorryAx`); implies `(reconstruct: 2)`. (default: 0)
+  - `smt-proof`: when reconstructing proofs of goals proved by the SMT solver, replay a proof produced by
+                 the SMT backend: 0 never, 1 after the tactic based strategies, 2 before them, 3 only.
+                 (default: environment variable `BLASTER_SMT_PROOF`, or 1)
 
 Examples:
    - #blaster [∀ x y : Nat, x + y ≥ x]
@@ -45,6 +48,7 @@ syntax "(max-depth:" num ")" : solveOption
 syntax "(random-seed:" num ")" : solveOption
 syntax "(reconstruct:" num ")" : solveOption
 syntax "(gen-proof:" num ")" : solveOption
+syntax "(smt-proof:" num ")" : solveOption
 
 -- NOTE: Limited to one term for the time being
 syntax solveTerm := "[" term "]"
@@ -133,6 +137,16 @@ def parseGenProof (sOpts : BlasterOptions) : TSyntax `solveOption → m BlasterO
       | _ => throwUnsupportedSyntax
   | _ => return sOpts
 
+def parseSmtProof (sOpts : BlasterOptions) : TSyntax `solveOption → m BlasterOptions
+  | `(solveOption| (smt-proof: $n:num)) =>
+      match n.getNat with
+      | 0 => return { sOpts with smtProof := some "off" }
+      | 1 => return { sOpts with smtProof := some "last" }
+      | 2 => return { sOpts with smtProof := some "first" }
+      | 3 => return { sOpts with smtProof := some "only" }
+      | _ => throwUnsupportedSyntax
+  | _ => return sOpts
+
 /-! ### Generic Parser for All Options -/
 def parseSolveOption (sOpts : BlasterOptions) (opt : TSyntax `solveOption) : m BlasterOptions := do
   let sOpts ← parseUnfoldDepth sOpts opt
@@ -147,6 +161,7 @@ def parseSolveOption (sOpts : BlasterOptions) (opt : TSyntax `solveOption) : m B
   let sOpts ← parseRandomSeed sOpts opt
   let sOpts ← parseReconstruct sOpts opt
   let sOpts ← parseGenProof sOpts opt
+  let sOpts ← parseSmtProof sOpts opt
   return sOpts
 
 /-! ### Process Multiple Options -/

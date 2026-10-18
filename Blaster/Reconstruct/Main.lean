@@ -120,7 +120,9 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | e => do
         -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
         -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
-        let mode := (← IO.getEnv "BLASTER_SMT_PROOF").getD "last"
+        let mode ← match task.smtProof with
+          | some m => pure m
+          | none => pure ((← IO.getEnv "BLASTER_SMT_PROOF").getD "last")
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
           let st ← saveState
@@ -141,13 +143,17 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
                 let ms := Json.mkObj (r.stats.msByRule.toList.map fun (k, v) => (k, toJson v))
                 let methods := Json.mkObj (r.stats.byRule.toList.map fun (k, m) =>
                   (k, Json.mkObj (m.toList.map fun (k', v) => (k', toJson v))))
-                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("ok", toJson true),
+                let fm ← getFileMap
+                let line := ((← getRef).getPos?.map fun pos => (fm.toPosition pos).line).getD 0
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("line", toJson line), ("ok", toJson true),
                   ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]))
               return some (r.proof, s!"smt residual by {r.backend} proof replay")
           | .error msg =>
               if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
                 let h ← IO.FS.Handle.mk f .append
-                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("error", toJson (msg.take 2000))]))
+                let fm ← getFileMap
+                let line := ((← getRef).getPos?.map fun pos => (fm.toPosition pos).line).getD 0
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("line", toJson line), ("error", toJson (msg.take 2000))]))
               return none
         let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
         match first? with
