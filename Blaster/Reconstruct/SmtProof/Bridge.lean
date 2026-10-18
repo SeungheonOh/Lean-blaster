@@ -226,6 +226,40 @@ def worldOf (ta tb : Expr) : MetaM (Option World) := do
   if ← isDefEq ta tb then return some .same
   return none
 
+/-- `omega` on goals and hypotheses with the literals of Blaster's normal forms (e.g., `Int.ofNat 0`,
+    `Int.negSucc 2`, which `omega` does not interpret). -/
+def omegaTac : MetaM (TSyntax `tactic) :=
+  `(tactic| ((try simp only [Int.ofNat_eq_coe, Int.negSucc_eq] at *) <;> omega))
+
+/-- The free variables of `es` and, transitively, of their types and values, in the order of the local context. -/
+def fvarClosure (es : Array Expr) : MetaM (Array Expr) := do
+  let mut todo := es.foldl (fun acc e => (collectFVars {} e).fvarIds ++ acc) #[]
+  let mut seen : FVarIdSet := {}
+  while !todo.isEmpty do
+    let f := todo.back!
+    todo := todo.pop
+    if seen.contains f then continue
+    seen := seen.insert f
+    let some d := (← getLCtx).find? f | continue
+    let s := collectFVars {} d.type
+    let s := match d.value? with | some v => collectFVars s v | none => s
+    todo := todo ++ s.fvarIds
+  let lctx ← getLCtx
+  return lctx.foldl (init := #[]) fun acc d => if seen.contains d.fvarId then acc.push d.toExpr else acc
+
+/-- Run `k` in the local context restricted to the free variables of `es` (see `fvarClosure`): tactics are not
+    slowed down by the other hypotheses of the context (e.g., the negated goal, which `simp at *` would rewrite
+    and `omega` would analyze). -/
+def withRestrictedLCtx [Monad n] [MonadControlT MetaM n] [MonadLiftT MetaM n] (es : Array Expr) (k : n α) : n α := do
+  let keep ← liftM (m := MetaM) <| fvarClosure es
+  let full ← liftM (m := MetaM) getLCtx
+  let restricted := keep.foldl (init := ({} : LocalContext)) fun l x =>
+    match full.find? x.fvarId! with
+    | some d => l.addDecl d
+    | none => l
+  let insts := (← liftM (m := MetaM) getLocalInstances).filter fun li => keep.contains li.fvar
+  withLCtx restricted insts k
+
 /-! ## Matchers -/
 
 /-- Translation of a match alternative: the conditions on the discriminants (in the order of
@@ -263,16 +297,57 @@ partial def natOffset? (p : Expr) : Option (Nat × Expr) :=
 
 def mkNatLe (a b : Expr) : Expr := mkApp4 (mkConst ``LE.le [levelZero]) (mkConst ``Nat) (mkConst ``instLENat) a b
 
+/-- Raw `Nat` literal. -/
+def rawNatLit? : Expr → Option Nat
+  | .lit (.natVal n) => some n
+  | _ => none
+
+/-- Blaster's normal form of the patterns in the conditions of the `ite` encoding (see
+    `removeNamedPatternExpr` and `optimizePattern`): named patterns removed, and `Nat.add` (resp. `Int.neg`)
+    applications on literals evaluated, e.g., `Int.neg (Int.ofNat (Nat.add 1 (p@(Nat.add 1 1))))` is `Int.negSucc 2`. -/
+partial def normPattern (p : Expr) : Expr :=
+  if p.isAppOfArity ``namedPattern 4 then normPattern p.getAppArgs[2]! else
+  if !p.isApp then p else
+  let f := p.getAppFn
+  let args := p.getAppArgs.map normPattern
+  if f.isConstOf ``Nat.add && args.size == 2 then
+    match rawNatLit? args[0]!, rawNatLit? args[1]! with
+    | some 0, _ => args[1]!
+    | some a, some b => mkRawNatLit (a + b)
+    | some a, none =>
+        -- `N₁ + (N₂ + n)` is `(N₁ + N₂) + n`
+        match (if args[1]!.isAppOfArity ``Nat.add 2 then rawNatLit? (args[1]!.getArg! 0) else none) with
+        | some b => mkApp2 f (mkRawNatLit (a + b)) (args[1]!.getArg! 1)
+        | none => mkAppN f args
+    | _, _ => mkAppN f args
+  else if f.isConstOf ``Int.neg && args.size == 1 then
+    let a := args[0]!
+    let lit? : Option Int :=
+      if a.isAppOfArity ``Int.ofNat 1 then (rawNatLit? a.appArg!).map Int.ofNat
+      else if a.isAppOfArity ``Int.negSucc 1 then (rawNatLit? a.appArg!).map Int.negSucc
+      else none
+    match lit? with
+    | some i =>
+        match -i with
+        | .ofNat n => mkApp (mkConst ``Int.ofNat) (mkRawNatLit n)
+        | .negSucc n => mkApp (mkConst ``Int.negSucc) (mkRawNatLit n)
+    | none => if a.isAppOfArity ``Int.neg 1 then a.appArg! else mkAppN f args
+  else mkAppN f args
+
 /-- Conditions and values of the `Nat`/`Int` patterns with variables (see `mkCond` and `mkLet` in
     `Blaster.Smt.Translate.Match`): `N + n` (`N ≤ x`, `n := x - N`), `Int.ofNat n` (`0 ≤ x`, `n := x.toNat`),
-    `Int.ofNat (N + n)` (`N ≤ x`, `n := (x - N).toNat`), `Int.negSucc n` (`x ≤ -1`, `n := (-x - 1).toNat`).
-    Returns the condition and the pattern of the variable with its value. -/
+    `Int.ofNat (N + n)` (`N ≤ x`, `n := (x - N).toNat`), `Int.neg (Int.ofNat (N + n))` (`x ≤ -N`,
+    `n := (-(x + N)).toNat`, Blaster's normal form of `Int.negSucc`), `Int.negSucc n` (`x ≤ -1`,
+    `n := (-x - 1).toNat`). Returns the condition and the pattern of the variable with its value. -/
 def numPattern? (x p : Expr) : Option (Expr × Expr × Expr) := Id.run do
   let natLit (n : Nat) : Expr := mkRawNatLit n
   if let some (n, q) := natOffset? p then
     return some (mkNatLe (natLit n) x, q,
       mkApp6 (mkConst ``HSub.hSub [levelZero, levelZero, levelZero]) (mkConst ``Nat) (mkConst ``Nat) (mkConst ``Nat)
         (mkApp2 (mkConst ``instHSub [levelZero]) (mkConst ``Nat) (mkConst ``instSubNat)) x (natLit n))
+  if p.isAppOfArity ``Int.neg 1 && p.appArg!.isAppOfArity ``Int.ofNat 1 then
+    if let some (n, q) := natOffset? p.appArg!.appArg! then
+      return some (mkIntLe x (mkIntNeg (mkIntLit n)), q, mkApp (mkConst ``Int.toNat) (mkIntNeg (mkIntAdd x (mkIntLit n))))
   if p.isAppOfArity ``Int.ofNat 1 then
     let q := p.appArg!
     if let some (n, q') := natOffset? q then
@@ -282,14 +357,21 @@ def numPattern? (x p : Expr) : Option (Expr × Expr × Expr) := Id.run do
     return some (mkIntLe x (mkIntNeg (mkIntLit 1)), p.appArg!, mkApp (mkConst ``Int.toNat) (mkIntSub (mkIntNeg x) (mkIntLit 1)))
   return none
 
+/-- Literals of Blaster's normal forms in the notation of the interpretation (see `mkIntLit`). -/
+def stdLit (e : Expr) : Expr :=
+  match e with
+  | .lit (.natVal n) => mkNatLit n
+  | .app (.const ``Int.ofNat _) (.lit (.natVal n)) => mkIntLit n
+  | .app (.const ``Int.negSucc _) (.lit (.natVal n)) => mkIntNeg (mkIntLit (n + 1))
+  | e => e
+
 /-- Conditions of pattern `p` on the discriminant `x` (see `mkCond` in `Blaster.Smt.Translate.Match`).
     Returns `none` for unsupported patterns. -/
 partial def patCond (x p : Expr) (acc : Array Expr) : MetaM (Option (Array Expr)) := do
-  let p := removeNamed p
-  -- NOTE: the named patterns below the root are removed (see `removeNamedPatternExpr`)
-  let p := stripNamed p
-  -- literals
-  if isLiteral p then return some (acc.push (← mkEq p x))
+  -- NOTE: the named patterns are removed and the literals evaluated (see `removeNamedPatternExpr`)
+  let p := normPattern p
+  -- literals (in the notation of the interpretation, e.g., `-3` for `Int.negSucc 2`)
+  if isLiteral p then return some (acc.push (← mkEq (stdLit p) x))
   if p.isFVar then return some acc
   if let some (c, q, _) := numPattern? x p then
     -- NOTE: the variable of the pattern has no condition
@@ -308,11 +390,6 @@ partial def patCond (x p : Expr) (acc : Array Expr) : MetaM (Option (Array Expr)
     let some acc' ← patCond s args[info.numParams + i]! acc | return none
     acc := acc'
   return some acc
-where
-  removeNamed (p : Expr) : Expr :=
-    if p.isAppOfArity ``namedPattern 4 then removeNamed p.getAppArgs[2]! else p
-  stripNamed (p : Expr) : Expr :=
-    p.replace fun e => if e.isAppOfArity ``namedPattern 4 then some (stripNamed e.getAppArgs[2]!) else none
 
 /-- Values of the variables of pattern `p` matched against `x` (see `mkLet` in
     `Blaster.Smt.Translate.Match`), as a substitution of the variables. -/
@@ -377,7 +454,7 @@ def altTypes (m : Name) (lvls : List Level) (info : MatcherInfo) (inst? : Option
     alternatives (with motive `mv`, a free variable): `if c₁ then alt₁ v⃗₁ else ... altₙ v⃗ₙ` where the
     last alternative has no condition, and an alternative without conditions ends the chain. The
     applications of the alternatives are β-reduced when `beta` is set. -/
-def iteOf (ty : Expr) (mv : Expr) (altTys : Array Expr) (discrs alts : Array Expr) (beta : Bool) :
+partial def iteOf (ty : Expr) (mv : Expr) (altTys : Array Expr) (discrs alts : Array Expr) (beta : Bool) :
     Term.TermElabM (Option Expr) := do
   let u ← getLevel ty
   -- per alternative: the condition and the application of the alternative given a proof of the condition
@@ -392,7 +469,7 @@ def iteOf (ty : Expr) (mv : Expr) (altTys : Array Expr) (discrs alts : Array Exp
       let mut conds := #[]
       let mut vals : Std.HashMap FVarId Expr := {}
       for (d, p) in discrs.zip pats do
-        let some cs ← patCond d p conds | dbg m!"bridge: unsupported pattern {p}"; return none
+        let some cs ← patCond d p conds | dbg m!"bridge: unsupported pattern {p} in {altTys[j]!}"; return none
         conds := cs
         let some vs ← patVals d p vals | dbg m!"bridge: unsupported pattern {p}"; return none
         vals := vs
@@ -446,7 +523,14 @@ where
     return acc
   /-- Proof of the equation of a named pattern under the condition of its alternative (in the local context). -/
   proveEquation (p : Expr) : Term.TermElabM (Option Expr) := do
-    for tac in [← `(tactic| (subst_vars; rfl)), ← `(tactic| omega), ← `(tactic| (simp_all; done)),
+    -- NOTE: the named patterns of the equations of the previous variables (reducible) are removed
+    let some pf ← proveEquation' (stripNamed p) | return none
+    return some (← mkExpectedTypeHint pf p)
+  stripNamed (e : Expr) : Expr :=
+    e.replace fun e => if e.isAppOfArity ``namedPattern 4 then some (stripNamed e.getAppArgs[2]!) else none
+  proveEquation' (p : Expr) : Term.TermElabM (Option Expr) := do
+    for tac in [← `(tactic| (subst_vars; rfl)), ← omegaTac,
+                ← `(tactic| (simp_all; done)),
                 ← `(tactic| (rename_i h; cases h; subst_vars; simp_all))] do
       if let some pf ← Blaster.Reconstruct.proveWithTactic p tac then return some pf
     return none
@@ -497,6 +581,19 @@ def stuckMajor? (e : Expr) : MetaM (Option FVarId) := do
       return some f
   | _ => return none
 
+/-- Value of a closed decidable condition (e.g., an equation between literals in different forms, such as
+    `Int.ofNat 0 = Int.ofNat Nat.zero`), by evaluation of its decision procedure. -/
+def evalClosed? (c : Expr) : MetaM (Option CondVal) := do
+  if c.hasFVar || c.hasMVar then return none
+  let some inst ← (try some <$> synthInstance (mkApp (mkConst ``Decidable) c) catch _ => pure none) | return none
+  let r ← try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 2000 * 1000 }) <|
+      withCurrHeartbeats <| withDefault <| whnf (mkApp2 (mkConst ``Decidable.decide) c inst)
+    catch _ => return none
+  let refl (b : Name) := mkApp2 (mkConst ``Eq.refl [levelOne]) (mkConst ``Bool) (mkConst b)
+  if r.isConstOf ``Bool.true then return some (.isTrue (mkApp3 (mkConst ``of_decide_eq_true) c inst (refl ``Bool.true)))
+  if r.isConstOf ``Bool.false then return some (.isFalse (mkApp3 (mkConst ``of_decide_eq_false) c inst (refl ``Bool.false)))
+  return none
+
 partial def evalCond (c : Expr) : Term.TermElabM CondVal := do
   let c := c.consumeMData
   if c.isAppOfArity ``And 2 then
@@ -513,6 +610,7 @@ partial def evalCond (c : Expr) : Term.TermElabM CondVal := do
   let c' ← whnfD c
   if c'.isConstOf ``True then return .isTrue (← mkExpectedTypeHint (mkConst ``True.intro) c)
   if c'.isConstOf ``False then return .isFalse (mkLambda `h .default c (.bvar 0))
+  if let some v ← evalClosed? c then return v
   if let some (_, l, r) := c'.eq? then
     let l ← whnfD l
     let r ← whnfD r
@@ -538,13 +636,18 @@ partial def evalCond (c : Expr) : Term.TermElabM CondVal := do
             if (a == r && b == l) then
               return .isFalse (mkLambda `h .default c (mkApp d.toExpr (mkApp4 (mkConst ``Eq.symm [u]) ty l r (.bvar 0))))
       return .splitProp (← mkEq v lit)
-    return .unknown
   if let some x ← stuckMajor? c' then return .splitFVar x
-  -- arithmetic conditions (e.g., of `n + 1` patterns): decided by `omega` in the context of the case analysis
-  let arith := c'.isAppOfArity ``LE.le 4 || c'.isAppOfArity ``LT.lt 4
+  -- arithmetic conditions (e.g., of `n + 1` patterns, or literal patterns of `Int` against the patterns of
+  -- the matcher's case analysis): decided by `omega` in the context of the case analysis
+  -- NOTE: on the condition before reduction (e.g., `Int.le` unfolds to `Int.NonNeg`)
+  let numEq ← match c.eq? with
+    | some (t, _, _) => do let t ← whnfR t; pure (t.isConstOf ``Int || t.isConstOf ``Nat)
+    | none => pure false
+  let arith := c.isAppOfArity ``LE.le 4 || c.isAppOfArity ``LT.lt 4 || numEq
   if arith then
-    if let some p ← Blaster.Reconstruct.proveWithTactic c (← `(tactic| omega)) then return .isTrue p
-    if let some p ← Blaster.Reconstruct.proveWithTactic (mkNot c) (← `(tactic| omega)) then return .isFalse p
+    let omega ← omegaTac
+    if let some p ← Blaster.Reconstruct.proveWithTactic c omega then return .isTrue p
+    if let some p ← Blaster.Reconstruct.proveWithTactic (mkNot c) omega then return .isFalse p
   dbg m!"bridge: unknown atom {c'}"
   return .unknown
 
@@ -576,67 +679,68 @@ def closeByOverlap (g : MVarId) (base : Nat) : MetaM Bool := g.withContext do
     s.restore
   return false
 
+/-- Variable of type `Nat` or `Int` of the condition `c` occurring in an overlap hypothesis of the splitter. -/
+def overlapVar? (g : MVarId) (c : Expr) (base : Nat) : MetaM (Option FVarId) := g.withContext do
+  let c ← instantiateMVars c
+  let lctx ← getLCtx
+  for d in lctx do
+    if d.index < base || d.isImplementationDetail || !d.type.isForall then continue
+    for x in (collectFVars {} c).fvarIds do
+      if !d.type.containsFVar x then continue
+      let some xd := lctx.find? x | continue
+      let t ← whnfR xd.type
+      if t.isConstOf ``Nat || t.isConstOf ``Int then return some x
+  return none
+
 /-- Prove `lhs = rhs`, where `rhs` is an `ite` chain over conditions decided by case analysis, by
     evaluating the conditions (with case analyses on the variables and literal equalities blocking them). -/
 partial def solveIte (g : MVarId) (fuel : Nat) (base : Nat) : Term.TermElabM Bool := g.withContext do
-  if fuel == 0 then return false
+  if fuel == 0 then dbg m!"bridge: no fuel left for {g}"; return false
   if ← closeByOverlap g base then return true
   let tgt ← instantiateMVars (← g.getType)
   let some (_, lhs, rhs) := tgt.eq? | return false
-  if rhs.isAppOfArity ``ite 5 then
-    let args := rhs.getAppArgs
-    let (α, c, inst, t, e) := (args[0]!, args[1]!, args[2]!, args[3]!, args[4]!)
-    match ← evalCond c with
-    | .isTrue pc =>
-        let g' ← mkFreshExprSyntheticOpaqueMVar (← mkEq lhs t)
-        let h ← mkAppOptM ``if_pos #[c, inst, pc, α, t, e]
-        g.assign (← mkEqTrans g' (← mkEqSymm h))
-        solveIte g'.mvarId! (fuel - 1) base
-    | .isFalse pnc =>
-        let g' ← mkFreshExprSyntheticOpaqueMVar (← mkEq lhs e)
-        let h ← mkAppOptM ``if_neg #[c, inst, pnc, α, t, e]
-        g.assign (← mkEqTrans g' (← mkEqSymm h))
-        solveIte g'.mvarId! (fuel - 1) base
-    | .splitFVar x =>
-        let gs ← try g.cases x catch ex =>
-          dbg m!"bridge: cases failed {ex.toMessageData} in {g}"
-          return false
-        gs.allM fun s => solveIte s.mvarId (fuel - 1) base
-    | .splitProp p =>
-        let (s₁, s₂) ← g.byCases p
-        let g₁ : MVarId := (← subst? s₁.mvarId s₁.fvarId).getD s₁.mvarId
-        if !(← solveIte g₁ (fuel - 1) base) then return false
-        solveIte s₂.mvarId (fuel - 1) base
-    | .unknown =>
-        dbg m!"bridge: unknown condition {c} ⟶ {← whnfD c} in {g}"
-        return false
-  else if rhs.isAppOfArity ``dite 5 then
-    let args := rhs.getAppArgs
-    let (α, c, inst, t, e) := (args[0]!, args[1]!, args[2]!, args[3]!, args[4]!)
-    match ← evalCond c with
-    | .isTrue pc =>
-        let g' ← mkFreshExprSyntheticOpaqueMVar (← mkEq lhs (mkApp t pc).headBeta)
-        let h ← mkAppOptM ``dif_pos #[c, inst, pc, α, t, e]
-        g.assign (← mkEqTrans g' (← mkEqSymm h))
-        solveIte g'.mvarId! (fuel - 1) base
-    | .isFalse pnc =>
-        let g' ← mkFreshExprSyntheticOpaqueMVar (← mkEq lhs (mkApp e pnc).headBeta)
-        let h ← mkAppOptM ``dif_neg #[c, inst, pnc, α, t, e]
-        g.assign (← mkEqTrans g' (← mkEqSymm h))
-        solveIte g'.mvarId! (fuel - 1) base
-    | .splitFVar x =>
-        let gs ← try g.cases x catch _ => return false
-        gs.allM fun s => solveIte s.mvarId (fuel - 1) base
-    | .splitProp p =>
-        let (s₁, s₂) ← g.byCases p
-        let g₁ : MVarId := (← subst? s₁.mvarId s₁.fvarId).getD s₁.mvarId
-        if !(← solveIte g₁ (fuel - 1) base) then return false
-        solveIte s₂.mvarId (fuel - 1) base
-    | .unknown => return false
-  else
+  let dep := rhs.isAppOfArity ``dite 5
+  if !dep && !rhs.isAppOfArity ``ite 5 then
     try g.refl; return true
     catch _ =>
-      dbg m!"bridge: leaf {g}"
+      -- applications of the same alternative to arguments equal up to arithmetic (e.g., the values of the
+      -- variables of `Int.ofNat (N + n)` patterns, `n` and `(Int.ofNat (n + N) - N).toNat`)
+      if lhs.getAppFn.isFVar && lhs.getAppFn == rhs.getAppFn then
+        let omega ← omegaTac
+        let tac ← `(tactic| (congr 1 <;> first | rfl | $omega:tactic))
+        if let some pf ← Blaster.Reconstruct.proveWithTactic tgt tac then
+          g.assign pf; return true
+      dbg m!"bridge: leaf {← ppGoal g}"
+      return false
+  let args := rhs.getAppArgs
+  let (α, c, inst, t, e) := (args[0]!, args[1]!, args[2]!, args[3]!, args[4]!)
+  -- `lhs = rhs` from `lhs = b` where `b` is the branch selected by `pc`
+  let select (lem : Name) (b pc : Expr) : Term.TermElabM Bool := do
+    let b := if dep then (mkApp b pc).headBeta else b
+    let g' ← mkFreshExprSyntheticOpaqueMVar (← mkEq lhs b)
+    let h ← mkAppOptM lem #[c, inst, pc, α, t, e]
+    g.assign (← mkEqTrans g' (← mkEqSymm h))
+    solveIte g'.mvarId! (fuel - 1) base
+  match ← evalCond c with
+  | .isTrue pc => select (if dep then ``dif_pos else ``if_pos) t pc
+  | .isFalse pnc => select (if dep then ``dif_neg else ``if_neg) e pnc
+  | .splitFVar x =>
+      let gs ← try g.cases x catch ex =>
+        dbg m!"bridge: cases failed {ex.toMessageData} in {g}"
+        return false
+      gs.allM fun s => solveIte s.mvarId (fuel - 1) base
+  | .splitProp p =>
+      let (s₁, s₂) ← g.byCases p
+      let g₁ : MVarId := (← subst? s₁.mvarId s₁.fvarId).getD s₁.mvarId
+      if !(← solveIte g₁ (fuel - 1) base) then return false
+      solveIte s₂.mvarId (fuel - 1) base
+  | .unknown =>
+      -- a variable constrained by an overlap hypothesis of the splitter (e.g., `∀ n, x = n + 2 → False` for an
+      -- arithmetic condition on `x`): case analysis
+      if let some x ← overlapVar? g c base then
+        if let some gs ← try some <$> g.cases x catch _ => pure none then
+          return ← gs.allM fun s => solveIte s.mvarId (fuel - 1) base
+      dbg m!"bridge: unknown condition {c} ⟶ {← whnfD c} in {← ppGoal g}"
       return false
 
 /-- Prove a matcher equation `∀ xs alts, M params motive xs alts = ite ...` (see `iteOf`). -/
@@ -687,26 +791,77 @@ structure State where
 
 abbrev BridgeM := ReaderT Cfg (StateRefT State Term.TermElabM)
 
+/-- `(∀ xs alts, M params motive xs alts = ite ..., proof)` (see `iteOf` and `proveMatchIte`), where `inst?` is
+    Blaster's optimized instance of the matcher. -/
+def matcherEquation (m : Name) (lvls : List Level) (info : MatcherInfo) (inst? : Option Expr) (params : Array Expr)
+    (motive resTy : Expr) : Term.TermElabM (Option (Expr × Expr)) := do
+  let head := mkAppN (mkConst m lvls) (params.push motive)
+  forallBoundedTelescope (← inferType head) (some (info.numDiscrs + info.numAlts)) fun xs _ => do
+    let xd := xs.extract 0 info.numDiscrs
+    let fs := xs.extract info.numDiscrs xs.size
+    let some rhs ← withLocalDeclD `m (← inferType motive) fun mv => do
+        let tys ← altTypes m lvls info inst? params mv xd
+        iteOf resTy mv tys xd fs false
+      | return none
+    let stmt ← mkForallFVars xs (← mkEq (mkAppN head xs) rhs)
+    let t0 ← IO.monoMsNow
+    let pf? ← proveMatchIte stmt
+    dbg m!"bridge: matcher equation of {m}: {(← IO.monoMsNow) - t0} ms"
+    let some pf := pf? | dbg m!"bridge: matcher equation not proved: {stmt}"; return none
+    return some (stmt, pf)
+
+/-- Matcher equations shared by the commands (`#blaster` commands are elaborated concurrently, in their own
+    environment branches): per matcher instance closed over its free variables (with Blaster's optimized
+    instance), the task computing the closed statement and proof of its equation (`none` when the computation
+    was aborted). -/
+initialize sharedEquations : IO.Ref (Std.HashMap (Expr × Option Expr) (Task (Option (Option (Expr × Expr))))) ←
+  IO.mkRef {}
+
+/-- `compute` once per `key` across the commands: the other commands wait for its result (and compute it
+    themselves when the computation was aborted, e.g., by an exception). -/
+def shareEquation (key : Expr × Option Expr) (compute : Term.TermElabM (Option (Expr × Expr))) :
+    Term.TermElabM (Option (Expr × Expr)) := do
+  let p ← IO.Promise.new
+  let existing? ← sharedEquations.modifyGet fun m => match m.get? key with
+    | some t => (some t, m)
+    | none => (none, m.insert key (p.resultD none))
+  if let some t := existing? then
+    if let some r ← IO.wait t then return r
+    return ← compute
+  try
+    let r ← compute
+    p.resolve (some r)
+    return r
+  finally
+    if !(← p.isResolved) then
+      p.resolve none
+      sharedEquations.modify (·.erase key)
+
 /-- `∀ xs alts, M params motive xs alts = ite ...`, proved once per matcher instance (as an auxiliary
-    theorem). -/
+    theorem). The equation is stated and proved in the local context of the free variables of the instance
+    (e.g., in the parameters), and shared by the commands (see `shareEquation`). -/
 def matcherLemma (m : Name) (lvls : List Level) (info : MatcherInfo) (params : Array Expr) (motive resTy : Expr) :
     BridgeM (Option Expr) := do
   let head := mkAppN (mkConst m lvls) (params.push motive)
   if let some l := (← get).lemmas.get? head then return l
   let inst? := (← read).matchInst m
   let l ← try
-      forallBoundedTelescope (← inferType head) (some (info.numDiscrs + info.numAlts)) fun xs _ => do
-        let xd := xs.extract 0 info.numDiscrs
-        let fs := xs.extract info.numDiscrs xs.size
-        let some rhs ← withLocalDeclD `m (← inferType motive) fun mv => do
-            let tys ← altTypes m lvls info inst? params mv xd
-            iteOf resTy mv tys xd fs false
-          | return none
-        let stmt ← mkForallFVars xs (← mkEq (mkAppN head xs) rhs)
-        let some pf ← proveMatchIte stmt | dbg m!"bridge: matcher equation not proved: {stmt}"; return none
-        -- NOTE: the statement may refer to free variables of the goal (e.g., in the parameters of the
-        -- matcher), but not the proof
-        some <$> mkAuxTheorem stmt pf
+      let xs ← fvarClosure #[head]
+      let compute : Term.TermElabM (Option (Expr × Expr)) := withRestrictedLCtx xs do
+        let some (stmt, pf) ← matcherEquation m lvls info inst? params motive resTy | return none
+        let stmt ← mkForallFVars xs stmt
+        let pf ← mkLambdaFVars xs pf
+        if stmt.hasFVar || pf.hasFVar || stmt.hasMVar || pf.hasMVar then return none
+        return some (stmt, pf)
+      let key := (← mkLambdaFVars xs head, inst?)
+      let r ← if key.1.hasLevelParam || key.1.hasFVar then compute else shareEquation key compute
+      let some (stmt, pf) := r | pure none
+      -- NOTE: the proof of another command is checked in the environment of this command (it may refer to
+      -- auxiliary declarations of its environment branch, in which case the equation is proved again)
+      let c ← try mkAuxTheorem stmt pf catch _ => do
+        let some (stmt, pf) ← compute | return none
+        mkAuxTheorem stmt pf
+      pure (some (mkAppN c xs))
     catch ex => dbg m!"bridge: matcher lemma {m}: {ex.toMessageData}"; pure none
   modify fun s => { s with lemmas := s.lemmas.insert head l }
   return l
@@ -839,8 +994,15 @@ partial def walk (a b : Expr) : BridgeM (Option Expr) := do
 
 /-- Proof of the proposition `p` from the hypotheses of the branch (`omega`). -/
 partial def byFacts (p : Expr) : BridgeM (Option Expr) := do
-  if (← read).facts.isEmpty then return none
-  Blaster.Reconstruct.proveWithTactic p (← `(tactic| omega))
+  let facts := (← read).facts
+  if facts.isEmpty then return none
+  withRestrictedLCtx (facts.push p) do
+    if let some pf ← Blaster.Reconstruct.proveWithTactic p (← omegaTac) then return some pf
+    -- hypotheses on datatype testers (e.g., the negated conditions of the previous alternatives of a matcher, in
+    -- the last alternative): case analyses on the variables of non-recursive datatypes
+    Blaster.Reconstruct.proveWithTactic p (← `(tactic| (blaster_cases_nonrec <;>
+      (try simp only [and_true, true_and, not_true, not_false_eq_true, and_false, false_and] at *) <;>
+      $(← omegaTac):tactic)))
 
 partial def walkCore (a b : Expr) : BridgeM (Option Expr) := do
   let ta ← inferType a
@@ -1235,7 +1397,9 @@ end
 /-- Proof of `a = b` (resp. `a → b` when `imp`) for a goal term `a` and the interpretation `b` of its
     translation, with the failed pairs of subterms (deepest first) when it fails. -/
 def prove (cfg : Cfg) (a b : Expr) : Term.TermElabM (Option Expr × Array (Expr × Expr)) := do
+  let t0 ← IO.monoMsNow
   let (r, s) ← (walk a b |>.run cfg).run {}
+  dbg m!"bridge: {(← IO.monoMsNow) - t0} ms ({r.isSome})"
   return (r, s.failures)
 
 end Blaster.Reconstruct.SmtProof.Bridge
