@@ -59,6 +59,9 @@ structure ReplayCtx where
   prepass : Bool := false
   /-- steps that don't depend on a scope (see `scopedSteps`): their proofs are valid at depth 0 -/
   global : Array Bool := #[]
+  /-- local context at depth 0, in which the steps that don't depend on a scope are replayed -/
+  baseLCtx : LocalContext := {}
+  baseInsts : LocalInstances := #[]
 
 structure ReplayState where
   /-- proofs of steps replayed at depth 0 -/
@@ -267,7 +270,14 @@ partial def replay (i : Nat) : ReplayM Expr := do
   if !isGlobal then
     if let some p := (← get).scopeCache.get? i then return p
     if (← get).scopeFailed.contains i then throwError "smt proof: step {i} already failed"
-  let p ← try replayCore i
+  -- NOTE: a step that doesn't depend on a scope is replayed outside of the scope (in particular, its proof
+  -- doesn't use the hypotheses of the scope), such that its proof can be cached globally
+  let atBase := ctx.depth > 0 && isGlobal
+  let p ← try
+      if atBase then
+        withReader (fun c => { c with depth := 0, facts := #[], interp := { c.interp with locals := {} } }) <|
+          withLCtx ctx.baseLCtx ctx.baseInsts (replayCore i)
+      else replayCore i
     catch ex =>
       if isGlobal then modify fun s => { s with failed := s.failed.insert i }
       else modify fun s => { s with scopeFailed := s.scopeFailed.insert i }
@@ -574,6 +584,56 @@ partial def replayComm (concl : Expr) : ReplayM Expr := do
   record "commutativity" "exact"
   return pf
 
+/-- Datatype facts as clauses: constructor injectivity `¬ (C a⃗ = C b⃗) ∨ aᵢ = bᵢ` and distinctness
+    `¬ (C a⃗ = D b⃗)` (Z3's `th-lemma datatype`), with explicit proofs (`C.inj`, `noConfusion`). -/
+partial def replayDatatype (concl : Expr) : MetaM (Option Expr) := do
+  let lits := disjuncts concl 2
+  -- distinctness
+  if lits.size == 1 then
+    let some eq := concl.not? | return none
+    let some (_, l, r) := eq.eq? | return none
+    let (lf, rf) := (l.getAppFn, r.getAppFn)
+    let (.const lc _, .const rc _) := (lf, rf) | return none
+    let env ← getEnv
+    if !(env.find? lc |>.any (·.isCtor)) || !(env.find? rc |>.any (·.isCtor)) || lc == rc then return none
+    return some (← withLam `h eq fun h => mkNoConfusion (mkConst ``False) h)
+  -- injectivity
+  if lits.size == 2 then
+    let some eq := lits[0]!.not? | return none
+    let some (_, l, r) := eq.eq? | return none
+    let some (_, x, y) := lits[1]!.eq? | return none
+    let .const c _ := l.getAppFn | return none
+    let some (.ctorInfo info) := (← getEnv).find? c | return none
+    if !r.isAppOf c then return none
+    let la := l.getAppArgs
+    let ra := r.getAppArgs
+    let some k := (List.range info.numFields).find? fun k =>
+      la[info.numParams + k]! == x && ra[info.numParams + k]! == y | return none
+    let injName := c ++ `inj
+    if !(← getEnv).contains injName then return none
+    -- `C.inj h : a₁ = b₁ ∧ ... ∧ aₙ = bₙ` (only the non-trivial equalities of fields)
+    let pos ← withLam `h eq fun h => do
+      let conj ← mkAppM injName #[h]
+      let mut cur := conj
+      let mut ty ← whnfR (← inferType conj)
+      -- find the equality `x = y` in the conjunction
+      let mut found : Option Expr := none
+      for _ in [0:info.numFields + 1] do
+        if let some (a, b) := ty.and? then
+          if let some (_, x', y') := a.eq? then
+            if x' == x && y' == y then found := some (mkApp3 (mkConst ``And.left) a b cur); break
+          cur := mkApp3 (mkConst ``And.right) a b cur
+          ty ← whnfR b
+        else
+          if let some (_, x', y') := ty.eq? then
+            if x' == x && y' == y then found := some cur
+          break
+      let some p := found | throwError "datatype: field equality not found"
+      return mkApp3 (mkConst ``Or.inr) (mkNot eq) lits[1]! p
+    let neg ← withLam `h (mkNot eq) fun h => return mkApp3 (mkConst ``Or.inl) (mkNot eq) lits[1]! h
+    return some (mkApp6 (mkConst ``Or.elim) eq (mkNot eq) concl (mkApp (mkConst ``Classical.em) eq) pos neg)
+  return none
+
 /-- Resolution steps: unit propagation on the premise clauses (see `rupProof`). -/
 partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
   let ctx ← read
@@ -599,6 +659,11 @@ partial def replayRup (step : Step) (concl : Expr) : ReplayM Expr := do
 
 /-- Prove `p₁ → ... → pₙ → c` with tactics and apply it to the premise proofs. -/
 partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
+  if step.rule == "th-lemma" && step.premises.isEmpty then
+    if let some p ← (try replayDatatype concl catch _ => pure none) then
+      if ← propEq (← inferType p) concl then
+        record step.rule "datatype"
+        return p
   -- identical sides (e.g., rewrites of Z3 normalizing the n-ary connectives folded by the interpretation)
   if let some (_, a, b) := concl.eq? then
     if a == b then

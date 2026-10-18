@@ -141,13 +141,17 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
                 let ms := Json.mkObj (r.stats.msByRule.toList.map fun (k, v) => (k, toJson v))
                 let methods := Json.mkObj (r.stats.byRule.toList.map fun (k, m) =>
                   (k, Json.mkObj (m.toList.map fun (k', v) => (k', toJson v))))
-                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("ok", toJson true),
+                let fm ← getFileMap
+                let line := ((← getRef).getPos?.map fun pos => (fm.toPosition pos).line).getD 0
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("line", toJson line), ("ok", toJson true),
                   ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]))
               return some (r.proof, s!"smt residual by {r.backend} proof replay")
           | .error msg =>
               if let some f ← IO.getEnv "BLASTER_SMTPROOF_LOG" then
                 let h ← IO.FS.Handle.mk f .append
-                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("error", toJson (msg.take 2000))]))
+                let fm ← getFileMap
+                let line := ((← getRef).getPos?.map fun pos => (fm.toPosition pos).line).getD 0
+                h.putStrLn (Json.compress (Json.mkObj [("file", toJson (← getFileName)), ("line", toJson line), ("error", toJson (msg.take 2000))]))
               return none
         let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
         match first? with

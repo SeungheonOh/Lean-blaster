@@ -4,6 +4,7 @@ import Blaster.Reconstruct.Discharge
 import Blaster.Reconstruct.SmtProof.Z3
 import Blaster.Reconstruct.SmtProof.Alethe
 import Blaster.Reconstruct.SmtProof.Replay
+import Blaster.Reconstruct.SmtProof.Bridge
 
 /-!
 # Proof reconstruction from SMT proofs
@@ -504,6 +505,10 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let tbl ← addSkolems sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
+    -- matcher instances optimized by Blaster (whose patterns are the translated ones)
+    let mut insts : Std.HashMap Name Expr := {}
+    for (k, v) in tenv.optEnv.memCache.isMatcherCache.toList do insts := insts.insert k.name v.instApp
+    let bcfg : Bridge.Cfg := { matchInst := insts.get? }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
@@ -517,6 +522,15 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
             catch _ => return false
           if c.isAppOfArity ``Not 1 then
             if ← defeq c (mkNot body') then return some (← mkExpectedTypeHint hneg c)
+          -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
+          let (r, fails) ← Bridge.prove bcfg (mkNot body') c
+          if let some p := r then
+            return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot body')))
+          if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
+            let h ← IO.FS.Handle.mk f .append
+            -- NOTE: only for the translation of the negated goal
+            for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 3 else #[] do
+              h.putStrLn s!"=== bridge mismatch:\n{← ppExpr a}\n--- interpretation:\n{← ppExpr b}\n"
           let r ← portfolio bridge c "bridge"
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
             logInfo m!"bridge failed: {c}"
@@ -534,7 +548,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
       let global := (scopedSteps sproof).map (!·)
-      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global }
+      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
+                               baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
       let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
                             catch ex => return Except.error ex) |>.run ctx).run {}
       let p ← match p? with
