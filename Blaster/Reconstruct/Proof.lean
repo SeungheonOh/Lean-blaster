@@ -94,6 +94,103 @@ def EqPf.close (pf : EqPf) (lhs rhs : Expr) (kind := HoleKind.frame) (label := "
       mkHole lhs rhs kind label
   | _ => return pf
 
+/-! ## Balanced transitivity chains
+
+The evidence of a long sequence of rewrites (e.g., the evaluation of a recursive function on concrete
+arguments, which may involve tens of thousands of steps) is a chain of `Eq.trans` applications.
+Built naively, i.e., `Eq.trans p₁ (Eq.trans p₂ (... pₙ))`, the depth of such a proof term is linear
+in the number of steps, which overflows the stack of the kernel type checker and of the recursive
+traversals performed on proof terms (e.g., `instantiate`, `abstract` or `Expr.replace`, which are not
+protected against stack overflows).
+
+Transitivity chains are instead kept as height-balanced (AVL) trees of `Eq.trans` nodes, whose height
+is logarithmic in the number of steps. Each node is annotated with its height (see `chainKey`),
+the leaves being the individual rewrite steps (i.e., any other equality proof). Two chains are
+concatenated via the standard AVL join, whose cost is proportional to the difference of their heights.
+Since `Eq.trans` is associative up to the grouping of the steps, the proof only differs by the order in
+which the kernel checks the steps, i.e., the end points of each step are unchanged.
+-/
+
+/-- Key used to tag a node of a balanced transitivity chain, i.e.,
+    `mdata {blaster.chain := height} (Eq.trans α a b c p q)`.
+-/
+def chainKey : Name := `blaster.chain
+
+/-- Return the height of the balanced transitivity chain `e` (`0` for a leaf, i.e., a single step). -/
+def chainHeight (e : Expr) : Nat :=
+  match e with
+  | .mdata d _ => match d.find chainKey with
+                  | some (.ofNat h) => h
+                  | _ => 0
+  | _ => 0
+
+/-- Return the components `(u, α, a, b, c, p, q)` of a chain node `mdata _ (Eq.trans.{u} α a b c p q)`. -/
+def chainNode? (e : Expr) : Option (Level × Expr × Expr × Expr × Expr × Expr × Expr) :=
+  if chainHeight e == 0 then none else
+  match e with
+  | .mdata _ (.app (.app (.app (.app (.app (.app (.const ``Eq.trans [u]) α) a) b) c) p) q) =>
+      some (u, α, a, b, c, p, q)
+  | _ => none
+
+/-- Return `(u, α, a, b)` such that `p : @Eq.{u} α a b`. -/
+def eqProofEnds (p : Expr) : MetaM (Level × Expr × Expr × Expr) := do
+  if let some (u, α, a, _, c, _, _) := chainNode? p then return (u, α, a, c)
+  let t ← whnfD (← inferType p)
+  let some (α, a, b) := t.eq? | throwError "eqProofEnds: equality proof expected{indentExpr p}"
+  let u ← match t.getAppFn with
+          | .const _ [u] => pure u
+          | _ => getLevel α
+  return (u, α, a, b)
+
+/-- Return the chain node `Eq.trans l r` (see `chainKey`). -/
+def mkChainNode (l r : Expr) : MetaM Expr := do
+  let (u, α, a, b) ← eqProofEnds l
+  let (_, _, _, c) ← eqProofEnds r
+  let h := max (chainHeight l) (chainHeight r) + 1
+  return mkMData (KVMap.empty.insert chainKey (.ofNat h)) (mkApp6 (mkConst ``Eq.trans [u]) α a b c l r)
+
+/-- Return the children of chain node `e`. -/
+@[inline] private def chainChildren (e : Expr) : Option (Expr × Expr) :=
+  (chainNode? e).map fun (_, _, _, _, _, p, q) => (p, q)
+
+/-- Concatenation of the balanced transitivity chains `l : a = b` and `r : b = c` (AVL join), i.e.,
+    the resulting chain has the steps of `l` followed by the steps of `r`, and its height is at most
+    `max (chainHeight l) (chainHeight r) + 1`.
+-/
+partial def joinChains (l r : Expr) : MetaM Expr := do
+  let hl := chainHeight l
+  let hr := chainHeight r
+  if hl > hr + 1 then
+    let some (ll, lr) := chainChildren l | mkChainNode l r
+    let t ← joinChains lr r
+    if chainHeight t ≤ chainHeight ll + 1 then return ← mkChainNode ll t
+    let some (tl, tr) := chainChildren t | mkChainNode ll t
+    if chainHeight tl ≤ chainHeight tr then
+      -- single rotation
+      mkChainNode (← mkChainNode ll tl) tr
+    else
+      -- double rotation
+      let some (x, y) := chainChildren tl | mkChainNode ll t
+      mkChainNode (← mkChainNode ll x) (← mkChainNode y tr)
+  else if hr > hl + 1 then
+    let some (rl, rr) := chainChildren r | mkChainNode l r
+    let t ← joinChains l rl
+    if chainHeight t ≤ chainHeight rr + 1 then return ← mkChainNode t rr
+    let some (tl, tr) := chainChildren t | mkChainNode t rr
+    if chainHeight tr ≤ chainHeight tl then
+      mkChainNode tl (← mkChainNode tr rr)
+    else
+      let some (x, y) := chainChildren tr | mkChainNode t rr
+      mkChainNode (← mkChainNode tl x) (← mkChainNode y rr)
+  else
+    mkChainNode l r
+
+/-- Same as `mkEqTrans` but the resulting proof is a balanced transitivity chain (see `joinChains`). -/
+def mkEqTransBalanced (p q : Expr) : MetaM Expr := do
+  if p.isAppOf ``Eq.refl then return q
+  if q.isAppOf ``Eq.refl then return p
+  joinChains p q
+
 /-- Transitivity: given `p : a = b` and `q : b = c` return evidence for `a = c`. -/
 def EqPf.trans (p q : EqPf) : TranslateEnvT EqPf := do
   match p.simplify, q.simplify with
@@ -101,7 +198,7 @@ def EqPf.trans (p q : EqPf) : TranslateEnvT EqPf := do
   | .defeq, q => return q
   | p, .defeq => return p
   | .proof a, .proof b =>
-      match ← tryInLocalContext (mkEqTrans a b) with
+      match ← tryInLocalContext (mkEqTransBalanced a b) with
       | some r => return .proof r
       | none => return .unknown
   | _, _ => return .unknown
