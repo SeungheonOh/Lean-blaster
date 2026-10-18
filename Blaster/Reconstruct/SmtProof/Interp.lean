@@ -128,7 +128,7 @@ def mkAppCoerce (f : Expr) (args : Array Expr) : MetaM Expr := do
   let types ← args.mapM inferType
   -- first pass: rigid arguments
   let mut done := Array.replicate args.size false
-  for h : j in [:args.size] do
+  for j in [:args.size] do
     let t ← whnfR types[j]!
     if isIntType t || t.isProp then continue
     let m := mvars[explicit[j]!]!
@@ -136,7 +136,7 @@ def mkAppCoerce (f : Expr) (args : Array Expr) : MetaM Expr := do
       m.mvarId!.assign args[j]!
       done := done.set! j true
   -- second pass: flexible arguments, with coercions
-  for h : j in [:args.size] do
+  for j in [:args.size] do
     if done[j]! then continue
     let m := mvars[explicit[j]!]!
     let expected ← instantiateMVars (← inferType m)
@@ -148,7 +148,7 @@ def mkAppCoerce (f : Expr) (args : Array Expr) : MetaM Expr := do
       m.mvarId!.assign (← coerce args[j]! types[j]! expected)
   -- remaining implicit arguments: instances (of the used prefix)
   let used := if args.size = explicit.size then mvars.size else explicit[args.size]!
-  for h : i in [:used] do
+  for i in [:used] do
     let m := mvars[i]!
     if (← instantiateMVars m).isMVar then
       if bis[i]!.isInstImplicit then
@@ -234,9 +234,6 @@ partial def decodeSmtString (s : String) : String := Id.run do
 
 def mkIntLit (n : Nat) : Expr :=
   mkApp3 (mkConst ``OfNat.ofNat [levelZero]) (mkConst ``Int) (mkRawNatLit n) (mkApp (mkConst ``instOfNat) (mkRawNatLit n))
-
-def binIntOp (n : Name) (inst : Name) : Expr :=
-  mkApp4 (mkConst n [levelZero, levelZero, levelZero]) intType intType intType (mkConst inst)
 
 def mkIntAdd (a b : Expr) : Expr := mkApp2 (mkApp4 (mkConst ``HAdd.hAdd [0, 0, 0]) intType intType intType
   (mkApp2 (mkConst ``instHAdd [0]) intType (mkConst ``Int.instAdd))) a b

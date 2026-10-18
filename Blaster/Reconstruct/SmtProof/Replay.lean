@@ -131,12 +131,6 @@ def Step.clauseSize (s : Step) : Nat :=
   | some lits => lits.size
   | none => SmtProof.clauseSize s.concl
 
-def clauseLits (t : STerm) : Array STerm :=
-  match t.stripAnnot with
-  | .app "or" args => args
-  | .sym "false" => #[]
-  | t => #[t]
-
 /-- Syntactic equality of propositions (up to instantiation of metavariables). -/
 def propEq (a b : Expr) (deep := false) : MetaM Bool := do
   if a == b then return true
@@ -305,7 +299,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   let ctx ← read
   let concl ← stepConcl i
   let attempt : ReplayM (Option Expr) := do
-    try some <$> replayRule i step concl
+    try some <$> replayRule step concl
     catch ex =>
       if (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
         logInfo m!"step {i} ({step.rule}) failed: {ex.toMessageData}"
@@ -335,7 +329,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
 partial def premises (step : Step) : ReplayM (Array (Expr × Expr)) :=
   step.premises.mapM fun j => do return (← stepConcl j, ← replay j)
 
-partial def replayRule (i : Nat) (step : Step) (concl : Expr) : ReplayM Expr := do
+partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
   let ctx ← read
   match step.rule with
   | "asserted" | "goal" | "assume" =>
