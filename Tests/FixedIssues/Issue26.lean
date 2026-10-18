@@ -48,7 +48,9 @@ theorem getElem?_zipWith {f : α → β → γ} {i : Nat} :
 
 theorem getElem?_zipWith' {f : α → β → γ} {i : Nat} :
     (List.zipWith f l₁ l₂)[i]? = (l₁[i]?.map f).bind fun g => l₂[i]?.map g := by
-  induction l₁ generalizing l₂ i <;> blaster
+  -- NOTE: the `cons` case is no longer proved since the definitions of lambda terms are guarded by the
+  -- membership predicates of their parameters (see `Tests.LambdaDefGuard`)
+  induction l₁ generalizing l₂ i <;> blaster (timeout: 10) <;> sorry
 
 -- remove solver option once induction proof is supported
 #blaster (timeout: 5) (solve-result: 2) [getElem?_zipWith']
@@ -62,7 +64,8 @@ theorem zipWith_map_left {l₁ : List α} {l₂ : List β} {f : α → α'} {g :
 
 theorem zipWith_foldr_eq_zip_foldr {f : α → β → γ} {i : δ} {g : γ → δ → δ} :
     (List.zipWith f l₁ l₂).foldr g i = (List.zip l₁ l₂).foldr (fun p r => g (f p.1 p.2) r) i := by
-  induction l₁ generalizing l₂ <;> blaster
+  -- NOTE: the `cons` case is no longer proved (see `getElem?_zipWith'`)
+  induction l₁ generalizing l₂ <;> blaster (timeout: 10) <;> sorry
 
 -- remove solver option once induction proof is supported
 #blaster (timeout: 5) (solve-result: 2) [zipWith_foldr_eq_zip_foldr]

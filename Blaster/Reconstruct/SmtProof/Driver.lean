@@ -244,12 +244,15 @@ where
   lambdaDef? (e : SExpr) : Option (String × STerm) := Id.run do
     let some #[SExpr.atom "forall", SExpr.list vs, SExpr.list ann] := e.list? | return none
     if ann[0]? != some (SExpr.atom "!") then return none
-    -- NOTE: the guards `0 ≤ x` of the variables of sort `Nat` (see `guardNatQuantifiers`) are removed
+    -- NOTE: the guards of the definition are removed: `0 ≤ x` for the variables of sort `Nat` (see
+    -- `guardNatQuantifiers`), and the membership predicates of the parameters (see `Blaster.Smt.translateLambda`)
     let rec unguard (e : SExpr) (fuel : Nat) : SExpr :=
       match fuel, e with
       | fuel + 1, .list #[.atom "=>", .list #[.atom "<=", .atom "0", .atom _], b] => unguard b fuel
+      | fuel + 1, .list #[.atom "=>", g, b] =>
+          if (g.head?.map unquote).any (·.startsWith "@is") then unguard b fuel else e
       | _, e => e
-    let some #[SExpr.atom "=", SExpr.list lhs, body] := (ann[1]?.map (unguard · vs.size)) >>= SExpr.list? | return none
+    let some #[SExpr.atom "=", SExpr.list lhs, body] := (ann[1]?.map (unguard · (3 * vs.size))) >>= SExpr.list? | return none
     let vars := vs.filterMap fun v => match v with
       | .list #[.atom x, s] => some (x, s)
       | _ => none
