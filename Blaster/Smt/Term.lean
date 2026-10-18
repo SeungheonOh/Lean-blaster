@@ -225,6 +225,24 @@ def strReplaceAllSymbol : SmtSymbol := mkReservedSymbol "str.replace_all"
 /-! length Smt symbol for String. -/
 def strLengthSymbol : SmtSymbol := mkReservedSymbol "str.len"
 
+/-! from code Smt symbol for String (i.e., singleton string for a given code point). -/
+def strFromCodeSymbol : SmtSymbol := mkReservedSymbol "str.from_code"
+
+/-! String.mk Smt symbol (i.e., converting a `List Char` to a String).
+    NOTE: This function is defined during translation whenever required.
+-/
+def strMkSymbol : SmtSymbol := mkReservedSymbol "@String.mk"
+
+/-! Smt symbol converting a `Char` to a singleton String.
+    NOTE: This function is defined during translation whenever required.
+-/
+def charToStrSymbol : SmtSymbol := mkReservedSymbol "@Char.toStr"
+
+/-! Smt symbol converting a `Char` not denotable in an Smt String to a singleton String.
+    NOTE: This function is declared during translation whenever required.
+-/
+def charHighToStrSymbol : SmtSymbol := mkReservedSymbol "@Char.highToStr"
+
 /-! ## Builtin Smt functions. -/
 
 /-! Create an Smt application term with function name `nm` and parameters `args`. -/
@@ -381,6 +399,10 @@ def strReplaceAllSmt (s : SmtTerm) (src : SmtTerm) (dst : SmtTerm) : SmtTerm :=
 /-! Create a String length Smt application. -/
 def strLengthSmt (s : SmtTerm) : SmtTerm :=
   mkSimpleSmtAppN strLengthSymbol #[s]
+
+/-! Create a String from code Smt application. -/
+def strFromCodeSmt (n : SmtTerm) : SmtTerm :=
+  mkSimpleSmtAppN strFromCodeSymbol #[n]
 
 
 /-! Create an as-array Smt application (i.e., converting a function to an array representation). -/
