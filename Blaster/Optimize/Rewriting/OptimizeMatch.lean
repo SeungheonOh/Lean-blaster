@@ -408,6 +408,9 @@ def constMatchPropagation?
         let dite_op ← mkBlasterDIteOpFor retType
         let pInfo ← getFunEnvInfo dite_op
         let dite_args := #[retType, pcond, e1', e2']
+        if ← isTracking then
+          recordStepM (← mkAppNExpr cm cargs) (← mkAppNExpr dite_op dite_args)
+            (mkApplyDiteProof cm cargs idx _psort pcond e1 e2 retType)
         setIsAppArg prevInApp
         if resolveArgs
         then return some (.AppOptimizeImplicitArgs dite_op dite_args 0 0 4 pInfo prevInApp .unknown)
@@ -432,6 +435,13 @@ def constMatchPropagation?
         let retType := getAppliedMatchType cargs[mInfo.getFirstDiscrPos - 1]! 0
         pargs ← pargs.modifyM idxType (updateMatchReturnType retType)
         let pInfo ← getFunEnvInfo argInfo.nameExpr
+        -- case of case: justified by the match equations of the pulled match
+        if ← isTracking then
+          let rhs ← mkAppNExpr argInfo.nameExpr pargs
+          recordStepM (← mkAppNExpr cm cargs) rhs do
+            let inner := cargs[idx]!
+            let ctx := Expr.lam `z (← Meta.inferType inner) (mkAppN cm (cargs.set! idx (.bvar 0))) .default
+            mkMatchPushProof ctx inner rhs
         setIsAppArg prevInApp
         if resolveArgs
         then return some (.AppOptimizeImplicitArgs argInfo.nameExpr pargs 0 0 pargs.size pInfo prevInApp .unknown)
@@ -454,9 +464,16 @@ def matchReduction?
   (matchToIte := false) (resolveArgs := false) : TranslateEnvT (Option OptimizeStack) := do
     -- try match reduction first
     if let some r ← reduceMatch? args mInfo resolveArgs then
-      -- NOTE: the match reduction is a definitional step (iota)
+      -- NOTE: the match reduction is a definitional step (iota), once the discriminants resolved with the
+      -- equality map of the match context are rewritten (see `reduceMatch?` and `proveMatchReduction`)
       if ← isTracking then
-        recordDefEqHint (← mkAppNExpr f args) r.betaReduced (do Lean.Meta.mkEqRefl (mkAppN f args))
+        let ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, _, _, ⟨_, _, _, _, _, _, active, _⟩, _, _, _⟩ := (← get).optEnv
+        let mut ds := #[]
+        for j in mInfo.getDiscrRange do
+          let d := args[j]!
+          let d' ← if resolveArgs then pure ((← ContextMap.findRaw equalityMap active d).getD d) else pure d
+          ds := ds.push d'
+        recordStepM (← mkAppNExpr f args) r.betaReduced (proveMatchReduction (mkAppN f args) ds r.betaReduced)
       return some (.InitOptimizeExpr r.betaReduced r.prevMVarIdDecls)
     -- try to apply match constant propagation rules
     if let some r ← constMatchPropagation? f args mInfo prevInApp resolveArgs then return r
@@ -732,7 +749,7 @@ partial def optimizeMatchAlt
   | some reuse =>
        setAndCommitCtx reuse.scope
        let body ← betaLambdaShared rhs reuse.fvars
-       return .InitOptimizeExpr body :: .MatchAltWaitForExpr reuse.fvars (some reuse.scope) currIdx matchInst :: stack
+       return .InitOptimizeExpr body :: .MatchAltWaitForExpr reuse.fvars (some reuse.scope) currIdx matchInst body #[] :: stack
   | none =>
        let alts ← getMatchAlts args mInfo
        let ⟨_, ⟨_, _, _, _, _, _, _, _, _,_, ⟨_, _, _, _, _, nextCtxId, _, _⟩, _, _, _⟩, _⟩ ← get
@@ -742,36 +759,24 @@ partial def optimizeMatchAlt
          let body ← betaLambdaShared rhs xs
          let updatedEqCtx ← updateEqMap mInfo lhs args nextCtxId false
          let mscope ← if updatedMCtx || updatedEqCtx then some <$> newCtx else pure none
-         return .InitOptimizeExpr body :: .MatchAltWaitForExpr xs mscope currIdx matchInst :: stack
+         let hyps ← declareDiscrPatternEqs xs
+         return .InitOptimizeExpr body :: .MatchAltWaitForExpr xs mscope currIdx matchInst body hyps :: stack
 
   where
-   /-- Return the equalities `dⱼ = pⱼ` between the discriminants and the patterns of alternative `altIdx`
-       of match application `f args`, instantiated with the alternative's parameters `params`.
-       NOTE: The patterns are obtained from the matcher's type and not from the optimized generic
-       instance, as the latter may contain optimized patterns that are not definitionally equal
-       to the patterns of the matcher (e.g., `Nat.add 1 n` instead of `n + 1`).
-       Return `none` when proof terms are not tracked or when the equalities can't be constructed.
+   /-- When tracking proof terms, declare the equalities `dⱼ = pⱼ` between the discriminants and the patterns
+       of the alternative (instantiated with its parameters `params`) in the local context, such that the
+       rewrites performed under the match context can be justified (see `Blaster.Reconstruct.mkMatchCongr`).
+       NOTE: Contexts are not reused when tracking proof terms (see `reuseContext?`).
    -/
-   discrPatternEqs? (f : Expr) (args : Array Expr) (mInfo : MatchInfo) (altIdx : Nat) (params : Array Expr) :
-     TranslateEnvT (Option (Array Expr)) := do
-     if !(← isTracking) then return none
-     try
-       let fType ← instantiateForall (← inferType f) (args.take mInfo.numParams)
-       forallBoundedTelescope fType (1 + mInfo.numDiscrs + mInfo.numAlts) fun fvars _ => do
-         let some altVar := fvars[1 + mInfo.numDiscrs + altIdx]? | return none
-         let motive := fvars[0]!
-         forallTelescope (← inferType altVar) fun xs b => do
-           if !b.getAppFn.isFVarOf motive.fvarId! then return none
-           let lhs := b.getAppArgs
-           if xs.size != params.size || lhs.size != mInfo.numDiscrs then return none
-           let mut eqs := #[]
-           for j in mInfo.getDiscrRange do
-             let pattern := (lhs[j - mInfo.getFirstDiscrPos]!.replaceFVars xs params).replaceFVar motive args[mInfo.numParams]!
-             let eq ← mkEq args[j]! pattern
-             Meta.check eq
-             eqs := eqs.push eq
-           return some eqs
-     catch _ => return none
+   declareDiscrPatternEqs (params : Array Expr) : TranslateEnvT (Array Expr) := do
+     if !(← isTracking) then return #[]
+     let some (some types) ← tryInLocalContext <|
+         discrPatternEqs? mInfo.nameExpr args mInfo.numParams mInfo.numDiscrs (altIdx - mInfo.getFirstAltPos) params
+       | return #[]
+     types.mapM fun t => do
+       let h ← mkExpr (mkFVar (← mkFreshFVarId))
+       mkLocalDecl h matchHypName t
+       return h
 
    onlyOnePattern (lhs : Array Expr) (idx : Nat) (onlyOne : Bool) : TranslateEnvT Bool := do
      if h : idx ≥ lhs.size then return onlyOne
@@ -954,8 +959,12 @@ partial def optimizeMatch
  -- check for match elimination rules first
  if let some r ← elimMatch? mInfo args then
    match r with
-   | Sum.inl e => return (← stackContinuity xs e)
-   | Sum.inr b => return Sum.inl (.InitOptimizeExpr b :: xs)
+   | Sum.inl e => return (← stackContinuity xs e (← commonRhsPf e))
+   | Sum.inr b =>
+       -- NOTE: the reduction to the last alternative relies on the disequalities of the match context,
+       -- i.e., a proof obligation is generated when tracking proof terms.
+       let step ← if ← isTracking then EqPf.close .unknown (← mkAppNExpr f args) b .rule "elimMatch" else pure .unknown
+       return Sum.inl (← pushTrans b step xs)
  -- check for match equivalence afterwards
  let (f', args') ← structEqMatch f args mInfo
  let e ← mkAppNExpr f' args'
@@ -963,6 +972,18 @@ partial def optimizeMatch
  return (← stackContinuity xs e)
 
  where
+   /-- Return evidence for the elimination of a match whose alternatives all have the same rhs `e`, i.e., a
+       case split over the alternatives, each one being definitionally equal to `e`.
+   -/
+   commonRhsPf (e : Expr) : TranslateEnvT EqPf := do
+     if !(← isTracking) then return .unknown
+     let lhs ← mkAppNExpr f args
+     let some p ← tryInLocalContext (mkMatchCasesProof lhs (fun _ => pure e) fun _ _ _ alt rhs => do
+         mkExpectedTypeHint (← Meta.mkEqRefl alt) (← mkEq alt rhs))
+       | return .unknown
+     if !(← validStep lhs e (.proof p)) then return .unknown
+     return .proof p
+
    propagateMatchReuseContext (mInfo : MatchInfo) (oldName : Expr) (newName : Expr) : TranslateEnvT Unit := do
      let rec visit (idx : USize) (stop : USize) (offset : USize) : TranslateEnvT Unit := do
        if idx ≥ stop then return ()
