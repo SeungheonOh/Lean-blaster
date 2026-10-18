@@ -144,6 +144,8 @@ def auxiliaryInterp (s : String) : MetaM (Option Expr) := do
   | "@Nat.log2" =>
       withLocalDeclD `x int fun x => do
         mkLambdaFVars #[x] (ofNat (mkApp (Lean.mkConst ``Nat.log2) (toNat x)))
+  -- the string of a list of characters
+  | "@String.mk" => return some (Lean.mkConst ``String.mk)
   | _ => return none
 
 /-- Remove the bars of a quoted symbol. -/
@@ -631,7 +633,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     -- 1. translation
     -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
     let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
-    let ((), tenv) ← (do
+    let (goalTerm, tenv) ← (do
         -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
         -- recursive functions); `body` being already optimized, `body'` is expected to be `body` (up to
         -- definitional equality, which the bridge requires).
@@ -652,8 +654,18 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         -- witnessing that `α` is inhabited)
         for x in xs do
           if !sortVars.contains x && !(← isProp (← inferType x)) then discard <| translateExpr x
-        let st ← translateExpr (if reopt then body' else body)
-        assertTerm (notSmt st) : TranslateEnvT Unit).run env
+        -- NOTE: the unoptimized goal may not be translatable (e.g., terms that only the optimizer normalizes):
+        -- its optimized form is then translated, when definitionally equal to it
+        let saved ← get
+        let (st, goalTerm) ← if reopt then pure (← translateExpr body', body') else
+          try pure (← translateExpr body, body) catch ex => do
+            set saved
+            let defeq ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
+                withCurrHeartbeats <| withDefault <| isDefEq body body' catch _ => pure false
+            if !defeq then throw ex
+            pure (← translateExpr body', body')
+        assertTerm (notSmt st)
+        return goalTerm : TranslateEnvT Expr).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
     let cmds := cmds.map guardNatQuantifiers
     -- 2. backend
@@ -706,7 +718,6 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       matchInst := insts.get?, macroOf
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
-    let goalTerm := body
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
