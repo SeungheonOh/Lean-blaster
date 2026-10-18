@@ -500,6 +500,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let tbl ← addSkolems sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
+    let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -516,7 +517,12 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
             logInfo m!"bridge failed: {c}"
           return r.map (·.1)
-        proveStep := fun rule stmt => do portfolio (← stepTactics rule) stmt rule }
+        proveStep := fun rule stmt => do
+          -- NOTE: the tactic syntax of each rule is built once per replay
+          let tacs ← match (← tacCache.get).get? rule with
+            | some t => pure t
+            | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+          portfolio tacs stmt rule }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
       let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline }
