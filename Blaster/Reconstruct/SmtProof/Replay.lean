@@ -462,6 +462,8 @@ where
     let .const T lvls := xt.getAppFn | return none
     let some (.inductInfo info) := (← getEnv).find? T | return none
     if info.numIndices != 0 then return none
+    let some casesOn := (← getEnv).find? (T ++ `casesOn) | return none
+    if casesOn.levelParams.length != lvls.length + 1 then return none
     let params := xt.getAppArgs.extract 0 info.numParams
     let absLits ← lits.mapM fun l => kabstract l x
     let absConcl ← kabstract concl x

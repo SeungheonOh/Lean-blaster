@@ -272,6 +272,8 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
     return ← whole
   -- conditionals (the instance depends on the condition): the branches under the condition (resp. its negation)
   if let some p ← iteCongrCtx? prove budget l r hyps then return some p
+  if l.isAppOfArity ``Decidable.decide 2 then
+    if let some p ← iteCongr? l r (diffEq prove budget · · hyps) then return some p
   let as := l.getAppArgs
   let bs := r.getAppArgs
   let info ← getFunInfoNArgs fl as.size
