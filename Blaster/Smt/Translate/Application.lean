@@ -1190,6 +1190,8 @@ def translateApp
              (! (= (@apply{k} @lambda{n} x₁ ... xₘ) sb)
                :pattern ((@apply{k} @lambda{n} x₁ ... xₘ))
                :qid @lambda{n]_def_cstr)))`
+        - When `decl.isMembership` and all sort variables in `e` are top level (see `hasGlobalSortVarsOnly`):
+           - assert membership `(@is{decl.instName} @r₀ ... @rₖ @lambda{n})` (see `generateFunInstDeclAux`)
         - return `smtSimpleVarId @lambda{n}`
      - When V ≠ ∅
         - let (y₁, yt₁) ... (yₖ, ytₖ) := [(V[i], translateFunLambdaParamType V[i].type termTranslator) | i ∈ [0..V.size-1]]
@@ -1241,6 +1243,9 @@ def translateLambda
      let applyTerm := mkSimpleSmtAppN applyName applyArgs
      let forallBody := eqSmt applyTerm sb
      assertTerm (mkForallTerm none svars forallBody (some #[mkPattern #[applyTerm], mkQid qidName]))
+     -- lambda term is a member of its function type (see `generateFunInstDeclAux`)
+     if decl.isMembership && (← hasGlobalSortVarsOnly lamType pInfo) then
+       assertTerm (← createPredQualifierAppAux' lamId lamType decl)
      return lamId
    else
     let mut gvars := (#[] : SortedVars)
@@ -1273,6 +1278,22 @@ def translateLambda
     return globalAppTerm
 
  where
+   /-- Return `true` when all the parameters of `e` are explicit and all the sort variables in
+       `lamType` are globally declared (i.e., top level), such that the membership predicate
+       of `lamType` can be asserted at the top level for lambda term `e`.
+       NOTE: A lambda term polymorphic in a locally quantified sort variable (e.g., `∀ β, ... (λ (x : β) => x) ...`)
+       is translated to a single smt term for all instantiations of `β` and must not be asserted as a member
+       of every instance of its function type (e.g., closed lambdas would otherwise be identified via
+       extensionality whenever an instance has an empty domain).
+   -/
+   hasGlobalSortVarsOnly (lamType : Expr) (pInfo : FunEnvInfo) : TranslateEnvT Bool := do
+     if pInfo.paramsInfo.any (λ p => !p.isExplicit) then return false
+     let genArgs ← retrieveGenericArgs (retrieveArrowTypes lamType)
+     for h : i in [:genArgs.size] do
+       let v := genArgs[i]
+       if isTypeUniverse (← inferTypeEnv v) && !(← isTopLevelFVar v.fvarId!) then return false
+     return true
+
    retrieveLocalFVars (b : Expr) : TranslateEnvT (Array Expr) := do
      -- Need to ensure that fvars are unique
      let (fvars, _) ← updateGenericArgs b #[] HashSet.emptyWithCapacity

@@ -36,6 +36,10 @@ namespace Test.SmtUninhabited
 #blaster (gen-cex: 0) (solve-result: 1)
   [ ∀ (α γ : Type) (_f : α → α) (h k : γ → γ), (∀ (_x : α), False) → h = k ]
 
+-- Counterexample: `α := Empty`, `γ := Bool`, `h := id`, `k := not`
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (α γ : Type) (_f : α → γ) (h k : γ → γ), (∀ (_x : α), False) → h = k ]
+
 /-! Test cases to ensure that distinct sort variables do not have the same cardinality. -/
 
 -- Counterexample: `α := Unit`, `β := Bool`
@@ -58,6 +62,9 @@ namespace Test.SmtUninhabited
 
 -- function extensionality on the domain of each function type instance
 #blaster [ ∀ (α β : Type) (f g : α → β), (∀ (x : α), f x = g x) → f = g ]
+
+-- lambda terms are members of their function type instance
+#blaster [ ∀ (α : Type) (f : α → α), (∀ x, f x = x) → f = (fun x => x) ]
 
 -- codomain constraint for each instantiation of a class function
 class ToNat (α : Type) where
