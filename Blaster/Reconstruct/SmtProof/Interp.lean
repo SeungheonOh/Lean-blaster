@@ -469,6 +469,25 @@ partial def interpCore (t : STerm) : InterpM Expr := do
         match (← read).table.syms.get? ctorSym with
         | some (.ctor c) => mkTester c (← interp x)
         | _ => throwError "smt proof: unknown constructor {ctorSym}"
+      -- pseudo-Boolean constraints (Z3): `((_ pbge k c₁ ... cₙ) a₁ ... aₙ)` is `c₁ [a₁] + ... + cₙ [aₙ] ≥ k`
+      -- where `[a]` is `if a then 1 else 0` (resp. `≤ k`, `= k` for `pble`, `pbeq`), and the cardinality
+      -- constraints `((_ at-least k) a₁ ... aₙ)` (resp. `at-most`) have the coefficients `1`
+      else if ["pbge", "pble", "pbeq", "at-least", "at-most"].contains f then
+        let nums ← idx.mapM fun i => match i with
+          | STerm.num n => pure n
+          | _ => throwError "smt proof: ill-formed pseudo-Boolean constraint {t}"
+        let some k := nums[0]? | throwError "smt proof: ill-formed pseudo-Boolean constraint {t}"
+        let coeffs := if f.startsWith "at-" then Array.replicate args.size 1 else nums.extract 1 nums.size
+        if coeffs.size != args.size || args.isEmpty then throwError "smt proof: ill-formed pseudo-Boolean constraint {t}"
+        let mut terms := #[]
+        for (c, a) in coeffs.zip args do
+          let ind ← mkClassicalIte (← interpProp a) (mkIntLit 1) (mkIntLit 0)
+          terms := terms.push (if c == 1 then ind else mkIntMul (mkIntLit c) ind)
+        let sum ← foldBin mkIntAdd terms
+        match f with
+        | "pbge" | "at-least" => return mkIntLe (mkIntLit k) sum
+        | "pble" | "at-most" => return mkIntLe sum (mkIntLit k)
+        | _ => mkEq sum (mkIntLit k)
       else
         -- indexed applications of recursive functions (e.g., `((_ @Nat.pow 0) x y)` in Z3 proofs)
         interpApp f args

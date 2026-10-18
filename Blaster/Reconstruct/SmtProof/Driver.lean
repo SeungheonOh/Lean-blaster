@@ -291,12 +291,14 @@ where
     (resp. `Classical.epsilon (fun x => φ)`). Only steps with a single bound variable are handled. -/
 partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
   let mut tbl := tbl
-  -- names introduced by `intro-def` (Z3's Tseitin names): `(= t k)` defines `k` as `t`
+  -- names introduced by `intro-def` (Z3's Tseitin names): `(= t k)` defines `k` as `t`; similarly for the
+  -- names introduced by theory lemmas (e.g., `(= pb!2 (or ...))` of Z3's pseudo-Boolean preprocessing)
   for step in proof.steps do
-    if step.rule != "intro-def" then continue
+    if !(step.rule == "intro-def" || (step.rule == "th-lemma" && step.premises.isEmpty)) then continue
     match step.concl.stripAnnot with
     | .app "=" #[t, .sym k] | .app "=" #[.sym k, t] =>
-        if !tbl.syms.contains k then tbl := { tbl with syms := tbl.syms.insert k (.macro #[] t) }
+        if !tbl.syms.contains k && (findSkolem k t (· == k)).isNone then
+          tbl := { tbl with syms := tbl.syms.insert k (.macro #[] t) }
     | _ => pure ()
   for step in proof.steps do
     if step.rule != "sk" then continue
