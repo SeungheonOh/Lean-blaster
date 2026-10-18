@@ -77,6 +77,9 @@ def finishProof
   (equivs : Array (Expr × Expr) := #[]) : TermElabM ReconOutcome := do
   let finish (o : ReconOutcome) : TermElabM ReconOutcome := do
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
+  -- NOTE: deeply nested subproofs are shared through `let` declarations such that the depth of the
+  -- proof term checked by the kernel (and traversed when discharging proof obligations) is bounded.
+  let proof ← shareDeepProofs proof
   let (proof, stats) ← dischargeHoles proof holes equivs
   let out := { out with stats }
   if !stats.failures.isEmpty || hasHoles proof then
