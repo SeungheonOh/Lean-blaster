@@ -594,7 +594,8 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
     match ctx.table.syms.get? f with
     | some (.expr e) =>
         if args.isEmpty then return e
-        mkAppCoerce e (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)
+        -- NOTE: interpretations of auxiliary functions are lambdas (see `auxiliaryInterp`)
+        return (← mkAppCoerce e (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)).headBeta
     | some (.macro params body) =>
         if args.isEmpty && !params.isEmpty then
           -- the function itself (e.g., `(= @isNat (lambda ((x Int)) (<= 0 x)))` in cvc5 proofs)

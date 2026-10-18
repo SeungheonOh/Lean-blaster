@@ -627,7 +627,7 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
                                    (try simp_all) <;> (try split) <;> first | done | omega | grind))),
     ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;> grind))),
     -- `@Nat.log2` (see `auxiliaryInterp`): one unfolding step
-    ("log2", ← `(tactic| (intros; rw [Nat.log2_def] <;> simp only [toNat_ediv_two] at * <;> split <;> omega)))]
+    ("log2", ← `(tactic| (intros; rw [Nat.log2_def] <;> (try simp only [toNat_ediv_two] at *) <;> split <;> omega)))]
   match rule with
   | "th-lemma" => return arith ++ simp ++ grind ++ unfold
   -- datatype lemmas over generalized terms (e.g., `x = C (C.0 x) ∨ ¬ is-C x`)
