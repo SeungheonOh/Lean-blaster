@@ -150,6 +150,9 @@ def toSmtWorld (e : Expr) : MetaM Expr := do
   if isBoolType t then return mkBoolTrue e
   return e
 
+/-- User name of the metavariables standing for the default values of selectors (see `mkSelector`). -/
+def defaultMVarName : Name := `_blaster_selector_default
+
 /-- Apply `f` to `args`, instantiating implicit arguments by unification and coercing explicit
     arguments when necessary. Arguments whose type is `Int` or `Prop` (i.e., flexible w.r.t. coercions)
     are unified last. -/
@@ -195,7 +198,10 @@ def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) : MetaM Exp
   let r ← instantiateMVars (mkAppN f (mvars.extract 0 used))
   -- NOTE: the remaining implicit arguments (e.g., the type parameter `α` of `Sum.inr (b : β) : α ⊕ β`) may be
   -- assigned by unification with the context
-  if r.hasMVar && !allowMVars then throwError "smt proof: can't infer implicit arguments of {f}"
+  if r.hasMVar && !allowMVars then
+    -- NOTE: the default values of selectors may be chosen later (see `mkSelector`)
+    if r.hasLevelMVar || (← (← getMVars r).anyM fun m => return (← m.getDecl).userName != defaultMVarName) then
+      throwError "smt proof: can't infer implicit arguments of {f}"
   return r
 
 /-! ## Sorts -/
@@ -324,9 +330,6 @@ def mkEqSmt (a b : Expr) : MetaM Expr := do
   -- e.g., constructor applications of different instances of a datatype
   try return ← mkEq (← coerce a ta tb) b
   catch _ => mkEq a (← coerce b tb ta)
-
-/-- User name of the metavariables standing for the default values of selectors (see `mkSelector`). -/
-def defaultMVarName : Name := `_blaster_selector_default
 
 /-- Selector of field `idx` of constructor `ctor` applied to `x`, defined by case analysis (with
     `default` for the other constructors). -/
