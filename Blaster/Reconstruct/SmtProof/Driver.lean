@@ -467,6 +467,8 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
     ("unfold", ← `(tactic| (intros; blaster_unfold_user <;> (try simp_all [Int.toNat_natCast]) <;> grind)))]
   match rule with
   | "th-lemma" => return arith ++ simp ++ grind ++ unfold
+  -- datatype lemmas over generalized terms (e.g., `x = C (C.0 x) ∨ ¬ is-C x`)
+  | "datatype" => return #[("cases", ← `(tactic| (intros; blaster_cases_vars <;> simp_all <;> done)))] ++ simp ++ grind
   | "quant-intro" => return quant ++ simp ++ grind
   | "def-axiom" | "not-or-elim" | "and-elim" | "iff~" | "nnf-pos" | "nnf-neg" => return simp ++ grind
   | _ => return simp ++ arith ++ grind

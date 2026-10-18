@@ -775,6 +775,17 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
           return ← mkExpectedTypeHint p concl
   -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
+  -- theory lemmas over large terms: the subterms common to the literals are generalized (e.g., datatype
+  -- lemmas `x = C (C.0 x) ∨ ¬ is-C x` over a large term `x`)
+  if step.rule == "th-lemma" && ps.isEmpty && !(Local.sizeLe stmt 200) then
+    let lits := disjuncts concl (clauseSize step.concl)
+    if lits.size ≥ 2 then
+      let rest := lits.extract 1 lits.size
+      let restE := rest.foldl (fun acc l => mkAnd acc l) (mkConst ``True)
+      if let some (g, vals) ← Local.generalizeCommon concl restE lits[0]! then
+        if let some (pf, method) ← timed "datatype" ((← read).cfg.proveStep "datatype" g) then
+          record step.rule s!"{method} (common)"
+          return mkAppN pf vals
   -- arithmetic lemmas over large atoms: the atoms are generalized
   if step.rule == "th-lemma" && (stmt.approxDepth.toNat > 8) then
     if let some (g, vals) ← Local.generalizeAtoms stmt then
