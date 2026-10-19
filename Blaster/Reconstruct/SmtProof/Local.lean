@@ -45,6 +45,14 @@ theorem ite_eq_and {α : Sort u} {c : Prop} {a b k : α} {e : Prop} (ha : c → 
 
 theorem eq_comm_eq {α : Sort u} (a b : α) : (a = b) = (b = a) := propext eq_comm
 
+theorem and_congr_ctx {a a' b b' : Prop} (ha : a = a') (hb : a → b = b') : (a ∧ b) = (a' ∧ b') := by
+  subst ha; exact propext ⟨fun ⟨x, y⟩ => ⟨x, hb x ▸ y⟩, fun ⟨x, y⟩ => ⟨x, (hb x).symm ▸ y⟩⟩
+
+theorem or_congr_ctx {a a' b b' : Prop} (ha : a = a') (hb : ¬a → b = b') : (a ∨ b) = (a' ∨ b') := by
+  subst ha
+  exact propext ⟨fun h => h.elim Or.inl (fun y => Classical.byCases (p := a) Or.inl (fun x => Or.inr (hb x ▸ y))),
+    fun h => h.elim Or.inl (fun y => Classical.byCases (p := a) Or.inl (fun x => Or.inr ((hb x).symm ▸ y)))⟩
+
 /-- `ite c x y = ite c' x' y'` (with the classical instances of the interpretation, whose argument depends on
     the condition), given the proofs of the equalities of the arguments (`sub`); similarly for `decide`. -/
 def iteCongr? [Monad m] [MonadLiftT MetaM m] (l r : Expr) (sub : Expr → Expr → m (Option Expr)) : m (Option Expr) := do
@@ -272,8 +280,9 @@ def decideTrue? (p : Expr) : MetaM (Option Expr) := do
 def relevantHyps (hyps : Array Expr) : MetaM (Array Expr) :=
   hyps.filterM fun h => do
     let t ← inferType h
-    let t' := t.not?.getD t
-    return isArithComparison t' && sizeLe t 64
+    -- NOTE: also the conjunctions of comparisons (e.g., the contexts of conjuncts, see `diffEq`)
+    let leaves := opLeaves ``And t
+    return leaves.all (fun c => isArithComparison (c.not?.getD c)) && sizeLe t (64 * leaves.size)
 
 /-- Arithmetic and propositional structure, traversed by `arithAtoms`. -/
 def isArithHead (e : Expr) : Bool :=
@@ -369,6 +378,17 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
   if let some p ← iteCongrCtx? prove budget l r hyps then return some p
   if l.isAppOfArity ``Decidable.decide 2 then
     if let some p ← iteCongr? l r (diffEq prove budget · · hyps) then return some p
+  -- conjunctions (resp. disjunctions): the right operands under the left one (resp. its negation), e.g., Z3's
+  -- simplifications of the conjuncts implied by the others
+  if (l.isAppOfArity ``And 2 && r.isAppOfArity ``And 2) || (l.isAppOfArity ``Or 2 && r.isAppOfArity ``Or 2) then
+    let isAnd := l.isAppOfArity ``And 2
+    let (a, b, a', b') := (l.appFn!.appArg!, l.appArg!, r.appFn!.appArg!, r.appArg!)
+    let some pa ← (if a == a' then some <$> mkEqRefl a else diffEq prove budget a a' hyps) | return ← whole
+    let some pb ← withLocalDeclD `h (if isAnd then a else mkNot a) fun h => do
+        let some p ← (if b == b' then some <$> mkEqRefl b else diffEq prove budget b b' (hyps.push h)) | return none
+        some <$> mkLambdaFVars #[h] p
+      | return ← whole
+    return some (mkAppN (mkConst (if isAnd then ``and_congr_ctx else ``or_congr_ctx)) #[a, a', b, b', pa, pb])
   let as := l.getAppArgs
   let bs := r.getAppArgs
   let info ← getFunInfoNArgs fl as.size

@@ -484,7 +484,7 @@ def usedFVars (e : Expr) : MetaM (Array Expr) := do
 def dumpGoal (g : Expr) : MetaM Unit := do
   let some f ← IO.getEnv "BLASTER_SMTPROOF_GOALDUMP" | return
   let s ← withOptions (fun o => o.setBool `pp.numericTypes true |>.setBool `pp.coercions.types true
-      |>.setBool `pp.fieldNotation false) do
+      |>.setBool `pp.fieldNotation false |>.setNat `pp.maxSteps 100000000 |>.setBool `pp.deepTerms true) do
     return toString (← ppExpr g)
   let h ← IO.FS.Handle.mk f .append
   h.putStrLn s!"example : {s} := by\n  blaster_nlarith\n"
@@ -779,6 +779,16 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
 partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   let ctx ← read
   let concl ← stepConcl i
+  -- debugging: the conclusions of the steps `BLASTER_SMTPROOF_STEPS` (indices) as Lean statements, in the file
+  -- `BLASTER_SMTPROOF_STEPDUMP`
+  if let some f ← IO.getEnv "BLASTER_SMTPROOF_STEPDUMP" then
+    if (((← IO.getEnv "BLASTER_SMTPROOF_STEPS").getD "").splitOn ",").contains (toString i) then
+      let g ← mkForallFVars (← usedFVars concl) concl
+      let s ← withOptions (fun o => o.setBool `pp.numericTypes true |>.setBool `pp.coercions.types true
+          |>.setBool `pp.fieldNotation false |>.setNat `pp.maxSteps 100000000 |>.setBool `pp.deepTerms true) do
+        return toString (← ppExpr g)
+      let h ← IO.FS.Handle.mk f .append
+      h.putStrLn s!"-- step {i} ({step.rule})\nexample : {s} := by\n  sorry\n"
   let attempt : ReplayM (Option Expr) := do
     try some <$> replayRule step concl
     catch ex =>
@@ -984,16 +994,18 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let some j := step.premises[0]? | throwError "lemma: premise expected"
   let n := step.clauseSize
   let lits := disjuncts concl n
-  let r ← timed "lemma" <| withLam `hn (mkNot concl) fun hn => do
+  let r ← timed "lemma" <| withLocalDeclD `hn (mkNot concl) fun hn => do
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
-    let mut facts := ctx.facts.push (mkNot concl, hn)
-    let sfx := orSuffixes lits
-    for k in [:lits.size] do
-      let l := lits[k]!
-      let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith lits sfx k h)
-      facts := facts.push (mkNot l, nl)
-      if let some a := l.not? then
-        facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
+    let facts ← timed "lemma facts" do
+      let mut facts := ctx.facts.push (mkNot concl, hn)
+      let sfx := orSuffixes lits
+      for k in [:lits.size] do
+        let l := lits[k]!
+        let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith lits sfx k h)
+        facts := facts.push (mkNot l, nl)
+        if let some a := l.not? then
+          facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
+      return facts
     -- the proofs of the steps not depending on the hypotheses discharged by the lemma stay valid after it
     -- NOTE: the hypotheses are matched on their propositions (see `hypothesis`), hence the occurrences of `hn`
     let disch := (ctx.openHyps.getD j #[]).filter (discharges ctx.proof step ·)
@@ -1013,7 +1025,7 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
         if let some a := t.not? then
           if ← propEq a cj then return mkApp p pj
       throwError "lemma: the premise is not refuted by the hypotheses")
-    return pf
+    timed "lemma abstract" do return mkLambda `hn .default (mkNot concl) (pf.abstract #[hn])
   record step.rule "exact"
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) concl r
 
