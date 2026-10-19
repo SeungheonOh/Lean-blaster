@@ -48,6 +48,35 @@ def Img {T : Sort u} {D : Sort v} (w : T → D) (d : D) : Prop := ∃ x, d = w x
 
 theorem img_self {T : Sort u} {D : Sort v} (w : T → D) (x : T) : Img w (w x) := ⟨x, rfl⟩
 
+/-! Images of the worlds of the functors (definitions of the membership predicates of their sorts, e.g., `@isList`). -/
+
+theorem img_list_nil {α : Type u} {β : Type v} (w : α → β) : Img (List.map w) [] := ⟨[], rfl⟩
+
+theorem img_list_cons {α : Type u} {β : Type v} {w : α → β} {x : β} {xs : List β} :
+    Img (List.map w) (x :: xs) ↔ Img w x ∧ Img (List.map w) xs := by
+  constructor
+  · intro ⟨l, hl⟩
+    cases l with
+    | nil => cases hl
+    | cons a l => cases hl; exact ⟨⟨a, rfl⟩, ⟨l, rfl⟩⟩
+  · intro ⟨⟨a, ha⟩, ⟨l, hl⟩⟩; exact ⟨a :: l, by rw [ha, hl]; rfl⟩
+
+theorem img_option_none {α : Type u} {β : Type v} (w : α → β) : Img (Option.map w) none := ⟨none, rfl⟩
+
+theorem img_option_some {α : Type u} {β : Type v} {w : α → β} {x : β} : Img (Option.map w) (some x) ↔ Img w x := by
+  constructor
+  · intro ⟨l, hl⟩
+    cases l with
+    | none => cases hl
+    | some a => cases hl; exact ⟨a, rfl⟩
+  · intro ⟨a, ha⟩; exact ⟨some a, by rw [ha]; rfl⟩
+
+theorem img_prod {α₁ : Type u₁} {α₂ : Type u₂} {β₁ : Type v₁} {β₂ : Type v₂} {w₁ : α₁ → α₂} {w₂ : β₁ → β₂}
+    {x : α₂} {y : β₂} : Img (Prod.map w₁ w₂) (x, y) ↔ Img w₁ x ∧ Img w₂ y := by
+  constructor
+  · intro ⟨⟨a, b⟩, h⟩; cases h; exact ⟨⟨a, rfl⟩, ⟨b, rfl⟩⟩
+  · intro ⟨⟨a, ha⟩, ⟨b, hb⟩⟩; exact ⟨(a, b), by rw [ha, hb]; rfl⟩
+
 /-- The function `f : A → B` on the interpretations `D` and `C` of its domain and codomain (worlds `wa : A → D`,
     `wb : B → C`), `dflt` outside of the image of `wa`. -/
 noncomputable def liftFun {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
@@ -236,6 +265,38 @@ theorem img_lam_ite {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
   ⟨fun x => Classical.choose (h (wa x) ⟨x, rfl⟩),
     (lam_world_ite hw fun x => (Classical.choose_spec (h (wa x) ⟨x, rfl⟩)).symm).symm⟩
 
+/-- One level of case analysis on the variables `fvs` of `g`. -/
+partial def casesVars (g : MVarId) (fvs : List FVarId) : MetaM (List MVarId) := do
+  match fvs with
+  | [] => return [g]
+  | fv :: rest =>
+      if !(← g.withContext do return (← getLCtx).contains fv) then return ← casesVars g rest
+      let sgs ← try g.cases fv catch _ => return ← casesVars g rest
+      let mut acc := []
+      for sg in sgs do
+        let rest' := rest.map fun f => match sg.subst.get f with | .fvar f' => f' | _ => f
+        acc := acc ++ (← casesVars sg.mvarId rest')
+      return acc
+
+syntax (name := blasterPolyCases) "blaster_poly_cases" : tactic
+
+/-- One level of case analysis on the variables of datatypes (e.g., in the catch-all cases of a functional
+    induction, whose hypotheses exclude the other patterns). -/
+@[tactic blasterPolyCases] def evalBlasterPolyCases : Tactic := fun _ => do
+  let g ← getMainGoal
+  let fvs ← g.withContext do
+    let mut acc := #[]
+    for d in ← getLCtx do
+      if d.isImplementationDetail then continue
+      let ty ← whnfR d.type
+      let .const n _ := ty.getAppFn | continue
+      if (← isProp ty) || (← isClass? ty).isSome then continue
+      let some (.inductInfo info) := (← getEnv).find? n | continue
+      if info.numIndices != 0 then continue
+      acc := acc.push d.fvarId
+    return acc
+  replaceMainGoal (← casesVars g fvs.toList)
+
 syntax (name := blasterPoly) "blaster_poly" : tactic
 
 /-- Proofs of the axioms of the encoding on the interpretation (e.g., the co-domain constraints and the
@@ -249,7 +310,10 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
     ← `(tactic| (apply ext_liftFun₂ (inj_injective _) <;> assumption)),
     ← `(tactic| (subst_vars; rfl)),
     ← `(tactic| (apply img_liftFun₂ (inj_injective _) (inj_injective _) <;> assumption)),
-    ← `(tactic| (apply img_liftFun (inj_injective _) <;> assumption))]
+    ← `(tactic| (apply img_liftFun (inj_injective _) <;> assumption)),
+    -- definitions of the membership predicates of the functors (e.g., `@isList`), on the cases of their arguments
+    ← `(tactic| (blaster_poly_cases <;> simp_all [img_list_nil, img_list_cons, img_option_none, img_option_some,
+          img_prod, img_self, liftFun_apply, inj_injective, listMap_injective, optionMap_injective, prodMap_injective]))]
   for t in attempts do
     let s ← saveState
     try
@@ -433,37 +497,6 @@ def instantiateUniv (e : Expr) (n : Nat) : MetaM Expr := do
 macro "blaster_poly_simp" : tactic => `(tactic| simp_all [liftFun_apply, inj_injective, liftFun_injective,
   listMap_injective, optionMap_injective, prodMap_injective, id_injective, natCast_injective, boolTrue_injective])
 
-/-- One level of case analysis on the variables `fvs` of `g`. -/
-partial def casesVars (g : MVarId) (fvs : List FVarId) : MetaM (List MVarId) := do
-  match fvs with
-  | [] => return [g]
-  | fv :: rest =>
-      if !(← g.withContext do return (← getLCtx).contains fv) then return ← casesVars g rest
-      let sgs ← try g.cases fv catch _ => return ← casesVars g rest
-      let mut acc := []
-      for sg in sgs do
-        let rest' := rest.map fun f => match sg.subst.get f with | .fvar f' => f' | _ => f
-        acc := acc ++ (← casesVars sg.mvarId rest')
-      return acc
-
-syntax (name := blasterPolyCases) "blaster_poly_cases" : tactic
-
-/-- One level of case analysis on the variables of datatypes (e.g., in the catch-all cases of a functional
-    induction, whose hypotheses exclude the other patterns). -/
-@[tactic blasterPolyCases] def evalBlasterPolyCases : Tactic := fun _ => do
-  let g ← getMainGoal
-  let fvs ← g.withContext do
-    let mut acc := #[]
-    for d in ← getLCtx do
-      if d.isImplementationDetail then continue
-      let ty ← whnfR d.type
-      let .const n _ := ty.getAppFn | continue
-      if (← isProp ty) || (← isClass? ty).isSome then continue
-      let some (.inductInfo info) := (← getEnv).find? n | continue
-      if info.numIndices != 0 then continue
-      acc := acc.push d.fvarId
-    return acc
-  replaceMainGoal (← casesVars g fvs.toList)
 
 syntax (name := blasterPolyNat) "blaster_poly_nat" : tactic
 

@@ -874,6 +874,8 @@ structure Cfg where
   facts : Array Expr := #[]
   /-- maximal number of nested unfoldings of the functions inlined by Blaster's optimizer (see `walkUnfold`) -/
   unfoldDepth : Nat := 2
+  /-- the polymorphic encoding is interpreted by `Poly` (see `walkReduced`) -/
+  polyWorld : Bool := false
 
 structure State where
   cache : Std.HashMap (Expr × Expr) (Option Expr) := {}
@@ -1205,15 +1207,41 @@ partial def walkCore (a b : Expr) : BridgeM (Option Expr) := do
   -- applications of functions of the polymorphic encoding (e.g., `f x` with `f : α → β`)
   if a.isApp && b.isApp && !a.getAppFn.isConst then
     if let some p ← walkLiftedApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
-  -- polymorphic functions at sort variables, interpreted at the universe (e.g., `List.zipWith`)
+  -- polymorphic functions at sort variables, interpreted at the universe (e.g., `List.zipWith`), and case analyses
   if let .const f _ := a.getAppFn then
     if b.getAppFn.isConstOf f && a.getAppNumArgs == b.getAppNumArgs && a != b then
-      if let some p ← walkPolyApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
-  match w with
-  | .same => walkSame a b
-  | .nat => walkNat a b
-  | .bool => walkBool a b
-  | .poly w h => walkPoly w h a b
+      if f == ``List.casesOn || f == ``Option.casesOn then
+        if let some p ← walkPolyCasesOn a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
+      else if let some p ← walkPolyApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
+  let r ← match w with
+    | .same => walkSame a b
+    | .nat => walkNat a b
+    | .bool => walkBool a b
+    | .poly w h => walkPoly w h a b
+  if r.isSome || !(← read).polyWorld then return r
+  let some p ← walkReduced a b | return none
+  return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
+
+/-- Case analyses on constructor applications (fallback of the polymorphic encoding): `match` on the goal side (ι
+    reduction) and `ite` of the interpretation whose condition is a tester of a constructor application (`if_pos`,
+    `if_neg`), e.g., the encoding of `match x :: xs with ...` on a list of a sort variable (whose matcher lemma would
+    need an inhabitant of the sort variable for the default values of its selectors). -/
+partial def walkReduced (a b : Expr) : BridgeM (Option Expr) := do
+  if let .reduced a' ← reduceMatcher? a then
+    if a' != a then return ← walk a' b
+  let some (c, x, y, _) := classicalIte? b | return none
+  let c' ← whnfR c
+  let (α, inst) := (b.getArg! 0, b.getArg! 2)
+  if c'.isConstOf ``True then
+    let some p ← walk a x | return none
+    let pe ← mkAppOptM ``if_pos #[c, inst, ← mkExpectedTypeHint (mkConst ``True.intro) c, α, x, y]
+    return some (← mkEqTrans p (← mkEqSymm pe))
+  if c'.isConstOf ``False then
+    let some p ← walk a y | return none
+    let hn ← mkExpectedTypeHint (mkLambda `h .default c (.bvar 0)) (mkNot c)
+    let pe ← mkAppOptM ``if_neg #[c, inst, hn, α, x, y]
+    return some (← mkEqTrans p (← mkEqSymm pe))
+  return none
 
 /-- Small terms: definitional equality (e.g., literals in different forms). -/
 partial def byDefEq (lhs b : Expr) : BridgeM (Option Expr) := do
@@ -1664,6 +1692,63 @@ partial def walkPolyApp (a b : Expr) : BridgeM (Option Expr) := do
     pf ← mkEqTrans pf (← mkCongrArg ctx (← mkExpectedTypeHint p (← mkEq cur[i]! bs[i]!)))
     cur := cur.set! i bs[i]!
   return some pf
+
+/-- Proof of `False` from the hypotheses of the branch (e.g., `d = []` and `¬ (List.casesOn d True fun _ _ => False)`). -/
+partial def absurdByFacts : BridgeM (Option Expr) := do
+  let facts := (← read).facts
+  if facts.isEmpty then return none
+  withRestrictedLCtx facts do
+    Blaster.Reconstruct.proveWithTactic (mkConst ``False) (← `(tactic| (subst_vars; simp_all)))
+
+/-- Case analyses on lists and options of the polymorphic encoding (testers and selectors, e.g., in the `ite`
+    encoding of a `match` on a list of a sort variable): `W(T.casesOn d ms) = T.casesOn D ms'` from `W d = D` and,
+    for each constructor, `W(mᵢ fs) = mᵢ' (W fs)` under `d = cᵢ fs`, or a contradiction of `d = cᵢ fs` with the
+    hypotheses of the branch (e.g., for the default values of selectors, see `Poly.list_casesOn_world`). -/
+partial def walkPolyCasesOn (a b : Expr) : BridgeM (Option Expr) := do
+  let .const f _ := a.getAppFn | return none
+  let (lem, map, nargs) ← if f == ``List.casesOn then pure (``Poly.list_casesOn_world, ``List.map, 5)
+    else if f == ``Option.casesOn then pure (``Poly.option_casesOn_world, ``Option.map, 4) else return none
+  if !(a.isAppOfArity f nargs && b.isAppOfArity f nargs) then return none
+  let as := a.getAppArgs
+  let bs := b.getAppArgs
+  let (d, dd) := (as[2]!, bs[2]!)
+  let some (wd, _) ← Poly.mkWorld (← inferType d) (← inferType dd) | return none
+  if !wd.isAppOfArity map 3 then return none
+  let w := wd.appArg!
+  -- non-dependent motives, and the world of the results
+  let .lam _ _ c _ := as[1]! | return none
+  let .lam _ _ c' _ := bs[1]! | return none
+  if c.hasLooseBVars || c'.hasLooseBVars then return none
+  let wr ← match ← Poly.mkWorld c c' with
+    | some (wr, _) => pure wr
+    | none => if ← isDefEq c c' then pure (mkLambda `x .default c (.bvar 0)) else return none
+  let some hd ← walk d dd | return none
+  -- `∀ fs, d = cᵢ fs → wr (mᵢ fs) = mᵢ' (W fs)`
+  let minor (fields : Array (Name × Expr)) (ctor : Array Expr → MetaM Expr) (lifted : Array Expr → MetaM (Array Expr))
+      (m m' : Expr) : BridgeM (Option Expr) :=
+    withLocalDeclsD (fields.map fun (n, t) => (n, fun _ => pure t)) fun fs => do
+    withLocalDeclD `e (← mkEq d (← ctor fs)) fun e => withReader (fun cfg => { cfg with facts := cfg.facts.push e }) do
+      let l := (mkAppN m fs).headBeta
+      let r := (mkAppN m' (← lifted fs)).headBeta
+      let goal ← mkEq (Poly.applyWorld wr l) r
+      let p ← match ← walk l r with
+        | some p => pure (some (← mkExpectedTypeHint p goal))
+        | none => do
+            let some pf ← absurdByFacts | pure none
+            pure (some (← mkFalseElim goal pf))
+      let some p := p | return none
+      some <$> mkLambdaFVars (fs.push e) p
+  let ta := as[0]!
+  if f == ``List.casesOn then
+    let some hn ← minor #[] (fun _ => mkAppOptM ``List.nil #[ta]) (fun _ => pure #[]) as[3]! bs[3]! | return none
+    let some hc ← minor #[(`h, ta), (`t, ← mkAppM ``List #[ta])] (fun fs => mkAppM ``List.cons #[fs[0]!, fs[1]!])
+        (fun fs => do return #[Poly.applyWorld w fs[0]!, ← mkAppM ``List.map #[w, fs[1]!]]) as[4]! bs[4]! | return none
+    return some (← mkAppM lem #[wr, hd, hn, hc])
+  else
+    let some hn ← minor #[] (fun _ => mkAppOptM ``Option.none #[ta]) (fun _ => pure #[]) as[3]! bs[3]! | return none
+    let some hc ← minor #[(`v, ta)] (fun fs => mkAppM ``Option.some #[fs[0]!])
+        (fun fs => do return #[Poly.applyWorld w fs[0]!]) as[4]! bs[4]! | return none
+    return some (← mkAppM lem #[wr, hd, hn, hc])
 
 /-- `w a = b` where `w` is the world of the type of `a` in the polymorphic encoding (see `Poly.mkWorld`), with
     `h` the proof of its injectivity. -/

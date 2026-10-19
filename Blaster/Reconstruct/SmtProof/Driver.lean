@@ -1006,7 +1006,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     -- 4. replay
     let bridge ← bridgeTactics
     -- axioms of the polymorphic encoding (see `Poly`)
-    let bridge ← if poly then pure (#[("poly", ← `(tactic| blaster_poly))] ++ bridge) else pure bridge
+    let polyTac := #[("poly", ← `(tactic| blaster_poly))]
+    let bridge := if poly then polyTac ++ bridge else bridge
     -- matcher instances optimized by Blaster (whose patterns are the translated ones)
     let mut insts : Std.HashMap Name Expr := {}
     for (k, v) in tenv.optEnv.memCache.isMatcherCache.toList do insts := insts.insert k.name v.instApp
@@ -1023,7 +1024,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       (interp body).run { table := tbl, locals }
     let macroTacs ← macroTactics
     let bcfg : Bridge.Cfg := {
-      matchInst := insts.get?, macroOf
+      matchInst := insts.get?, macroOf, polyWorld := poly
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
@@ -1062,6 +1063,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           let tacs ← match (← tacCache.get).get? rule with
             | some t => pure t
             | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+          -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
+          let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
           portfolio tacs stmt rule }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
