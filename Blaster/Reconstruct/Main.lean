@@ -83,7 +83,7 @@ def logSmtProof (kind : String) (res : Except String SmtProof.SmtProofResult) : 
         let ms := Json.mkObj (r.stats.msByRule.toList.map fun (k, v) => (k, toJson v))
         let methods := Json.mkObj (r.stats.byRule.toList.map fun (k, m) =>
           (k, Json.mkObj (m.toList.map fun (k', v) => (k', toJson v))))
-        [("ok", toJson true), ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]
+        [("ok", toJson true), ("backend", toJson r.backend), ("steps", toJson r.steps), ("ms", ms), ("methods", methods)]
     | .error msg => [("error", toJson (msg.take 2000))]
   h.putStrLn (Json.compress (Json.mkObj ([("file", toJson (← getFileName)), ("line", toJson line),
     ("kind", toJson kind)] ++ fields)))

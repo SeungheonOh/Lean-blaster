@@ -683,7 +683,7 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let some j := step.premises[0]? | throwError "lemma: premise expected"
   let n := step.clauseSize
   let lits := disjuncts concl n
-  let r ← withLam `hn (mkNot concl) fun hn => do
+  let r ← timed "lemma" <| withLam `hn (mkNot concl) fun hn => do
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
     let mut facts := ctx.facts.push (mkNot concl, hn)
     for k in [:lits.size] do
@@ -692,7 +692,7 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
       facts := facts.push (mkNot l, nl)
       if let some a := l.not? then
         facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
-    let pf ← withScope (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
+    let pf ← timed "subproof" <| withScope (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
       -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
       let cj ← stepConcl j

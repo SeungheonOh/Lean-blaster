@@ -52,6 +52,8 @@ structure Pair where
   assertIdx : Nat
   /-- the formula of the axiom -/
   formula : SExpr
+  /-- a type predicate of a recursive datatype (`@isT` defined by the recursive definition `@isT_LRec`) -/
+  isPred : Bool := false
   deriving Inhabited
 
 structure InlineCtx where
@@ -165,11 +167,11 @@ def rewriteQuery (cmds : Array SExpr) : Except String (Array SExpr × Array Pair
       let some n := declared.get? f | continue
       let some d := defs.get? g | continue
       if n != vars.size || d.params.size != vars.size then continue
-      found := found.push { fn := f, defn := g, assertIdx := i, formula := φ }
+      found := found.push { fn := f, defn := g, assertIdx := i, formula := φ, isPred := d.isRec && f.startsWith "@is" }
       paired := paired.insert f
       break
   let dropped : Std.HashSet Nat := found.foldl (fun s p => s.insert p.assertIdx) {}
-  let pairs := found.filter (!·.fn.startsWith "@is")
+  let pairs := found.filter (!·.isPred)
   if pairs.isEmpty then throw "no recursive function"
   let fns : Std.HashSet String := pairs.foldl (fun s p => s.insert p.fn) {}
   let ictx : InlineCtx := {
@@ -394,14 +396,23 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
       todo := subgoals.toList.map (·.mvarId) ++ todo
       continue
     setGoals [g]
-    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done))) catch _ => pure ()
+    -- NOTE: e.g., `grind` for the orientations of equalities and the orders of conjunctions of Blaster's normal forms
+    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done) | rfl | (simp_all <;> grind) | grind))
+    catch _ => pure ()
     if (← getGoals).isEmpty then continue
-    if unfolded.contains g then remaining := remaining ++ [g]; continue
-    -- user definitions exposed by the case analyses
-    try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
-    for g' in ← getGoals do
-      unfolded := unfolded.insert g'
-      todo := g' :: todo
+    if !unfolded.contains g then
+      -- user definitions exposed by the case analyses
+      try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
+      for g' in ← getGoals do
+        unfolded := unfolded.insert g'
+        todo := g' :: todo
+      continue
+    -- case analyses on the conditions of `match` (e.g., literal patterns) and `if`
+    let some gs ← observing? (do evalTactic (← `(tactic| split)); getGoals) | remaining := remaining ++ [g]; continue
+    count := count + gs.length
+    if count > maxEqnGoals then throwError "blaster_rec_eqn: too many cases"
+    for g' in gs do unfolded := unfolded.insert g'
+    todo := gs ++ todo
   if !remaining.isEmpty then
     for g in remaining.take 2 do debugLog m!"blaster_rec_eqn: unsolved case\n{← Meta.ppGoal g}"
     throwError "blaster_rec_eqn: unsolved cases"
