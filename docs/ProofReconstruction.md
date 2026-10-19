@@ -273,14 +273,15 @@ tactic strategies), `first`, `only` (no tactic strategies, to measure the replay
 ### Results
 
 On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=only` (no tactic strategy for
-SMT residuals), the replay of Z3 proofs proves **93.5%** of the goals closed by the SMT solver (302/323, nightly
-Z3; 88.9%, 248/279, before the closed-statement tactics, the polymorphic universe interpretation and the
-nonlinear lemmas). The remaining failures are mostly `match` patterns on `Int` with named patterns
-(`Tests/Smt/SmtMatch.lean`, 9) and polymorphic Lean functions in goals with several sort variables
-(`Tests/FixedIssues/Issue26.lean`, 7; all 8 goals of this file are now replayed with the interpretation of the
-polymorphic functions at the universe). With the default mode (`last`), the replay complements the tactic
-strategies: 99.8% of all the reconstruction attempts succeed (3914/3921), including all the 380 goals closed by
-the SMT solver; the 7 failures are `#testOptimize` certificates of `match` normalizations.
+SMT residuals), the replay of Z3 proofs proves **99.1%** of the goals closed by the SMT solver (338/341, nightly
+Z3; 88.9%, 248/279, before the closed-statement tactics, the universe interpretation of polymorphic goals, the
+nonlinear lemmas and the bridge of normalized `match` patterns). Counting each replay attempt of the `Tests/Smt`
+and `Tests/FixedIssues` files, 283 of 297 goals are replayed; the remaining ones involve polymorphic user
+datatypes (no world for them), types quantified as values, empty types, a nonlinear lemma over products of
+conditionals (`Tests/Smt/SmtMatch.lean`) and a proof-production timeout. With the default mode (`last`), the
+replay complements the tactic strategies: 99.8% of all the reconstruction attempts succeed (3917/3924),
+including all the 383 goals closed by the SMT solver and the 411 goals closed by the optimizer; the 7 failures
+are `#testOptimize` certificates of `match` normalizations.
 
 The replay also scales to the validators of
 [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
