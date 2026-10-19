@@ -82,6 +82,14 @@ theorem zipWith_map_left {l₁ : List α} {l₂ : List β} {f : α → α'} {g :
     List.zipWith g (l₁.map f) l₂ = List.zipWith (fun a b => g (f a) b) l₁ l₂ := by
   induction l₁ generalizing l₂ <;> blaster (reconstruct: 2) (smt-proof: 3)
 
+-- `match` on datatypes with fields of sort variables (by case analysis on the discriminant, see `walkPolySplit`)
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [(∀ (β : Type) (xs : List β) (g : β → Nat), (match xs with | [] => 5 | h :: _ => g h) > 3) →
+   ∀ (α : Type) (xs : List α) (g : α → Nat), (match xs with | [] => 5 | h :: _ => g h) > 2]
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [(∀ (β : Type) (o : Option β) (g : β → Nat), (match o with | none => 5 | some h => g h) > 3) →
+   ∀ (α : Type) (o : Option α) (g : α → Nat), (match o with | none => 5 | some h => g h) > 2]
+
 -- datatypes of the user over sort variables, mapped to the universe by their recursors (see `Poly.mkIndWorld`):
 -- the images of their constructors (definitions of their membership predicates), case analyses, constructors of
 -- undetermined instances

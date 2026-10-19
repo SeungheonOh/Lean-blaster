@@ -256,11 +256,15 @@ their recursors (each constructor to itself, its fields by their worlds, its nes
 injectivity (case analysis and injection) and, per constructor, its equation in the world (with the nested
 occurrences as `List.map`) and its image (`Img W (C ys) = Img Ŵ₁ y₁ ∧ …`), used by the bridge (constructors,
 case analyses, definitions of the membership predicates expanded by the backend) and by the tactics proving
-the axioms of the encoding and the naturality lemmas. Polymorphic Lean functions instantiated at sort
-variables (e.g., `@List.zipWith α β γ`, whose SMT function is shared by all the instantiations of a universe)
-are interpreted at the universe (`@List.zipWith Univ Univ Univ`, with the universe levels inferred by type
-checking), such that their definitional axioms hold on all the values of the universe; the bridge relates their applications in the goal to their
-interpretations by *naturality* lemmas, e.g., `List.zipWith (lift f) (List.map (inj α) xs) (List.map (inj β) ys) =
+the axioms of the encoding and the naturality lemmas. A `match` on such a datatype (or on a list or an option of
+a sort variable), whose `ite` encoding would need default values of the selectors at the sort variables, is
+related to its interpretation by case analysis on its discriminant (generalized in both terms), with the
+equations of the constructors in the world and the testers and selectors of the interpretation reduced.
+Polymorphic Lean functions instantiated at sort variables (e.g., `@List.zipWith α β γ`, whose SMT function is
+shared by all the instantiations of a universe) are interpreted at the universe (`@List.zipWith Univ Univ Univ`,
+with the universe levels inferred by type checking), such that their definitional axioms hold on all the values
+of the universe; the bridge relates their applications in the goal to their interpretations by *naturality*
+lemmas, e.g., `List.zipWith (lift f) (List.map (inj α) xs) (List.map (inj β) ys) =
 List.map (inj γ) (List.zipWith f xs ys)`, stated from the types of the function and proved once per function and
 instantiation by functional induction (`blaster_poly_nat`), and relates the testers and selectors of lists and
 options of sort variables to those of their interpretations (the default values of selectors by contradiction with
@@ -317,8 +321,9 @@ For instance, a 245-step Z3 proof involving a recursive function replays in ~6 s
 
 Limitations: polymorphic goals with several sort variables over datatypes of the user without world (indices,
 recursive fields of function types, proof fields whose propositions mention the sort variables, e.g., properties
-quantified over the instances of a class), `match` on datatypes with fields of sort variables in the universe
-interpretation (the `ite` encoding needs default values of the selectors), axioms and non-parametric functions;
+quantified over the instances of a class), constructor applications whose instance only the sort of a quantified
+variable determines (the undetermined type parameters of the conclusions of steps default to the universe), axioms
+and non-parametric functions;
 `match` patterns on `Nat`/`Int` with variables (e.g., `n + 1`, whose translation needs the conditions of the
 branch) and named patterns; cvc5's native CPC format (whose steps often leave their conclusion
 implicit) is not supported; Z3 may not find a proof without Blaster's `recfun-finder` tactic (incompatible

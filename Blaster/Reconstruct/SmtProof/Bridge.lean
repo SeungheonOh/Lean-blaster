@@ -1228,8 +1228,74 @@ partial def walkCore (a b : Expr) : BridgeM (Option Expr) := do
     | .bool => walkBool a b
     | .poly w h => walkPoly w h a b
   if r.isSome || !(← read).polyWorld then return r
+  if let some p ← walkPolySplit w a b then return some p
   let some p ← walkReduced a b | return none
   return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
+
+/-- Matchers on the datatypes over sort variables (e.g., lists, or datatypes of the user, see `Poly.mkIndWorld`),
+    whose `ite` encoding would need default values of the selectors at the sort variables (see `matcherIte?`):
+    `W(M d alts) = B[W' d]` by case analysis on the discriminant `d` (generalized in both terms), the equations of the
+    constructors in the world `W'` of `d` (see `Poly.IndWorldLemmas`, by reduction for the functors, e.g.,
+    `List.map`), and the testers and selectors of the interpretation reduced on constructor applications (see
+    `reduceCases` and `walkReduced`). -/
+partial def walkPolySplit (w : World) (a b : Expr) : BridgeM (Option Expr) := do
+  let .const m _ := a.getAppFn | return none
+  let some info ← getMatcherInfo? m | return none
+  if info.numDiscrs != 1 || a.getAppNumArgs != info.arity then return none
+  let i := info.numParams + 1
+  let d := a.getArg! i
+  if (a.getAppArgs.extract (i + 1) a.getAppNumArgs).any fun alt => (alt.find? (· == d)).isSome then return none
+  -- the world of `d`: its application in the interpretation
+  let cands ← IO.mkRef (#[] : Array Expr)
+  b.forEach fun s => do if s.isApp && s.appArg! == d then cands.modify (·.push s)
+  let mut wdd? := none
+  for s in ← cands.get do
+    if let some (w', _) ← Poly.mkWorld (← inferType d) (← inferType s) then
+      if Poly.applyWorld w' d == s then wdd? := some (s, w'); break
+  let some (wdd, wd) := wdd? | return none
+  -- the equations of the constructors in the world (by reduction for the functors, e.g., `List.map`)
+  let lemmas? ← Poly.indWorldLemmas? wd
+  let tD ← inferType wdd
+  let B ← kabstract b wdd
+  if !B.hasLooseBVars || (B.find? (· == d)).isSome then return none
+  let td ← whnfD (← inferType d)
+  let .const T lvls := td.getAppFn | return none
+  let some (.inductInfo tinfo) := (← getEnv).find? T | return none
+  if tinfo.numIndices != 0 then return none
+  let ps := td.getAppArgs
+  let stmt (z : Expr) : MetaM Expr := do mkEq (w.lift (mkAppN a.getAppFn (a.getAppArgs.set! i z))) (B.instantiate1 (Poly.applyWorld wd z))
+  let motive ← withLocalDeclD `z td fun z => do mkLambdaFVars #[z] (← stmt z)
+  let mut minors := #[]
+  for ctor in tinfo.ctors do
+    let some eqn ← (match lemmas? with
+        | some lemmas => pure ((lemmas.eqns.find? (·.1 == ctor)).map (·.2))
+        | none => do
+            let c := mkAppN (mkConst ctor lvls) ps
+            forallTelescope (← inferType c) fun fs _ => do
+              let l := Poly.applyWorld wd (mkAppN c fs)
+              let r ← whnf l
+              if !(← isConstructorApp r) then return none
+              some <$> mkLambdaFVars fs (← mkExpectedTypeHint (← mkEqRefl r) (← mkEq l r)))
+      | return none
+    let some minor ← forallTelescope (← inferType eqn) fun fs e => do
+        let some (_, l, r) := e.eq? | return none
+        let cfs := l.appArg!
+        -- `M (C fs) alts` reduces to the alternative of `C`
+        let .reduced ai ← reduceMatcher? (mkAppN a.getAppFn (a.getAppArgs.set! i cfs)) | return none
+        let bi := B.instantiate1 r
+        let bi' ← reduceCases bi
+        let some p ← walk ai bi' | return none
+        let p ← mkExpectedTypeHint p (← mkEq (w.lift ai) bi)
+        let ctx ← withLocalDeclD `z tD fun z => do mkLambdaFVars #[z] (B.instantiate1 z)
+        let p₁ ← mkCongrArg ctx (mkAppN eqn fs)
+        let p ← mkEqTrans p (← mkEqSymm p₁)
+        some <$> mkLambdaFVars fs (← mkExpectedTypeHint p (← stmt cfs))
+      | return none
+    minors := minors.push minor
+  let casesOn := mkCasesOnName T
+  let clvls := if (← getConstInfo casesOn).levelParams.length == lvls.length + 1 then levelZero :: lvls else lvls
+  let pf := mkAppN (mkConst casesOn clvls) (ps.push motive |>.push d |>.append minors)
+  return some (← mkExpectedTypeHint pf (← mkEq (w.lift a) b))
 
 /-- Case analyses on constructor applications (fallback of the polymorphic encoding): `match` on the goal side (ι
     reduction) and `ite` of the interpretation whose condition is a tester of a constructor application (`if_pos`,
@@ -1614,9 +1680,9 @@ partial def walkPolyBinder (a b : Expr) : BridgeM (Option Expr) := do
       else mkAppM ``forall_congr #[pc]
     return some (← mkExpectedTypeHint (← mkEqTrans pf pc) (← mkEq a b))
 
-/-- `∀ y, Img w y = G y` where `G` is the definition of the membership predicate of a datatype (e.g., `@isEither`,
-    a macro expanded by the backend in the asserted formulas), by case analysis on `y` and the images of the
-    constructors (see `Poly.IndWorldLemmas`), once per statement (closed over its free variables). -/
+/-- `∀ y, Img w y = G y` where `G` is the definition of the membership predicate of a datatype (e.g., `@isEither` or
+    `@isOption`, macros expanded by the backend in the asserted formulas), by case analysis on `y` and the images of
+    the constructors (see `Poly.IndWorldLemmas`), once per statement (closed over its free variables). -/
 partial def polyGuardEq (w d guard : Expr) : BridgeM (Option Expr) := do
   let stmt ← withLocalDeclD `y d fun y => do
     mkForallFVars #[y] (← mkEq (← mkAppM ``Poly.Img #[w, y]) (guard.instantiate1 y))
@@ -1629,7 +1695,8 @@ partial def polyGuardEq (w d guard : Expr) : BridgeM (Option Expr) := do
         let extra ← Poly.indWorldSimpTerms closed
         let l ← try
             let some pf ← withLCtx {} {} (Blaster.Reconstruct.proveWithTactic closed
-                (← `(tactic| (intros; blaster_poly_cases <;> simp_all [$extra,*]))))
+                (← `(tactic| (intros; blaster_poly_cases <;> simp_all [Poly.img_list_nil, Poly.img_list_cons,
+                  Poly.img_option_none, Poly.img_option_some, Poly.img_prod, $extra,*]))))
               | pure none
             pure (some (← mkAuxTheorem closed pf))
           catch _ => pure none
