@@ -238,7 +238,7 @@ def stackContinuity (stack : List OptimizeStack) (optExpr : Expr) (skipCache := 
        -- continuity with optimizing next expression
        let e ← mkLambdaFVarExpr x optExpr
        if inDite then
-         if ← isCstIteMatch optExpr then updateCtorMatchPropCache e
+         if (← isCstIteMatch optExpr).res then updateCtorMatchPropCache e
          resetChoiceContext hctx #[x] e 0
          stackContinuity xs e
        else
@@ -263,7 +263,7 @@ def stackContinuity (stack : List OptimizeStack) (optExpr : Expr) (skipCache := 
        -- optExpr corresponds to the optimized match rhs
        -- continuity with optimizing next expression
        let e ← mkLambdaFVarsExpr params optExpr
-       if ← isCstIteMatch optExpr then updateCtorMatchPropCache e
+       if (← isCstIteMatch optExpr).res then updateCtorMatchPropCache e
        resetChoiceContext hctx params matchInst idx
        stackContinuity xs e
 

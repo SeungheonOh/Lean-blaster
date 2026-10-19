@@ -56,8 +56,8 @@ partial def allExplicitParamsAreCtor (f : Expr) (args: Array Expr) (funPropagati
         then
           if funPropagation then
             let res ← isCstIteMatch e
-             if (← pure res <||> isPropFunType p e)
-             then loop (i+1) stop pInfoSize (atLeastOneExplicitCstr || res && (← isIteOrMatch e))
+             if (← pure res.res <||> isPropFunType p e)
+             then loop (i+1) stop pInfoSize (atLeastOneExplicitCstr || res.res && !res.isConstructor)
              else return false
           else
              let cstProp ← isNormConstructor e
@@ -375,8 +375,8 @@ def constMatchPropagation?
       else
         let p := cargs[idx]!
         let res ← isCstIteMatch p
-        if res then
-          allDiscrsAreCstMatch (idx + 1) stop (atLeastOneMatchITE || (← isIteOrMatch p))
+        if res.res then
+          allDiscrsAreCstMatch (idx + 1) stop (atLeastOneMatchITE || !res.isConstructor)
         else return false
 
 
@@ -425,7 +425,7 @@ def constMatchPropagation?
         eraseMatchRhsRewriteCache mInfo
         let mut pargs := cargs[idx]!.getAppArgs
         for i in [argInfo.getFirstAltPos : argInfo.arity] do
-          -- NOTE: No need to propagate reuse context as match name has not changed
+          -- NOTE: No need to propagate reuse context as match name and discriminators have not changed
           pargs ← pargs.modifyM i (pushMatchInLambda cm cargs idx)
         -- NOTE: we also need to set the return type for pulled over match
         -- to meet the return type of the embedded match.
