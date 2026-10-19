@@ -182,13 +182,15 @@ def toSmtWorld (e : Expr) : MetaM Expr := do
 initialize typeAliasCache : IO.Ref (Std.HashMap Name Bool) ← IO.mkRef {}
 
 /-- Whether `c` is a type alias: a non-recursive definition of a type or of a type constructor (e.g.,
-    `def ScriptHash : Type := ByteString`), which Blaster's translation unfolds. -/
+    `def ScriptHash : Type := ByteString`), which Blaster's translation unfolds. The types of the interpretation
+    itself (e.g., `Poly.Univ`) are not aliases. -/
 def isTypeAlias (c : Name) : MetaM Bool := do
   if let some b := (← typeAliasCache.get).get? c then return b
   let env ← getEnv
   let b := match env.find? c with
     | some (.defnInfo info) =>
-        info.type.getForallBody.isSort && !isInstanceCore env c && !(info.value.find? (·.isConstOf c)).isSome
+        !(`Blaster).isPrefixOf c && info.type.getForallBody.isSort && !isInstanceCore env c &&
+        !(info.value.find? (·.isConstOf c)).isSome
     | _ => false
   typeAliasCache.modify (·.insert c b)
   return b
