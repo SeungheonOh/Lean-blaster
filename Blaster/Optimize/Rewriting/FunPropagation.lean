@@ -90,7 +90,12 @@ def normChoiceApplication?
         margs ← margs.modifyM i (mkAppInRhs extra_args lhs)
       -- update match return type
       margs ← margs.modifyM idxType (updateMatchReturnType retType)
-      return mkAppN f margs
+      let r := mkAppN f margs
+      -- justified by the match equations, i.e., `(match d with alts) x₁ ... xₙ = match d with (alts · x₁ ... xₙ)`
+      Blaster.Reconstruct.withProofM (mkAppN f args) r do
+        let inner := mkAppN f (args.take argInfo.arity)
+        let ctx := Expr.lam `z (← Meta.inferType inner) (mkAppN (.bvar 0) extra_args) .default
+        Blaster.Reconstruct.mkMatchPushProof ctx inner r
 
 /-- Apply the following propagation rules on any function application `fn e₁ ... eₙ`
     only when fn := Expr.const n l ∧ n ≠ Blaster.dite' ∧ ¬ isNotFun fn ∧ propagate fn e₁ ... eₙ
@@ -216,6 +221,11 @@ def funPropagation? (cf : Expr) (cargs : Array Expr) (skipPropCheck := false) (r
         pargs ← pargs.modifyM i (updateRhsWithFun f args idxArg lhs)
       -- NOTE: we also need to set the return type for pulled over match to meet the function's return type
       pargs ← pargs.modifyM idxType (updateMatchReturnType retType)
-      return (mkAppN argInfo.nameExpr pargs)
+      let r := mkAppN argInfo.nameExpr pargs
+      -- justified by the match equations, i.e., `f (match d with alts) = match d with (f ∘ alts)`
+      Blaster.Reconstruct.withProofM (mkAppN f args) r do
+        let inner := args[idxArg]!
+        let ctx := Expr.lam `z (← Meta.inferType inner) (mkAppN f (args.set! idxArg (.bvar 0))) .default
+        Blaster.Reconstruct.mkMatchPushProof ctx inner r
 
 end Blaster.Optimize

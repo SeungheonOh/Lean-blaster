@@ -264,7 +264,12 @@ def constMatchPropagation?
         pargs ← pargs.modifyM idxType (updateMatchReturnType retType)
         let pMatchExpr := mkAppN argInfo.nameExpr pargs
         if extra_args.isEmpty
-        then return pMatchExpr
+        then
+          -- case of case: justified by the match equations of the pulled match
+          Blaster.Reconstruct.withProofM (mkAppN cm cargs) pMatchExpr do
+            let inner := cargs[idx]!
+            let ctx := mkLambda `z .default (← Meta.inferType inner) (mkAppN cm (margs.set! idx (.bvar 0)))
+            Blaster.Reconstruct.mkMatchPushProof ctx inner pMatchExpr
         else return mkAppN pMatchExpr extra_args
       else return none
 
