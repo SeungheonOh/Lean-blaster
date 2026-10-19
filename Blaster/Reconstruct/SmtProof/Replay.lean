@@ -1186,6 +1186,12 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     if ← timed "defeq" (defeqBudget a b 20000 unfoldable) then
       record step.rule "defeq"
       return ← mkExpectedTypeHint (← mkEqRefl a) concl
+  -- unfoldings of recursive functions by Z3's rewriter (e.g., applications to constructors): instances of their
+  -- definitional equations (see `RecFun.proveLemma`)
+  if step.rule == "rewrite" && step.premises.isEmpty && cfg.recFunOnly && concl.isEq then
+    if let some p ← timed "recfun" (cfg.proveRecFun concl 1) then
+      record step.rule "recfun"
+      return p
   let ps ← premises step
   -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl

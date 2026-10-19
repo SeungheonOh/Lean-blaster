@@ -565,6 +565,20 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     throwError "blaster_rec_eqn: unsolved cases"
   setGoals []
 
+/-- Proof of the definitional axiom `∀ x⃗, f x⃗ = body` of a recursive function `f` asserted by Blaster's query (the
+    backends without `define-funs-rec`, e.g., `z3`), by `blaster_rec_eqn`. -/
+def proveDefAxiom? (c : Expr) : TermElabM (Option Expr) := do
+  if c.hasFVar || c.hasMVar then return none
+  let some head ← forallTelescope c fun _ b => do
+      let some (_, l, _) := b.eq? | return none
+      return lhsHead? l
+    | return none
+  if !(← isRecursiveDefinition head) then return none
+  let t0 ← IO.monoMsNow
+  let p ← withLCtx {} {} <| proveWithTactic c (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
+  debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for the axiom of {head} ({(← IO.monoMsNow) - t0} ms)"
+  return p
+
 /-! ## Lemmas -/
 
 /-- Short form of `e` for debugging messages (large terms are not printed). -/

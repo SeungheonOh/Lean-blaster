@@ -1192,6 +1192,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           -- definitions of Lean functions (e.g., by `match`): the traversal of their unfolding
           if !c.isAppOfArity ``Not 1 then
             if let some p ← (try Bridge.proveDefinition? bcfg c catch _ => pure none) then return some p
+          -- definitional axioms of recursive functions (backends without `define-funs-rec`)
+          if !c.isAppOfArity ``Not 1 then
+            if let some p ← RecFun.proveDefAxiom? c then return some p
           let r ← portfolio bridge c "bridge"
           if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then debugLog m!"bridge failed: {← dagString c 4000}"
           if r.isNone then
