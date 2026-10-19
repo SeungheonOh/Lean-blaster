@@ -637,9 +637,14 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
         match imp with
         | some q => pure (stmt', mkApp q p)
         | none => debugLog m!"recfun: no normal form for {eq.head}"; pure (stmt, p)
-      let m ← mkFreshExprMVar stmt
-      m.mvarId!.assign p
-      r := some (stmt, m)
+      -- NOTE: an auxiliary theorem, such that the instances of the equation (see `instantiateEq`) do not copy its
+      -- proof (the instantiation of a metavariable assigned to the proof would beta-reduce its applications)
+      let p ← instantiateMVars p
+      let c ← try mkAuxTheorem stmt p catch _ => do
+        let m ← mkFreshExprMVar stmt
+        m.mvarId!.assign p
+        pure m
+      r := some (stmt, c)
       break
     debugLog m!"recfun: definitional equation not proved: {brief stmt}"
   eq.proof.set (some r)
