@@ -232,22 +232,28 @@ where
 -/
 def reconMaxRecDepth : Nat := 100000
 
-@[inline] def withReconRecDepth (x : TermElabM α) : TermElabM α :=
-  withTheReader Core.Context (fun ctx => { ctx with maxRecDepth := reconMaxRecDepth }) x
+/-- Execute `x` (a reconstruction) with the maximum recursion depth `reconMaxRecDepth` and without asynchronous
+    elaboration, i.e., the auxiliary declarations created during reconstruction (e.g., by tactics or by the replay
+    of SMT proofs) are checked by the kernel when they are added and kernel errors are reported as exceptions,
+    instead of messages reported once the reconstruction has succeeded (the declaration being added as an axiom).
+-/
+@[inline] def withReconContext (x : TermElabM α) : TermElabM α :=
+  withOptions (fun o => Elab.async.set o false) <|
+    withTheReader Core.Context (fun ctx => { ctx with maxRecDepth := reconMaxRecDepth }) x
 
 /-- Same as `reconstruct` but any exception (including runtime exceptions such as maximum recursion
     depth or heartbeats) is reported as a reconstruction failure.
 -/
 def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome := do
   let s ← saveState
-  let out ← tryCatchRuntimeEx (withReconRecDepth (reconstruct task recon)) fun ex => do
+  let out ← tryCatchRuntimeEx (withReconContext (reconstruct task recon)) fun ex => do
     s.restore
     return { failure := m!"exception: {ex.toMessageData}" }
   if out.proof?.isSome then return out
   -- fallback: prove the original goal directly with Lean's decision procedures
   let startTime ← IO.monoMsNow
   let s ← saveState
-  let direct ← tryCatchRuntimeEx (withReconRecDepth (proveDirect task.goal task.axioms)) fun _ => do
+  let direct ← tryCatchRuntimeEx (withReconContext (proveDirect task.goal task.axioms)) fun _ => do
     s.restore
     return none
   match direct with
@@ -279,7 +285,7 @@ where
 /-- Same as `reconstructRewrite` but any exception is reported as a reconstruction failure. -/
 def reconstructRewriteSafe (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermElabM ReconOutcome := do
   let s ← saveState
-  tryCatchRuntimeEx (withReconRecDepth (reconstructRewrite e optExpr pf recon)) fun ex => do
+  tryCatchRuntimeEx (withReconContext (reconstructRewrite e optExpr pf recon)) fun ex => do
     s.restore
     return { failure := m!"exception: {ex.toMessageData}" }
 
