@@ -382,9 +382,17 @@ def withScope (x : ReplayM α) (inherit := false) (keep : Nat → Bool := fun _ 
   -- `keep` (e.g., not depending on the hypotheses of a nested lemma) are kept, such that the steps shared by the
   -- subproofs of nested lemmas are not replayed in each of them
   modify fun s => { s with scopeCache := if inherit then s.scopeCache else {}, scopeFailed := {} }
-  try x finally modify fun s =>
-    let inner := if inherit then s.scopeCache.fold (fun m i p => if keep i then m.insert i p else m) saved.1 else saved.1
-    { s with scopeCache := inner, scopeFailed := saved.2 }
+  let lctx ← getLCtx
+  try x finally
+    -- debugging: kept proofs with free variables of the new scope
+    if inherit && (← IO.getEnv "BLASTER_SMTPROOF_CHECKSCOPE").isSome then
+      for (i, p) in (← get).scopeCache.toList do
+        if keep i && !saved.1.contains i then
+          let p' ← instantiateMVars p
+          if p'.hasAnyFVar (!lctx.contains ·) then IO.eprintln s!"scope: kept step {i} has free variables of its scope"
+    modify fun s =>
+      let inner := if inherit then s.scopeCache.fold (fun m i p => if keep i then m.insert i p else m) saved.1 else saved.1
+      { s with scopeCache := inner, scopeFailed := saved.2 }
 
 /-- Definitional equality with a heartbeat budget (default transparency when `unfold`, reducible otherwise). -/
 def defeqBudget (a b : Expr) (budget : Nat) (unfold : Bool) : MetaM Bool := do
