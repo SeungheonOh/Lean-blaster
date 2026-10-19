@@ -151,4 +151,26 @@ abbrev TermCache (α : Type) := Std.HashMap USize α
 @[inline] unsafe def termAddrImpl (t : STerm) : USize := ptrAddrUnsafe t
 @[implemented_by termAddrImpl] opaque termAddr (t : STerm) : USize
 
+/-- Structural equality of `a` and `b` (shared objects are equal), `false` beyond `fuel` nodes. -/
+partial def STerm.eqBounded (a b : STerm) (fuel : Nat := 1000) : Bool :=
+  (go a b fuel).getD false
+where
+  go (a b : STerm) (fuel : Nat) : Option Bool := do
+    if termAddr a == termAddr b then return true
+    if fuel == 0 then none
+    let all (as bs : Array STerm) : Option Bool := do
+      if as.size != bs.size then return false
+      for (x, y) in as.zip bs do
+        if !(← go x y (fuel / (as.size + 1))) then return false
+      return true
+    match a, b with
+    | .sym x, .sym y | .lit x, .lit y | .str x, .str y => return x == y
+    | .num x, .num y => return x == y
+    | .app f as, .app g bs => if f != g then return false else all as bs
+    | .iapp f i as, .iapp g j bs => if f != g then return false else
+        if !(← all i j) then return false else all as bs
+    | .qual f s as, .qual g t bs => if f != g || s != t then return false else all as bs
+    | .annot x _, y | y, .annot x _ => go x y (fuel - 1)
+    | _, _ => none
+
 end Blaster.Reconstruct.SmtProof

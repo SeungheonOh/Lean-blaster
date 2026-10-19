@@ -368,7 +368,11 @@ def discharges (p : Proof) (s : Step) (h : Nat) : Bool :=
     let φ := p.steps[h]!.concl
     -- discharged: `¬ φ` is a literal, or `φ = ¬ a` and `a` is a literal
     negated.contains (termAddr φ) || negated.contains (termAddr φ.stripAnnot) ||
-      ((STerm.not? φ).map (fun a => plain.contains (termAddr a.stripAnnot))).getD false
+      ((STerm.not? φ).map (fun a => plain.contains (termAddr a.stripAnnot))).getD false ||
+      -- NOTE: the same terms may be printed as different objects (e.g., small terms not shared by `let`)
+      lits.any fun l =>
+        ((STerm.not? l).map (fun a => STerm.eqBounded a φ.stripAnnot)).getD false ||
+        ((STerm.not? φ).map (fun a => STerm.eqBounded a.stripAnnot l.stripAnnot)).getD false
   else false
 
 /-- Open hypotheses of each step (indices of `hypothesis` steps not discharged, see `discharges`). -/
