@@ -6,6 +6,7 @@ import Blaster.Reconstruct.SmtProof.Alethe
 import Blaster.Reconstruct.SmtProof.Replay
 import Blaster.Reconstruct.SmtProof.Bridge
 import Blaster.Reconstruct.SmtProof.NlArith
+import Blaster.Reconstruct.SmtProof.RecFun
 
 /-!
 # Proof reconstruction from SMT proofs
@@ -980,22 +981,30 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let cmds := cmds.map guardNatQuantifiers
     -- 2. backend
     -- backends tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`)
-    -- (`z3+`: Z3 with the simplifiers of the query, tried after `z3`)
-    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3+").splitOn ","
+    -- (`z3+`: Z3 with the simplifiers of the query; `z3rec`: Z3 on the query with its recursive functions defined by
+    -- `define-funs-rec` (see `RecFun`), skipped when the query has no recursive function)
+    -- NOTE: `z3rec` finds proofs when Z3 gets lost in the instantiations of the axioms of recursive functions (e.g., on
+    -- the CEK evaluation of validators), but may time out where `z3` succeeds
+    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3rec,z3+").splitOn ","
     let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
     let mut res : Option (Backend × Proof) := none
+    let mut recPairs : Array RecFun.Pair := #[]
     let mut errors := #[]
     for n in names do
+      let recQuery := if n.trim == "z3rec" then (RecFun.rewriteQuery cmds).toOption else none
+      if n.trim == "z3rec" && recQuery.isNone then continue
       let backend ← match n.trim with
         | "z3" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout)
         | "z3+" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout (simplifiers := true))
+        | "z3rec" => pure { z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout with name := "z3rec" }
         | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
         | b => throwError "unknown proof backend {b}"
-      match ← runBackendCached backend cmds with
+      let (query, pairs) := if n.trim == "z3rec" then recQuery.getD (cmds, #[]) else (cmds, #[])
+      match ← runBackendCached backend query with
       | .error msg => errors := errors.push msg
       | .ok out =>
           match backend.parseProof out with
-          | .ok p => res := some (backend, p); break
+          | .ok p => res := some (backend, p); recPairs := pairs; break
           | .error msg => errors := errors.push s!"{backend.name}: {msg}"
     let some (backend, sproof) := res | throwError "no proof: {errors}"
     -- 3. interpretation
@@ -1007,6 +1016,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
     let tbl ← if poly then polyBuildSymTable cmds tenv consts sortVars else buildSymTable cmds tenv consts sortVars[0]?
     let tbl ← addSkolems sproof tbl
+    -- auxiliary functions and case predicates of recursive functions (Z3)
+    let (tbl, recAux) ← RecFun.addProofDefs sproof tbl
     -- 4. replay
     let bridge ← bridgeTactics
     -- axioms of the polymorphic encoding (see `Poly`)
@@ -1031,6 +1042,23 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       matchInst := insts.get?, macroOf, polyWorld := poly
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
+    let proveStep (rule : String) (stmt : Expr) : TermElabM (Option (Expr × String)) := do
+      -- NOTE: the tactic syntax of each rule is built once per replay
+      let tacs ← match (← tacCache.get).get? rule with
+        | some t => pure t
+        | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+      -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
+      let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
+      portfolio tacs stmt rule
+    -- recursive functions (`z3rec`): definitional equations, proved with the bridge tactics in the empty local
+    -- context when closed (see `proveClosed`), and differences of normal forms in their unfoldings
+    let recCtx ← RecFun.mkCtx tbl recAux recPairs sproof.defs
+      (fun stmt => do
+        let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
+        if stmt.hasFVar then run else withLCtx {} {} run)
+      (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
+      (fun a b => do Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite") (← IO.mkRef 6) a b)
+    let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
         proveDirect := fun c => do
@@ -1062,18 +1090,20 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
               let h ← IO.FS.Handle.mk f .append
               h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot goalTerm)}\n"
           return r.map (·.1)
-        proveStep := fun rule stmt => do
-          -- NOTE: the tactic syntax of each rule is built once per replay
-          let tacs ← match (← tacCache.get).get? rule with
-            | some t => pure t
-            | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
-          -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
-          let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
-          portfolio tacs stmt rule }
+        proveStep
+        proveRecFun := fun c n => do
+          -- NOTE: the lemmas have no premises (a failure is not retried)
+          if let some r := (← recCache.get).get? c then return r
+          let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
+          if r.isNone then debugLog m!"recfun lemma failed: {RecFun.brief c}"
+          recCache.modify (·.insert c r)
+          return r
+        recFunOnly := !recPairs.isEmpty }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
       let global := (scopedSteps sproof).map (!·)
       let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
+                               openHyps := openHypotheses sproof,
                                baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
       let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
                             catch ex => return Except.error ex) |>.run ctx).run {}
@@ -1094,6 +1124,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
     -- NOTE: e.g., type parameters that nothing determines (the other interpretation is then tried)
     if proof.hasMVar then throwError "smt proof: proof term contains metavariables"
+    -- debugging: free variables escaping their scopes (environment variable `BLASTER_SMTPROOF_CHECKFINAL`)
+    if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then reportEscapedFVars proof
     return .ok { proof, backend := backend.name, steps := sproof.steps.size, stats }
   catch ex =>
     return .error (← ex.toMessageData.toString)

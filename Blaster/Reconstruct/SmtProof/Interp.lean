@@ -59,7 +59,17 @@ structure SymTable where
   /-- Lean types of the datatype sorts as they occur in proofs (aliases expanded), e.g., `(@List Int) ↦ List Nat`
       when the query only uses `(@List Nat)`. -/
   expandedSorts : Std.HashMap String Expr := {}
+  /-- guards of Z3's case predicates of recursive functions `((_ case-def k f) args)`, per key `k f` (see
+      `caseDefKey?`): arguments of the predicate and guard (see `RecFun.lean`) -/
+  caseGuards : Std.HashMap String (Array (Array STerm × STerm)) := {}
   deriving Inhabited
+
+/-- Key `k f` of the indices `k (_ f 0)` of a case predicate `((_ case-def k (_ f 0)) args)` (Z3). -/
+def caseDefKey? (idx : Array STerm) : Option String :=
+  match idx[0]?, idx[1]? with
+  | some (STerm.num k), some (STerm.iapp f _ #[]) | some (STerm.num k), some (STerm.sym f)
+  | some (STerm.num k), some (STerm.app f #[]) => some s!"{k} {f}"
+  | _, _ => none
 
 structure InterpCtx where
   table : SymTable
@@ -71,8 +81,16 @@ structure InterpCtx where
   /-- the type parameters of applications that nothing determines are left as metavariables, to be assigned by
       unification with the context or defaulted after the interpretation of the whole term (see `defaultTypes`) -/
   deferTypes : Bool := false
+  /-- interpretation of the terms already interpreted in the current scope of local variables (e.g., the body
+      of a macro for given arguments): set when the scope is entered (see `withScopeCache`) -/
+  scopeCache : Option (IO.Ref (TermCache Expr)) := none
 
 abbrev InterpM := ReaderT InterpCtx MetaM
+
+/-- Run `x` with the local variables `locals` (a new scope: terms are memoized in a fresh cache). -/
+def withScopeCache (locals : Std.HashMap String Expr) (x : InterpM α) : InterpM α := do
+  let ref ← IO.mkRef {}
+  withReader (fun c => { c with locals, scopeCache := some ref }) x
 
 /-! ## Casts -/
 
@@ -308,6 +326,8 @@ def mkIntNeg (a : Expr) : Expr := mkApp (mkApp2 (mkConst ``Neg.neg [0]) intType 
 def mkIntLe (a b : Expr) : Expr := mkApp4 (mkConst ``LE.le [0]) intType (mkConst ``Int.instLEInt) a b
 def mkIntLt (a b : Expr) : Expr := mkApp4 (mkConst ``LT.lt [0]) intType (mkConst ``Int.instLTInt) a b
 
+def mkStrLt (a b : Expr) : Expr := mkApp4 (mkConst ``LT.lt [0]) (mkConst ``String) (mkConst ``String.instLT) a b
+
 /-- `if c then a else b` with the classical instance. -/
 def mkClassicalIte (c a b : Expr) : MetaM Expr := do
   let t ← inferType a
@@ -506,6 +526,14 @@ partial def interp (t : STerm) : InterpM Expr := do
       let e ← interpCore t
       if !e.hasMVar then ref.modify (·.insert addr e)
       return e
+  -- NOTE: terms below binders are memoized for their scope (e.g., the shared subterms of macro bodies)
+  if let some ref := ctx.scopeCache then
+    if !ctx.locals.isEmpty then
+      let addr := termAddr t
+      if let some e := (← ref.get).get? addr then return e
+      let e ← interpCore t
+      if !e.hasMVar then ref.modify (·.insert addr e)
+      return e
   interpCore t
 
 /-- Interpret the SMT formula `t` as a proposition. -/
@@ -543,6 +571,7 @@ partial def interpCore (t : STerm) : InterpM Expr := do
   | .iapp f idx args =>
       -- testers: `((_ is C) x)` and `((_ is-C C is-C) x)` (Z3)
       -- character literals `(_ Char n)`
+      if f == "case-def" then return ← interpCaseDef idx args
       if f == "Char" && args.isEmpty then
         let some (STerm.num n) := idx[0]? | throwError "smt proof: ill-formed character {t}"
         return mkApp (mkConst ``Char.ofNat) (mkRawNatLit n)
@@ -587,7 +616,7 @@ partial def interpQuant (k : QuantKind) (vars : Array (String × SExpr)) (body :
         let v := if natParam vars[i].2 then mkIntOfNat x else x
         withReader (fun ctx => { ctx with locals := ctx.locals.insert vars[i].1 v }) (go (i + 1) (fvars.push x))
     else
-      let b ← interp body
+      let b ← withScopeCache (← read).locals (interp body)
       match k with
       | .forall => mkForallFVars fvars b
       | .lambda => mkLambdaFVars fvars b
@@ -647,6 +676,9 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   | ">", _ => chain (fun a b => pure (mkIntLt b a)) (← args.mapM interpInt)
   | "str.++", _ | "seq.++", _ => foldBin (fun a b => mkApp2 (mkConst ``String.append) a b) (← args.mapM interp)
   | "str.len", 1 | "seq.len", 1 => return mkIntOfNat (mkApp (mkConst ``String.length) (← interp args[0]!))
+  -- lexicographic order (`str.<=` as the negation of the converse, the order being total)
+  | "str.<", 2 => return mkStrLt (← interp args[0]!) (← interp args[1]!)
+  | "str.<=", 2 => return mkNot (mkStrLt (← interp args[1]!) (← interp args[0]!))
   -- strings as sequences of characters (Z3 proofs): `(seq.unit (_ Char n))`
   | "seq.unit", 1 => return mkApp (mkConst ``String.singleton) (← interp args[0]!)
   | "seq.empty", 0 => return mkStrLit ""
@@ -664,7 +696,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         let vals ← args.mapM interp
         -- NOTE: macro bodies only refer to their parameters
         let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) {}
-        withReader (fun c => { c with locals }) (interp body)
+        withScopeCache locals (interp body)
     | some .trueFun => return mkConst ``True
     | some (.lam e) =>
         if args.isEmpty then return e
@@ -693,7 +725,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) ty)
         withLocalDeclD (Name.mkSimple x) ty fun fx => do
           let locals := (params.zip vals).foldl (fun m (y, v) => m.insert y v) ctx.locals |>.insert x fx
-          let φ ← withReader (fun c => { c with locals }) (interpProp body)
+          let φ ← withScopeCache locals (interpProp body)
           let p ← mkLambdaFVars #[fx] (if neg then mkNot φ else φ)
           return mkApp3 (mkConst ``Classical.epsilon [u]) ty inst p
     | some .apply =>
@@ -701,6 +733,23 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         let r ← mkAppCoerce (← interp fn) (← (args.extract 1 args.size).mapM interp) (allowTypeMVars := ctx.deferTypes)
         toSmtWorld r
     | none => throwError "smt proof: unknown symbol {f}"
+
+/-- Z3's case predicate `((_ case-def k f) args)` of a recursive function `f`: the conjunction of the guards
+    of the case given by the proof for `args` (`True` when there is none). Case predicates are introduced
+    by Z3 to unfold recursive functions by cases; any interpretation validating the steps of the proof can be
+    chosen (see `RecFun.lean`). -/
+partial def interpCaseDef (idx args : Array STerm) : InterpM Expr := do
+  let some key := caseDefKey? idx | throwError "smt proof: ill-formed case predicate {idx.map toString}"
+  let vals ← args.mapM interp
+  let mut guards : Array Expr := #[]
+  for (as, g) in (← read).table.caseGuards.getD key #[] do
+    if as.size != vals.size then continue
+    let vs ← as.mapM interp
+    if ← (vs.zip vals).allM fun (a, b) => do return a == b || (← withReducible (isDefEq a b)) then
+      let p ← interpProp g
+      if !guards.contains p then guards := guards.push p
+  if guards.isEmpty then return mkConst ``True
+  foldBinRight mkAnd guards
 
 /-- Interpret `t` as an `Int` term (casting `Nat` terms). -/
 partial def interpInt (t : STerm) : InterpM Expr := do
