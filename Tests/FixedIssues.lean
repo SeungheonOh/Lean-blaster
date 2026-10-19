@@ -34,3 +34,4 @@ import Tests.FixedIssues.Issue34
 import Tests.FixedIssues.Issue35
 import Tests.FixedIssues.Issue36
 import Tests.FixedIssues.LambdaDefGuard
+import Tests.FixedIssues.InstanceArgs
