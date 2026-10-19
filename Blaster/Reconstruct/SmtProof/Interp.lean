@@ -400,11 +400,23 @@ def mkEqSmt (a b : Expr) : MetaM Expr := do
   try return ← mkEq (← coerce a ta tb) b
   catch _ => mkEq a (← coerce b tb ta)
 
+/-- The type of `x` (in weak head normal form), an application of the inductive type `induct`: when it is not
+    determined yet (a metavariable, e.g., the type of a selector of an undetermined instance of a datatype), it is
+    unified with an application of `induct` to fresh metavariables (determined by the context, or defaulted, see
+    `defaultTypes`). -/
+def inductTypeOf (x : Expr) (induct : Name) : MetaM Expr := do
+  let xt ← whnfD (← instantiateMVars (← inferType x))
+  if !xt.getAppFn.isMVar then return xt
+  let (ps, _, _) ← forallMetaTelescopeReducing (← inferType (← mkConstWithFreshMVarLevels induct))
+  let c ← mkConstWithFreshMVarLevels induct
+  if ← isDefEq xt (mkAppN c ps) then return ← whnfD (← instantiateMVars xt)
+  return xt
+
 /-- Selector of field `idx` of constructor `ctor` applied to `x`, defined by case analysis (with
     `default` for the other constructors). -/
 partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := false) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"
-  let xt ← whnfD (← inferType x)
+  let xt ← inductTypeOf x cinfo.induct
   if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: selector {ctor} applied to {xt}"
   let lvls := xt.getAppFn.constLevels!
   let some (.inductInfo iinfo) := (← getEnv).find? cinfo.induct | throwError "smt proof: unknown inductive {cinfo.induct}"
@@ -529,7 +541,7 @@ def assignDefaultTypes (e : Expr) (dflt : Expr) : MetaM Expr := do
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"
-  let xt ← whnfD (← inferType x)
+  let xt ← inductTypeOf x cinfo.induct
   if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: tester {ctor} applied to {xt}"
   let lvls := xt.getAppFn.constLevels!
   let some (.inductInfo iinfo) := (← getEnv).find? cinfo.induct | throwError "smt proof: unknown inductive {cinfo.induct}"

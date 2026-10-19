@@ -585,6 +585,15 @@ def proveDefAxiom? (c : Expr) : TermElabM (Option Expr) := do
 def brief (e : Expr) : String :=
   if Local.sizeLe e 2000 then toString e else "<large term>"
 
+/-- The error of the kernel on the closed theorem `type` with proof `value`, if any. -/
+def kernelError? (type value : Expr) : MetaM (Option MessageData) := do
+  if type.hasFVar || type.hasMVar || value.hasFVar || value.hasMVar then return some m!"open term"
+  let lvls := (collectLevelParams (collectLevelParams {} type) value).params.toList
+  let decl := Declaration.thmDecl { name := ← mkFreshUserName `_blaster_check, levelParams := lvls, type, value }
+  match Lean.Kernel.Environment.addDecl (← getEnv).toKernelEnv (← getOptions) decl with
+  | .ok _ => return none
+  | .error ex => return some (ex.toMessageData (← getOptions))
+
 /-- Definitional equation `∀ x⃗, f x⃗ = body` of a recursive function, proved on first use. The candidate
     statements are tried in order: the body of the function in the header of Z3's proof (on which Z3's lemmas
     are expressed), then the body of the query (Blaster's normal form). -/
@@ -669,10 +678,12 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       -- NOTE: an auxiliary theorem, such that the instances of the equation (see `instantiateEq`) do not copy its
       -- proof (the instantiation of a metavariable assigned to the proof would beta-reduce its applications)
       let p ← instantiateMVars p
-      let c ← try mkAuxTheorem stmt p catch _ => do
-        let m ← mkFreshExprMVar stmt
-        m.mvarId!.assign p
-        pure m
+      -- the proof is checked by the kernel first: an ill-typed equation fails cleanly (the theorem would only be
+      -- checked asynchronously, see `Elab.async`)
+      if let some msg ← kernelError? stmt p then
+        debugLog m!"recfun: definitional equation of {eq.head} rejected by the kernel: {msg}"
+        continue
+      let some c ← (try some <$> mkAuxTheorem stmt p catch _ => pure none) | continue
       r := some (stmt, c)
       break
     debugLog m!"recfun: definitional equation not proved: {brief stmt}"

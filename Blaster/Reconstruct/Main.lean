@@ -92,7 +92,11 @@ def logSmtProof (kind : String) (res : Except String SmtProof.SmtProofResult) : 
     kernel such that the other strategies can be tried otherwise (the state is restored on failure). -/
 def bySmtProofReplay (task : ReconTask) (kind : String) (goal : Expr) : TermElabM (Option (Expr × String)) := do
   let st ← saveState
-  let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
+  -- NOTE: the auxiliary declarations of the replay (e.g., the definitional equations of recursive functions) are
+  -- checked by the kernel synchronously (`Elab.async` false), such that an ill-typed one fails the replay (instead of
+  -- an error reported after the reconstruction)
+  let res ← tryCatchRuntimeEx (withOptions (Elab.async.set · false) <|
+      SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
     (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
   let res ← match res with
     | .ok r =>
