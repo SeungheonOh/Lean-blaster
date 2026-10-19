@@ -713,8 +713,11 @@ syntax (name := blasterDivModSimp) "blaster_divmod_simp" : tactic
 @[tactic blasterDivModSimp] def evalBlasterDivModSimp : Tactic := fun _ => withMainContext do
   if (evalBlasterDivMod.collect (← instantiateMVars (← getMainTarget))).isEmpty then
     throwError "blaster_divmod_simp: no division"
-  evalTactic (← `(tactic| (intros; (repeat' split) <;> (try subst_vars) <;>
-    simp_all [Int.emod_neg, Int.ediv_neg, Int.neg_one_mul, Int.ediv_self, ediv_self_of_zero_ne, Int.emod_self] <;> done)))
+  -- NOTE: without case analyses first (e.g., `x % (-1 * y) = x % y` for large conditional terms `x` and `y`)
+  evalTactic (← `(tactic| first
+    | (intros; simp only [Int.neg_one_mul, Int.emod_neg, Int.ediv_neg, Int.neg_neg]; done)
+    | (intros; (repeat' split) <;> (try subst_vars) <;>
+        simp_all [Int.emod_neg, Int.ediv_neg, Int.neg_one_mul, Int.ediv_self, ediv_self_of_zero_ne, Int.emod_self] <;> done)))
 
 theorem str_lt_total (a b : String) : a < b ∨ a = b ∨ b < a := by
   by_cases h : a < b
@@ -1196,7 +1199,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
             if r.isNone then debugLog m!"recfun lemma failed: {RecFun.brief c}"
             recCache.modify (·.insert c r)
             return r
-          recFunOnly := !recPairs.isEmpty }
+          recFunOnly := !recPairs.isEmpty
+          recHeads := recCtx.eqs.foldl (fun s eq => s.insert eq.head) {} }
         let cache ← IO.mkRef {}
         let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
         let global := (scopedSteps sproof).map (!·)

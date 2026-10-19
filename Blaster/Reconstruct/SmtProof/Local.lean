@@ -309,8 +309,9 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
   -- normalized arithmetic: the congruence on the arguments would mostly produce false differences
   -- NOTE: also for large terms whose arithmetic atoms are common to both sides (generalized by the prover, e.g., Z3's
   -- rewrites of the modulos of CEK terms)
-  if isArithOp l && isArithOp r then
-    if sizeLe l 400 && sizeLe r 400 then return ← whole
+  let arithOrDivMod (e : Expr) : Bool := isArithOp e || e.isAppOfArity ``HDiv.hDiv 6 || e.isAppOfArity ``HMod.hMod 6
+  if arithOrDivMod l && arithOrDivMod r then
+    if isArithOp l && isArithOp r && sizeLe l 400 && sizeLe r 400 then return ← whole
     let al ← arithAtoms l
     let ar ← arithAtoms r
     if al.size ≤ 8 && al.all ar.contains && ar.all al.contains then return ← whole

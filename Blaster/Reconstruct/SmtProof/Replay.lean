@@ -49,6 +49,8 @@ structure ReplayConfig where
   /-- whether the lemmas of recursive functions are only replayed by `proveRecFun` (the generic tactics being
       costly and unlikely to succeed on them) -/
   recFunOnly : Bool := false
+  /-- the recursive functions with definitional equations (see `proveRecFun`) -/
+  recHeads : NameSet := {}
 
 structure ReplayCtx where
   proof : Proof
@@ -1188,10 +1190,17 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       return ← mkExpectedTypeHint (← mkEqRefl a) concl
   -- unfoldings of recursive functions by Z3's rewriter (e.g., applications to constructors): instances of their
   -- definitional equations (see `RecFun.proveLemma`)
-  if step.rule == "rewrite" && step.premises.isEmpty && cfg.recFunOnly && concl.isEq then
-    if let some p ← timed "recfun" (cfg.proveRecFun concl 1) then
-      record step.rule "recfun"
-      return p
+  if step.rule == "rewrite" && step.premises.isEmpty && cfg.recFunOnly then
+    -- the head function of an application, through the conversions of the interpretation
+    let head? (e : Expr) : Option Name :=
+      let e := if e.isAppOfArity ``Eq 3 && (e.getArg! 2).isConstOf ``Bool.true then e.getArg! 1 else e
+      let e := if e.isAppOfArity ``Nat.cast 3 then e.appArg! else e
+      e.getAppFn.constName?
+    if let some (_, l, r) := concl.eq? then
+      if [l, r].any fun e => (head? e).any cfg.recHeads.contains then
+        if let some p ← timed "recfun" (cfg.proveRecFun concl 1) then
+          record step.rule "recfun"
+          return p
   let ps ← premises step
   -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
