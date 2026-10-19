@@ -832,14 +832,15 @@ def proveByLit (ctx : Ctx) (lits : Array Expr) (concl : Expr) (j : Nat) : TermEl
   let r ← withLocalDeclD `hn (mkNot concl) fun hn => do
     let mut facts : Std.HashMap Expr Expr := {}
     let mut hyps := #[]
+    let sfx := orSuffixes lits
     for i in [:lits.size] do
       if i == j then continue
       let l := lits[i]!
-      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj lits i h)
+      let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith lits sfx i h)
       facts ← addFact facts (mkNot l) nl
       hyps := hyps.push (mkNot l, nl)
     let some p ← proveLit ctx facts hyps lits[j]! | return none
-    return some (mkLambda `hn .default (mkNot concl) ((mkApp hn (← mkOrInj lits j p)).abstract #[hn]))
+    return some (mkLambda `hn .default (mkNot concl) ((mkApp hn (mkOrInjWith lits sfx j p)).abstract #[hn]))
   return r.map (mkApp2 (mkConst ``Classical.byContradiction) concl ·)
 
 /-- Proof of `goal` by case splits on `atoms` (in order), each case by unit propagation (see `PropEngine`), e.g.,

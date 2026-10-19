@@ -250,23 +250,31 @@ def propEq (a b : Expr) (deep := false) : MetaM Bool := do
   -- e.g., `Int.toNat (↑n)` and `n`
   if deep then withDefault <| isDefEq a b else return false
 
-/-- Proof of the `i`-th injection into the right-nested disjunction `lits` (of size `n`). -/
-def mkOrInj (lits : Array Expr) (i : Nat) (p : Expr) : MetaM Expr := do
-  -- lits = [l₀, ..., lₙ₋₁], disjunction l₀ ∨ (l₁ ∨ ... ∨ lₙ₋₁)
+/-- The suffixes `lⱼ ∨ (lⱼ₊₁ ∨ ... ∨ lₙ₋₁)` of the right-nested disjunction of `lits`, built once (and shared) for the
+    injections into the disjunction (see `mkOrInjWith`). -/
+def orSuffixes (lits : Array Expr) : Array Expr := Id.run do
+  let n := lits.size
+  if n == 0 then return #[]
+  let mut sfx := Array.replicate n lits[n-1]!
+  for k in (List.range (n - 1)).reverse do
+    sfx := sfx.set! k (mkOr lits[k]! sfx[k+1]!)
+  return sfx
+
+/-- Proof of the `i`-th injection into the right-nested disjunction `lits`, given its suffixes `sfx` (see
+    `orSuffixes`): `Or.inr^i (Or.inl p)` (`Or.inr^i p` for the last literal). -/
+def mkOrInjWith (lits sfx : Array Expr) (i : Nat) (p : Expr) : Expr := Id.run do
   let n := lits.size
   if n == 1 then return p
-  let rest (j : Nat) : Expr := Id.run do
-    let mut r := lits[n-1]!
-    for k in (List.range (n - 1 - j)).reverse do
-      r := mkOr lits[j + k]! r
-    r
-  -- proof for position i: Or.inr^i (Or.inl p) (or just Or.inr^i p for the last one)
-  let mut proof := if i == n - 1 then p else mkApp3 (Lean.mkConst ``Or.inl) lits[i]! (rest (i+1)) p
+  let mut proof := if i == n - 1 then p else mkApp3 (Lean.mkConst ``Or.inl) lits[i]! sfx[i+1]! p
   let mut j := i
   while j > 0 do
     j := j - 1
-    proof := mkApp3 (Lean.mkConst ``Or.inr) lits[j]! (rest (j+1)) proof
+    proof := mkApp3 (Lean.mkConst ``Or.inr) lits[j]! sfx[j+1]! proof
   return proof
+
+/-- Proof of the `i`-th injection into the right-nested disjunction `lits` (of size `n`). -/
+def mkOrInj (lits : Array Expr) (i : Nat) (p : Expr) : MetaM Expr :=
+  return mkOrInjWith lits (orSuffixes lits) i p
 
 /-- Case analysis on a proof `d` of the disjunction of `lits`: `k i hᵢ` builds a proof of `goal`
     from a proof `hᵢ` of the `i`-th literal. -/
@@ -283,16 +291,17 @@ partial def orElim (lits : Array Expr) (d : Expr) (goal : Expr) (k : Nat → Exp
 /-- Given a proof `d` of a clause with literals `lits`, refutations of some literals and the target
     clause `target`, build a proof of `target` (each literal is either refuted or occurs in `target`). -/
 def weakenClause (lits : Array Expr) (d : Expr) (refute : Expr → MetaM (Option Expr)) (targetLits : Array Expr) : MetaM Expr := do
-  let target := if targetLits.isEmpty then Lean.mkConst ``False else targetLits.pop.foldr mkOr targetLits.back!
+  let sfx := orSuffixes targetLits
+  let target := sfx[0]?.getD (Lean.mkConst ``False)
   orElim lits d target fun i h => do
     let l := lits[i]!
     -- NOTE: syntactic matches first (the definitional ones are costly on large literals)
     for j in [:targetLits.size] do
-      if targetLits[j]! == l then return ← mkOrInj targetLits j h
+      if targetLits[j]! == l then return mkOrInjWith targetLits sfx j h
     if let some r ← refute l then
       return mkApp2 (Lean.mkConst ``False.elim [levelZero]) target (mkApp r h)
     for j in [:targetLits.size] do
-      if ← propEq targetLits[j]! l then return ← mkOrInj targetLits j h
+      if ← propEq targetLits[j]! l then return mkOrInjWith targetLits sfx j h
     throwError "smt proof: literal {l} is neither refuted nor in the conclusion"
 
 /-- Proof built by `k` from the premises `ps` (propositions and proofs), given local hypotheses standing for the
@@ -327,14 +336,15 @@ def refuteBy (units : Array (Expr × Expr)) (l : Expr) : MetaM (Option Expr) := 
     and unit propagation on the clauses must derive a conflict. This justifies resolution steps
     (e.g., Alethe's `resolution`, Z3's `unit-resolution`) independently of pivot annotations. -/
 partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr) : MetaM Expr := do
-  let goal := if target.isEmpty then Lean.mkConst ``False else target.pop.foldr mkOr target.back!
+  let sfx := orSuffixes target
+  let goal := sfx[0]?.getD (Lean.mkConst ``False)
   let r ← withLam `hn (mkNot goal) fun hn => do
     -- refuted propositions ↦ proof of their negation (refutations are computed once, when facts are added)
     let mut falses : Std.HashMap Expr Expr := {}
     let mut trues : Std.HashSet Expr := {}
     for k in [:target.size] do
       let l := target[k]!
-      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj target k h)
+      let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith target sfx k h)
       falses := falses.insert l nl
     let mut used := Array.replicate clauses.size false
     let mut changed := true
@@ -812,6 +822,9 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       record step.rule "bridge"
       return p
   | "hypothesis" =>
+      -- NOTE: syntactic matches first (the definitional ones are costly on large propositions)
+      for (t, p) in ctx.facts do
+        if t == concl then record step.rule "exact"; return p
       for (t, p) in ctx.facts do
         if ← propEq t concl then record step.rule "exact"; return p
       throwError "hypothesis not found"
@@ -904,7 +917,7 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       let n := ctx.proof.steps[step.premises[0]!]!.clauseSize
       let lits := disjuncts c n
       -- NOTE: the conclusion may be a single literal of the clause which is a disjunction
-      let single ← lits.anyM fun l => propEq l concl
+      let single ← pure (lits.any (· == concl)) <||> lits.anyM fun l => propEq l concl
       let targetLits :=
         if step.clauseSize == 0 then #[]
         else if single then #[concl]
@@ -967,23 +980,28 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let r ← timed "lemma" <| withLam `hn (mkNot concl) fun hn => do
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
     let mut facts := ctx.facts.push (mkNot concl, hn)
+    let sfx := orSuffixes lits
     for k in [:lits.size] do
       let l := lits[k]!
-      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj lits k h)
+      let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith lits sfx k h)
       facts := facts.push (mkNot l, nl)
       if let some a := l.not? then
         facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
     -- the proofs of the steps not depending on the hypotheses discharged by the lemma stay valid after it
     -- NOTE: the hypotheses are matched on their propositions (see `hypothesis`), hence the occurrences of `hn`
     let disch := (ctx.openHyps.getD j #[]).filter (discharges ctx.proof step ·)
+    -- NOTE: `containsFVar` skips the closed subterms (e.g., the large terms of a CEK evaluation)
     let keep (k : Nat) (p : Expr) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·) &&
-      (p.find? fun e => e.isFVarOf hn.fvarId!).isNone
+      !p.containsFVar hn.fvarId!
     let inherit := (← IO.getEnv "BLASTER_SMTPROOF_NOINHERIT").isNone
     let pf ← timed "subproof" <| withScope (inherit := inherit) (keep := keep) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
       -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
       let cj ← stepConcl j
       if cj.isConstOf ``False then return pj
+      for (t, p) in facts do
+        if let some a := t.not? then
+          if a == cj then return mkApp p pj
       for (t, p) in facts do
         if let some a := t.not? then
           if ← propEq a cj then return mkApp p pj
