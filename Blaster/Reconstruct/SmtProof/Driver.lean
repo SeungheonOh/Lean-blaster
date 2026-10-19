@@ -390,12 +390,14 @@ def polyBuildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.Ha
     (resp. `Classical.epsilon (fun x => φ)`). Only steps with a single bound variable are handled. -/
 partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
   let mut tbl := tbl
-  -- names introduced by `intro-def` (Z3's Tseitin names): `(= t k)` defines `k` as `t`
+  -- names introduced by `intro-def` (Z3's Tseitin names): `(= t k)` defines `k` as `t`; similarly for the
+  -- names introduced by theory lemmas (e.g., `(= pb!2 (or ...))` of Z3's pseudo-Boolean preprocessing)
   for step in proof.steps do
-    if step.rule != "intro-def" then continue
+    if !(step.rule == "intro-def" || (step.rule == "th-lemma" && step.premises.isEmpty)) then continue
     match step.concl.stripAnnot with
     | .app "=" #[t, .sym k] | .app "=" #[.sym k, t] =>
-        if !tbl.syms.contains k then tbl := { tbl with syms := tbl.syms.insert k (.macro #[] t) }
+        if !tbl.syms.contains k && (findSkolem k t (· == k)).isNone then
+          tbl := { tbl with syms := tbl.syms.insert k (.macro #[] t) }
     | _ => pure ()
   for step in proof.steps do
     if step.rule != "sk" then continue
@@ -928,6 +930,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
             -- NOTE: only for the translation of the negated goal
             for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 3 else #[] do
               h.putStrLn s!"=== bridge mismatch:\n{← ppExpr a}\n--- interpretation:\n{← ppExpr b}\n"
+          -- definitions of Lean functions (e.g., by `match`): the traversal of their unfolding
+          if !c.isAppOfArity ``Not 1 then
+            if let some p ← (try Bridge.proveDefinition? bcfg c catch _ => pure none) then return some p
           let r ← portfolio bridge c "bridge"
           if r.isNone then debugLog m!"bridge failed: {c}"
           if r.isNone then

@@ -358,14 +358,18 @@ def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Opt
   let args ← fvs.filterM fun x => return !(← x.fvarId!.getDecl).isLet
   return some (mkAppN pf args, m)
 
-/-- Proof of a local difference `l = r` of a step (see `Local.diffEq`): definitional equality, then the
-    propositional engine and tactics on the statement with the subterms common to `l` and `r` generalized. -/
+/-- Proof of a local difference `∀ hs, l = r` of a step (see `Local.diffEq`, `hs` are hypotheses of the
+    context of the difference): definitional equality, then the propositional engine and tactics on the
+    statement with the subterms common to `l` and `r` generalized. -/
 def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Option Expr) := do
-  let some (_, l, r) := eq.eq? | return none
+  -- NOTE: `l` and `r` don't depend on the hypotheses
+  let some (l, r) ← forallTelescope eq fun _ body => pure (body.eq?.map fun (_, l, r) => (l, r)) | return none
+  if l.hasLooseBVars || r.hasLooseBVars then return none
   -- definitional differences (e.g., testers of constructor applications)
   let small := Local.sizeLe eq 2000
   if ← defeqBudget l r 5000 small then
-    return some (← mkExpectedTypeHint (← mkEqRefl l) eq)
+    return some (← forallTelescope eq fun hs body => do
+      mkLambdaFVars hs (← mkExpectedTypeHint (← mkEqRefl l) body))
   let t0 ← IO.monoMsNow
   let some (g, vals) ← Local.generalizeCommon eq l r
     | if small then return (← proveClosed cfg rule eq).map (·.1) else return none
@@ -419,6 +423,91 @@ partial def quantIntro (t h concl : Expr) : MetaM (Option Expr) := do
             | none => return none
       return none
   | _, _ => return none
+
+/-- `l₀ ∨ (l₁ ∨ ... ∨ lₙ)` from a proof `p` of `lᵢ`. -/
+def orIntro (ls : Array Expr) (i : Nat) (p : Expr) : Expr :=
+  go 0
+where
+  go (j : Nat) : Expr :=
+    if j + 1 ≥ ls.size then p else
+    let rest := (ls.extract (j + 1) ls.size).pop.foldr mkOr ls.back!
+    if i == j then mkApp3 (mkConst ``Or.inl) ls[j]! rest p
+    else mkApp3 (mkConst ``Or.inr) ls[j]! rest (go (j + 1))
+  termination_by ls.size - j
+
+/-- Proof of the literal `l` by evaluation: `True`, `¬ False` and `a = a` up to definitional unfolding (e.g., the
+    testers and selectors of the interpretation applied to constructors, reduced by `casesOn`). -/
+def evalLit? (l : Expr) : MetaM (Option Expr) := do
+  let defeq (a b : Expr) : MetaM Bool := do
+    try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
+        withCurrHeartbeats <| withDefault <| isDefEq a b
+    catch _ => return false
+  if let some a := l.not? then
+    if (← whnfD a).isConstOf ``False then return some (← mkExpectedTypeHint (mkLambda `h .default a (.bvar 0)) l)
+    return none
+  if let some (_, a, b) := l.eq? then
+    if ← defeq a b then return some (← mkExpectedTypeHint (← mkEqRefl a) l)
+    return none
+  if (← whnfD l).isConstOf ``True then return some (← mkExpectedTypeHint (mkConst ``True.intro) l)
+  return none
+
+/-- Datatype lemmas by case analysis on a term `x` of a datatype, e.g., `x = C (C.0 x) ∨ ¬ is-C x` where the tester
+    and the selectors are interpreted by `casesOn` on `x` (see `mkTester`): `T.casesOn x`, with, for each
+    constructor, a literal of the clause `lits` that holds by evaluation (see `evalLit?`). The candidates for
+    `x` are the major premises of the testers. -/
+def caseLemma? (concl : Expr) (lits : Array Expr) : MetaM (Option Expr) := do
+  let env ← getEnv
+  let isTester (e : Expr) : Option Expr := Id.run do
+    let .const n _ := e.getAppFn | return none
+    if !isCasesOnRecursor env n then return none
+    let some (.inductInfo info) := env.find? n.getPrefix | return none
+    let args := e.getAppArgs
+    if info.numIndices != 0 || args.size != info.numParams + 2 + info.ctors.length then return none
+    let .lam _ _ (.sort .zero) _ := args[info.numParams]! | return none
+    return some args[info.numParams + 1]!
+  let mut cands : Array Expr := #[]
+  for l in lits do
+    for x in collectTesters isTester l #[] 64 do
+      if !x.hasLooseBVars && !cands.contains x then cands := cands.push x
+  for x in cands do
+    if let some p ← caseOn? x then return some p
+  return none
+where
+  /-- Major premises of the testers in `e` (bounded depth). -/
+  collectTesters (isTester : Expr → Option Expr) (e : Expr) (acc : Array Expr) (fuel : Nat) : Array Expr :=
+    if fuel == 0 then acc else
+    let acc := match isTester e with | some x => acc.push x | none => acc
+    match e with
+    | .app f a => collectTesters isTester a (collectTesters isTester f acc (fuel - 1)) (fuel - 1)
+    | .lam _ t b _ | .forallE _ t b _ => collectTesters isTester b (collectTesters isTester t acc (fuel - 1)) (fuel - 1)
+    | .mdata _ b | .proj _ _ b => collectTesters isTester b acc (fuel - 1)
+    | _ => acc
+  caseOn? (x : Expr) : MetaM (Option Expr) := do
+    let xt ← whnfD (← inferType x)
+    let .const T lvls := xt.getAppFn | return none
+    let some (.inductInfo info) := (← getEnv).find? T | return none
+    if info.numIndices != 0 then return none
+    let some casesOn := (← getEnv).find? (T ++ `casesOn) | return none
+    if casesOn.levelParams.length != lvls.length + 1 then return none
+    let params := xt.getAppArgs.extract 0 info.numParams
+    let absLits ← lits.mapM fun l => kabstract l x
+    let absConcl ← kabstract concl x
+    if !absConcl.hasLooseBVars then return none
+    let mut minors := #[]
+    for c in info.ctors do
+      let ci ← getConstInfo c
+      let some minor ← forallTelescopeReducing (← instantiateForall (ci.instantiateTypeLevelParams lvls) params) fun fs _ => do
+          let v := mkAppN (mkConst c lvls) (params ++ fs)
+          let ls := absLits.map (·.instantiate1 v)
+          for i in [:ls.size] do
+            if let some p ← evalLit? ls[i]! then
+              return some (← mkLambdaFVars fs (← mkExpectedTypeHint (orIntro ls i p) (absConcl.instantiate1 v)))
+          return none
+        | return none
+      minors := minors.push minor
+    let motive := mkLambda `z .default xt absConcl
+    let pf := mkAppN (mkConst (T ++ `casesOn) (levelZero :: lvls)) (params ++ #[motive, x] ++ minors)
+    return some (← mkExpectedTypeHint pf concl)
 
 mutual
 
@@ -883,6 +972,10 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       if ← propEq (← inferType p) concl then
         record step.rule "datatype"
         return p
+    -- case analyses on a datatype term (e.g., `x = C (C.0 x) ∨ ¬ is-C x`)
+    if let some p ← timed "datatype cases" (try caseLemma? concl (disjuncts concl (clauseSize step.concl)) catch _ => pure none) then
+      record step.rule "datatype cases"
+      return p
   -- large statements (e.g., the CEK evaluation of validators): tactics are only applied to their local
   -- differences (see `Local`)
   let large := !(Local.sizeLe concl 20000)
@@ -941,7 +1034,13 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     record step.rule method
     return applyPremises pf
   -- datatype lemmas over variables (e.g., `x = C (C.0 x) ∨ ¬ is-C x`): case analyses
-  if step.rule == "th-lemma" then
+  -- NOTE: only for statements with testers or selectors (case analyses of the interpretation); the other
+  -- tactics of the portfolio were tried above
+  let env ← getEnv
+  let hasCases := (stmt.find? fun s => match s.getAppFn with
+    | .const n _ => isCasesOnRecursor env n
+    | _ => false).isSome
+  if step.rule == "th-lemma" && hasCases then
     if let some (pf, method) ← timed "datatype" (proveClosed cfg "datatype" stmt) then
       record step.rule s!"{method} (datatype)"
       return applyPremises pf
