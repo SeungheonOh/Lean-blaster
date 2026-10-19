@@ -310,6 +310,20 @@ def guardedLambda (tbl : SymTable) (n : String) (s : SExpr) (ys xs : Array (Stri
     t := .quant .lambda #[xs[i]!] t
   return (if ys.isEmpty then t else .quant .lambda ys t, tbl)
 
+/-- `d` (the interpretation of an arrow sort of this branch, see `polySymTable`) with the `Bool` codomains replaced by
+    `Prop` where the Lean type `t` has `Prop`, when there is one (`none` otherwise). -/
+partial def alignProp (t d : Expr) : MetaM (Option Expr) := do
+  let t ← whnfR t
+  if t.isProp && d.isConstOf ``Bool then return some (mkSort levelZero)
+  match t, d with
+  | .forallE _ a b _, .forallE n da c bi =>
+      if b.hasLooseBVars || c.hasLooseBVars then return none
+      let da' ← alignProp a da
+      let c' ← alignProp b c
+      if da'.isNone && c'.isNone then return none
+      return some (.forallE n (da'.getD da) (c'.getD c) bi)
+  | _, _ => return none
+
 /-- Interpretation of Blaster's polymorphic encoding (see `Poly`), given the sort variables of the goal: the
     membership predicates of the sort variables and of the types over them are the images of their worlds (e.g.,
     `|@is@α…| v` is `Img (inj α) v`, and the predicate `Fun…` of `α → β` is `Img (liftFun (inj α) (inj β) _)`), the
@@ -323,6 +337,34 @@ def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (con
     (sortVars : Array (String × Expr)) : MetaM SymTable := do
   let mut tbl := tbl
   let lctx ← getLCtx
+  -- NOTE (this branch): the arrow sorts have `Bool` codomains for the Lean functions to `Prop` too (e.g.,
+  -- `(@@ArrowT2 @β Bool)` for `β → Prop`, `(@@ArrowT2 @Instance Prop)` on the `beta-lambda-cache-optimization`
+  -- branch), which `sortToType` interprets as `Bool`: the arrow sorts of the constants of the goal are interpreted
+  -- with the `Prop` codomains of their Lean types (when all the constants of the sort agree), such that their
+  -- worlds exist (see `alignProp`)
+  let mut aligned : Std.HashMap String (Option Expr) := {}
+  for c in cmds do
+    let some #[SExpr.atom "declare-const", SExpr.atom n, s] := c.list? | continue
+    let some x := consts.get? n | continue
+    let some _ := s.list? | continue
+    try
+      let d ← (sortToType s).run { table := tbl }
+      let some d' ← alignProp (← inferType x) d | continue
+      let key := toString (expandSort tbl s)
+      match aligned.get? key with
+      | some (some d'') => if !(← isDefEq d' d'') then aligned := aligned.insert key none
+      | some none => pure ()
+      | none => aligned := aligned.insert key (some d')
+    catch _ => pure ()
+  for (key, d?) in aligned.toList do
+    -- NOTE: not when a constant of the sort is a function to `Bool`
+    let conflict ← cmds.anyM fun c => do
+      let some #[SExpr.atom "declare-const", SExpr.atom n, s] := c.list? | return false
+      let some x := consts.get? n | return false
+      if toString (expandSort tbl s) != key then return false
+      return (← alignProp (← inferType x) ((← (sortToType s).run { table := tbl }))).isNone
+    if let some d := d? then
+      if !conflict then tbl := { tbl with expandedSorts := tbl.expandedSorts.insert key d }
   -- membership predicates of the sort variables and of the types over them: `fun v => Img w v`
   for (k, decl) in env.smtEnv.indTypeInstCache.toList do
     if !sortVars.any (fun (_, α) => k.containsFVar α.fvarId!) then continue
