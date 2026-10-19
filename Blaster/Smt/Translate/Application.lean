@@ -489,6 +489,16 @@ def createAppNAux (pInfo : FunEnvInfo) (s : Sum SmtQualifiedIdent SmtTerm)
   (isHOF := false) : TranslateEnvT SmtTerm := do
   let nbSize := if args.size < pInfo.paramsInfo.size then args.size else pInfo.paramsInfo.size
   if isHOF then
+    -- NOTE: the instance arguments of function values are erased (see `removeClassConstraintsInFunType`), which is
+    -- only faithful for the canonical instances of their classes: e.g., a function field `f [LT α] : α → α` applied
+    -- to two different instances of `LT Nat` would otherwise denote the same SMT function
+    for h : i in [:nbSize] do
+      if pInfo.paramsInfo[i]!.binderInfo.isInstImplicit then
+        let a := args[i]!
+        let some inst ← trySynthConstraintInstance? (← inferTypeEnv a)
+          | throwEnvError "createAppNAux: instance argument of a function value without canonical instance {reprStr a}"
+        if !(exprEq inst a) && !(← withReducibleAndInstances (isDefEq inst a)) then
+          throwEnvError "createAppNAux: non-canonical instance argument of a function value {reprStr a}"
     let instType ← inferFunType pInfo.type args
     withInstantiatedImplicitArgs pInfo.type fun polyType' => do
       let instArgTypes := retrieveArrowTypes instType
