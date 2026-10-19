@@ -530,13 +530,20 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
     | some p => some <$> mkLambdaFVars zs p
     | none => pure none
   if let some pp := pp? then return some (mkAppN pp vals)
-  let r ← proveClosed cfg rule g
+  let mut res ← proveClosed cfg rule g
+  -- the generalization without loss of the relations between the generalized subterms (see `Local.commonSubterms`)
+  let mut vals := vals
+  if res.isNone then
+    if let some (g', vals') ← Local.generalizeCommon eq l r (lossless := true) then
+      if g' != g then
+        res ← proveClosed cfg rule g'
+        vals := vals'
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
     let t2 ← IO.monoMsNow
     if t2 - t0 > 100 then
       let h ← IO.FS.Handle.mk f .append
-      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 1500}"
-  return r.map fun (pf, _) => mkAppN pf vals
+      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({res.map (·.2)}): {(toString (← ppExpr g)).take 1500}"
+  return res.map fun (pf, _) => mkAppN pf vals
 
 /-- `quant-intro` (Z3): from `h : ∀ xs, a xs = b xs` (resp. `∀ xs, a xs → b xs`), a proof of
     `(∀ xs, a xs) = (∀ xs, b xs)` (resp. `(∀ xs, a xs) → (∀ xs, b xs)`), when `concl` has this form. -/
