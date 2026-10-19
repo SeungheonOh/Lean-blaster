@@ -168,8 +168,10 @@ def process (t p : Expr) : M Unit := do
       if let some nb ← getNeg? b then
         addFact (mkNot a) (← withLocalDeclD `h a fun h => do mkLambdaFVars #[h] (mkApp nb (← mkEqMP p h)))
 
-/-- Saturate the facts until a conflict is found (at most `fuel` rounds). -/
-partial def saturate (fuel : Nat := 8) : M (Option Expr) := do
+/-- Saturate the facts until a conflict is found (at most `fuel` rounds).
+    NOTE: a round decomposes one level of the nested connectives (e.g., the literals of wide clauses `l₁ ∨ ... ∨ lₙ`
+    need `n` rounds); the saturation stops when a round derives no new fact. -/
+partial def saturate (fuel : Nat := 64) : M (Option Expr) := do
   for _ in [0:fuel] do
     if let some c := (← get).conflict then return some c
     let todo := (← get).todo

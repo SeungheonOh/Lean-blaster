@@ -33,12 +33,23 @@ structure Step where
   clause? : Option (Array STerm) := none
   deriving Inhabited
 
+/-- Function defined by the backend in the proof output (e.g., Z3's `define-funs-rec` header listing the
+    recursive functions of the query and the auxiliary `fold-rec-n` functions it introduces). -/
+structure FunDef where
+  name : String
+  params : Array (String × SExpr)
+  sort : SExpr
+  body : STerm
+  deriving Inhabited
+
 structure Proof where
   /-- name of the backend that produced the proof (e.g., `z3`, `cvc5`) -/
   backend : String
   steps : Array Step
   /-- index of the step deriving `false` -/
   root : Nat
+  /-- functions defined in the proof output -/
+  defs : Array FunDef := #[]
   deriving Inhabited
 
 namespace Proof
