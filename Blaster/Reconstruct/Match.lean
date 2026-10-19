@@ -104,6 +104,18 @@ def proveMatchAltEq (m : Expr) (alt : Expr) (altIdx : Nat) (isCasesOn : Bool) : 
     return ← mkFalseElim (← mkEq m alt) h
   throwError "proveMatchAltEq: cannot reduce alternative {altIdx}"
 
+/-- Return the free variables of the last `n` declarations of `lctx`, from the last one.
+    NOTE: the local context is not traversed as a whole (unlike `LocalContext.getFVars`), as it may be
+    large (e.g., the local context of the optimizer).
+-/
+def lastFVarsRev (lctx : LocalContext) (n : Nat) : Array Expr := Id.run do
+  let mut r := #[]
+  let mut i := lctx.decls.size
+  while i > 0 && r.size < n do
+    i := i - 1
+    if let some d := lctx.decls.get! i then r := r.push d.toExpr
+  return r
+
 /-- Given a match application `m := matcher ps motive d₁ ... dₙ alt₁ ... altₖ` and `rhsFn` returning
     `rhs[x₁ ... xₙ]` for motive arguments `x₁ ... xₙ`, return a proof of `m = rhsFn #[d₁, ..., dₙ]`.
     The obligation for alternative `i` is provided by `altPf i args hs alt rhsᵢ` with:
@@ -135,10 +147,8 @@ def mkMatchCasesProof {n} [MonadLiftT MetaM n] [MonadControlT MetaM n] [Monad n]
     (onAlt := fun altIdx altType args alt => do
       let some (_, lhs, rhs) := altType.eq? | throwError "mkMatchCasesProof: equality expected"
       -- the equalities added by `transform` are the last `nDiscrs` local declarations (in reverse order)
-      let lctx ← liftMetaM getLCtx
-      let fvars := lctx.getFVars
-      if fvars.size < nDiscrs then throwError "mkMatchCasesProof: missing equalities"
-      let hs := (fvars.extract (fvars.size - nDiscrs) fvars.size).reverse
+      let hs := lastFVarsRev (← liftMetaM getLCtx) nDiscrs
+      if hs.size < nDiscrs then throwError "mkMatchCasesProof: missing equalities"
       for h in hs do
         if !(← liftMetaM (inferType h)).isEq then throwError "mkMatchCasesProof: heterogeneous equality"
       let pLhs ← liftMetaM (proveMatchAltEq lhs alt altIdx isCasesOn)
