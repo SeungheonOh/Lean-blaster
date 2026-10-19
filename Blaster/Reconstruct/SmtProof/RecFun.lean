@@ -10,16 +10,17 @@ Blaster translates a recursive function `f` to a declaration `(declare-fun F (S�
 `(define-fun F_LRec ((x S)⃗) T body[F])` and the axiom `(assert (forall ((x S)⃗) (= (F x⃗) (F_LRec x⃗))))`,
 which Z3's `recfun-finder` simplifier turns into a recursive function definition. The simplifier does nothing
 when proofs are produced: Z3 then reasons on the axioms by quantifier instantiation, which may not terminate
-in practice (e.g., on the CEK evaluation of validators). This module:
+in practice (e.g., on the CEK evaluation of validators). This module (backend `z3rec`, see `proveBySmtProof`):
  1. rewrites such queries at the SMT-LIB level, as `recfun-finder` does (`rewriteQuery`): the functions are
     defined by a `define-funs-rec` block;
  2. extends the interpretation (`addProofDefs`) with the auxiliary functions defined in the header of Z3's
-    proofs (`fold-rec-n`, which name subterms of the bodies, interpreted as macros), and with the case
-    predicates `((_ case-def k f) a⃗)` of the recursive functions (see `interpCaseDef`);
+    proofs (`fold-rec-n`, which name subterms of the bodies, interpreted as auxiliary definitions), and with the
+    case predicates `((_ case-def k f) a⃗)` of the recursive functions (see `interpCaseDef`);
  3. replays the lemmas of Z3's theory of recursive functions (`th-lemma recfun`) with exact proofs
     (`proveLemma`): unfoldings `¬ g₁ ∨ ... ∨ ¬ gₙ ∨ f a⃗ = r` of a function in the case of the guards `gᵢ` are
-    proved by instantiating the definitional equation `∀ x⃗, f x⃗ = body` (proved once, with the bridge tactics)
-    and reducing the conditionals of the body with the guards; lemmas on case predicates are propositional.
+    proved by instantiating the definitional equation `∀ x⃗, f x⃗ = body` (proved once by case analysis, see
+    `blaster_rec_eqn`, in the normal forms of Z3's rewriter) and reducing the conditionals of the body with the
+    guards (`rewriteChain`); lemmas on case predicates are propositional.
 -/
 
 open Lean Meta Elab Term Tactic
@@ -317,6 +318,58 @@ def addProofDefs (proof : Proof) (tbl : SymTable) : TermElabM (SymTable × NameS
   return (tbl, aux)
 
 /-! ## Definitional equations -/
+
+/-- `e` in Z3's normal forms (see `z3Normalize`) with a proof of `e = e'`, for the propositional structure of `e` (the
+    normal forms of the instances of definitions, e.g., `"" < s` for the argument `s := ByteString.mk ""` of
+    `x.data < y`); `none` when unchanged. -/
+partial def z3NormalizeProp (e : Expr) (cache : IO.Ref (Std.HashMap Expr (Option (Expr × Expr)))) :
+    MetaM (Option (Expr × Expr)) := do
+  if let some r := (← cache.get).get? e then return r
+  let r ← core
+  cache.modify (·.insert e r)
+  return r
+where
+  core : MetaM (Option (Expr × Expr)) := do
+    if e.isAppOfArity ``LT.lt 4 then
+      let (ty, a, b) := (e.getArg! 0, e.getArg! 2, e.getArg! 3)
+      if ty.isConstOf ``Int then return some (mkNot (mkIntLe b a), mkApp2 (mkConst ``smt_int_lt) a b)
+      if ty.isConstOf ``String && (← whnfCore a) == mkStrLit "" then
+        return some (mkNot (mkApp3 (mkConst ``Eq [1]) ty (mkStrLit "") b), mkApp (mkConst ``smt_str_empty_lt) b)
+      return none
+    -- propositional structure
+    if e.isAppOfArity ``Not 1 || e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 || e.isAppOfArity ``Iff 2 ||
+        (e.isAppOfArity ``Eq 3 && (e.getArg! 0).isProp) then
+      let f := e.getAppFn
+      let args := e.getAppArgs
+      let first := if e.isAppOfArity ``Eq 3 then 1 else 0
+      let mut changed := false
+      let mut cur := mkAppN f (args.extract 0 first)
+      let mut pf ← mkEqRefl cur
+      for i in [first:args.size] do
+        match ← z3NormalizeProp args[i]! cache with
+        | some (a', pa) =>
+            pf ← if changed then mkCongr pf pa else mkCongrArg cur pa
+            cur := mkApp cur a'
+            changed := true
+        | none =>
+            if changed then pf ← mkCongrFun pf args[i]!
+            cur := mkApp cur args[i]!
+            if !changed then pf ← mkEqRefl cur
+      return if changed then some (cur, pf) else none
+    -- conditionals with the classical instance of the interpretation
+    if e.isAppOfArity ``ite 5 && (e.getArg! 2).isAppOfArity ``Classical.propDecidable 1 then
+      let args := e.getAppArgs
+      let c' ← z3NormalizeProp args[1]! cache
+      let a' ← z3NormalizeProp args[3]! cache
+      let b' ← z3NormalizeProp args[4]! cache
+      if c'.isNone && a'.isNone && b'.isNone then return none
+      let (c₂, pc) ← match c' with | some r => pure r | none => do pure (args[1]!, ← mkEqRefl args[1]!)
+      let (a₂, pa) ← match a' with | some r => pure r | none => do pure (args[3]!, ← mkEqRefl args[3]!)
+      let (b₂, pb) ← match b' with | some r => pure r | none => do pure (args[4]!, ← mkEqRefl args[4]!)
+      let u := e.getAppFn.constLevels!
+      let e' ← mkClassicalIte c₂ a₂ b₂
+      return some (e', mkAppN (mkConst ``Local.classical_ite_congr u) #[args[0]!, args[1]!, c₂, args[3]!, a₂, args[4]!, b₂, pc, pa, pb])
+    return none
 
 /-- The application `f a⃗` of the left-hand side of a definitional equation, through the conversions of the
     interpretation (`↑(f a⃗)` for functions returning `Nat`, `f a⃗ = true` for functions returning `Bool`). -/
@@ -622,7 +675,7 @@ partial def addFact (facts : Std.HashMap Expr Expr) (t p : Expr) : MetaM (Std.Ha
 /-- Rewrite steps on `t`: unfolding of the recursive functions with their definitional equations, and reduction of
     the conditionals whose condition is decided by the facts. Returns the terms `t = t₀, t₁, ...` with the proofs
     of `t = tᵢ`. -/
-def rewriteChain (ctx : Ctx) (facts : Std.HashMap Expr Expr) (t : Expr) (fuel := 64) : TermElabM (Array (Expr × Expr)) := do
+partial def rewriteChain (ctx : Ctx) (facts : Std.HashMap Expr Expr) (t : Expr) (fuel := 64) : TermElabM (Array (Expr × Expr)) := do
   let mut cur := t
   let mut pf ← mkEqRefl t
   let mut out := #[(t, pf)]
@@ -635,7 +688,7 @@ def rewriteChain (ctx : Ctx) (facts : Std.HashMap Expr Expr) (t : Expr) (fuel :=
 where
   /-- The truth value of `c` given by the facts (with a proof of `c` or `¬ c`), also through the normal forms of
       Z3 (`a < b` as `¬ b ≤ a`, equalities up to symmetry). -/
-  decide? (c : Expr) : MetaM (Option (Bool × Expr)) := do
+  decide? (c : Expr) (normalized := false) : MetaM (Option (Bool × Expr)) := do
     if let some p := facts.get? c then return some (true, p)
     if let some p := facts.get? (mkNot c) then return some (false, p)
     if c.isAppOfArity ``LT.lt 4 && (c.getArg! 0).isConstOf ``Int then
@@ -656,6 +709,13 @@ where
           if ← defeqBudget a (mkConst ``True) 2000 true then hyps := hyps.push (a, ← mkExpectedTypeHint (mkConst ``True.intro) a)
       if let some p ← PropEngine.prove hyps c (splits := 0) then return some (true, p)
       if let some p ← PropEngine.prove hyps (mkNot c) (splits := 0) then return some (false, p)
+    -- Z3's normal forms in the instances of the definitions (e.g., `"" < s` as `¬ "" = s`)
+    if !normalized then
+      if let some (c', pc) ← z3NormalizeProp c (← IO.mkRef {}) then
+        match ← decide? c' (normalized := true) with
+        | some (true, p) => return some (true, ← mkEqMPR pc p)
+        | some (false, p) => return some (false, ← withLam `h c fun h => do return mkApp p (← mkEqMP pc h))
+        | none => pure ()
     return none
   step (t : Expr) : TermElabM (Option (Expr × Expr)) := do
     if t.isAppOfArity ``ite 5 then
@@ -701,6 +761,11 @@ def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (hyps : Array (Expr × 
     -- differences of the rewritten sides
     let (x, px) := ca.back!
     let (y, py) := cb.back!
+    -- Z3's normal forms in the instances of the definitions
+    let (x, px) ← match ← z3NormalizeProp x (← IO.mkRef {}) with
+      | some (x', p) => pure (x', ← mkEqTrans px p)
+      | none => pure (x, px)
+    if x == y then return some (← mkEqTrans px (← mkEqSymm py))
     if let some p ← ctx.proveDiff x y then
       return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
     if let some p ← proveUnder ctx hyps (← mkEq x y) then
