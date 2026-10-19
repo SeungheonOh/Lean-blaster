@@ -472,6 +472,9 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     let aux ← auxDefs.get
     g'.withContext do g'.replaceTargetDefEq (← deltaExpand (← instantiateMVars (← g'.getType)) aux.contains)
   replaceMainGoal [g]
+  -- NOTE: the Boolean equalities of lawful instances as decided equalities (the user instances are unfolded by
+  -- `blaster_unfold_user`, e.g., `x == y` into a recursive `eqData x y`, while Blaster translates them as equalities)
+  try evalTactic (← `(tactic| simp only [Bool.beq_eq_decide_eq])) catch _ => pure ()
   try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
   -- case analyses: the goals are reduced (`dsimp`) and split, the eliminators of the left-hand side (the Lean
   -- definition) first, those of the right-hand side (the SMT definition, whose testers may examine more constructors
@@ -548,6 +551,7 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     if (← getGoals).isEmpty then continue
     if !unfolded.contains g then
       -- user definitions exposed by the case analyses
+      try evalTactic (← `(tactic| simp only [Bool.beq_eq_decide_eq])) catch _ => pure ()
       try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
       for g' in ← getGoals do
         unfolded := unfolded.insert g'
