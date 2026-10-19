@@ -703,6 +703,19 @@ where
       | _ => pure ()
     return acc
 
+theorem ediv_self_of_zero_ne {a : Int} (h : ¬0 = a) : a / a = 1 := Int.ediv_self (Ne.symm h)
+
+syntax (name := blasterDivModSimp) "blaster_divmod_simp" : tactic
+
+/-- The `Int` divisions and modulos by non-literal divisors of the goal normalized by case analyses on the
+    conditionals and the signs (e.g., Z3's rewrites of `x % (-y)` into `x % y`, of `x / x` into
+    `if x = 0 then 0 / 0 else 1`, of `x % (if c then a else b)` into `if c then x % a else x % b`). -/
+@[tactic blasterDivModSimp] def evalBlasterDivModSimp : Tactic := fun _ => withMainContext do
+  if (evalBlasterDivMod.collect (← instantiateMVars (← getMainTarget))).isEmpty then
+    throwError "blaster_divmod_simp: no division"
+  evalTactic (← `(tactic| (intros; (repeat' split) <;> (try subst_vars) <;>
+    simp_all [Int.emod_neg, Int.ediv_neg, Int.neg_one_mul, Int.ediv_self, ediv_self_of_zero_ne, Int.emod_self] <;> done)))
+
 syntax (name := blasterCasesNat) "blaster_cases_nat" : tactic
 
 /-- Case analysis (`0` / `n + 1`) on the local variables of type `Nat`. -/
@@ -799,7 +812,10 @@ def macroTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("split+omega", ← `(tactic| (intros; (repeat' split) <;> omega))),
     ("simp+omega", ← `(tactic| (intros; (repeat' split) <;> simp_all [Int.natCast_ediv, Int.natCast_emod] <;> omega))),
     ("simp", ← `(tactic| (intros; simp [Int.natCast_ediv, Int.natCast_emod]; done))),
-    ("grind", ← `(tactic| (intros; grind)))]
+    ("grind", ← `(tactic| (intros; grind))),
+    -- the divisions and modulos of `Int` (see `Bridge.tdiv_macro`)
+    ("int div", ← `(tactic| first | exact Bridge.tdiv_macro | exact Bridge.tmod_macro | exact Bridge.fdiv_macro |
+                                      exact Bridge.fmod_macro | exact Bridge.ediv_macro | exact Bridge.emod_macro))]
 
 theorem toNat_ediv_two (y : Int) : (y / 2).toNat = y.toNat / 2 := by omega
 
@@ -807,6 +823,7 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
   let arith := #[
     ("omega", ← `(tactic| (intros; omega))),
     ("divmod+omega", ← `(tactic| (intros; blaster_divmod; omega))),
+    ("divmod simp", ← `(tactic| blaster_divmod_simp)),
     ("propext+omega", ← `(tactic| (intros; apply propext; constructor <;> intro <;> omega))),
     ("split+omega", ← `(tactic| (intros; (repeat' split) <;> omega))),
     -- nonlinear arithmetic (fails quickly on goals without nonlinear terms)

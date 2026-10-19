@@ -103,7 +103,17 @@ def isArithComparison (e : Expr) : Bool :=
   (e.isAppOfArity ``Eq 3 && numeric (e.getArg! 0)) || (e.isAppOfArity ``LE.le 4 && numeric (e.getArg! 0)) ||
   (e.isAppOfArity ``LT.lt 4 && numeric (e.getArg! 0))
 
-/-- Maximal subterms of `l` that also occur in `r` (and are neither atomic, types nor arithmetic comparisons). -/
+/-- Applications of the arithmetic operations of `Int` and `Nat` (not comparisons). -/
+def isArithOperation (e : Expr) : Bool :=
+  let ops := #[(``HAdd.hAdd, 6), (``HSub.hSub, 6), (``HMul.hMul, 6), (``HDiv.hDiv, 6), (``HMod.hMod, 6),
+    (``Neg.neg, 3), (``Nat.cast, 3), (``Int.toNat, 1), (``Int.natAbs, 1), (``Int.add, 2), (``Int.mul, 2),
+    (``Int.neg, 1), (``Int.sub, 2), (``Int.ediv, 2), (``Int.emod, 2), (``Int.tdiv, 2), (``Int.tmod, 2),
+    (``Int.fdiv, 2), (``Int.fmod, 2), (``Nat.add, 2), (``Nat.mul, 2), (``Nat.sub, 2), (``Nat.div, 2), (``Nat.mod, 2),
+    (``Nat.succ, 1)]
+  ops.any fun (n, k) => e.isAppOfArity n k
+
+/-- Maximal subterms of `l` that also occur in `r` (and are neither atomic, types, arithmetic operations nor arithmetic
+    comparisons). -/
 partial def commonSubterms (l r : Expr) : MetaM (Array Expr) := do
   let inR := closedSubterms r {}
   let visited ← IO.mkRef ({} : Std.HashSet Expr)
@@ -111,7 +121,9 @@ partial def commonSubterms (l r : Expr) : MetaM (Array Expr) := do
   let rec go (e : Expr) : MetaM Unit := do
     if (← visited.get).contains e then return
     visited.modify (·.insert e)
-    if !e.hasLooseBVars && !isAtomic e && !isArithComparison e && inR.contains e then
+    -- NOTE: arithmetic terms are not generalized (their atoms are), e.g., `x` in `x / (-1 * x)`, whose relations
+    -- would be lost otherwise
+    if !e.hasLooseBVars && !isAtomic e && !isArithComparison e && !isArithOperation e && inR.contains e then
       -- values and propositions (not types, partial applications, nor instances, which tactics must see)
       let ty ← whnfR (← inferType e)
       if !(ty.isSort && !ty.isProp) && !ty.isForall && (← isClass? ty).isNone then

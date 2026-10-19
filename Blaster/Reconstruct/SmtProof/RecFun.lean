@@ -480,6 +480,8 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
   let mut count := todo.length
   let mut unfolded : Std.HashSet MVarId := {}
   let mut remaining := []
+  -- debugging: the case analyses (environment variable `BLASTER_RECEQN_DEBUG`)
+  let trace := (← IO.getEnv "BLASTER_RECEQN_DEBUG").isSome
   while !todo.isEmpty do
     let g := todo.head!
     todo := todo.tail!
@@ -505,13 +507,17 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     let env ← getEnv
     let lhsCond := lhs.find? fun e => e.isAppOf ``ite || e.isAppOf ``dite || isMatcherCore env e.getAppFn.constName
     if let some x := (← g.withContext (blockingVars lhs))[0]? then
+      if trace then debugLog m!"blaster_rec_eqn: cases on {← g.withContext (ppExpr (mkFVar x))} (left-hand side)"
       subgoals? := some ((← g.cases x).toList.map (·.mvarId))
     else if lhsCond.isSome then
       subgoals? ← observing? (do evalTactic (← `(tactic| split)); getGoals)
+      if trace then debugLog m!"blaster_rec_eqn: split (left-hand side): {subgoals?.map (·.length)}"
     if subgoals?.isNone then
       let vars ← g.withContext (blockingVars all)
       let vars ← if !vars.isEmpty then pure vars else g.withContext structVars
-      if let some x := vars[0]? then subgoals? := some ((← g.cases x).toList.map (·.mvarId))
+      if let some x := vars[0]? then
+        if trace then debugLog m!"blaster_rec_eqn: cases on {← g.withContext (ppExpr (mkFVar x))}"
+        subgoals? := some ((← g.cases x).toList.map (·.mvarId))
     if let some gs := subgoals? then
       count := count + gs.length
       if count > maxEqnGoals then
@@ -532,6 +538,7 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
         todo := g' :: todo
       continue
     -- case analyses on the conditions of the right-hand side
+    if trace then debugLog m!"blaster_rec_eqn: split (right-hand side)\n{← Meta.ppGoal g}"
     let some gs ← observing? (do evalTactic (← `(tactic| split)); getGoals) | remaining := remaining ++ [g]; continue
     count := count + gs.length
     if count > maxEqnGoals then throwError "blaster_rec_eqn: too many cases"
@@ -627,7 +634,10 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
             debugLog m!"recfun: blaster_rec_eqn: {gs.length} goals left, {(← IO.monoMsNow) - t0} ms, {((← IO.getNumHeartbeats) - h0) / 1000} heartbeats, mvars {prf.hasMVar}, errors {(← Core.getMessageLog).hasErrors}"
           catch ex => debugLog m!"recfun: blaster_rec_eqn: {ex.toMessageData}"
       if p.isSome then return p
-      ctx.proveDef stmt
+      debugLog m!"recfun: bridge tactics on the definitional equation of {eq.head}"
+      let r ← ctx.proveDef stmt
+      debugLog m!"recfun: bridge tactics {if r.isSome then "proved" else "failed"} for {eq.head}"
+      return r
     if let some p ← (try prove catch _ => pure none) then
       -- Z3's normal forms (as in Z3's lemmas)
       let stmt' ← z3Normalize stmt
