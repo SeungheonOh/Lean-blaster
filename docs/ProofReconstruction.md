@@ -132,6 +132,10 @@ target another Blaster branch.
    The `match` rules are justified as follows:
    - `matchReduction` on constructor discriminants: definitional (iota);
    - `matchReduction` pushing a match over `Blaster.dite'` (`constMatchPropagation?`): `apply_dite'`;
+   - case of case (`constMatchPropagation?`), a function over a match (`funPropagation?`) and a match
+     applied to extra arguments (`normChoiceApplication?`), i.e., `F[match d with alts] = match d with
+     (F[·] ∘ alts)`: a case split over the alternatives of the resulting match, each case being justified
+     by the match equation of the pushed match (`mkMatchPushProof`);
    - `elimMatch` with a common rhs: a case split over the splitter with `rfl` in each case;
    - `elimMatch` with the match context (`matchInHyps?`): the discriminants are rewritten with the
      equalities `h : dⱼ = pⱼ` of the enclosing alternative, then the match is reduced.
@@ -200,10 +204,17 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    backends as an uninterpreted function `f`, its definition `f_LRec` and the definitional axiom
    `∀ x, f x = f_LRec x`, such that their unfoldings are quantifier instantiations. The axioms over `Nat`
    are guarded with `0 ≤ x` (this only weakens the query).
-2. **Backends** (`BLASTER_SMTPROOF_BACKENDS`, `z3,z3+` by default, e.g., `z3,cvc5`): Z3 with legacy proof
-   objects (`:produce-proofs true`, `pp.simplify_implies false`), the same with the simplifier options of
-   the query kept (`z3+`, e.g., `smt.macro_finder`, which may be needed to find a proof but gives coarser
-   proofs), and cvc5 with Alethe proofs (`--parsing-mode=lenient`, `--proof-granularity=dsl-rewrite`).
+2. **Backends** (`BLASTER_SMTPROOF_BACKENDS`, `z3,z3rec,z3+` by default, e.g., `z3,cvc5`): Z3 with legacy proof
+   objects (`:produce-proofs true`, `pp.simplify_implies false`); `z3rec`, Z3 on the query with its recursive
+   functions defined by a `define-funs-rec` block (`RecFun.lean`: Z3's `recfun-finder` simplifier, which does the
+   same, is disabled under proof production, and Z3 may then get lost in the instantiations of the definitional
+   axioms; skipped when the query has no recursive function), whose `recfun` theory lemmas are replayed with exact
+   proofs (unfoldings of the definitional equations, proved once per function by case analysis in the normal
+   forms of Z3's rewriter, `blaster_rec_eqn`; Z3's auxiliary `fold-rec-n` functions as auxiliary definitions); the
+   same as `z3` with the simplifier options of the query kept (`z3+`, e.g., `smt.macro_finder`, which may be needed
+   to find a proof but gives coarser proofs); and cvc5 with Alethe proofs (`--parsing-mode=lenient`,
+   `--proof-granularity=dsl-rewrite`). Proofs are produced with the random seed and the timeout of the
+   theorem's solver options.
    The timeout of a backend is `BLASTER_SMTPROOF_TIMEOUT` (seconds, 20 by default). Each adapter
    translates the proof into a DAG of steps (`IR.lean`): rule, premises, arguments (e.g., quantifier
    instantiations) and conclusion (clauses as disjunctions). The Alethe adapter also serves veriT.
@@ -220,8 +231,13 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    rewriting and theory lemmas. Large equalities (e.g., Z3 `rewrite`s inside big formulas) are related by
    congruence on their common structure, and only their differences are given to tactics, with the
    subterms common to both sides generalized (`Local.lean`); arithmetic lemmas over large atoms are
-   generalized the same way, with facts on `div`/`mod` for `omega`. The proof of `False` is turned into a
-   proof of the goal and checked by the kernel like any other reconstructed proof.
+   generalized the same way, with facts on `div`/`mod` for `omega`; nonlinear integer lemmas are proved by
+   `blaster_nlarith` (`NlArith.lean`: case splits, products of hypotheses, polynomials normalized with the
+   commutative ring lemmas of `grind`, then `omega` with the monomials as atoms). Tactics run on the statement of
+   the step closed over the variables it mentions, in an empty local context: a step holds by itself (its
+   premises are hypotheses of the statement), and the hypotheses of the context (e.g., the negated goal of a CEK
+   evaluation) only slowed down `simp_all` and case analyses, by one to two orders of magnitude. The proof of
+   `False` is turned into a proof of the goal and checked by the kernel like any other reconstructed proof.
 5. **Bridge** (`Bridge.lean`). The asserted formula is the translation of the negated goal, interpreted
    back. It is related to the negated goal by a simultaneous traversal of both terms: congruence on their
    common structure, and a lemma for each encoding of the translation where they differ: `match` as `ite`
@@ -233,11 +249,32 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    definitions of the other functions are bridged by tactics. The traversal is linear in the size of the
    (shared) terms, which matters for goals such as the CEK evaluation of validators.
 
-Blaster's polymorphic encoding is interpreted when the goal has a single sort variable `α`. On this
-branch, the values of the sort variables are values of the universal sort `@@Type` (a sort variable is an
-alias `@α` of `@@Type`, with a membership predicate `@is@α`): `@@Type` is interpreted as `α` and the
-membership predicates as `True`. Lambda terms of the translation (`@lambda`, `@global_lambda` with their
-definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as Lean `Nat` variables.
+Blaster's polymorphic encoding is interpreted in two ways. On this branch, the values of the sort variables are
+values of the universal sort `@@Type` (a sort variable is an alias `@α` of `@@Type`, with a membership predicate
+`@is@α`; the sort variables quantified in hypotheses are instantiated with `@@Type`), and the membership
+predicates of the types over sort variables are specific to each type (e.g., `@isList._uniq.n` for `List α`,
+`Fun_uniq.n` for `α → β`). With a single sort variable `α` of an inhabited type, `@@Type` is interpreted as `α` and
+the membership predicates as `True`. Otherwise (several, possibly empty, sort variables; `Poly.lean`), `@@Type` is
+interpreted as the always inhabited universe `Univ.{u} := Option (PSigma fun α : Sort u => α)`, values as their
+injections (lifted through lists, options, pairs, functions and the inductive types of the user, whose maps to
+their instances at the universe are defined with their recursors), and each membership predicate as "lies in the
+image of the injection" of its type; the bridge relates the goal to the asserted formula with an additional world
+for these injections. Polymorphic Lean functions instantiated at sort variables (e.g., `@List.zipWith α β γ`,
+whose SMT function is shared by all their instantiations) are interpreted at the universe, such that their
+definitional axioms hold on all its values, and the bridge relates their applications in the goal to their
+interpretations by *naturality* lemmas proved once per function and instantiation by functional induction
+(`blaster_poly_nat`). A `match` on a datatype with fields of sort variables is related to its interpretation by
+case analysis on its discriminant. Naturality only holds for parametric functions: axioms and opaque functions at
+sort variables, and functions with instance arguments that don't exist at the universe (e.g., `[BEq α]`), are only
+interpreted with `@@Type` as the sort variable. Lambda terms of the translation (`@lambda`, `@global_lambda` with
+their definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as Lean `Nat` variables;
+with the universe, they are guarded by the membership predicates of their parameters as their definitions are
+(`fun x => if Img w x then b else dflt x`). Differences with the `beta-lambda-cache-optimization` port, whose
+encoding has a sort of types `@Type` per universe and membership predicates parametrized by sort values: the sort
+variables of a goal must live in the same universe (they share `@@Type`), the arrow sorts of functions to `Prop`
+have `Bool` codomains (interpreted with the `Prop` codomains of the Lean types of the goal's constants), and goals
+with universe level parameters are re-optimized as by the proof run (the optimizer normalizes the universe levels
+to `1` otherwise, such that the caches of the translation would not match the goal).
 
 The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a
 `Nat` function instantiated with a negative integer) simply fails to replay. Soundness only relies on the
@@ -248,10 +285,36 @@ tests the replay alone (`(smt-proof: 3)`).
 
 ### Results
 
-On this branch, with `BLASTER_SMT_PROOF=only` (no tactic strategy for SMT residuals) on 42 files of `Tests/Smt`
-and `Tests/FixedIssues` (all those with SMT residuals except `SmtNatMod`, `CharBitVec` and `Issue18`), 110 of
-the 220 replays succeed with the system Z3 4.13.3 (82 before the sync with 9b9a511 of `feat/smt-proof-replay`),
-and 149/219 with Z3 5.3.1, in line with the source branch on the same files with Z3 5.3.1 (143/220; the test
+On this branch, with `BLASTER_SMT_PROOF=only` (no tactic strategy for SMT residuals) on the 42 files of
+`Tests/Smt` and `Tests/FixedIssues` with SMT residuals (except `SmtNatMod`, `CharBitVec` and `Issue18`), after the
+sync with 53dc075 of `feat/smt-proof-replay` (Z3 5.3.1): **199 of the 220 replays succeed** (90.5%), and all 5 of
+the new soundness tests (`LambdaDefGuard`, `InstanceArgs`). The source branch replays 212 of 223 on its versions
+of the same files. Per file (target / source):
+
+| file | this branch | `feat/smt-proof-replay` |
+|------|-------------|-------------------------|
+| `Tests/Smt/SmtMatch.lean` | 72/73 | 72/73 |
+| `Tests/Smt/SmtNat/SmtNatSub.lean`, `SmtNatMul`, `SmtNatDiv`, `SmtNatAdd`, `SmtNatPow` | 68/68 | 67/67 |
+| `Tests/Smt/SmtEqArith.lean`, `SmtLtArith`, `SmtRecFun` | 14/14 | 13/13 |
+| `Tests/Smt/SmtUninhabited.lean` | 6/8 | 8/8 |
+| `Tests/Smt/SmtPredQualifier.lean` | 5/7 | 7/7 |
+| `Tests/FixedIssues/Issue26.lean` | 3/8 | 8/8 |
+| other `Tests/FixedIssues` files | 31/42 | 37/47 |
+| `Tests/Reconstruct/SmtProof.lean` | 16/22 | 22/22 |
+
+The differences come from this branch's polymorphic encoding: sort variables of different universes (e.g., the
+universe polymorphic theorems of `Issue26` and `zipWith_map_left`: they share `@@Type`, while the source has a
+sort of types per universe), hypotheses quantifying over sorts (instantiated with `@@Type`: Z3 finds no proof with
+proof production for `SmtPredQualifier`, `Issue32` and the four such goals of `SmtProof.lean`), class methods at
+several sort variables (no instance at the universe, `Issue29` and `SmtUninhabited`), and two goals whose
+re-translation fails on this branch (`Issue3`: `UInt32.toNat c.val`, `Issue25`: a sort variable of `Sort u`). The
+`z3rec` backend behaves as on the source: with `BLASTER_SMTPROOF_BACKENDS=z3rec`, 44 of the 73 goals of
+`SmtMatch.lean` are replayed on both branches (the others have no recursive function), with the same `recfun`
+lemmas. The optimizer's evidence for pushing functions and matches into match alternatives replaces 16 of the 98
+obligations of `Tests/Reconstruct/MatchEdge.lean` (reconstruction time 12.0 s → 9.2 s).
+
+At the sync with 9b9a511, on the same files, 110 of the 220 replays succeeded with the system Z3 4.13.3 (82 before
+that sync), and 149/219 with Z3 5.3.1, in line with the source branch on the same files with Z3 5.3.1 (143/220; the test
 files of both branches differ slightly). Most of the failures with Z3 4.13.3 are in `Tests/Smt/SmtMatch.lean`
 (13/73, 52/73 with Z3 5.3.1): Z3 4.13.3 rewrites the definitional axioms of the derived `BEq` instances under
 their binders, and these large `rewrite` steps (proved by local differences and tactics) exceed the replay
@@ -261,11 +324,13 @@ Z3 5.3.1. With Z3 4.13.3, 5 of them are replayed, and the other two are proved b
 of `x / (y + 1) ≤ x` needs a non-linear `div` lemma, and the proof of the `Option α` goal a datatype lemma over a
 selector of `Option α`, whose interpretation needs an inhabitant of `α`.
 
-On the `beta-lambda-cache-optimization` port (`feat/smt-proof-replay`, nightly Z3), the replay proves 88.9% of the
-goals closed by the SMT solver on the whole test suite (248/279), and scales to the validators of
+On the `beta-lambda-cache-optimization` port (`feat/smt-proof-replay` at 53dc075, nightly Z3), the replay proves
+99.1% of the goals closed by the SMT solver on the whole test suite (338/341), and scales to the validators of
 [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
 evaluation of UPLC programs by the CEK machine (Z3 proofs of ≈900 steps over formulas of tens of thousands of
-nodes). With the default mode (`last`), the replay complements the tactic strategies.
+nodes): `HelloWorld`, `UnlockPIN`, `ParamFeed` and `Auction` are fully reconstructed with the replay only, and the
+`z3rec` backend yields the proofs of `MintingPolicy` (a residual of 22K steps replayed and kernel checked in about
+2.5 min). With the default mode (`last`), the replay complements the tactic strategies.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
@@ -279,8 +344,8 @@ adaptively by success rate per time unit for each rule and goal shape. Performan
 For instance, on the `beta-lambda-cache-optimization` port, a 245-step Z3 proof involving a recursive function
 replays in ~6 s, and a 2458-step cvc5 (Alethe) proof of the same goal in ~30 s.
 
-Limitations: polymorphic goals with several sort variables; `match` patterns on `Nat`/`Int` with
-variables (e.g., `n + 1`, whose translation needs the conditions of the branch) and named patterns; cvc5's
+Limitations: polymorphic goals whose sort variables live in different universes, or whose hypotheses quantify
+over sorts (see above); class methods and other non-parametric functions at several sort variables; cvc5's
 native CPC format (whose steps often leave their conclusion implicit) is not supported; the proofs depend on
 the version of Z3 (see above), and proof production may time out where the verdict did not.
 
@@ -294,6 +359,34 @@ Reconstruction checks every individual rewrite, so it surfaces problems in the t
   Reconstruction refuses the goal and pinpoints `(∀ (_x : α), False) = False`; see
   `Tests/Reconstruct/Unsound.lean`. The same holds for `∃ (x : α), e ⟶ e`. These refusals are counted
   separately in the coverage measurements.
+- **Unguarded definitions of lambda terms (soundness bug, fixed).** The definitional axioms of lambda terms
+  (`@lambda_n_def_cstr`, `@global_lambda_n_def_cstr`) constrained their applications on all the values of the
+  sorts of their parameters: on this branch, the values of the universal sort `@@Type` for the parameters of sort
+  variables, and the negative integers for `Nat` parameters. Function equality being translated as SMT equality,
+  two lambda terms equal in Lean were equal on all the values of their sorts, which is inconsistent when they
+  differ outside their domain: `∀ (α β : Type) (c : α) (b1 b2 : β), (∀ x : α, x = c) → (fun x : α => x) =
+  (fun _ => c) → b1 ≠ b2 → False` and `∀ (b : Bool), (fun n : Nat => n - 1 + 1) = (fun n : Nat => if n = 0 then 1
+  else n) → b = true` were reported `Valid`. The definitions are now guarded by the membership predicates of the
+  parameters (`Tests/FixedIssues/LambdaDefGuard.lean`). The replay of SMT proofs could not prove these goals (the
+  axioms have no model in its interpretation), which is how the bug was found on the
+  `beta-lambda-cache-optimization` port. Two induction steps of `Tests/FixedIssues/Issue26.lean` are no longer
+  proved by Blaster.
+- **Non-canonical instances (soundness bug, fixed).** `@LT.lt α inst` (resp. `LE.le`) was taken as the relation of
+  the SMT theory for `α ∈ [Nat, Int, Bool, String]` whatever `inst`, and the instance arguments of function values
+  (e.g., a structure field `f [LT Nat] : Nat → Nat`) are erased by the translation. With `lt1 := ⟨(· < ·)⟩` and
+  `lt2 := ⟨fun a b => b < a⟩ : LT Nat` passed explicitly, `∀ x y, @g Nat lt1 _ x y = @g Nat lt2 _ x y` (with
+  `g x y := decide (x < y)`) and `∀ r x, @FunRelNat.f r lt1 x = @FunRelNat.f r lt2 x` were reported `Valid`.
+  Other instances of `LT`/`LE` are now unfolded, and applications of function values are only translated when
+  their instance arguments are canonical or instance-implicit binders of the goal
+  (`Tests/FixedIssues/InstanceArgs.lean`; two instance-implicit binders of the same class are still not
+  distinguished).
+- **Issues of this branch found while porting the fixes** (not fixed):
+  - a structure field polymorphic in a sort variable and applied at a type (e.g., `f [LT α] : α → α` applied at
+    `Nat`) is translated with an undeclared `@apply` function (`Unexpected smt error: unknown constant
+    @apply_uniq.n (@@ArrowT2 Int)`);
+  - when `blaster` leaves a goal it can't prove, the goal has its universe levels normalized to `1`, which the
+    kernel rejects for universe polymorphic theorems (e.g., `blaster <;> sorry`); `first | (blaster; done) | sorry`
+    closes the original goal instead.
 - **Ill-typed optimizer output.** The proof run avoids the following issues; the verdict run is unchanged.
   - The else branch of `Blaster.dite'` received the *normalized* type of `¬ c` (e.g. `false = c`
     instead of `¬ (true = c)`), so `dite'` applications were ill-typed. When tracking proofs, the
@@ -388,8 +481,10 @@ unresolved (down from 796).
 - Match equations and splitters are generated by Lean on demand (`Match.getEquationsFor`). For
   matchers with many overlapping patterns, the generation can exceed Lean's fixed heartbeat
   budget. These matchers fall back to coarse obligations.
-- Goals proved by the SMT solver rely on Lean decision procedures. The next step is to replay Z3
-  proofs, or at least use unsat cores and quantifier instantiations from Z3 as hints.
+- Goals proved by the SMT solver are reconstructed with Lean decision procedures and by the replay of SMT
+  proofs (see above); the replay fails on polymorphic goals whose sort variables live in different universes or
+  whose hypotheses quantify over sorts (Z3 does not find proofs for this branch's encoding of such hypotheses,
+  instantiated with the universal sort), and on cvc5 proofs whose Alethe export contains skolems.
 - Equivalences between recursive functions that need a generalized induction hypothesis or mutual
   induction still fail.
 - Arithmetic (`Nat`/`Int`) constant folding and `match` normalization rules still rely on tactic
