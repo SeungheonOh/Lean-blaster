@@ -82,4 +82,26 @@ theorem zipWith_map_left {l₁ : List α} {l₂ : List β} {f : α → α'} {g :
     List.zipWith g (l₁.map f) l₂ = List.zipWith (fun a b => g (f a) b) l₁ l₂ := by
   induction l₁ generalizing l₂ <;> blaster (reconstruct: 2) (smt-proof: 3)
 
+-- datatypes of the user over sort variables, mapped to the universe by their recursors (see `Poly.mkIndWorld`):
+-- the images of their constructors (definitions of their membership predicates), case analyses, constructors of
+-- undetermined instances
+inductive Tree (α : Type u) where
+  | leaf
+  | node (l : Tree α) (v : α) (r : Tree α)
+
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [(∀ (β : Type) (t : Tree β) (g : Tree β → Nat), g t < 100) →
+   ∀ (α : Type) (t : Tree α) (a : α) (g : Tree α → Nat), g (Tree.node t a .leaf) < 101]
+
+inductive Either (α : Type u) (β : Type v) where
+  | left : α → Either α β
+  | right : β → Either α β
+
+def Either.getLeft (d : α) : Either α β → α
+  | .left a => a
+  | .right _ => d
+
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [∀ (α β : Type) (e : Either α β) (d : α), (∀ b, e ≠ .right b) → (Either.left (e.getLeft d) : Either α β) = e]
+
 end Tests.Reconstruct.SmtProof
