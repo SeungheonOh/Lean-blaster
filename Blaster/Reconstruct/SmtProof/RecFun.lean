@@ -511,6 +511,22 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
       subgoals? := some ((← g.cases x).toList.map (·.mvarId))
     else if lhsCond.isSome then
       subgoals? ← observing? (do evalTactic (← `(tactic| split)); getGoals)
+      -- NOTE: `split` fails when the discriminants of a `match` can't be generalized in the goal (e.g., `x :: xs`
+      -- matched against string literal patterns): the discriminants of the first `match` of the left-hand side are
+      -- generalized first
+      if subgoals?.isNone then
+        let isMatch (e : Expr) : Bool := match e.getAppFn with
+          | .const m _ => isMatcherCore env m && (getMatcherInfoCore? env m).any (·.arity == e.getAppNumArgs)
+          | _ => false
+        if let some m := lhs.find? isMatch then
+          if let some app ← g.withContext (matchMatcherApp? m) then
+            let ds := app.discrs.filter (!·.isFVar)
+            if !ds.isEmpty then
+              subgoals? ← observing? do
+                let (_, g') ← g.generalize (ds.map fun d => { expr := d, hName? := some `hd })
+                setGoals [g']
+                evalTactic (← `(tactic| split))
+                getGoals
       if trace then debugLog m!"blaster_rec_eqn: split (left-hand side): {subgoals?.map (·.length)}"
     if subgoals?.isNone then
       let vars ← g.withContext (blockingVars all)
@@ -622,17 +638,6 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       let p ← if stmt.hasFVar then pure none else
         withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
       debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for {eq.head} ({(← IO.monoMsNow) - t0} ms)"
-      -- the reason of the failure (debugging)
-      if p.isNone && !stmt.hasFVar && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
-        withoutModifyingState <| withLCtx {} {} do
-          try
-            let m ← mkFreshExprMVar stmt
-            let t0 ← IO.monoMsNow
-            let h0 ← IO.getNumHeartbeats
-            let gs ← withoutErrToSorry <| Tactic.run m.mvarId! (evalTactic (← `(tactic| blaster_rec_eqn)))
-            let prf ← instantiateMVars m
-            debugLog m!"recfun: blaster_rec_eqn: {gs.length} goals left, {(← IO.monoMsNow) - t0} ms, {((← IO.getNumHeartbeats) - h0) / 1000} heartbeats, mvars {prf.hasMVar}, errors {(← Core.getMessageLog).hasErrors}"
-          catch ex => debugLog m!"recfun: blaster_rec_eqn: {ex.toMessageData}"
       if p.isSome then return p
       debugLog m!"recfun: bridge tactics on the definitional equation of {eq.head}"
       let r ← ctx.proveDef stmt
