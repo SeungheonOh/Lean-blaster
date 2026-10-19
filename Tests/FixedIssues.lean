@@ -32,3 +32,4 @@ import Tests.FixedIssues.Issue32
 import Tests.FixedIssues.Issue33
 import Tests.FixedIssues.NatLog2
 import Tests.FixedIssues.CharBitVec
+import Tests.FixedIssues.LambdaDefGuard
