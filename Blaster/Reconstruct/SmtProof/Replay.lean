@@ -645,6 +645,42 @@ where
     let pf := mkAppN (mkConst (T ++ `casesOn) (levelZero :: lvls)) (params ++ #[motive, x] ++ minors)
     return some (← mkExpectedTypeHint pf concl)
 
+/-- `f as = f bs` from the proofs `diffs` of `asᵢ = bsᵢ` for the arguments that differ: congruence on the partial
+    applications `f as[0..i)` when their types are not dependent, and otherwise on the full applications
+    `fun z => f bs[0..i) z as(i..n]` when only the type of the application depends on `z` and it reduces to a type
+    not depending on `z` (e.g., the major premise of a `casesOn` with a constant motive). -/
+def congrArgs (f : Expr) (as bs : Array Expr) (diffs : Array (Nat × Expr)) : MetaM (Option Expr) := do
+  let partialApps : MetaM (Option Expr) := do
+    let mut pf ← mkEqRefl f
+    let mut cur := f
+    let mut changed := false
+    let mut k := 0
+    for i in [:as.size] do
+      if k < diffs.size && diffs[k]!.1 == i then
+        let pi := diffs[k]!.2
+        k := k + 1
+        if !(← whnfR (← inferType cur)).isArrow then return none
+        pf ← if changed then mkCongr pf pi else mkCongrArg cur pi
+        cur := mkApp cur bs[i]!
+        changed := true
+      else
+        pf ← if changed then mkCongrFun pf as[i]! else pure pf
+        cur := mkApp cur as[i]!
+        if !changed then pf ← mkEqRefl cur
+    return some pf
+  if let some pf ← partialApps then return some pf
+  let info ← getFunInfoNArgs f as.size
+  let mut pf ← mkEqRefl (mkAppN f as)
+  let mut cur := as
+  for (i, pi) in diffs do
+    if (info.paramInfo.extract (i + 1) info.paramInfo.size).any (·.backDeps.contains i) then return none
+    let ctx ← withLocalDeclD `z (← inferType as[i]!) fun z => mkLambdaFVars #[z] (mkAppN f (cur.set! i z))
+    let .forallE _ _ body _ ← whnfR (← inferType ctx) | return none
+    if body.hasLooseBVars then return none
+    pf ← mkEqTrans pf (← mkCongrArg ctx pi)
+    cur := cur.set! i bs[i]!
+  return some pf
+
 mutual
 
 /-- Proof of the interpretation of the conclusion of step `i`. -/
@@ -989,20 +1025,12 @@ partial def congrDescent (eqs : Array (Expr × Expr × Expr)) (l r : Expr) (fuel
   -- conditionals (the instance depends on the condition)
   if let some p ← Local.iteCongr? l r (congrDescent eqs · · (fuel - 1)) then return some p
   -- congruence on each argument (dependent arguments must be equal)
-  let mut pf ← mkEqRefl (mkAppN lf #[])
-  let mut cur := lf
-  let mut changed := false
+  let mut diffs := #[]
   for i in [:las.size] do
-    if las[i]! == ras[i]! then
-      pf ← if changed then mkCongrFun pf las[i]! else pure pf
-      cur := mkApp cur las[i]!
-      if !changed then pf ← mkEqRefl cur
-      continue
+    if las[i]! == ras[i]! then continue
     let some pi ← congrDescent eqs las[i]! ras[i]! (fuel - 1) | return none
-    pf ← if changed then mkCongr pf pi else mkCongrArg cur pi
-    cur := mkApp cur ras[i]!
-    changed := true
-  return some pf
+    diffs := diffs.push (i, pi)
+  congrArgs lf las ras diffs
 
 /-- Congruence (`monotonicity`): from premises `aᵢ = bᵢ`, prove `L = R` by abstracting the
     occurrences of each `aᵢ` in `L` and applying `congrArg` (premises not occurring are ignored). -/

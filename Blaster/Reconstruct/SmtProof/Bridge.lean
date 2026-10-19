@@ -1411,17 +1411,24 @@ partial def walkApp (a b : Expr) : BridgeM (Option Expr) := do
   let mut cur := as
   for i in [:as.size] do
     if as[i]! == bs[i]! then continue
+    let mut resultDep := false
     if let some pi := info.paramInfo[i]? then
       if pi.hasFwdDeps then
         -- dependent argument: only definitionally equal arguments
         if ← isDefEq as[i]! bs[i]! then cur := cur.set! i bs[i]!; continue
-        return none
+        -- NOTE: an argument on which only the result type depends (e.g., the major premise of a `casesOn` with a
+        -- constant motive) is related when the type of the application does not depend on it (see below)
+        if (info.paramInfo.extract (i + 1) info.paramInfo.size).any (·.backDeps.contains i) then return none
+        resultDep := true
     let ta ← inferType as[i]!
     let tb ← inferType bs[i]!
     if !(← isDefEq ta tb) then return none
     let some p ← walk as[i]! bs[i]! | return none
     -- `fun z => f cur[0..i) z as(i..n]`
     let ctx ← withLocalDeclD `z ta fun z => mkLambdaFVars #[z] (mkAppN fa (cur.set! i z))
+    if resultDep then
+      let .forallE _ _ body _ ← whnfR (← inferType ctx) | return none
+      if body.hasLooseBVars then return none
     pf ← mkEqTrans pf (← mkCongrArg ctx p)
     cur := cur.set! i bs[i]!
   return some (← mkExpectedTypeHint pf (← mkEq a b))
