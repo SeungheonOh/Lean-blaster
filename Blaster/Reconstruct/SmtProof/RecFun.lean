@@ -304,14 +304,15 @@ theorem smt_str_empty_lt (s : String) : ("" < s) = ¬ ("" = s) := by
 
 /-- The normal forms of Z3's rewriter in the cases of recursive functions: `a < b` as `¬ b ≤ a` (integers), `"" < s`
     as `¬ "" = s` (see `smt_int_lt`, `smt_str_empty_lt`). -/
-def z3Normalize (e : Expr) : Expr :=
-  e.replace fun t =>
+def z3Normalize (e : Expr) : MetaM Expr :=
+  Meta.transform e (post := fun t => do
     if t.isAppOfArity ``LT.lt 4 then
       let (ty, a, b) := (t.getArg! 0, t.getArg! 2, t.getArg! 3)
-      if ty.isConstOf ``Int then some (mkNot (mkIntLe b a))
-      else if ty.isConstOf ``String && a == mkStrLit "" then some (mkNot (mkApp3 (mkConst ``Eq [1]) ty a b))
-      else none
-    else none
+      if ty.isConstOf ``Int then return .done (mkNot (mkIntLe b a))
+      -- NOTE: through the projections of constructor applications (e.g., `(ByteString.mk "").data`)
+      if ty.isConstOf ``String && (← whnfCore a) == mkStrLit "" then
+        return .done (mkNot (mkApp3 (mkConst ``Eq [1]) ty a b))
+    return .done t)
 
 /-- The application `f a⃗` of the left-hand side of a definitional equation, through the conversions of the
     interpretation (`↑(f a⃗)` for functions returning `Nat`, `f a⃗ = true` for functions returning `Bool`). -/
@@ -571,7 +572,7 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       ctx.proveDef stmt
     if let some p ← (try prove catch _ => pure none) then
       -- Z3's normal forms (as in Z3's lemmas)
-      let stmt' := z3Normalize stmt
+      let stmt' ← z3Normalize stmt
       let (stmt, p) ← if stmt' == stmt then pure (stmt, p) else do
         let imp ← withLCtx {} {} <| proveWithTactic (mkForall `h .default stmt stmt')
           (← `(tactic| (intro h; simp only [smt_int_lt, smt_str_empty_lt] at h ⊢; exact h)))
@@ -641,6 +642,15 @@ where
       if let some p := facts.get? c' then return some (true, ← mkEqSymm p)
       if let some p := facts.get? (mkNot c') then
         return some (false, ← withLam `h c fun h => do return mkApp p (← mkEqSymm h))
+    -- conjunctions of facts and of trivial conditions (e.g., the testers of single-constructor types, which Z3
+    -- removes from the guards), by unit propagation
+    if c.isAppOfArity ``And 2 then
+      let mut hyps := facts.toArray
+      for a in Local.opLeaves ``And c do
+        if !facts.contains a then
+          if ← defeqBudget a (mkConst ``True) 2000 true then hyps := hyps.push (a, ← mkExpectedTypeHint (mkConst ``True.intro) a)
+      if let some p ← PropEngine.prove hyps c (splits := 0) then return some (true, p)
+      if let some p ← PropEngine.prove hyps (mkNot c) (splits := 0) then return some (false, p)
     return none
   step (t : Expr) : TermElabM (Option (Expr × Expr)) := do
     if t.isAppOfArity ``ite 5 then
