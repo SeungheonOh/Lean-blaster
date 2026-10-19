@@ -426,16 +426,29 @@ def fillDefaults (e : Expr) : MetaM Expr := do
     if let some v ← mkSelector.inhabitant? t 8 then m.assign v
   instantiateMVars e
 
-/-- Assign the remaining type metavariables of `e` with `dflt`: the type parameters that nothing determines (e.g.,
-    of `Option.none` under a tester, whose instance Z3 doesn't print), then the default values of selectors. -/
+/-- Replace the remaining type metavariables of `e` with `dflt`: the type parameters that nothing determines (e.g.,
+    of `Option.none` under a tester, whose instance Z3 doesn't print), then the default values of selectors of
+    these types. The metavariables are substituted, not assigned: they may be shared with the interpretations of
+    the same subterms in other steps, where their context determines them. -/
 def defaultTypes (e : Expr) (dflt : Expr := mkConst ``Unit) : MetaM Expr := do
   if !e.hasExprMVar then return e
+  let dfltTy ← inferType dflt
+  let mut subst : Std.HashMap MVarId Expr := {}
   for m in (← getMVars e) do
     if ← m.isAssigned then continue
     let t ← instantiateMVars (← m.getType)
     -- NOTE: the universe of the parameter may be a metavariable (e.g., `Option.{?u} ?α`)
-    if t.isSort && (← isDefEq t (← inferType dflt)) then m.assign dflt
-  fillDefaults (← instantiateMVars e)
+    if t.isSort && (← isDefEq t dfltTy) then subst := subst.insert m dflt
+  if subst.isEmpty then return e
+  let apply (subst : Std.HashMap MVarId Expr) (x : Expr) : Expr :=
+    x.replace fun y => if let .mvar m := y then subst.get? m else none
+  -- the default values of selectors whose type is now known
+  for m in (← getMVars e) do
+    if (← m.isAssigned) || subst.contains m || (← m.getDecl).userName != defaultMVarName then continue
+    let t := apply subst (← instantiateMVars (← m.getType))
+    if t.hasExprMVar || (← isProp t) then continue
+    if let some v ← mkSelector.inhabitant? t 8 then subst := subst.insert m v
+  return apply subst e
 
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
