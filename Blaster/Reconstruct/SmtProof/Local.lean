@@ -277,12 +277,16 @@ def decideTrue? (p : Expr) : MetaM (Option Expr) := do
 
 /-- Hypotheses of the context passed to the tactics on the differences: arithmetic comparisons and their
     negations (e.g., the conditions of the conditionals enclosing a difference simplified under them). -/
-def relevantHyps (hyps : Array Expr) : MetaM (Array Expr) :=
+def relevantHyps (hyps : Array Expr) (l r : Expr) : MetaM (Array Expr) := do
+  let terms := closedSubterms r (closedSubterms l {})
   hyps.filterM fun h => do
     let t ← inferType h
     -- NOTE: also the conjunctions of comparisons (e.g., the contexts of conjuncts, see `diffEq`)
     let leaves := opLeaves ``And t
-    return leaves.all (fun c => isArithComparison (c.not?.getD c)) && sizeLe t (64 * leaves.size)
+    if !leaves.all (fun c => isArithComparison (c.not?.getD c)) then return false
+    -- small comparisons, or comparisons of the atoms of the difference (e.g., the condition `7 = x` of a conditional
+    -- simplified under it, where `x` is a large term generalized with the difference)
+    return sizeLe t (64 * leaves.size) || (arithLeaves t).all terms.contains
 
 /-- Arithmetic and propositional structure, traversed by `arithAtoms`. -/
 def isArithHead (e : Expr) : Bool :=
@@ -338,7 +342,7 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
   let whole : TermElabM (Option Expr) := do
     if (← budget.get) == 0 then return none
     budget.modify (· - 1)
-    let hs ← relevantHyps hyps
+    let hs ← relevantHyps hyps l r
     let some p ← prove (← mkForallFVars hs (← mkEq l r)) | return none
     return some (mkAppN p hs)
   -- Z3's rewrite of `ite c a b = k` into `c ∨ b' = k` (resp. `¬c ∧ b' = k`) when `a = k` (resp. `a ≠ k`) under `c`
@@ -547,7 +551,7 @@ partial def acEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat
   if l' == r then return some p₁
   if (← budget.get) == 0 then return none
   budget.modify (· - 1)
-  let hs ← relevantHyps hyps
+  let hs ← relevantHyps hyps l' r
   let some p₂ ← prove (← mkForallFVars hs (← mkEq l' r)) | return none
   return some (← mkEqTrans p₁ (mkAppN p₂ hs))
 end

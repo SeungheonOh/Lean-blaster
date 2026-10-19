@@ -540,6 +540,8 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
       if g' != g then
         res ← proveClosed cfg rule g'
         vals := vals'
+  if res.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
+    debugLog m!"local difference not proved:\n{← dagString eq 8000}"
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
     let t2 ← IO.monoMsNow
     if t2 - t0 > 100 then
@@ -996,7 +998,8 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let some j := step.premises[0]? | throwError "lemma: premise expected"
   let n := step.clauseSize
   let lits := disjuncts concl n
-  let r ← timed "lemma" <| withLocalDeclD `hn (mkNot concl) fun hn => do
+  let r ← timed "lemma" <| withLocalDeclD `hn (mkNot concl) fun hn => timed "lemma body" do
+    let t0 ← IO.monoMsNow
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
     let facts ← timed "lemma facts" do
       let mut facts := ctx.facts.push (mkNot concl, hn)
@@ -1018,6 +1021,10 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
     let keep (k : Nat) (p : Expr) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·) &&
       !p.containsFVar hn.fvarId!
     let inherit := (← IO.getEnv "BLASTER_SMTPROOF_NOINHERIT").isNone
+    let ms := (← IO.monoMsNow) - t0
+    if ms > 100 then
+      if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
+        (← IO.FS.Handle.mk f .append).putStrLn s!"  phase lemma setup: {ms} ms"
     let pf ← timed "subproof" <| withScope (inherit := inherit) (keep := keep) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
       -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
