@@ -823,11 +823,6 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           if let some r := (← recCache.get).get? c then return r
           let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
           if r.isNone then debugLog m!"recfun lemma failed: {RecFun.brief c}"
-          if let some p := r then
-            if (← IO.getEnv "BLASTER_SMTPROOF_CHECKSCOPE").isSome then
-              let lctx ← getLCtx
-              if (← instantiateMVars p).hasAnyFVar (!lctx.contains ·) then
-                IO.eprintln "recfun: lemma proof with unknown free variables"
           recCache.modify (·.insert c r)
           return r
         recFunOnly := !recPairs.isEmpty }
@@ -850,15 +845,12 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       let pt ← inferType p
       if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
       -- NOTE: the proofs of the steps are instantiated once (see `replay`)
-      let p ← instantiateMVars p
-      if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then reportEscapedFVars p
-      return (← mkLambdaFVars #[hneg] p, st.stats)
+      return (← mkLambdaFVars #[hneg] (← instantiateMVars p), st.stats)
     let (pf, stats) := pf
     let proofBody := mkApp2 (mkConst ``Classical.byContradiction) body pf
     let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
-    if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then
-      debugLog m!"final proof: free variables {(collectFVars {} proof).fvarIds.map (·.name)}, local context {(← getLCtx).getFVarIds.map (·.name)}"
-      reportEscapedFVars proof
+    -- debugging: free variables escaping their scopes (environment variable `BLASTER_SMTPROOF_CHECKFINAL`)
+    if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then reportEscapedFVars proof
     return .ok { proof, backend := backend.name, steps := sproof.steps.size, stats }
   catch ex =>
     return .error (← ex.toMessageData.toString)

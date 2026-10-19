@@ -355,8 +355,8 @@ partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) goal r
 
 /-- Whether the step `s` (`lemma` or `subproof`) discharges the hypothesis of step `h`: a Z3 `lemma` discharges the
-    hypotheses whose negation is one of its literals (matched on shared term objects), an Alethe `subproof` the
-    assumptions it lists. -/
+    hypotheses whose negation is one of its literals (matched on shared term objects, then structurally), an Alethe
+    `subproof` the assumptions it lists. -/
 def discharges (p : Proof) (s : Step) (h : Nat) : Bool :=
   if s.rule == "subproof" then s.discharged.contains h
   else if s.rule == "lemma" then
