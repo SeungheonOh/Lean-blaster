@@ -70,6 +70,8 @@ structure ReplayCtx where
   global : Array Bool := #[]
   /-- open hypotheses of the steps (see `openHypotheses`) -/
   openHyps : Array (Array Nat) := #[]
+  /-- index of the step being replayed (see `replayCore'`) -/
+  stepIdx : Nat := 0
   /-- local context at depth 0, in which the steps that don't depend on a scope are replayed -/
   baseLCtx : LocalContext := {}
   baseInsts : LocalInstances := #[]
@@ -790,7 +792,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
       let h ← IO.FS.Handle.mk f .append
       h.putStrLn s!"-- step {i} ({step.rule})\nexample : {s} := by\n  sorry\n"
   let attempt : ReplayM (Option Expr) := do
-    try some <$> replayRule step concl
+    try some <$> withReader (fun c => { c with stepIdx := i }) (replayRule step concl)
     catch ex =>
       debugLog m!"step {i} ({step.rule}) failed: {ex.toMessageData}"
       return none
@@ -1008,7 +1010,10 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
       return facts
     -- the proofs of the steps not depending on the hypotheses discharged by the lemma stay valid after it
     -- NOTE: the hypotheses are matched on their propositions (see `hypothesis`), hence the occurrences of `hn`
-    let disch := (ctx.openHyps.getD j #[]).filter (discharges ctx.proof step ·)
+    -- NOTE: the open hypotheses of the premise that are not open hypotheses of the lemma (see `openHypotheses`; the
+    -- matching of the hypotheses with the literals, see `discharges`, is costly on large clauses)
+    let own : Std.HashSet Nat := (ctx.openHyps.getD ctx.stepIdx #[]).foldl (·.insert ·) {}
+    let disch : Std.HashSet Nat := (ctx.openHyps.getD j #[]).foldl (fun s h => if own.contains h then s else s.insert h) {}
     -- NOTE: `containsFVar` skips the closed subterms (e.g., the large terms of a CEK evaluation)
     let keep (k : Nat) (p : Expr) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·) &&
       !p.containsFVar hn.fvarId!
