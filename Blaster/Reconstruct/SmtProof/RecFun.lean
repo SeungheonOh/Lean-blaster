@@ -286,6 +286,33 @@ def addProofDefs (proof : Proof) (tbl : SymTable) : TermElabM (SymTable × NameS
 
 /-! ## Definitional equations -/
 
+theorem smt_int_lt (a b : Int) : (a < b) = ¬ (b ≤ a) := propext Int.not_le.symm
+
+theorem smt_str_empty_lt (s : String) : ("" < s) = ¬ ("" = s) := by
+  apply propext
+  rw [String.lt_iff]
+  cases s with
+  | mk l =>
+    cases l with
+    | nil => simp
+    | cons c cs =>
+      constructor
+      · intro _ h
+        have := congrArg String.data h
+        simp at this
+      · intro _; exact List.Lex.nil
+
+/-- The normal forms of Z3's rewriter in the cases of recursive functions: `a < b` as `¬ b ≤ a` (integers), `"" < s`
+    as `¬ "" = s` (see `smt_int_lt`, `smt_str_empty_lt`). -/
+def z3Normalize (e : Expr) : Expr :=
+  e.replace fun t =>
+    if t.isAppOfArity ``LT.lt 4 then
+      let (ty, a, b) := (t.getArg! 0, t.getArg! 2, t.getArg! 3)
+      if ty.isConstOf ``Int then some (mkNot (mkIntLe b a))
+      else if ty.isConstOf ``String && a == mkStrLit "" then some (mkNot (mkApp3 (mkConst ``Eq [1]) ty a b))
+      else none
+    else none
+
 /-- The application `f a⃗` of the left-hand side of a definitional equation, through the conversions of the
     interpretation (`↑(f a⃗)` for functions returning `Nat`, `f a⃗ = true` for functions returning `Bool`). -/
 def lhsApp (e : Expr) : Expr :=
@@ -543,6 +570,14 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       if p.isSome then return p
       ctx.proveDef stmt
     if let some p ← (try prove catch _ => pure none) then
+      -- Z3's normal forms (as in Z3's lemmas)
+      let stmt' := z3Normalize stmt
+      let (stmt, p) ← if stmt' == stmt then pure (stmt, p) else do
+        let imp ← withLCtx {} {} <| proveWithTactic (mkForall `h .default stmt stmt')
+          (← `(tactic| (intro h; simp only [smt_int_lt, smt_str_empty_lt] at h ⊢; exact h)))
+        match imp with
+        | some q => pure (stmt', mkApp q p)
+        | none => debugLog m!"recfun: no normal form for {eq.head}"; pure (stmt, p)
       let m ← mkFreshExprMVar stmt
       m.mvarId!.assign p
       r := some (stmt, m)
