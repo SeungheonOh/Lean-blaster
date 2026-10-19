@@ -416,9 +416,15 @@ def createAppNAux (pInfo : FunEnvInfo) (s : Sum SmtQualifiedIdent SmtTerm)
     for h : i in [:nbSize] do
       if pInfo.paramsInfo[i]!.binderInfo.isInstImplicit then
         let a := args[i]!
-        let some inst ← trySynthConstraintInstance? (← inferTypeEnv a)
-          | throwEnvError "createAppNAux: instance argument of a function value without canonical instance {reprStr a}"
-        if !(exprEq inst a) && !(← withReducibleAndInstances (isDefEq inst a)) then
+        -- NOTE: the instance-implicit binders of the goal (e.g., `[LT α]`) stand for the instances of their classes
+        -- (two such binders of the same class are not distinguished)
+        if a.isFVar then
+          if (← a.fvarId!.getEnvDecl).binderInfo.isInstImplicit then continue
+        let canonical ← try
+            let some inst ← trySynthConstraintInstance? (← inferTypeEnv a) | pure false
+            pure (exprEq inst a || (← withReducibleAndInstances (isDefEq inst a)))
+          catch _ => pure false
+        if !canonical then
           throwEnvError "createAppNAux: non-canonical instance argument of a function value {reprStr a}"
     let instType ← inferFunType pInfo.type args
     withInstantiatedImplicitArgs pInfo.type fun polyType' => do
