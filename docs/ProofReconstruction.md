@@ -350,6 +350,15 @@ Reconstruction checks every individual rewrite, so it surfaces problems in the t
   parameters (`Tests/FixedIssues/LambdaDefGuard.lean`). The replay of SMT proofs could not prove these goals
   (the axioms have no model in its interpretation), which is how the bug was found. Two induction steps of
   `Tests/FixedIssues/Issue26.lean` are no longer proved by Blaster.
+- **Non-canonical instances (soundness bug, fixed).** `@LT.lt α inst` (resp. `LE.le`) was taken as the relation of the
+  SMT theory for `α ∈ [Nat, Int, Bool, String]` whatever `inst`, and the instance arguments of function values
+  (e.g., a structure field `f [LT α] : α → α`) are erased by the translation. With `lt1 := ⟨(· < ·)⟩` and
+  `lt2 := ⟨fun a b => b < a⟩ : LT Nat` passed explicitly, `∀ x y, @g Nat lt1 _ x y = @g Nat lt2 _ x y` (with
+  `g x y := decide (x < y)`) and `∀ r x, @FunRel.f r Nat lt1 x = @FunRel.f r Nat lt2 x` were reported `Valid`.
+  Other instances of `LT`/`LE` are now unfolded, and applications of function values are only translated when their
+  instance arguments are canonical or instance-implicit binders of the goal (`Tests/FixedIssues/InstanceArgs.lean`;
+  two instance-implicit binders of the same class are still not distinguished). Found by the replay of SMT proofs
+  on polymorphic datatypes, which could not prove the goal.
 - **Ill-typed optimizer output.** The proof run avoids the following issues; the verdict run is unchanged.
   - The else branch of `Blaster.dite'` received the *normalized* type of `¬ c` (e.g. `false = c`
     instead of `¬ (true = c)`), so `dite'` applications were ill-typed. When tracking proofs, the
