@@ -158,7 +158,7 @@ partial def dagString (e : Expr) (maxLen := 30000) : MetaM String := do
       | .forallE n t b _ => pure s!"(∀ ({n} : {← go t}), {← go b})"
       | .mdata _ b => go b
       | .proj _ i b => pure s!"{← go b}.{i + 1}"
-      | .fvar x => pure (toString (← x.getUserName))
+      | .fvar x => pure (match (← getLCtx).find? x with | some d => toString d.userName | none => s!"?{x.name}")
       | .const n _ => pure (toString n)
       | .bvar i => pure s!"!{i}"
       | s => pure (toString s)
@@ -624,7 +624,11 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   -- NOTE: direct proofs are costly; they are attempted a bounded number of times
   if !ctx.prepass && (← get).directAttempts < ctx.maxDirect then
     modify fun s => { s with directAttempts := s.directAttempts + 1 }
-    if let some p ← ctx.cfg.proveDirect concl then
+    -- NOTE: in the local context of depth 0 when possible: the proof must not use the hypotheses of the scopes (e.g.,
+    -- the negations of the clauses of lemmas), which the step does not depend on
+    let base := !concl.hasAnyFVar (!ctx.baseLCtx.contains ·)
+    let p? ← if base then withLCtx ctx.baseLCtx ctx.baseInsts (ctx.cfg.proveDirect concl) else ctx.cfg.proveDirect concl
+    if let some p := p? then
       record step.rule "direct"
       return p
   throwError "smt proof: could not replay step {i} ({step.rule})"
