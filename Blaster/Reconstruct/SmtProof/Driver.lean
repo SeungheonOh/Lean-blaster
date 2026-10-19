@@ -856,6 +856,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let (pf, stats) := pf
     let proofBody := mkApp2 (mkConst ``Classical.byContradiction) body pf
     let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
+    if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then
+      debugLog m!"final proof: free variables {(collectFVars {} proof).fvarIds.map (·.name)}, local context {(← getLCtx).getFVarIds.map (·.name)}"
+      reportEscapedFVars proof
     return .ok { proof, backend := backend.name, steps := sproof.steps.size, stats }
   catch ex =>
     return .error (← ex.toMessageData.toString)

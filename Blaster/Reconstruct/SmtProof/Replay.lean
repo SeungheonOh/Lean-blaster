@@ -176,14 +176,14 @@ def reportEscapedFVars (p : Expr) : MetaM Unit := do
   let lctx ← getLCtx
   let bad := (collectFVars {} p).fvarIds.filter (!lctx.contains ·)
   if bad.isEmpty then return
-  IO.eprintln s!"escaped free variables: {bad.size}"
+  debugLog m!"escaped free variables: {bad.size} {bad.map (·.name)}"
   let subs := p.find? fun e => e.isApp && (e.getAppFn.isFVar && bad.contains e.getAppFn.fvarId! ||
     e.getAppArgs.any fun a => a.isFVar && bad.contains a.fvarId!)
-  if let some e := subs then IO.eprintln s!"escaped in:\n{← dagString e 4000}"
+  if let some e := subs then debugLog m!"escaped in:\n{← dagString e 4000}"
   -- the enclosing lambda (its binder types hint at the construction)
   let lam? := p.find? fun e => e.isLambda && (e.bindingBody!.find? fun s => s.isFVar && bad.contains s.fvarId!).isSome &&
     !(e.bindingBody!.find? (·.isLambda)).isSome
-  if let some e := lam? then IO.eprintln s!"innermost lambda:\n{← dagString e 4000}"
+  if let some e := lam? then debugLog m!"innermost lambda:\n{← dagString e 4000}"
 
 def record (rule method : String) : ReplayM Unit :=
   modify fun s => { s with stats := s.stats.record rule method }
