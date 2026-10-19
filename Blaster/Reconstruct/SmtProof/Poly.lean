@@ -15,13 +15,20 @@ constants of sort `@Instance`). The general interpretation is:
    (applied to their interpreted arguments, `dflt` outside of their domain), ... (see `mkWorld`);
  - Blaster's membership predicates (`@isInstance`, `@isFun`, `@isList`, ...) are the images of the worlds (`Img`),
    such that the extensionality axioms of the encoding hold: the functions of the encoding are determined by their
-   values on their domain.
+   values on their domain;
+ - the polymorphic Lean functions instantiated at sort variables (e.g., `@List.zipWith α β γ`, translated as SMT
+   functions on `@Instance` shared by all the instantiations of a universe) are interpreted at the universe (e.g.,
+   `@List.zipWith Univ Univ Univ`, see `instantiateUniv`), such that their definitional axioms hold on the whole
+   universe; their applications in the goal are related to their interpretations by naturality lemmas (see
+   `blaster_poly_nat`);
+ - the lambda terms of the encoding, whose definitions are guarded by the membership predicates of their parameters,
+   are interpreted with the same guards (`fun x => if Img w x then b else dflt x`, see `Driver.guardedLambda`), such
+   that they are images of Lean functions whatever their bodies outside of their domain (e.g., constant functions).
 
 NOTE: the values of the datatypes of the user over sort variables (e.g., `Either α β`) have no world (no `map`
-function), and the Lean functions of the goal applied to values of sort variables (e.g., `natCast : α → Nat` at
-several sort variables) are only interpreted when `@Instance` is interpreted as the sort variable. The lambda terms of
-the encoding are interpreted by their bodies on the whole universe, such that their membership predicates only hold
-when their bodies are `dflt` outside of their domain (e.g., the identity).
+function). Naturality only holds for parametric functions: the axioms and opaque functions at sort variables (e.g.,
+`hash : α → String`), and the functions with instance arguments that can't be synthesized at the universe (e.g.,
+`BEq Univ`), are only interpreted when `@Instance` is interpreted as the sort variable.
 -/
 
 open Lean Meta Elab Tactic
@@ -47,6 +54,35 @@ theorem inj_injective (α : Sort u) : Function.Injective (inj α) := by
 def Img {T : Sort u} {D : Sort v} (w : T → D) (d : D) : Prop := ∃ x, d = w x
 
 theorem img_self {T : Sort u} {D : Sort v} (w : T → D) (x : T) : Img w (w x) := ⟨x, rfl⟩
+
+/-! Images of the worlds of the functors (definitions of the membership predicates of their sorts, e.g., `@isList`). -/
+
+theorem img_list_nil {α : Type u} {β : Type v} (w : α → β) : Img (List.map w) [] := ⟨[], rfl⟩
+
+theorem img_list_cons {α : Type u} {β : Type v} {w : α → β} {x : β} {xs : List β} :
+    Img (List.map w) (x :: xs) ↔ Img w x ∧ Img (List.map w) xs := by
+  constructor
+  · intro ⟨l, hl⟩
+    cases l with
+    | nil => cases hl
+    | cons a l => cases hl; exact ⟨⟨a, rfl⟩, ⟨l, rfl⟩⟩
+  · intro ⟨⟨a, ha⟩, ⟨l, hl⟩⟩; exact ⟨a :: l, by rw [ha, hl]; rfl⟩
+
+theorem img_option_none {α : Type u} {β : Type v} (w : α → β) : Img (Option.map w) none := ⟨none, rfl⟩
+
+theorem img_option_some {α : Type u} {β : Type v} {w : α → β} {x : β} : Img (Option.map w) (some x) ↔ Img w x := by
+  constructor
+  · intro ⟨l, hl⟩
+    cases l with
+    | none => cases hl
+    | some a => cases hl; exact ⟨a, rfl⟩
+  · intro ⟨a, ha⟩; exact ⟨some a, by rw [ha]; rfl⟩
+
+theorem img_prod {α₁ : Type u₁} {α₂ : Type u₂} {β₁ : Type v₁} {β₂ : Type v₂} {w₁ : α₁ → α₂} {w₂ : β₁ → β₂}
+    {x : α₂} {y : β₂} : Img (Prod.map w₁ w₂) (x, y) ↔ Img w₁ x ∧ Img w₂ y := by
+  constructor
+  · intro ⟨⟨a, b⟩, h⟩; cases h; exact ⟨⟨a, rfl⟩, ⟨b, rfl⟩⟩
+  · intro ⟨⟨a, ha⟩, ⟨b, hb⟩⟩; exact ⟨(a, b), by rw [ha, hb]; rfl⟩
 
 /-- The function `f : A → B` on the interpretations `D` and `C` of its domain and codomain (worlds `wa : A → D`,
     `wb : B → C`), `dflt` outside of the image of `wa`. -/
@@ -142,6 +178,16 @@ theorem lam_world {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
   · obtain ⟨x, rfl⟩ := hy; rw [liftFun_apply hw, h]
   · rw [liftFun_out _ _ _ _ hy, hout y hy]
 
+/-- Lambda terms guarded by the membership predicates of their parameters (see `guardedLambda`). -/
+theorem lam_world_ite {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
+    {wa : A → D} (hw : Function.Injective wa) {wb : B → C} {dflt : D → C} {f : A → B} {F : D → C}
+    (h : ∀ x, wb (f x) = F (wa x)) :
+    liftFun wa wb dflt f = fun y => @ite C (Img wa y) (Classical.propDecidable _) (F y) (dflt y) := by
+  funext y
+  by_cases hy : Img wa y
+  · rw [if_pos hy]; obtain ⟨x, rfl⟩ := hy; rw [liftFun_apply hw, h]
+  · rw [if_neg hy, liftFun_out _ _ _ _ hy]
+
 theorem ite_world {T : Sort u} {D : Sort v} (w : T → D) {c c' : Prop} [h : Decidable c] {x y : T} {x' y' : D}
     (hc : c = c') (hx : c → w x = x') (hy : ¬ c → w y = y') :
     w (@ite T c h x y) = @ite D c' (Classical.propDecidable c') x' y' := by
@@ -149,6 +195,26 @@ theorem ite_world {T : Sort u} {D : Sort v} (w : T → D) {c c' : Prop} [h : Dec
   by_cases hc : c
   · rw [if_pos hc, if_pos hc]; exact hx hc
   · rw [if_neg hc, if_neg hc]; exact hy hc
+
+/-- Case analyses (testers and selectors, see `Bridge.walkPolyCasesOn`) on lists in the world `List.map w`, with the
+    world `wr` of their results. -/
+theorem list_casesOn_world {A : Type u} {B : Type v} {w : A → B} {C : Sort x} {C' : Sort y} (wr : C → C')
+    {d : List A} {D : List B} (hd : List.map w d = D) {n : C} {n' : C'} {c : A → List A → C}
+    {c' : B → List B → C'} (hn : d = [] → wr n = n') (hc : ∀ h t, d = h :: t → wr (c h t) = c' (w h) (List.map w t)) :
+    wr (@List.casesOn A (fun _ => C) d n c) = @List.casesOn B (fun _ => C') D n' c' := by
+  subst hd
+  cases d with
+  | nil => exact hn rfl
+  | cons h t => exact hc h t rfl
+
+theorem option_casesOn_world {A : Type u} {B : Type v} {w : A → B} {C : Sort x} {C' : Sort y} (wr : C → C')
+    {d : Option A} {D : Option B} (hd : Option.map w d = D) {n : C} {n' : C'} {c : A → C} {c' : B → C'}
+    (hn : d = none → wr n = n') (hc : ∀ v, d = some v → wr (c v) = c' (w v)) :
+    wr (@Option.casesOn A (fun _ => C) d n c) = @Option.casesOn B (fun _ => C') D n' c' := by
+  subst hd
+  cases d with
+  | none => exact hn rfl
+  | some v => exact hc v rfl
 
 /-! ## Axioms of the encoding -/
 
@@ -197,6 +263,47 @@ theorem img_id {T : Sort u} {D : Sort v} {w : T → D} (hw : Function.Injective 
     Img (liftFun w w (fun x => x)) (fun x => x) :=
   ⟨fun x => x, (lam_world hw (fun _ => rfl) (fun _ _ => rfl)).symm⟩
 
+/-- Membership of the lambda terms guarded by the membership predicates of their parameters (see
+    `guardedLambda`). -/
+theorem img_lam_ite {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
+    {wa : A → D} (hw : Function.Injective wa) {wb : B → C} {dflt : D → C} {F : D → C}
+    (h : ∀ y, Img wa y → Img wb (F y)) :
+    Img (liftFun wa wb dflt) (fun y => @ite C (Img wa y) (Classical.propDecidable _) (F y) (dflt y)) :=
+  ⟨fun x => Classical.choose (h (wa x) ⟨x, rfl⟩),
+    (lam_world_ite hw fun x => (Classical.choose_spec (h (wa x) ⟨x, rfl⟩)).symm).symm⟩
+
+/-- One level of case analysis on the variables `fvs` of `g`. -/
+partial def casesVars (g : MVarId) (fvs : List FVarId) : MetaM (List MVarId) := do
+  match fvs with
+  | [] => return [g]
+  | fv :: rest =>
+      if !(← g.withContext do return (← getLCtx).contains fv) then return ← casesVars g rest
+      let sgs ← try g.cases fv catch _ => return ← casesVars g rest
+      let mut acc := []
+      for sg in sgs do
+        let rest' := rest.map fun f => match sg.subst.get f with | .fvar f' => f' | _ => f
+        acc := acc ++ (← casesVars sg.mvarId rest')
+      return acc
+
+syntax (name := blasterPolyCases) "blaster_poly_cases" : tactic
+
+/-- One level of case analysis on the variables of datatypes (e.g., in the catch-all cases of a functional
+    induction, whose hypotheses exclude the other patterns). -/
+@[tactic blasterPolyCases] def evalBlasterPolyCases : Tactic := fun _ => do
+  let g ← getMainGoal
+  let fvs ← g.withContext do
+    let mut acc := #[]
+    for d in ← getLCtx do
+      if d.isImplementationDetail then continue
+      let ty ← whnfR d.type
+      let .const n _ := ty.getAppFn | continue
+      if (← isProp ty) || (← isClass? ty).isSome then continue
+      let some (.inductInfo info) := (← getEnv).find? n | continue
+      if info.numIndices != 0 then continue
+      acc := acc.push d.fvarId
+    return acc
+  replaceMainGoal (← casesVars g fvs.toList)
+
 syntax (name := blasterPoly) "blaster_poly" : tactic
 
 /-- Proofs of the axioms of the encoding on the interpretation (e.g., the co-domain constraints and the
@@ -210,7 +317,10 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
     ← `(tactic| (apply ext_liftFun₂ (inj_injective _) <;> assumption)),
     ← `(tactic| (subst_vars; rfl)),
     ← `(tactic| (apply img_liftFun₂ (inj_injective _) (inj_injective _) <;> assumption)),
-    ← `(tactic| (apply img_liftFun (inj_injective _) <;> assumption))]
+    ← `(tactic| (apply img_liftFun (inj_injective _) <;> assumption)),
+    -- definitions of the membership predicates of the functors (e.g., `@isList`), on the cases of their arguments
+    ← `(tactic| (blaster_poly_cases <;> simp_all [img_list_nil, img_list_cons, img_option_none, img_option_some,
+          img_prod, img_self, liftFun_apply, inj_injective, listMap_injective, optionMap_injective, prodMap_injective]))]
   for t in attempts do
     let s ← saveState
     try
@@ -318,5 +428,109 @@ where
 
 /-- `w x`, β-reduced. -/
 def applyWorld (w x : Expr) : Expr := (mkApp w x).headBeta
+
+/-! ## Polymorphic functions
+
+The Lean functions of the translation instantiated at sort variables (e.g., `@List.zipWith α β γ`) are translated as
+SMT functions on `@Instance`, shared by all the instantiations at the sort variables of a universe. They are
+interpreted at the universe (e.g., `@List.zipWith Univ Univ Univ`), such that their definitional axioms hold on all
+the values of the universe (outside of the images of the worlds too). Their applications in the goal are related to
+their interpretations by *naturality* lemmas proved once per function and instantiation (see `blaster_poly_nat` and
+`Bridge.walkPolyApp`), e.g., `List.zipWith (liftFun (inj α) (liftFun (inj β) (inj γ) _) _ f) (List.map (inj α) xs)
+(List.map (inj β) ys) = List.map (inj γ) (List.zipWith f xs ys)`.
+
+NOTE: naturality only holds for parametric functions (e.g., not for axioms such as `hash : α → String`). -/
+
+/-- Number of generic parameters of the Lean function `e` of the translation (abstracted over its generic parameters,
+    see `Blaster.Optimize.getInstApp`), given the arity of its SMT function: the leading parameters that are not
+    arguments of the SMT function. -/
+def genericParams (e : Expr) (arity : Nat) : MetaM Nat :=
+  lambdaTelescope e fun ps b => do
+    let explicit ← forallTelescope (← inferType b) fun xs _ =>
+      xs.filterM fun x => return (← x.fvarId!.getBinderInfo).isExplicit
+    return ps.size + explicit.size - arity
+
+/-- `e` with fresh universe level metavariables for the levels of its constants and of its sorts (except `Prop`),
+    and the original levels. -/
+def freshLevels (e : Expr) : StateT (Array (LMVarId × Level)) MetaM Expr :=
+  Core.transform e (pre := fun s => do
+    let fresh (l : Level) : StateT (Array (LMVarId × Level)) MetaM Level := do
+      let m ← mkFreshLevelMVar
+      modify (·.push (m.mvarId!, l))
+      return m
+    match s with
+    | .const n ls => return .done (.const n (← ls.mapM fresh))
+    | .sort l => if l.isZero then return .done s else return .done (.sort (← fresh l))
+    | _ => return .continue)
+
+/-- The Lean function `e` of the translation at the universe: its first `n` (generic) parameters are instantiated with
+    `Univ.{u}` for the sort parameters of `Sort u`, and with synthesized instances for the instance parameters (`e`
+    itself when an instance can't be synthesized, e.g., `BEq Univ`). The universe levels of the instance are inferred
+    by type checking (e.g., `@List.zipWith.{u+1} Univ.{u+1}` for `@List.zipWith.{u} α` with `α : Type u`), the
+    original levels otherwise. -/
+def instantiateUniv (e : Expr) (n : Nat) : MetaM Expr := do
+  let e := e.headBeta
+  let mut binders := #[]
+  let mut body := e
+  for _ in [:n] do
+    let .lam _ t b _ := body | break
+    binders := binders.push t
+    body := b
+  if binders.isEmpty then return e
+  try
+    let (r, origs) ← (do
+      let body ← freshLevels body
+      let mut vals := #[]
+      for t in binders do
+        let t := t.instantiateRev vals
+        if let .sort u := ← whnfR t then
+          if u.isZero then throwError "instantiateUniv: proposition"
+          vals := vals.push (mkConst ``Univ [u])
+        else
+          let t ← freshLevels t
+          Meta.check t
+          vals := vals.push (← synthInstance (← instantiateMVars t))
+      let r := body.instantiateRev vals
+      Meta.check r
+      return r : StateT (Array (LMVarId × Level)) MetaM Expr).run #[]
+    for (m, l) in origs do
+      if !(← isLevelMVarAssigned m) then assignLevelMVar m l
+    let r ← instantiateMVars r
+    Meta.check r
+    return r.headBeta
+  catch _ => return e
+
+/-- Simplification of the naturality statements (see `blaster_poly_nat`). -/
+macro "blaster_poly_simp" : tactic => `(tactic| simp_all [liftFun_apply, inj_injective, liftFun_injective,
+  listMap_injective, optionMap_injective, prodMap_injective, id_injective, natCast_injective, boolTrue_injective])
+
+
+syntax (name := blasterPolyNat) "blaster_poly_nat" : tactic
+
+/-- Proofs of the naturality statements `∀ αs xs, f Univ (W xs) = W (f αs xs)` (see `Bridge.walkPolyApp`): functional
+    induction on `f αs xs` (the right-hand side), and simplification with the lemmas on the worlds. -/
+@[tactic blasterPolyNat] def evalBlasterPolyNat : Tactic := fun _ => do
+  evalTactic (← `(tactic| intros))
+  let (app, f) ← withMainContext do
+    let t ← instantiateMVars (← getMainTarget)
+    let some (_, lhs, rhs) := t.eq? | throwError "blaster_poly_nat: equation expected"
+    let some f := lhs.getAppFn.constName? | throwError "blaster_poly_nat: application expected"
+    let some app := rhs.find? (·.isAppOf f) | throwError "blaster_poly_nat: application expected"
+    return (app, f)
+  let stx ← withMainContext (Term.exprToSyntax app)
+  let fId := mkIdent f
+  let attempts : Array (TSyntax `tactic) := #[
+    ← `(tactic| (fun_induction $stx <;> blaster_poly_simp)),
+    ← `(tactic| (fun_induction $stx <;> (try blaster_poly_simp) <;> blaster_poly_cases <;> blaster_poly_simp)),
+    ← `(tactic| (fun_induction $stx <;> (try simp_all [$fId:ident]) <;> (try blaster_poly_cases) <;> blaster_poly_simp)),
+    ← `(tactic| blaster_poly_simp)]
+  for t in attempts do
+    let s ← saveState
+    try
+      evalTactic t
+      if (← getGoals).isEmpty then return
+    catch _ => pure ()
+    s.restore
+  throwError "blaster_poly_nat: failed"
 
 end Blaster.Reconstruct.SmtProof.Poly

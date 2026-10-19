@@ -167,11 +167,101 @@ def auxiliaryInterp (s : String) : MetaM (Option Expr) := do
 def unquote (s : String) : String :=
   if s.startsWith "|" && s.endsWith "|" && s.length ≥ 2 then (s.drop 1).dropRight 1 else s
 
+/-- The definition of a lambda term of the translation (see `Blaster.Smt.translateLambda`):
+    `(forall (xs) (! (=> G₁ (=> ... (= (@apply @lambda_n xs) b))) :qid @lambda_n_def_cstr))`, and
+    `(forall (ys xs) (! (=> G₁ (=> ... (= (@apply (@apply @global_lambda_n ys) xs) b))) ...))`: its name, the
+    parameters `ys` and `xs`, the guards on variables (membership predicates, the guards `0 ≤ x` are removed, see
+    `guardNatQuantifiers`) and its body. -/
+def guardedLambdaDef? (e : SExpr) :
+    Option (String × Array (String × SExpr) × Array (String × SExpr) × Std.HashMap String SExpr × STerm) := Id.run do
+  let some #[SExpr.atom "forall", SExpr.list vs, SExpr.list ann] := e.list? | return none
+  if ann[0]? != some (SExpr.atom "!") then return none
+  let some d₀ := ann[1]? | return none
+  let mut d := d₀
+  let names := vs.filterMap fun v => match v with
+    | .list #[.atom x, _] => some x
+    | _ => none
+  let mut guards : Std.HashMap String SExpr := {}
+  for _ in [0:3 * vs.size] do
+    match d with
+    | .list #[.atom "=>", .list #[.atom "<=", .atom "0", .atom _], b] => d := b
+    | .list #[.atom "=>", g, b] =>
+        let some h := g.head? | return none
+        if !(unquote h).startsWith "@is" then return none
+        -- the guarded parameter (e.g., `(@isInstance x α)`, `(@isList α x)`)
+        let some args := g.list? | return none
+        let isParam (a : SExpr) : Option String := match a with
+          | .atom x => if names.contains x then some x else none
+          | _ => none
+        let some x := args.findSome? isParam | return none
+        guards := guards.insert x g
+        d := b
+    | _ => break
+  let some #[SExpr.atom "=", SExpr.list lhs, body] := d.list? | return none
+  let vars := vs.filterMap fun v => match v with
+    | .list #[.atom x, s] => some (x, s)
+    | _ => none
+  let some (SExpr.atom apply) := lhs[0]? | return none
+  if !apply.startsWith "@apply" then return none
+  let .ok b := STerm.ofSExpr {} body | return none
+  match lhs[1]? with
+  | some (SExpr.atom l) =>
+      if !l.startsWith "@lambda" then return none
+      return some (l, #[], vars, guards, b)
+  | some (SExpr.list inner) =>
+      let some (SExpr.atom g) := inner[1]? | return none
+      if !g.startsWith "@global_lambda" then return none
+      let k := inner.size - 2
+      if k > vars.size then return none
+      return some (g, vars.extract 0 k, vars.extract k vars.size, guards, b)
+  | _ => return none
+
+/-- Interpretation of a lambda term of the translation (see `guardedLambdaDef?`) of sort `s` in `Poly`: each parameter
+    `x` guarded by a membership predicate `Img w x` is bound by `fun x => if Img w x then b else dflt x`, where `dflt`
+    is the default of the world of the function (see `Poly.mkWorld`), such that the lambda term is the image of a
+    Lean function (see `Poly.lam_world_ite`) whatever its body outside of the domain (e.g., constant functions). The
+    definition, guarded by the same predicates, holds. Returns the term and the table with the symbols of the default
+    values. -/
+def guardedLambda (tbl : SymTable) (n : String) (s : SExpr) (ys xs : Array (String × SExpr))
+    (guards : Std.HashMap String SExpr) (body : STerm) : MetaM (STerm × SymTable) := do
+  let mut tbl := tbl
+  let mut ty ← (sortToType s).run { table := tbl }
+  for _ in ys do
+    let .forallE _ _ b _ ← whnfR ty | throwError "guardedLambda: function type expected"
+    ty := b
+  let mut doms := #[]
+  for _ in xs do
+    let .forallE _ d b _ ← whnfR ty | throwError "guardedLambda: function type expected"
+    doms := doms.push (d, b)
+    ty := b
+  let mut t := body
+  for i' in [0:xs.size] do
+    let i := xs.size - 1 - i'
+    let (x, _) := xs[i]!
+    let (d, c) := doms[i]!
+    let guarded ← match guards.get? x with
+      | some g =>
+          let some h := g.head? | pure none
+          let some (.lam _) := tbl.syms.get? h | pure none
+          let .ok g := STerm.ofSExpr {} g | pure none
+          pure (some g)
+      | none => pure none
+    if let some g := guarded then
+      -- the default of the world (see `Poly.mkWorld`): the identity for the functions of a sort into itself
+      let dflt ← if c == d || (← withReducible (isDefEq d c)) then pure (STerm.sym x) else do
+        let k := s!"@@poly_default_{n}_{i}"
+        tbl := { tbl with syms := tbl.syms.insert k (.expr (← Poly.mkDefault c)) }
+        pure (STerm.sym k)
+      t := .app "ite" #[g, t, dflt]
+    t := .quant .lambda #[xs[i]!] t
+  return (if ys.isEmpty then t else .quant .lambda ys t, tbl)
+
 /-- Interpretation of Blaster's polymorphic encoding (see `Poly`), given the sort variables of the goal with their
     SMT symbols: the membership predicates of the types with sort variables are the images of their worlds (e.g.,
-    `@isFun α β f` is `Img (liftFun (inj α) (inj β) _) f`), and the constants of the goal the images of their values
-    (e.g., `x : α` is `inj α x`). The sorts `@Type` and `@Instance` and the predicates `@isInstance` are interpreted by
-    `buildSymTable`. -/
+    `@isFun α β f` is `Img (liftFun (inj α) (inj β) _) f`), the constants of the goal the images of their values
+    (e.g., `x : α` is `inj α x`), and the lambda terms are guarded by the membership predicates of their parameters
+    (see `guardedLambda`). The sorts `@Type` and `@Instance`, the predicates `@isInstance` and the polymorphic
+    functions (at the universe, see `Poly.instantiateUniv`) are interpreted by `buildSymTable`. -/
 def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMap String Expr)
     (sortVars : Array (String × Expr)) : MetaM SymTable := do
   let mut tbl := tbl
@@ -185,6 +275,8 @@ def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (con
       let pred ← lambdaTelescope k.expr fun αs t => do
         if ← αs.anyM fun α => do return !isTypeUniverse (← inferType α) then throwError "not a sort variable"
         let some (w, _) ← Poly.mkWorld t d | throwError "no world for {t}"
+        -- NOTE: the sort parameters are explicit arguments of the predicates (e.g., `{β}` in the cached type)
+        withNewBinderInfos (αs.map (·.fvarId!, .default)) do
         withLocalDeclD `v d fun v => do mkLambdaFVars (αs.push v) (← mkAppM ``Poly.Img #[w, v])
       let n := toString decl.instName
       -- NOTE: the recursive definitions of the predicates of datatypes (`_LRec`) have the same interpretation
@@ -199,6 +291,22 @@ def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (con
       let d ← (sortToType s).run { table := tbl }
       if let some (w, _) ← Poly.mkWorld (← inferType x) d then
         tbl := { tbl with syms := tbl.syms.insert n (.expr (Poly.applyWorld w x)) }
+    catch _ => pure ()
+  -- lambda terms, guarded by the membership predicates of their parameters (the first definition, as in
+  -- `buildSymTable`)
+  let mut sorts : Std.HashMap String SExpr := {}
+  for c in cmds do
+    if let some #[SExpr.atom "declare-const", SExpr.atom n, s] := c.list? then sorts := sorts.insert n s
+  let mut guarded : Std.HashSet String := {}
+  for c in cmds do
+    let some #[SExpr.atom "assert", a] := c.list? | continue
+    let some (n, ys, xs, guards, body) := guardedLambdaDef? a | continue
+    let some s := sorts.get? n | continue
+    if guarded.contains n then continue
+    guarded := guarded.insert n
+    try
+      let (t, tbl') ← guardedLambda tbl n s ys xs guards body
+      tbl := { tbl' with syms := tbl'.syms.insert n (.macro #[] t) }
     catch _ => pure ()
   return tbl
 
@@ -224,11 +332,13 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
       tbl := { tbl with syms := tbl.syms.insert (toString decl.instName) (.lam mem) }
   -- Lean functions of the translation
   let mut funs : Std.HashMap String Expr := {}
+  let arities := if polySortVars?.isSome then funArities cmds else {}
   for (k, v) in env.smtEnv.funInstCache.toList do
     let nm := match v with
       | .SimpleIdent s => toString s
       | .QualifiedIdent s _ => toString s
-    funs := funs.insert nm (← instantiateSortParams instanceType? k.expr)
+    let e ← if polySortVars?.isSome then polyInstantiate arities nm k.expr else instantiateSortParams instanceType? k.expr
+    funs := funs.insert nm e
   let mut datatypeSorts : Array SExpr := #[]
   for c in cmds do
     let some xs := c.list? | continue
@@ -309,6 +419,17 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
     if let some t := v then tbl := { tbl with expandedSorts := tbl.expandedSorts.insert k t }
   return tbl
 where
+  /-- Arities of the functions declared by `cmds`. -/
+  funArities (cmds : Array SExpr) : Std.HashMap String Nat := Id.run do
+    let mut m := {}
+    for c in cmds do
+      if let some #[SExpr.atom "declare-fun", SExpr.atom n, SExpr.list ss, _] := c.list? then m := m.insert n ss.size
+    return m
+  /-- Lean functions of the translation abstracted over their generic parameters, interpreted by `Poly`: at the
+      universe (see `Poly.instantiateUniv`). -/
+  polyInstantiate (arities : Std.HashMap String Nat) (nm : String) (e : Expr) : MetaM Expr := do
+    let some arity := arities.get? nm | return e
+    try Poly.instantiateUniv e (← Poly.genericParams e arity) catch _ => return e
   /-- Lean functions of the translation abstracted over their generic parameters (instances of
       `Blaster.Optimize.getInstApp`, e.g., `fun α [BEq α] a b => a == b`), which are erased in their SMT
       signatures: with a single sort variable `α` interpreting `@Instance`, the explicit sort parameters are
@@ -889,7 +1010,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     -- 4. replay
     let bridge ← bridgeTactics
     -- axioms of the polymorphic encoding (see `Poly`)
-    let bridge ← if poly then pure (#[("poly", ← `(tactic| blaster_poly))] ++ bridge) else pure bridge
+    let polyTac := #[("poly", ← `(tactic| blaster_poly))]
+    let bridge := if poly then polyTac ++ bridge else bridge
     -- matcher instances optimized by Blaster (whose patterns are the translated ones)
     let mut insts : Std.HashMap Name Expr := {}
     for (k, v) in tenv.optEnv.memCache.isMatcherCache.toList do insts := insts.insert k.name v.instApp
@@ -906,7 +1028,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       (interp body).run { table := tbl, locals }
     let macroTacs ← macroTactics
     let bcfg : Bridge.Cfg := {
-      matchInst := insts.get?, macroOf
+      matchInst := insts.get?, macroOf, polyWorld := poly
       proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
     let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
@@ -945,6 +1067,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           let tacs ← match (← tacCache.get).get? rule with
             | some t => pure t
             | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+          -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
+          let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
           portfolio tacs stmt rule }
       let cache ← IO.mkRef {}
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)

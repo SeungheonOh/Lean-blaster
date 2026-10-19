@@ -249,8 +249,21 @@ Otherwise (several, possibly empty, or quantified sort variables; `Poly.lean`), 
 `Sort u`, `@Instance` as the always inhabited universe `Option (PSigma fun α : Sort u => α)`, values as their
 injections (lifted through lists, options, pairs and functions), and membership predicates as "lies in the
 image of the injection"; the bridge relates the goal to the asserted formula with an additional world for
-these injections. Lambda terms of the translation (`@lambda`, `@global_lambda` with their
-definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as Lean `Nat` variables.
+these injections. Polymorphic Lean functions instantiated at sort variables (e.g., `@List.zipWith α β γ`, whose
+SMT function is shared by all the instantiations of a universe) are interpreted at the universe
+(`@List.zipWith Univ Univ Univ`, with the universe levels inferred by type checking), such that their definitional
+axioms hold on all the values of the universe; the bridge relates their applications in the goal to their
+interpretations by *naturality* lemmas, e.g., `List.zipWith (lift f) (List.map (inj α) xs) (List.map (inj β) ys) =
+List.map (inj γ) (List.zipWith f xs ys)`, stated from the types of the function and proved once per function and
+instantiation by functional induction (`blaster_poly_nat`), and relates the testers and selectors of lists and
+options of sort variables to those of their interpretations (the default values of selectors by contradiction with
+the conditions of their branch). Naturality only holds for parametric functions: axioms and opaque functions at sort
+variables (e.g., `hash : α → String`) and functions with instance arguments that don't exist at the universe (e.g.,
+`[BEq α]`) are only interpreted with `@Instance` as the sort variable. Lambda terms of the translation (`@lambda`,
+`@global_lambda` with their definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as
+Lean `Nat` variables; with the universe, they are guarded by the membership predicates of their parameters as their
+definitions are (`fun x => if Img w x then b else dflt x`), such that they are images of Lean functions whatever
+their bodies outside of their domain (e.g., constant functions).
 
 The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a
 `Nat` function instantiated with a negative integer) simply fails to replay. Soundness only relies on the
@@ -264,7 +277,8 @@ SMT residuals), the replay of Z3 proofs proves **93.5%** of the goals closed by 
 Z3; 88.9%, 248/279, before the closed-statement tactics, the polymorphic universe interpretation and the
 nonlinear lemmas). The remaining failures are mostly `match` patterns on `Int` with named patterns
 (`Tests/Smt/SmtMatch.lean`, 9) and polymorphic Lean functions in goals with several sort variables
-(`Tests/FixedIssues/Issue26.lean`, 7). With the default mode (`last`), the replay complements the tactic
+(`Tests/FixedIssues/Issue26.lean`, 7; all 8 goals of this file are now replayed with the interpretation of the
+polymorphic functions at the universe). With the default mode (`last`), the replay complements the tactic
 strategies: 99.8% of all the reconstruction attempts succeed (3914/3921), including all the 380 goals closed by
 the SMT solver; the 7 failures are `#testOptimize` certificates of `match` normalizations.
 
@@ -293,7 +307,8 @@ adaptively by success rate per time unit for each rule and goal shape. Performan
 For instance, a 245-step Z3 proof involving a recursive function replays in ~6 s, and a 2458-step cvc5
 (Alethe) proof of the same goal in ~30 s.
 
-Limitations: polymorphic goals with several sort variables; `match` patterns on `Nat`/`Int` with
+Limitations: polymorphic goals with several sort variables over datatypes of the user (no world), axioms and
+non-parametric functions; `match` patterns on `Nat`/`Int` with
 variables (e.g., `n + 1`, whose translation needs the conditions of the branch) and named patterns; cvc5's native CPC format (whose steps often leave their conclusion
 implicit) is not supported; Z3 may not find a proof without Blaster's `recfun-finder` tactic (incompatible
 with proof production), and proof production may time out where the verdict did not.
