@@ -542,8 +542,9 @@ partial def replay (i : Nat) : ReplayM Expr := do
   let atBase := ctx.depth > 0 && isGlobal
   let p ← try
       if atBase then
+        -- NOTE: the proofs of the current scope are not available at depth 0 (e.g., for nested lemmas)
         withReader (fun c => { c with depth := 0, facts := #[], interp := { c.interp with locals := {} } }) <|
-          withLCtx ctx.baseLCtx ctx.baseInsts (replayCore i)
+          withLCtx ctx.baseLCtx ctx.baseInsts (withScope (replayCore i))
       else replayCore i
     catch ex =>
       if isGlobal then modify fun s => { s with failed := s.failed.insert i }
