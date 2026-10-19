@@ -481,12 +481,15 @@ structure Ctx where
   /-- proof of `g₁ → ... → gₙ → l = r` for the rewritten sides `l` and `r` of an unfolding under the guards `gᵢ`
       when they differ (e.g., in the normal forms of Blaster and Z3, like `0 < x` and `¬ x ≤ 0`) -/
   proveImp : Expr → TermElabM (Option Expr) := fun _ => pure none
+  /-- proof of `l = r` for terms that differ in a few places (e.g., `0 < x` and `¬ x ≤ 0`, see `Local.diffEq`) -/
+  proveDiff : Expr → Expr → TermElabM (Option Expr) := fun _ _ => pure none
 
 
 /-- Definitional equations of the recursive functions `pairs`: the interpretation of `∀ x⃗, f x⃗ = body` for the
     body of `f` in the definitions `defs` of the proof output, and of the axiom of `f` in the query. -/
 def mkCtx (tbl : SymTable) (aux : NameSet) (pairs : Array Pair) (defs : Array FunDef)
-    (proveDef proveImp : Expr → TermElabM (Option Expr)) : TermElabM Ctx := do
+    (proveDef proveImp : Expr → TermElabM (Option Expr)) (proveDiff : Expr → Expr → TermElabM (Option Expr)) :
+    TermElabM Ctx := do
   if !pairs.isEmpty then debugLog m!"recfun: {pairs.size} recursive functions, {defs.size} definitions in the proof"
   let interpStmt (φ : STerm) : TermElabM (Option (Expr × Name)) := do
     try
@@ -514,7 +517,7 @@ def mkCtx (tbl : SymTable) (aux : NameSet) (pairs : Array Pair) (defs : Array Fu
         if head.isAnonymous then head := h
         if h == head then stmts := stmts.push stmt
     if !stmts.isEmpty then eqs := eqs.push { stmts, head, proof := ← IO.mkRef none }
-  return { eqs, aux, proveDef, proveImp }
+  return { eqs, aux, proveDef, proveImp, proveDiff }
 
 /-- Proof of the definitional equation `eq` (attempted once; the proof is shared by the lemmas using it). -/
 def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
@@ -648,6 +651,8 @@ def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (hyps : Array (Expr × 
     -- differences of the rewritten sides
     let (x, px) := ca.back!
     let (y, py) := cb.back!
+    if let some p ← ctx.proveDiff x y then
+      return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
     if let some p ← proveUnder ctx hyps (← mkEq x y) then
       return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
     debugLog m!"recfun: no common rewrite of {ca.map (brief ·.1)} and {cb.map (brief ·.1)}"

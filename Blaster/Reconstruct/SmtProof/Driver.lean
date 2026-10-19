@@ -787,6 +787,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
         let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
         if stmt.hasFVar then run else withLCtx {} {} run)
       (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
+      (fun a b => do Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite") (← IO.mkRef 6) a b)
     let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
     let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
       let cfg : ReplayConfig := {
@@ -829,6 +830,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
       let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
       let global := (scopedSteps sproof).map (!·)
       let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
+                               openHyps := openHypotheses sproof,
                                baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
       let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
                             catch ex => return Except.error ex) |>.run ctx).run {}

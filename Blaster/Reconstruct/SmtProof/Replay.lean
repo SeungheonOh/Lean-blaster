@@ -66,6 +66,8 @@ structure ReplayCtx where
   prepass : Bool := false
   /-- steps that don't depend on a scope (see `scopedSteps`): their proofs are valid at depth 0 -/
   global : Array Bool := #[]
+  /-- open hypotheses of the steps (see `openHypotheses`) -/
+  openHyps : Array (Array Nat) := #[]
   /-- local context at depth 0, in which the steps that don't depend on a scope are replayed -/
   baseLCtx : LocalContext := {}
   baseInsts : LocalInstances := #[]
@@ -158,6 +160,7 @@ partial def dagString (e : Expr) (maxLen := 30000) : MetaM String := do
       | .proj _ i b => pure s!"{← go b}.{i + 1}"
       | .fvar x => pure (toString (← x.getUserName))
       | .const n _ => pure (toString n)
+      | .bvar i => pure s!"!{i}"
       | s => pure (toString s)
     if counts.getD s 0 > 1 && str.length > 20 then
       let k := (← ids.get).size
@@ -337,15 +340,51 @@ partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr
     return pf
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) goal r
 
+/-- Whether the step `s` (`lemma` or `subproof`) discharges the hypothesis of step `h`: a Z3 `lemma` discharges the
+    hypotheses whose negation is one of its literals (matched on shared term objects), an Alethe `subproof` the
+    assumptions it lists. -/
+def discharges (p : Proof) (s : Step) (h : Nat) : Bool :=
+  if s.rule == "subproof" then s.discharged.contains h
+  else if s.rule == "lemma" then
+    let lits := match s.concl.stripAnnot with
+      | .app "or" ls => ls
+      | l => #[l]
+    let negated : Array USize := lits.filterMap fun l => (STerm.not? l).map termAddr
+    let plain : Array USize := lits.map fun l => termAddr l.stripAnnot
+    let φ := p.steps[h]!.concl
+    -- discharged: `¬ φ` is a literal, or `φ = ¬ a` and `a` is a literal
+    negated.contains (termAddr φ) || negated.contains (termAddr φ.stripAnnot) ||
+      ((STerm.not? φ).map (fun a => plain.contains (termAddr a.stripAnnot))).getD false
+  else false
+
+/-- Open hypotheses of each step (indices of `hypothesis` steps not discharged, see `discharges`). -/
+def openHypotheses (p : Proof) : Array (Array Nat) := Id.run do
+  let n := p.steps.size
+  let mut hyps : Array (Array Nat) := Array.replicate n #[]
+  for i in [:n] do
+    let s := p.steps[i]!
+    if s.rule == "hypothesis" then hyps := hyps.set! i #[i]
+    else
+      let mut hs : Array Nat := #[]
+      for j in s.premises do
+        for h in hyps[j]! do
+          if !hs.contains h then hs := hs.push h
+      if s.rule == "subproof" || s.rule == "lemma" then hs := hs.filter (!discharges p s ·)
+      hyps := hyps.set! i hs
+  return hyps
+
 /-- Run `x` in a new scope (hypotheses or bound variables): the proofs (and failures) of the
     current scope are saved and restored, also when `x` fails. -/
-def withScope (x : ReplayM α) (inherit := false) : ReplayM α := do
+def withScope (x : ReplayM α) (inherit := false) (keep : Nat → Bool := fun _ => false) : ReplayM α := do
   let saved := ((← get).scopeCache, (← get).scopeFailed)
   -- NOTE: with `inherit`, the proofs of the current scope stay available in the new scope (e.g., for the hypotheses
-  -- of nested lemmas, which extend the context of the enclosing ones), such that the steps shared by the subproofs
-  -- of nested lemmas are not replayed in each of them
+  -- of nested lemmas, which extend the context of the enclosing ones), and the proofs of the new scope satisfying
+  -- `keep` (e.g., not depending on the hypotheses of a nested lemma) are kept, such that the steps shared by the
+  -- subproofs of nested lemmas are not replayed in each of them
   modify fun s => { s with scopeCache := if inherit then s.scopeCache else {}, scopeFailed := {} }
-  try x finally modify fun s => { s with scopeCache := saved.1, scopeFailed := saved.2 }
+  try x finally modify fun s =>
+    let inner := if inherit then s.scopeCache.fold (fun m i p => if keep i then m.insert i p else m) saved.1 else saved.1
+    { s with scopeCache := inner, scopeFailed := saved.2 }
 
 /-- Definitional equality with a heartbeat budget (default transparency when `unfold`, reducible otherwise). -/
 def defeqBudget (a b : Expr) (budget : Nat) (unfold : Bool) : MetaM Bool := do
@@ -739,7 +778,10 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
       facts := facts.push (mkNot l, nl)
       if let some a := l.not? then
         facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
-    let pf ← timed "subproof" <| withScope (inherit := true) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
+    -- the proofs of the steps not depending on the hypotheses discharged by the lemma stay valid after it
+    let disch := (ctx.openHyps.getD j #[]).filter (discharges ctx.proof step ·)
+    let keep (k : Nat) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·)
+    let pf ← timed "subproof" <| withScope (inherit := true) (keep := keep) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
       -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
       let cj ← stepConcl j
@@ -1020,30 +1062,7 @@ end
     shared term objects), an Alethe `subproof` the assumptions it lists. -/
 def scopedSteps (p : Proof) : Array Bool := Id.run do
   let n := p.steps.size
-  -- open hypotheses of each step (indices of `hypothesis` steps)
-  let mut hyps : Array (Array Nat) := Array.replicate n #[]
-  for i in [:n] do
-    let s := p.steps[i]!
-    if s.rule == "hypothesis" then hyps := hyps.set! i #[i]
-    else
-      let mut hs : Array Nat := #[]
-      for j in s.premises do
-        for h in hyps[j]! do
-          if !hs.contains h then hs := hs.push h
-      if s.rule == "subproof" then
-        hs := hs.filter (!s.discharged.contains ·)
-      else if s.rule == "lemma" then
-        let lits := match s.concl.stripAnnot with
-          | .app "or" ls => ls
-          | l => #[l]
-        let negated : Array USize := lits.filterMap fun l => (STerm.not? l).map termAddr
-        let plain : Array USize := lits.map fun l => termAddr l.stripAnnot
-        hs := hs.filter fun h =>
-          let φ := p.steps[h]!.concl
-          -- discharged: `¬ φ` is a literal, or `φ = ¬ a` and `a` is a literal
-          !(negated.contains (termAddr φ) || negated.contains (termAddr φ.stripAnnot) ||
-            ((STerm.not? φ).map (fun a => plain.contains (termAddr a.stripAnnot))).getD false)
-      hyps := hyps.set! i hs
+  let hyps := openHypotheses p
   let mut inScope := hyps.map (!·.isEmpty)
   -- subtrees below binders
   let mut todo : Array Nat := #[]
