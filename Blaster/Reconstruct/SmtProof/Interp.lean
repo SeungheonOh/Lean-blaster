@@ -176,6 +176,36 @@ def toSmtWorld (e : Expr) : MetaM Expr := do
   if isBoolType t then return mkBoolTrue e
   return e
 
+/-! ## Types -/
+
+/-- Type aliases, per constant (see `isTypeAlias`). -/
+initialize typeAliasCache : IO.Ref (Std.HashMap Name Bool) ← IO.mkRef {}
+
+/-- Whether `c` is a type alias: a non-recursive definition of a type or of a type constructor (e.g.,
+    `def ScriptHash : Type := ByteString`), which Blaster's translation unfolds. -/
+def isTypeAlias (c : Name) : MetaM Bool := do
+  if let some b := (← typeAliasCache.get).get? c then return b
+  let env ← getEnv
+  let b := match env.find? c with
+    | some (.defnInfo info) =>
+        info.type.getForallBody.isSort && !isInstanceCore env c && !(info.value.find? (·.isConstOf c)).isSome
+    | _ => false
+  typeAliasCache.modify (·.insert c b)
+  return b
+
+/-- `t` with its type aliases unfolded (see `isTypeAlias`): the canonical form of the types of the interpretation.
+    The SMT sorts are interpreted as the unfolded types, while the types of Lean declarations (e.g., of the fields of
+    constructors) may refer to the aliases (e.g., `Option ScriptHash` and `Option ByteString` in the testers of a
+    field and of the branches of a conditional), which unification identifies but the syntactic comparisons of the
+    replay (e.g., `congrDescent`) do not. -/
+def unfoldTypeAliases (t : Expr) : MetaM Expr := do
+  if !(← t.getUsedConstants.anyM isTypeAlias) then return t
+  Meta.transform t (pre := fun e => do
+    let .const c _ := e.getAppFn | return .continue
+    if !(← isTypeAlias c) then return .continue
+    let some e' ← unfoldDefinition? e | return .continue
+    return .visit e'.headBeta)
+
 /-- User name of the metavariables standing for the default values of selectors (see `mkSelector`). -/
 def defaultMVarName : Name := `_blaster_selector_default
 
@@ -221,7 +251,11 @@ def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) (allowTypeM
       if bis[i]!.isInstImplicit then
         let inst ← synthInstance (← instantiateMVars (← inferType m))
         m.mvarId!.assign inst
-  let r ← instantiateMVars (mkAppN f (mvars.extract 0 used))
+  -- NOTE: the type arguments with their type aliases unfolded (see `unfoldTypeAliases`)
+  let r ← instantiateMVars (mkAppN f (← (mvars.extract 0 used).mapIdxM fun i m => do
+    let v ← instantiateMVars m
+    if bis[i]!.isExplicit || bis[i]!.isInstImplicit || v.hasMVar then return v
+    unfoldTypeAliases v))
   -- NOTE: the remaining implicit arguments (e.g., the type parameter `α` of `Sum.inr (b : β) : α ⊕ β`) may be
   -- assigned by unification with the context
   if r.hasMVar && !allowMVars then
@@ -372,7 +406,8 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := fal
   if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: selector {ctor} applied to {xt}"
   let lvls := xt.getAppFn.constLevels!
   let some (.inductInfo iinfo) := (← getEnv).find? cinfo.induct | throwError "smt proof: unknown inductive {cinfo.induct}"
-  let params := xt.getAppArgs.extract 0 iinfo.numParams
+  let params ← (xt.getAppArgs.extract 0 iinfo.numParams).mapM unfoldTypeAliases
+  let xt := mkAppN xt.getAppFn (params ++ xt.getAppArgs.extract iinfo.numParams xt.getAppNumArgs)
   -- structure: projection (a proof field is interpreted as its proposition)
   if iinfo.ctors.length == 1 && iinfo.numIndices == 0 && !iinfo.isRec then
     let p := mkProj cinfo.induct idx x
@@ -382,7 +417,7 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := fal
   let fieldTy ← forallTelescopeReducing (← instantiateForall (ctorType (.ctorInfo cinfo)) params) fun fs _ => do
     let t ← inferType fs[idx]!
     if t.hasAnyFVar (fs.contains <| .fvar ·) then throwError "smt proof: dependent field selector not supported"
-    return t
+    unfoldTypeAliases t
   -- default value for the other constructors: `x` itself when the field has the type of `x` (e.g., the
   -- argument of a recursive constructor), an inhabitant of the field type otherwise
   -- NOTE: when the field type is not known yet (e.g., `List.nil` of an unknown instance), the inhabitant can be
@@ -496,7 +531,8 @@ def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
   if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: tester {ctor} applied to {xt}"
   let lvls := xt.getAppFn.constLevels!
   let some (.inductInfo iinfo) := (← getEnv).find? cinfo.induct | throwError "smt proof: unknown inductive {cinfo.induct}"
-  let params := xt.getAppArgs.extract 0 iinfo.numParams
+  let params ← (xt.getAppArgs.extract 0 iinfo.numParams).mapM unfoldTypeAliases
+  let xt := mkAppN xt.getAppFn (params ++ xt.getAppArgs.extract iinfo.numParams xt.getAppNumArgs)
   let motive := mkLambda `x .default xt (mkSort levelZero)
   let mut minors := #[]
   for c in iinfo.ctors do
