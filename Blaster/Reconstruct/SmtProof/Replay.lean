@@ -127,6 +127,47 @@ def debugLog (msg : MessageData) : MetaM Unit := do
   let h ← IO.FS.Handle.mk f .append
   h.putStrLn s!"{← msg.toString}"
 
+/-- Printing of a large term with its shared subterms named (`#n`), for debugging: printed as a tree, the terms of
+    the interpretation may be exponentially large (e.g., nested selectors of recursive types). -/
+partial def dagString (e : Expr) (maxLen := 30000) : MetaM String := do
+  -- shared subterms (occurring at least twice, of size at least 2)
+  let mut counts : Std.HashMap Expr Nat := {}
+  let mut stack := #[e]
+  while !stack.isEmpty do
+    let s := stack.back!
+    stack := stack.pop
+    let n := counts.getD s 0
+    counts := counts.insert s (n + 1)
+    if n > 0 then continue
+    match s with
+    | .app f a => stack := stack.push f |>.push a
+    | .lam _ t b _ | .forallE _ t b _ => stack := stack.push t |>.push b
+    | .mdata _ b | .proj _ _ b => stack := stack.push b
+    | _ => pure ()
+  let ids ← IO.mkRef ({} : Std.HashMap Expr Nat)
+  let defs ← IO.mkRef (#[] : Array String)
+  let rec go (s : Expr) : MetaM String := do
+    if let some k := (← ids.get).get? s then return s!"#{k}"
+    let str ← match s with
+      | .app .. =>
+          let args ← s.getAppArgs.mapM go
+          pure s!"({← go s.getAppFn} {" ".intercalate args.toList})"
+      | .lam n t b _ => pure s!"(fun ({n} : {← go t}) => {← go b})"
+      | .forallE n t b _ => pure s!"(∀ ({n} : {← go t}), {← go b})"
+      | .mdata _ b => go b
+      | .proj _ i b => pure s!"{← go b}.{i + 1}"
+      | .fvar x => pure (toString (← x.getUserName))
+      | .const n _ => pure (toString n)
+      | s => pure (toString s)
+    if counts.getD s 0 > 1 && str.length > 20 then
+      let k := (← ids.get).size
+      ids.modify (·.insert s k)
+      defs.modify (·.push s!"#{k} := {str}")
+      return s!"#{k}"
+    return str
+  let top ← go e
+  return ("\n".intercalate ((← defs.get).toList ++ [top])).take maxLen
+
 def record (rule method : String) : ReplayM Unit :=
   modify fun s => { s with stats := s.stats.record rule method }
 
@@ -451,7 +492,10 @@ partial def replay (i : Nat) : ReplayM Expr := do
       let msg := s!"step {i} ({step.rule}): {toString step.concl |>.take 300}: {(← ex.toMessageData.toString).take 300}"
       if let some f ← IO.getEnv "BLASTER_SMTPROOF_FAILDUMP" then
         let h ← IO.FS.Handle.mk f .append
-        let c ← try pure (toString (← ppExpr (← stepConcl i))) catch _ => pure "?"
+        let c ← try (do
+            let c ← stepConcl i
+            -- NOTE: large terms are printed with their sharing
+            if Local.sizeLe c 20000 then pure (toString (← ppExpr c)) else dagString c) catch _ => pure "?"
         h.putStrLn s!"=== step {i} ({step.rule}) premises {step.premises}: {(← ex.toMessageData.toString).take 500}\n{c.take 30000}\n"
       modify fun s => { s with stats := { s.stats with failures := s.stats.failures.push msg } }
       throw ex
