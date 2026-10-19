@@ -123,7 +123,14 @@ partial def replaceAll (m : Std.HashMap Expr Expr) (e : Expr) : StateM (Std.Hash
 def generalizeCommon (stmt l r : Expr) : MetaM (Option (Expr × Array Expr)) := do
   let ss ← commonSubterms l r
   if ss.isEmpty then return none
-  let types ← ss.mapM inferType
+  -- NOTE: the types are unfolded to their inductive types (e.g., `Value := List (Data × Data)`), such that tactics
+  -- can perform case analyses on the variables
+  let types ← ss.mapM fun s => do
+    let t ← inferType s
+    let t' ← whnfD t
+    if let .const n _ := t'.getAppFn then
+      if (← getEnv).find? n matches some (.inductInfo _) then return t'
+    return t
   let decls := (ss.zip types).mapIdx fun i (_, t) => (Name.mkSimple s!"z{i}", fun (_ : Array Expr) => pure t)
   withLocalDeclsD decls fun zs => do
     let m : Std.HashMap Expr Expr := (ss.zip zs).foldl (fun m (s, z) => m.insert s z) {}

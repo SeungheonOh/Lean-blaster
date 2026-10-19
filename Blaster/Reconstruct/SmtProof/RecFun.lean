@@ -402,7 +402,8 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     try evalTactic (← `(tactic| dsimp only)) catch _ => pure ()
     let some g ← (do return (← getGoals).head?) | continue
     setGoals [g]
-    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done))) catch _ => pure ()
+    -- NOTE: `simp_all` closes the contradictory cases (e.g., the patterns excluded by the hypotheses of `split`)
+    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done))) catch _ => pure ()
     if (← getGoals).isEmpty then continue
     let (lhs, all) ← g.withContext do
       let t ← instantiateMVars (← g.getType)
