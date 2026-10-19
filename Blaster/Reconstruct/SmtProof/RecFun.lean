@@ -655,7 +655,8 @@ def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (hyps : Array (Expr × 
       return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
     if let some p ← proveUnder ctx hyps (← mkEq x y) then
       return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
-    debugLog m!"recfun: no common rewrite of {ca.map (brief ·.1)} and {cb.map (brief ·.1)}"
+    if (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
+      debugLog m!"recfun: no common rewrite ({ca.size}, {cb.size} rewrites) of\n{← dagString x 6000}\nand\n{← dagString y 6000}"
     return none
   if let some q := l.not? then
     let cq ← rewriteChain ctx facts q

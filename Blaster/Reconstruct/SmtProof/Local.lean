@@ -300,6 +300,61 @@ partial def arithAtoms (e : Expr) : MetaM (Array Expr) := do
   go e
   found.get
 
+/-- Datatype terms of the propositional structure of `e` examined by a theory lemma: the sides of equalities and the
+    arguments of testers (`casesOn` or recursors into propositions), through constructor applications, when they are
+    not variables. -/
+partial def datatypeAtoms (e : Expr) : MetaM (Array Expr) := do
+  let visited ← IO.mkRef ({} : Std.HashSet Expr)
+  let found ← IO.mkRef (#[] : Array Expr)
+  let isInductive (t : Expr) : MetaM Bool := do
+    let .const n _ := (← whnfD t).getAppFn | return false
+    -- NOTE: arithmetic terms are left to the arithmetic tactics
+    if n == ``Int || n == ``Nat then return false
+    return (← getEnv).find? n matches some (.inductInfo _)
+  let rec term (x : Expr) : MetaM Unit := do
+    if (← visited.get).contains x || x.hasLooseBVars || isAtomic x then return
+    visited.modify (·.insert x)
+    if let .const c _ := x.getAppFn then
+      if let some (.ctorInfo info) := (← getEnv).find? c then
+        for a in x.getAppArgs.extract info.numParams x.getAppNumArgs do term a
+        return
+    if ← isInductive (← inferType x) then found.modify (·.push x)
+  let rec prop (e : Expr) : MetaM Unit := do
+    if e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 || e.isAppOfArity ``Iff 2 then
+      prop e.appFn!.appArg!; prop e.appArg!
+    else if e.isAppOfArity ``Not 1 then prop e.appArg!
+    else if let .forallE _ t b _ := e then
+      if !b.hasLooseBVars then prop t; prop b
+    else if e.isAppOfArity ``Eq 3 then
+      if (e.getArg! 0).isProp then prop (e.getArg! 1); prop (e.getArg! 2)
+      else if ← isInductive (e.getArg! 0) then term (e.getArg! 1); term (e.getArg! 2)
+    else if let some m ← matchMatcherApp? e (alsoCasesOn := true) then
+      for d in m.discrs do term d
+    else if let .const r _ := e.getAppFn then
+      if let some (.recInfo info) := (← getEnv).find? r then
+        if let some d := e.getAppArgs[info.getMajorIdx]? then term d
+  prop e
+  found.get
+
+/-- `(∀ zs, stmt[zs/atoms], atoms)` for the datatype terms of `stmt` (see `datatypeAtoms`), e.g., for datatype lemmas
+    whose premises relate different terms (`¬ is-nil a → ¬ is-cons b → a = b → False`). -/
+def generalizeDatatypeAtoms (stmt : Expr) : MetaM (Option (Expr × Array Expr)) := do
+  let ss ← datatypeAtoms stmt
+  if ss.isEmpty then return none
+  let types ← ss.mapM fun s => do
+    let t ← inferType s
+    let t' ← whnfD t
+    if let .const n _ := t'.getAppFn then
+      if (← getEnv).find? n matches some (.inductInfo _) then return t'
+    return t
+  let decls := (ss.zip types).mapIdx fun i (_, t) => (Name.mkSimple s!"d{i}", fun (_ : Array Expr) => pure t)
+  withLocalDeclsD decls fun zs => do
+    let m : Std.HashMap Expr Expr := (ss.zip zs).foldl (fun m (s, z) => m.insert s z) {}
+    let (stmt', _) := (replaceAll m stmt).run {}
+    let g ← mkForallFVars zs stmt'
+    if !(← isTypeCorrect g) then return none
+    return some (g, ss)
+
 /-- `(∀ zs, stmt[zs/atoms], atoms)` for the arithmetic atoms of `stmt` (see `arithAtoms`). -/
 def generalizeAtoms (stmt : Expr) : MetaM (Option (Expr × Array Expr)) := do
   let ss ← arithAtoms stmt
