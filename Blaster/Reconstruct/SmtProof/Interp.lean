@@ -11,7 +11,9 @@ SMT terms occurring in a proof are interpreted as Lean terms:
  - `Bool`-sorted terms are interpreted as propositions, and converted with `decide` (resp. `= true`)
    when a Lean `Bool` is expected (resp. given);
  - other sorts (e.g., datatypes, `String`, uninterpreted sorts) are interpreted as the corresponding
-   Lean types.
+   Lean types; the sorts `@Instance` and `@Type` of Blaster's polymorphic encoding are interpreted as a
+   sort variable and `Unit`, or as the universe `Poly.Univ.{u}` of the values of `Sort u` and `Sort u`
+   (see `Poly.lean`).
 
 The interpretation of the symbols of the query is given by a `SymTable`. Each step of an SMT proof is
 then replayed as a Lean proof of the interpretation of its conclusion. Since the Lean proof is checked by
@@ -31,6 +33,9 @@ inductive SymInterp where
   | macro (params : Array (String × SExpr)) (body : STerm)
   /-- a type predicate of Blaster's encoding, interpreted as `fun _ => True` -/
   | trueFun
+  /-- a Lean function given as a lambda (e.g., the membership predicates of the polymorphic encoding, see
+      `Poly.lean`): applications are β-reduced -/
+  | lam (e : Expr)
   /-- a datatype constructor -/
   | ctor (n : Name)
   /-- a datatype selector: constructor, index of the field -/
@@ -54,7 +59,17 @@ structure SymTable where
   /-- Lean types of the datatype sorts as they occur in proofs (aliases expanded), e.g., `(@List Int) ↦ List Nat`
       when the query only uses `(@List Nat)`. -/
   expandedSorts : Std.HashMap String Expr := {}
+  /-- guards of Z3's case predicates of recursive functions `((_ case-def k f) args)`, per key `k f` (see
+      `caseDefKey?`): arguments of the predicate and guard (see `RecFun.lean`) -/
+  caseGuards : Std.HashMap String (Array (Array STerm × STerm)) := {}
   deriving Inhabited
+
+/-- Key `k f` of the indices `k (_ f 0)` of a case predicate `((_ case-def k (_ f 0)) args)` (Z3). -/
+def caseDefKey? (idx : Array STerm) : Option String :=
+  match idx[0]?, idx[1]? with
+  | some (STerm.num k), some (STerm.iapp f _ #[]) | some (STerm.num k), some (STerm.sym f)
+  | some (STerm.num k), some (STerm.app f #[]) => some s!"{k} {f}"
+  | _, _ => none
 
 structure InterpCtx where
   table : SymTable
@@ -63,8 +78,19 @@ structure InterpCtx where
   /-- interpretation of the (closed) terms already interpreted, on term object addresses: terms are
       shared DAGs (e.g., after the expansion of `let`), which must not be traversed as trees -/
   cache : Option (IO.Ref (TermCache Expr)) := none
+  /-- the type parameters of applications that nothing determines are left as metavariables, to be assigned by
+      unification with the context or defaulted after the interpretation of the whole term (see `defaultTypes`) -/
+  deferTypes : Bool := false
+  /-- interpretation of the terms already interpreted in the current scope of local variables (e.g., the body
+      of a macro for given arguments): set when the scope is entered (see `withScopeCache`) -/
+  scopeCache : Option (IO.Ref (TermCache Expr)) := none
 
 abbrev InterpM := ReaderT InterpCtx MetaM
+
+/-- Run `x` with the local variables `locals` (a new scope: terms are memoized in a fresh cache). -/
+def withScopeCache (locals : Std.HashMap String Expr) (x : InterpM α) : InterpM α := do
+  let ref ← IO.mkRef {}
+  withReader (fun c => { c with locals, scopeCache := some ref }) x
 
 /-! ## Casts -/
 
@@ -133,6 +159,13 @@ partial def coerce (e actual expected : Expr) : MetaM Expr := do
               ms[i]!.mvarId!.assign (← coerce args[i]! (← inferType args[i]!) fty)
             let r ← instantiateMVars (mkAppN k ms)
             if !r.hasExprMVar then return r
+  -- functions (e.g., lambda terms with `Nat` parameters and an `Int` body where `Nat → Nat` is expected): the
+  -- arguments are coerced back and the results coerced, pointwise
+  if let (.forallE _ a b _, .forallE n a' b' bi) := (actual, expected') then
+    if !b.hasLooseBVars && !b'.hasLooseBVars then
+      return ← withLocalDecl n bi a' fun y => do
+        let x ← coerce y a' a
+        mkLambdaFVars #[y] (← coerce (mkApp e x).headBeta b b')
   throwError "smt proof: can't coerce {e} : {actual} to {expected}"
 
 /-- Normalize the type of an interpreted term for the SMT world: `Nat` terms are cast to `Int`,
@@ -143,10 +176,13 @@ def toSmtWorld (e : Expr) : MetaM Expr := do
   if isBoolType t then return mkBoolTrue e
   return e
 
+/-- User name of the metavariables standing for the default values of selectors (see `mkSelector`). -/
+def defaultMVarName : Name := `_blaster_selector_default
+
 /-- Apply `f` to `args`, instantiating implicit arguments by unification and coercing explicit
     arguments when necessary. Arguments whose type is `Int` or `Prop` (i.e., flexible w.r.t. coercions)
     are unified last. -/
-def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) : MetaM Expr := do
+def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) (allowTypeMVars := false) : MetaM Expr := do
   let fty ← inferType f
   let (mvars, bis, _) ← forallMetaTelescopeReducing fty
   let explicit := (List.range mvars.size).toArray.filter fun i => bis[i]!.isExplicit
@@ -188,7 +224,15 @@ def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) : MetaM Exp
   let r ← instantiateMVars (mkAppN f (mvars.extract 0 used))
   -- NOTE: the remaining implicit arguments (e.g., the type parameter `α` of `Sum.inr (b : β) : α ⊕ β`) may be
   -- assigned by unification with the context
-  if r.hasMVar && !allowMVars then throwError "smt proof: can't infer implicit arguments of {f}"
+  if r.hasMVar && !allowMVars then
+    -- NOTE: the default values of selectors (see `mkSelector`), and type parameters when `allowTypeMVars`, may be
+    -- chosen later
+    let pending (m : MVarId) : MetaM Bool := do
+      if (← m.getDecl).userName == defaultMVarName then return true
+      return allowTypeMVars && (← instantiateMVars (← m.getType)).isSort
+    -- NOTE: the universe levels of the type parameters may be chosen later too (see `defaultTypes`)
+    if (r.hasLevelMVar && !allowTypeMVars) || (← (← getMVars r).anyM fun m => return !(← pending m)) then
+      throwError "smt proof: can't infer implicit arguments of {f}"
   return r
 
 /-! ## Sorts -/
@@ -215,7 +259,7 @@ partial def sortToType (s : SExpr) : InterpM Expr := do
     | .atom a =>
         if let some s' := tbl.aliases.get? a then return ← sortToType s'
         match tbl.sorts.get? a with
-        | some (.const n _) =>
+        | some (.const n []) =>
             let info ← getConstInfo n
             return mkConst n (info.levelParams.map fun _ => levelZero)
         | some t => return t
@@ -282,6 +326,8 @@ def mkIntNeg (a : Expr) : Expr := mkApp (mkApp2 (mkConst ``Neg.neg [0]) intType 
 def mkIntLe (a b : Expr) : Expr := mkApp4 (mkConst ``LE.le [0]) intType (mkConst ``Int.instLEInt) a b
 def mkIntLt (a b : Expr) : Expr := mkApp4 (mkConst ``LT.lt [0]) intType (mkConst ``Int.instLTInt) a b
 
+def mkStrLt (a b : Expr) : Expr := mkApp4 (mkConst ``LT.lt [0]) (mkConst ``String) (mkConst ``String.instLT) a b
+
 /-- `if c then a else b` with the classical instance. -/
 def mkClassicalIte (c a b : Expr) : MetaM Expr := do
   let t ← inferType a
@@ -320,7 +366,7 @@ def mkEqSmt (a b : Expr) : MetaM Expr := do
 
 /-- Selector of field `idx` of constructor `ctor` applied to `x`, defined by case analysis (with
     `default` for the other constructors). -/
-partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
+partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := false) : MetaM Expr := do
   let some (.ctorInfo cinfo) := (← getEnv).find? ctor | throwError "smt proof: unknown constructor {ctor}"
   let xt ← whnfD (← inferType x)
   if !xt.getAppFn.isConstOf cinfo.induct then throwError "smt proof: selector {ctor} applied to {xt}"
@@ -339,7 +385,11 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
     return t
   -- default value for the other constructors: `x` itself when the field has the type of `x` (e.g., the
   -- argument of a recursive constructor), an inhabitant of the field type otherwise
-  let dflt ← if ← isDefEq fieldTy xt then pure x else mkDefault fieldTy
+  -- NOTE: when the field type is not known yet (e.g., `List.nil` of an unknown instance), the inhabitant can be
+  -- chosen after the interpretation of the whole term (`deferDefault`, see `fillDefaults`)
+  let dflt ← if ← isDefEq fieldTy xt then pure x
+    else if deferDefault && (← instantiateMVars fieldTy).hasExprMVar then mkFreshExprMVar fieldTy (userName := defaultMVarName)
+    else mkDefault fieldTy (locals := deferDefault)
   let motive := mkLambda `x .default xt fieldTy
   let mut minors := #[]
   for c in iinfo.ctors do
@@ -352,11 +402,12 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) : MetaM Expr := do
   if casesOn.levelParams.length != lvls.length + 1 then throwError "smt proof: no large elimination for {cinfo.induct}"
   return mkAppN (mkConst (cinfo.induct ++ `casesOn) (u :: lvls)) (params ++ #[motive, x] ++ minors)
 where
-  mkDefault (t : Expr) : MetaM Expr := do
-    if let some v ← inhabitant? t 8 then return v
+  mkDefault (t : Expr) (locals := false) : MetaM Expr := do
+    if let some v ← inhabitant? t 8 locals then return v
     throwError "smt proof: no inhabitant found for {t}"
-  /-- An inhabitant of `t`: from an instance, or a constructor application with inhabited fields. -/
-  inhabitant? (t : Expr) (depth : Nat) : MetaM (Option Expr) := do
+  /-- An inhabitant of `t`: from an instance, or a constructor application with inhabited fields (or a variable of
+      the context when `locals`). -/
+  inhabitant? (t : Expr) (depth : Nat) (locals := false) : MetaM (Option Expr) := do
     let u ← getLevel t
     try
       let inst ← synthInstance (mkApp (mkConst ``Inhabited [u]) t)
@@ -366,6 +417,12 @@ where
       let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) t)
       return some (mkApp2 (mkConst ``Classical.ofNonempty [u]) t inst)
     catch _ => pure ()
+    -- in the interpretation: a variable of the context of type `α` (a sort variable of the goal, e.g., `x : α`)
+    -- NOTE: the first one, i.e., a variable of the goal when there is one (the variables of the replay come later)
+    if locals && t.isFVar then
+      if let some d := (← getLCtx).findDecl? fun d =>
+          if !d.isImplementationDetail && d.type == t then some d else none then
+        return some d.toExpr
     if depth == 0 then return none
     let t ← whnfD t
     let .const n lvls := t.getAppFn | return none
@@ -379,12 +436,58 @@ where
           let ft ← inferType f
           -- non-dependent fields only
           if ft.hasAnyFVar (fs.contains <| .fvar ·) then return none
-          match ← inhabitant? ft (depth - 1) with
+          match ← inhabitant? ft (depth - 1) locals with
           | some v => vals := vals.push v
           | none => return none
         return some (mkAppN (mkAppN (mkConst c lvls) params) vals)
       if r.isSome then return r
     return none
+
+/-- Assign the metavariables of `e` standing for default values of selectors (see `mkSelector`) whose type is
+    known, with inhabitants of their types. -/
+def fillDefaults (e : Expr) : MetaM Expr := do
+  if !e.hasExprMVar then return e
+  for m in (← getMVars e) do
+    if (← m.isAssigned) || (← m.getDecl).userName != defaultMVarName then continue
+    let t ← instantiateMVars (← m.getType)
+    if t.hasExprMVar || (← isProp t) then continue
+    if let some v ← mkSelector.inhabitant? t 8 (locals := true) then m.assign v
+  instantiateMVars e
+
+/-- Replace the remaining type metavariables of `e` with `dflt`: the type parameters that nothing determines (e.g.,
+    of `Option.none` under a tester, whose instance Z3 doesn't print), then the default values of selectors of
+    these types. The metavariables are substituted, not assigned: they may be shared with the interpretations of
+    the same subterms in other steps, where their context determines them. -/
+def defaultTypes (e : Expr) (dflt : Expr := mkConst ``Unit) : MetaM Expr := do
+  if !e.hasExprMVar then return e
+  let dfltTy ← inferType dflt
+  let mut subst : Std.HashMap MVarId Expr := {}
+  for m in (← getMVars e) do
+    if ← m.isAssigned then continue
+    let t ← instantiateMVars (← m.getType)
+    -- NOTE: the universe of the parameter may be a metavariable (e.g., `Option.{?u} ?α`)
+    if t.isSort && (← isDefEq t dfltTy) then subst := subst.insert m dflt
+  if subst.isEmpty then return e
+  let apply (subst : Std.HashMap MVarId Expr) (x : Expr) : Expr :=
+    x.replace fun y => if let .mvar m := y then subst.get? m else none
+  -- the default values of selectors whose type is now known
+  for m in (← getMVars e) do
+    if (← m.isAssigned) || subst.contains m || (← m.getDecl).userName != defaultMVarName then continue
+    let t := apply subst (← instantiateMVars (← m.getType))
+    if t.hasExprMVar || (← isProp t) then continue
+    if let some v ← mkSelector.inhabitant? t 8 then subst := subst.insert m v
+  -- NOTE: the universe levels of the substituted parameters are assigned (e.g., `?u` in `Option.{?u} ?α`)
+  instantiateMVars (apply subst e)
+
+/-- Assign the remaining type metavariables of `e` with `dflt` (see `defaultTypes`), e.g., the type parameters of the
+    constructors of an undetermined instance in the instantiations of quantifiers, which unification does not
+    determine when the constructor applications are reduced (e.g., `Either.Right.0 (Either.Right x)`). -/
+def assignDefaultTypes (e : Expr) (dflt : Expr) : MetaM Expr := do
+  if !e.hasExprMVar then return e
+  for m in (← getMVars e) do
+    if ← m.isAssigned then continue
+    if (← instantiateMVars (← m.getType)).isSort then discard <| isDefEq (mkMVar m) dflt
+  instantiateMVars e
 
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
@@ -418,6 +521,14 @@ partial def interp (t : STerm) : InterpM Expr := do
   -- NOTE: terms are memoized when no local variable is in scope (closed terms)
   if let some ref := ctx.cache then
     if ctx.locals.isEmpty then
+      let addr := termAddr t
+      if let some e := (← ref.get).get? addr then return e
+      let e ← interpCore t
+      if !e.hasMVar then ref.modify (·.insert addr e)
+      return e
+  -- NOTE: terms below binders are memoized for their scope (e.g., the shared subterms of macro bodies)
+  if let some ref := ctx.scopeCache then
+    if !ctx.locals.isEmpty then
       let addr := termAddr t
       if let some e := (← ref.get).get? addr then return e
       let e ← interpCore t
@@ -460,6 +571,7 @@ partial def interpCore (t : STerm) : InterpM Expr := do
   | .iapp f idx args =>
       -- testers: `((_ is C) x)` and `((_ is-C C is-C) x)` (Z3)
       -- character literals `(_ Char n)`
+      if f == "case-def" then return ← interpCaseDef idx args
       if f == "Char" && args.isEmpty then
         let some (STerm.num n) := idx[0]? | throwError "smt proof: ill-formed character {t}"
         return mkApp (mkConst ``Char.ofNat) (mkRawNatLit n)
@@ -469,6 +581,25 @@ partial def interpCore (t : STerm) : InterpM Expr := do
         match (← read).table.syms.get? ctorSym with
         | some (.ctor c) => mkTester c (← interp x)
         | _ => throwError "smt proof: unknown constructor {ctorSym}"
+      -- pseudo-Boolean constraints (Z3): `((_ pbge k c₁ ... cₙ) a₁ ... aₙ)` is `c₁ [a₁] + ... + cₙ [aₙ] ≥ k`
+      -- where `[a]` is `if a then 1 else 0` (resp. `≤ k`, `= k` for `pble`, `pbeq`), and the cardinality
+      -- constraints `((_ at-least k) a₁ ... aₙ)` (resp. `at-most`) have the coefficients `1`
+      else if ["pbge", "pble", "pbeq", "at-least", "at-most"].contains f then
+        let nums ← idx.mapM fun i => match i with
+          | STerm.num n => pure n
+          | _ => throwError "smt proof: ill-formed pseudo-Boolean constraint {t}"
+        let some k := nums[0]? | throwError "smt proof: ill-formed pseudo-Boolean constraint {t}"
+        let coeffs := if f.startsWith "at-" then Array.replicate args.size 1 else nums.extract 1 nums.size
+        if coeffs.size != args.size || args.isEmpty then throwError "smt proof: ill-formed pseudo-Boolean constraint {t}"
+        let mut terms := #[]
+        for (c, a) in coeffs.zip args do
+          let ind ← mkClassicalIte (← interpProp a) (mkIntLit 1) (mkIntLit 0)
+          terms := terms.push (if c == 1 then ind else mkIntMul (mkIntLit c) ind)
+        let sum ← foldBin mkIntAdd terms
+        match f with
+        | "pbge" | "at-least" => return mkIntLe (mkIntLit k) sum
+        | "pble" | "at-most" => return mkIntLe sum (mkIntLit k)
+        | _ => mkEq sum (mkIntLit k)
       else
         -- indexed applications of recursive functions (e.g., `((_ @Nat.pow 0) x y)` in Z3 proofs)
         interpApp f args
@@ -485,7 +616,7 @@ partial def interpQuant (k : QuantKind) (vars : Array (String × SExpr)) (body :
         let v := if natParam vars[i].2 then mkIntOfNat x else x
         withReader (fun ctx => { ctx with locals := ctx.locals.insert vars[i].1 v }) (go (i + 1) (fvars.push x))
     else
-      let b ← interp body
+      let b ← withScopeCache (← read).locals (interp body)
       match k with
       | .forall => mkForallFVars fvars b
       | .lambda => mkLambdaFVars fvars b
@@ -500,7 +631,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   let ctx ← read
   if let some x := ctx.locals.get? f then
     if args.isEmpty then return x
-    return ← mkAppCoerce x (← args.mapM interp)
+    return ← mkAppCoerce x (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)
   match f, args.size with
   | "true", 0 => return mkConst ``True
   | "false", 0 => return mkConst ``False
@@ -518,13 +649,26 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
       for i in [:es.size] do
         for j in [i+1:es.size] do cs := cs.push (mkNot (← mkEqSmt es[i]! es[j]!))
       if cs.isEmpty then return mkConst ``True else foldBinRight mkAnd cs
-  | "ite", 3 => mkClassicalIte (← interpProp args[0]!) (← interpInt? args[1]!) (← interpInt? args[2]!)
+  | "ite", 3 =>
+      let (x, y) := (← interpInt? args[1]!, ← interpInt? args[2]!)
+      let c ← interpProp args[0]!
+      -- NOTE: the branches have the same type: the parameters of nullary constructors in a branch (e.g.,
+      -- `Option.none` of an undetermined instance, see `deferTypes`) are given by the other branch, and the branches
+      -- may be interpreted in different instances of a datatype (e.g., `Option Nat` and `Option Int`)
+      let (tx, ty) := (← inferType x, ← inferType y)
+      if ← isDefEq tx ty then return ← mkClassicalIte c x y
+      if let some y' ← (try some <$> coerce y ty tx catch _ => pure none) then return ← mkClassicalIte c x y'
+      mkClassicalIte c (← coerce x tx ty) y
   | "+", _ => foldBin mkIntAdd (← args.mapM interpInt)
   | "-", 1 => return mkIntNeg (← interpInt args[0]!)
   | "-", _ => foldBin mkIntSub (← args.mapM interpInt)
   | "*", _ => foldBin mkIntMul (← args.mapM interpInt)
   | "div", _ => foldBin mkIntDiv (← args.mapM interpInt)
   | "mod", 2 => return mkIntMod (← interpInt args[0]!) (← interpInt args[1]!)
+  -- Z3's (unspecified) division and modulo by zero (e.g., `(= (div x y) (div0 x y))` in the lemmas on `y = 0`),
+  -- interpreted as the division and modulo
+  | "div0", 2 => return mkIntDiv (← interpInt args[0]!) (← interpInt args[1]!)
+  | "mod0", 2 => return mkIntMod (← interpInt args[0]!) (← interpInt args[1]!)
   | "abs", 1 => return mkApp (mkConst ``Int.natAbs) (← interpInt args[0]!) |> mkIntOfNat
   | "<=", _ => chain (fun a b => pure (mkIntLe a b)) (← args.mapM interpInt)
   | "<", _ => chain (fun a b => pure (mkIntLt a b)) (← args.mapM interpInt)
@@ -532,6 +676,9 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   | ">", _ => chain (fun a b => pure (mkIntLt b a)) (← args.mapM interpInt)
   | "str.++", _ | "seq.++", _ => foldBin (fun a b => mkApp2 (mkConst ``String.append) a b) (← args.mapM interp)
   | "str.len", 1 | "seq.len", 1 => return mkIntOfNat (mkApp (mkConst ``String.length) (← interp args[0]!))
+  -- lexicographic order (`str.<=` as the negation of the converse, the order being total)
+  | "str.<", 2 => return mkStrLt (← interp args[0]!) (← interp args[1]!)
+  | "str.<=", 2 => return mkNot (mkStrLt (← interp args[1]!) (← interp args[0]!))
   -- strings as sequences of characters (Z3 proofs): `(seq.unit (_ Char n))`
   | "seq.unit", 1 => return mkApp (mkConst ``String.singleton) (← interp args[0]!)
   | "seq.empty", 0 => return mkStrLit ""
@@ -539,7 +686,8 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
     match ctx.table.syms.get? f with
     | some (.expr e) =>
         if args.isEmpty then return e
-        mkAppCoerce e (← args.mapM interp)
+        -- NOTE: interpretations of auxiliary functions are lambdas (see `auxiliaryInterp`)
+        return (← mkAppCoerce e (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)).headBeta
     | some (.macro params body) =>
         if args.isEmpty && !params.isEmpty then
           -- the function itself (e.g., `(= @isNat (lambda ((x Int)) (<= 0 x)))` in cvc5 proofs)
@@ -548,8 +696,12 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         let vals ← args.mapM interp
         -- NOTE: macro bodies only refer to their parameters
         let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) {}
-        withReader (fun c => { c with locals }) (interp body)
+        withScopeCache locals (interp body)
     | some .trueFun => return mkConst ``True
+    | some (.lam e) =>
+        if args.isEmpty then return e
+        -- NOTE: the arguments may be constructor applications of undetermined instances (see `deferTypes`)
+        return (← mkAppCoerce e (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)).headBeta
     | some (.ctor n) =>
         let c ← mkConstWithFreshMVarLevels n
         if args.isEmpty then
@@ -560,7 +712,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         mkAppCoerce c (← args.mapM interp) (allowMVars := true)
     | some (.selector c i) =>
         let some a := args[0]? | throwError "smt proof: selector without argument"
-        let e ← mkSelector c i (← interp a)
+        let e ← mkSelector c i (← interp a) (deferDefault := true)
         toSmtWorld e
     | some (.tester c) =>
         let some a := args[0]? | throwError "smt proof: tester without argument"
@@ -573,14 +725,31 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
         let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) ty)
         withLocalDeclD (Name.mkSimple x) ty fun fx => do
           let locals := (params.zip vals).foldl (fun m (y, v) => m.insert y v) ctx.locals |>.insert x fx
-          let φ ← withReader (fun c => { c with locals }) (interpProp body)
+          let φ ← withScopeCache locals (interpProp body)
           let p ← mkLambdaFVars #[fx] (if neg then mkNot φ else φ)
           return mkApp3 (mkConst ``Classical.epsilon [u]) ty inst p
     | some .apply =>
         let some fn := args[0]? | throwError "smt proof: apply without argument"
-        let r ← mkAppCoerce (← interp fn) (← (args.extract 1 args.size).mapM interp)
+        let r ← mkAppCoerce (← interp fn) (← (args.extract 1 args.size).mapM interp) (allowTypeMVars := ctx.deferTypes)
         toSmtWorld r
     | none => throwError "smt proof: unknown symbol {f}"
+
+/-- Z3's case predicate `((_ case-def k f) args)` of a recursive function `f`: the conjunction of the guards
+    of the case given by the proof for `args` (`True` when there is none). Case predicates are introduced
+    by Z3 to unfold recursive functions by cases; any interpretation validating the steps of the proof can be
+    chosen (see `RecFun.lean`). -/
+partial def interpCaseDef (idx args : Array STerm) : InterpM Expr := do
+  let some key := caseDefKey? idx | throwError "smt proof: ill-formed case predicate {idx.map toString}"
+  let vals ← args.mapM interp
+  let mut guards : Array Expr := #[]
+  for (as, g) in (← read).table.caseGuards.getD key #[] do
+    if as.size != vals.size then continue
+    let vs ← as.mapM interp
+    if ← (vs.zip vals).allM fun (a, b) => do return a == b || (← withReducible (isDefEq a b)) then
+      let p ← interpProp g
+      if !guards.contains p then guards := guards.push p
+  if guards.isEmpty then return mkConst ``True
+  foldBinRight mkAnd guards
 
 /-- Interpret `t` as an `Int` term (casting `Nat` terms). -/
 partial def interpInt (t : STerm) : InterpM Expr := do

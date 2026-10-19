@@ -169,10 +169,108 @@ def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) 
       | some p => mkEqTrans (mkAppN p (args ++ hs)) pRhs)
   app.remaining.foldlM (init := p) fun acc a => mkCongrFun acc a
 
+/-- Given `inner := matcher ps motive d₁ ... dₙ alt₁ ... altₖ`, a context `F := fun z => F[z]` and
+    `rhs := matcher ps' motive' d₁ ... dₙ alt'₁ ... alt'ₖ` such that each `alt'ᵢ` is definitionally equal to
+    `fun args => F[altᵢ args]`, return a proof of `F[inner] = rhs`, i.e., the propagation of `F` over the
+    alternatives of `inner` (e.g., `f (match d with alts) = match d with (f ∘ alts)`, case of case).
+    Each alternative of `rhs` is justified by the corresponding match equation of `inner`
+    (see `mkMatchCasesProof`).
+-/
+def mkMatchPushProof (F inner rhs : Expr) : MetaM Expr := do
+  let some app ← matchMatcherApp? inner (alsoCasesOn := true)
+    | throwError "mkMatchPushProof: match application expected"
+  if !app.remaining.isEmpty then throwError "mkMatchPushProof: over-applied match"
+  let isCasesOn := isCasesOnRecursor (← getEnv) app.matcherName
+  let mkInner (discrs : Array Expr) : Expr :=
+    mkAppN (mkConst app.matcherName app.matcherLevels.toList) (app.params ++ #[app.motive] ++ discrs ++ app.alts)
+  let p ← mkMatchCasesProof rhs (fun xs => pure (F.beta #[mkInner xs]))
+    (fun altIdx args hs alt rhsᵢ => do
+      -- `rhsᵢ := F[inner[pats]]` with `pats` the patterns of the alternative (see the equalities `hs`)
+      let pats ← hs.mapM fun h => do
+        let some (_, _, p) := (← inferType h).eq? | throwError "mkMatchPushProof: equality expected"
+        return p
+      let pInner ← proveMatchAltEq (mkInner pats) (app.alts[altIdx]!.beta args) altIdx isCasesOn
+      let p ← mkEqSymm (← mkCongrArg F pInner)
+      mkExpectedTypeHint p (← mkEq alt rhsᵢ))
+  mkEqSymm p
+
 /-- User name of the equalities between the discriminants and the patterns declared in the local
     context when optimizing a match alternative (see `Blaster.Optimize.optimizeMatchAlt`).
 -/
 def matchHypName : Name := `h_match
+
+/-- Return the equalities `dⱼ = pⱼ` between the discriminants and the patterns of alternative `altIdx` of the
+    match application `f args` (with `numParams` parameters and `numDiscrs` discriminants), instantiated
+    with the parameters `params` of the alternative.
+    NOTE: The patterns are obtained from the matcher's type and not from the optimized generic instance
+    (see `Blaster.Optimize.getMatchAlts`), as the latter may contain optimized patterns that are not
+    definitionally equal to the patterns of the matcher (e.g., `Nat.add 1 n` instead of `n + 1`).
+-/
+def discrPatternEqs? (f : Expr) (args : Array Expr) (numParams numDiscrs altIdx : Nat) (params : Array Expr) :
+    MetaM (Option (Array Expr)) := do
+  let fType ← instantiateForall (← inferType f) (args.extract 0 numParams)
+  Meta.forallTelescope fType fun fvars _ => do
+    let some motive := fvars[0]? | return none
+    let some altVar := fvars[1 + numDiscrs + altIdx]? | return none
+    Meta.forallTelescope (← inferType altVar) fun xs b => do
+      if !b.getAppFn.isFVarOf motive.fvarId! then return none
+      let lhs := b.getAppArgs
+      if xs.size != params.size || lhs.size != numDiscrs then return none
+      let mut eqs := #[]
+      for j in [0:numDiscrs] do
+        let some d := args[numParams + 1 + j]? | return none
+        let pattern := (lhs[j]!.replaceFVars xs params).replaceFVar motive args[numParams]!
+        let eq ← mkEq d pattern
+        Meta.check eq
+        eqs := eqs.push eq
+      return some eqs
+
+/-- Return a proof of `a = b` given by an equality `h : a = p` (resp. `h : p = a`) between a discriminant and
+    a pattern declared in the local context (see `matchHypName`) such that `p` and `b` are definitionally equal,
+    i.e., the justification of a discriminant resolved with the equality map of the match context
+    (see `Blaster.Optimize.reduceMatch?`).
+-/
+def matchHypEqProof? (a b : Expr) : MetaM (Option Expr) := do
+  for decl in (← getLCtx).decls.toArray.reverse do
+    let some decl := decl | continue
+    if decl.userName != matchHypName then continue
+    let some (_, l, r) := decl.type.eq? | continue
+    let p? ←
+      if l == a && (r == b || (← isDefEq r b)) then pure (some decl.toExpr)
+      else if r == a && (l == b || (← isDefEq l b)) then some <$> mkEqSymm decl.toExpr
+      else pure none
+    if let some p := p? then
+      return some (← mkExpectedTypeHint p (← mkEq a b))
+  return none
+
+/-- Given a match application `m := matcher ps motive d₁ ... dₙ alts` and `ds'` the discriminants such that
+    each `d'ⱼ` is either `dⱼ` or its value in the match context (see `matchHypEqProof?`), return a proof of
+    `m = r` with `r` the alternative to which `matcher ps motive d'₁ ... d'ₙ alts` reduces.
+-/
+def proveMatchReduction (m : Expr) (ds' : Array Expr) (r : Expr) : MetaM Expr := do
+  let some app ← matchMatcherApp? m (alsoCasesOn := true)
+    | throwError "proveMatchReduction: match application expected"
+  let f := m.getAppFn
+  let firstDiscr := app.params.size + 1
+  let mut args := m.getAppArgs
+  let mut pf? : Option Expr := none
+  for h : j in [0:app.discrs.size] do
+    let d := app.discrs[j]
+    let some d' := ds'[j]? | throwError "proveMatchReduction: missing discriminant"
+    if d == d' then continue
+    let some h ← matchHypEqProof? d d' | throwError "proveMatchReduction: no equality for discriminant {j}"
+    let motive := mkLambda `z .default (← inferType d) (mkAppN f (args.set! (firstDiscr + j) (.bvar 0)))
+    let step ← mkCongrArg motive h
+    pf? ← match pf? with
+          | none => pure (some step)
+          | some p => some <$> mkEqTrans p step
+    args := args.set! (firstDiscr + j) d'
+  let m' := mkAppN f args
+  unless ← withTransparency .default (isDefEq m' r) do throwError "proveMatchReduction: not reducible"
+  let refl ← mkExpectedTypeHint (← mkEqRefl m') (← mkEq m' r)
+  match pf? with
+  | none => return refl
+  | some p => mkEqTrans p refl
 
 /-- Given a match application `m := matcher ps motive d₁ ... dₙ alts`, replace each discriminant `dⱼ`
     for which an equality `h : dⱼ = pⱼ` is declared in the local context (see `matchHypName`) with `pⱼ`.

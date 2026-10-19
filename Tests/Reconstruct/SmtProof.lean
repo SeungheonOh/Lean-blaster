@@ -15,6 +15,12 @@ namespace Tests.Reconstruct.SmtProof
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x t : Int), x = 1 → (Int.toNat t) + 2 ≥ 2]
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y : Nat), x / (y + 1) ≤ x]
 
+-- nonlinear arithmetic (see `blaster_nlarith`), Z3's division and modulo by zero (`div0`, `mod0`)
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y z : Int), x * z = y * x → x ≠ 0 → y = z]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (w x y z : Nat), w ≤ x → y ≤ z → w * y ≤ x * z]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y z : Nat), 0 < x → x * y / (x * z) = y / z]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y : Nat), x % y ≤ x]
+
 -- Bool encodings
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x : Int) (f : Int → Bool), (f x && x == 0) = true → x = 0]
 
@@ -59,5 +65,51 @@ def nested (d : D) : Bool :=
 
 -- polymorphism (a single sort variable)
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (α : Type) (o : Option α), o.isSome = true → o ≠ none]
+
+-- polymorphism: several sort variables, possibly empty sort variables (skolem constants of their sort),
+-- quantified sort variables
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α β : Type) (_f : α → β), (∀ (_y : β), False) → ∀ (_x : α), False]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α β : Type) (f g : α → β), (∀ (x : α), f x = g x) → f = g]
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α : Type) (f : α → α), (∀ x, f x = x) → f = (fun x => x)]
+#blaster (reconstruct: 2) (smt-proof: 3)
+  [(∀ (β : Type) (xs : List β) (f : List β → Nat), f xs > 10) → ∀ (α : Type) (xs : List α) (f : List α → Nat), f xs > 5]
+
+-- polymorphic functions at several sort variables (interpreted at the universe and related to the goal by naturality
+-- lemmas), lambda terms guarded by the membership predicates of their parameters (e.g., constant functions)
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α β : Type) (xs : List α) (c : β), List.map (fun _ => c) xs = [] → xs = []]
+
+theorem zipWith_map_left {l₁ : List α} {l₂ : List β} {f : α → α'} {g : α' → β → γ} :
+    List.zipWith g (l₁.map f) l₂ = List.zipWith (fun a b => g (f a) b) l₁ l₂ := by
+  induction l₁ generalizing l₂ <;> blaster (reconstruct: 2) (smt-proof: 3)
+
+-- `match` on datatypes with fields of sort variables (by case analysis on the discriminant, see `walkPolySplit`)
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [(∀ (β : Type) (xs : List β) (g : β → Nat), (match xs with | [] => 5 | h :: _ => g h) > 3) →
+   ∀ (α : Type) (xs : List α) (g : α → Nat), (match xs with | [] => 5 | h :: _ => g h) > 2]
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [(∀ (β : Type) (o : Option β) (g : β → Nat), (match o with | none => 5 | some h => g h) > 3) →
+   ∀ (α : Type) (o : Option α) (g : α → Nat), (match o with | none => 5 | some h => g h) > 2]
+
+-- datatypes of the user over sort variables, mapped to the universe by their recursors (see `Poly.mkIndWorld`):
+-- the images of their constructors (definitions of their membership predicates), case analyses, constructors of
+-- undetermined instances
+inductive Tree (α : Type u) where
+  | leaf
+  | node (l : Tree α) (v : α) (r : Tree α)
+
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [(∀ (β : Type) (t : Tree β) (g : Tree β → Nat), g t < 100) →
+   ∀ (α : Type) (t : Tree α) (a : α) (g : Tree α → Nat), g (Tree.node t a .leaf) < 101]
+
+inductive Either (α : Type u) (β : Type v) where
+  | left : α → Either α β
+  | right : β → Either α β
+
+def Either.getLeft (d : α) : Either α β → α
+  | .left a => a
+  | .right _ => d
+
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10)
+  [∀ (α β : Type) (e : Either α β) (d : α), (∀ b, e ≠ .right b) → (Either.left (e.getLeft d) : Either α β) = e]
 
 end Tests.Reconstruct.SmtProof

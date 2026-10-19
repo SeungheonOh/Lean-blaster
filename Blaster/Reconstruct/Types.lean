@@ -149,6 +149,9 @@ structure ReconTask where
   recon : ReconEnv := {}
   /-- When to replay a proof of the SMT backend (see `BlasterOptions.smtProof`). -/
   smtProof : Option String := none
+  /-- Random seed and timeout (in seconds) of the backend SMT solver (also used to produce the proofs to replay). -/
+  randomSeed : Option Nat := none
+  timeout : Option Nat := none
 deriving Inhabited
 
 end Blaster.Reconstruct

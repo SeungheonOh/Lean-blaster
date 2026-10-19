@@ -24,6 +24,27 @@ theorem classical_decide_congr {p p' : Prop} (h : p = p') :
     @decide p (Classical.propDecidable p) = @decide p' (Classical.propDecidable p') := by
   subst h; rfl
 
+theorem classical_ite_congr_ctx {α : Sort u} {c c' : Prop} {x x' y y' : α} (hc : c = c') (hx : c → x = x')
+    (hy : ¬c → y = y') :
+    @ite α c (Classical.propDecidable c) x y = @ite α c' (Classical.propDecidable c') x' y' := by
+  subst hc; by_cases h : c
+  · rw [if_pos h, if_pos h]; exact hx h
+  · rw [if_neg h, if_neg h]; exact hy h
+
+theorem ite_eq_or {α : Sort u} {c : Prop} {a b k : α} {e : Prop} (ha : c → a = k) (hb : ¬c → (b = k) = e) :
+    (@ite α c (Classical.propDecidable c) a b = k) = (c ∨ e) := by
+  by_cases h : c
+  · rw [if_pos h]; exact propext ⟨fun _ => Or.inl h, fun _ => ha h⟩
+  · rw [if_neg h, hb h]; exact propext ⟨Or.inr, fun h' => h'.resolve_left h⟩
+
+theorem ite_eq_and {α : Sort u} {c : Prop} {a b k : α} {e : Prop} (ha : c → ¬a = k) (hb : ¬c → (b = k) = e) :
+    (@ite α c (Classical.propDecidable c) a b = k) = (¬c ∧ e) := by
+  by_cases h : c
+  · rw [if_pos h]; exact propext ⟨fun h' => absurd h' (ha h), fun h' => absurd h h'.1⟩
+  · rw [if_neg h, hb h]; exact propext ⟨fun h' => ⟨h, h'⟩, fun h' => h'.2⟩
+
+theorem eq_comm_eq {α : Sort u} (a b : α) : (a = b) = (b = a) := propext eq_comm
+
 /-- `ite c x y = ite c' x' y'` (with the classical instances of the interpretation, whose argument depends on
     the condition), given the proofs of the equalities of the arguments (`sub`); similarly for `decide`. -/
 def iteCongr? [Monad m] [MonadLiftT MetaM m] (l r : Expr) (sub : Expr → Expr → m (Option Expr)) : m (Option Expr) := do
@@ -75,7 +96,14 @@ def isAtomic (e : Expr) : Bool :=
     e.isAppOfArity ``OfNat.ofNat 3 || e.isAppOfArity ``Nat.cast 3 && (e.getArg! 2).isRawNatLit ||
     e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1 || e.isAppOfArity ``Neg.neg 3 && (e.getArg! 2).isAppOfArity ``OfNat.ofNat 3
 
-/-- Maximal subterms of `l` that also occur in `r` (and are neither atomic nor types). -/
+/-- Comparisons of integers and natural numbers, kept visible to the arithmetic tactics (e.g., the conditions
+    of conditionals rewritten under these conditions, such as `if 0 = x then 2 + x else ...` into `2`). -/
+def isArithComparison (e : Expr) : Bool :=
+  let numeric (t : Expr) := t.isConstOf ``Int || t.isConstOf ``Nat
+  (e.isAppOfArity ``Eq 3 && numeric (e.getArg! 0)) || (e.isAppOfArity ``LE.le 4 && numeric (e.getArg! 0)) ||
+  (e.isAppOfArity ``LT.lt 4 && numeric (e.getArg! 0))
+
+/-- Maximal subterms of `l` that also occur in `r` (and are neither atomic, types nor arithmetic comparisons). -/
 partial def commonSubterms (l r : Expr) : MetaM (Array Expr) := do
   let inR := closedSubterms r {}
   let visited ← IO.mkRef ({} : Std.HashSet Expr)
@@ -83,10 +111,10 @@ partial def commonSubterms (l r : Expr) : MetaM (Array Expr) := do
   let rec go (e : Expr) : MetaM Unit := do
     if (← visited.get).contains e then return
     visited.modify (·.insert e)
-    if !e.hasLooseBVars && !isAtomic e && inR.contains e then
-      -- values and propositions (not types, nor partial applications)
+    if !e.hasLooseBVars && !isAtomic e && !isArithComparison e && inR.contains e then
+      -- values and propositions (not types, partial applications, nor instances, which tactics must see)
       let ty ← whnfR (← inferType e)
-      if !(ty.isSort && !ty.isProp) && !ty.isForall then
+      if !(ty.isSort && !ty.isProp) && !ty.isForall && (← isClass? ty).isNone then
         found.modify (·.push e)
         return
     match e with
@@ -116,7 +144,14 @@ partial def replaceAll (m : Std.HashMap Expr Expr) (e : Expr) : StateM (Std.Hash
 def generalizeCommon (stmt l r : Expr) : MetaM (Option (Expr × Array Expr)) := do
   let ss ← commonSubterms l r
   if ss.isEmpty then return none
-  let types ← ss.mapM inferType
+  -- NOTE: the types are unfolded to their inductive types (e.g., `Value := List (Data × Data)`), such that tactics
+  -- can perform case analyses on the variables
+  let types ← ss.mapM fun s => do
+    let t ← inferType s
+    let t' ← whnfD t
+    if let .const n _ := t'.getAppFn then
+      if (← getEnv).find? n matches some (.inductInfo _) then return t'
+    return t
   let decls := (ss.zip types).mapIdx fun i (_, t) => (Name.mkSimple s!"z{i}", fun (_ : Array Expr) => pure t)
   withLocalDeclsD decls fun zs => do
     let m : Std.HashMap Expr Expr := (ss.zip zs).foldl (fun m (s, z) => m.insert s z) {}
@@ -151,44 +186,101 @@ partial def congrLeaves (op : Name) (proofs : Std.HashMap Expr Expr) (e : Expr) 
   | some p => return p
   | none => mkEqRefl e
 
+/-- Arithmetic operations, whose arguments are reordered and combined by the arithmetic normalizations
+    of the solvers (e.g., Z3 sorting the summands and folding the constants). -/
+def isArithOp (e : Expr) : Bool :=
+  e.isAppOfArity ``HAdd.hAdd 6 || e.isAppOfArity ``HSub.hSub 6 || e.isAppOfArity ``HMul.hMul 6 ||
+  e.isAppOfArity ``Neg.neg 3
+
+/-- Numeric literals of the interpretation and of Blaster's normal forms. -/
+def isNumLit (e : Expr) : Bool :=
+  e.isRawNatLit || e.isAppOfArity ``OfNat.ofNat 3 ||
+  (e.isAppOfArity ``Neg.neg 3 && (e.getArg! 2).isAppOfArity ``OfNat.ofNat 3) ||
+  ((e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1) && e.appArg!.isRawNatLit)
+
+/-- Proof of `a = a'` under the hypothesis `h : k = t` (resp. `t = k`) where `k` is a literal, when `a` with `t`
+    replaced by `k` is definitionally equal to `a'` (e.g., `3 + -2 * x` and `9` under `-3 = x`, Z3's
+    simplification of the branches of conditionals under their conditions). -/
+def substProof? (h a a' : Expr) : MetaM (Option Expr) := do
+  let some (_, l, r) := (← inferType h).eq? | return none
+  let (t, k, toK) ← if isNumLit l && !isNumLit r then pure (r, l, ← mkEqSymm h)
+    else if isNumLit r && !isNumLit l then pure (l, r, h)
+    else return none
+  let abst ← kabstract a t
+  if !abst.hasLooseBVars then return none
+  let ok ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
+      withCurrHeartbeats <| withDefault <| isDefEq (abst.instantiate1 k) a'
+    catch _ => pure false
+  if !ok then return none
+  let f := mkLambda `z .default (← inferType t) abst
+  return some (← mkExpectedTypeHint (← mkCongrArg f toK) (← mkEq a a'))
+
+/-- Proof of the closed decidable proposition `p` by evaluation of its decision procedure, when it holds. -/
+def decideTrue? (p : Expr) : MetaM (Option Expr) := do
+  if p.hasFVar || p.hasMVar then return none
+  let some inst ← (try some <$> synthInstance (mkApp (mkConst ``Decidable) p) catch _ => pure none) | return none
+  let r ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
+      withCurrHeartbeats <| withDefault <| whnf (mkApp2 (mkConst ``Decidable.decide) p inst)
+    catch _ => return none
+  if !r.isConstOf ``Bool.true then return none
+  return some (mkApp3 (mkConst ``of_decide_eq_true) p inst (mkApp2 (mkConst ``Eq.refl [levelOne]) (mkConst ``Bool) (mkConst ``Bool.true)))
+
+/-- Hypotheses of the context passed to the tactics on the differences: arithmetic comparisons and their
+    negations (e.g., the conditions of the conditionals enclosing a difference simplified under them). -/
+def relevantHyps (hyps : Array Expr) : MetaM (Array Expr) :=
+  hyps.filterM fun h => do
+    let t ← inferType h
+    let t' := t.not?.getD t
+    return isArithComparison t' && sizeLe t 64
+
 mutual
 /-- Proof of `l = r` by congruence on the common structure of `l` and `r`, proving the remaining
     differences with `prove` (given the equality to prove, returns a proof). At most `budget` calls of
     `prove`. Conjunctions and disjunctions are compared modulo associativity and unit elements (e.g., the
     flattening of n-ary connectives by Z3's rewriter). -/
-partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (l r : Expr) : TermElabM (Option Expr) := do
+partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (l r : Expr)
+    (hyps : Array Expr := #[]) : TermElabM (Option Expr) := do
   if l == r then return some (← mkEqRefl l)
   for op in [``And, ``Or] do
     if (l.isAppOfArity op 2 || r.isAppOfArity op 2) && !sameOpShape op l r then
-      if let some p ← acEq prove budget op l r then return some p
+      if let some p ← acEq prove budget op l r hyps then return some p
+  -- the difference as a whole, with the relevant hypotheses of the context (`∀ hs, l = r`)
   let whole : TermElabM (Option Expr) := do
     if (← budget.get) == 0 then return none
     budget.modify (· - 1)
-    prove (← mkEq l r)
+    let hs ← relevantHyps hyps
+    let some p ← prove (← mkForallFVars hs (← mkEq l r)) | return none
+    return some (mkAppN p hs)
+  -- Z3's rewrite of `ite c a b = k` into `c ∨ b' = k` (resp. `¬c ∧ b' = k`) when `a = k` (resp. `a ≠ k`) under `c`
+  if let some p ← iteEq? prove budget l r hyps then return some p
+  -- normalized arithmetic: the congruence on the arguments would mostly produce false differences
+  if isArithOp l && isArithOp r && sizeLe l 400 && sizeLe r 400 then return ← whole
   let fl := l.getAppFn
   let fr := r.getAppFn
   if !l.isApp || !r.isApp || fl != fr || l.getAppNumArgs != r.getAppNumArgs then
     match l, r with
     | .forallE n t b bi, .forallE _ t' b' _ =>
-        if t == t' && (b.hasLooseBVars || b'.hasLooseBVars) && (← isProp l) then
+        if (t == t' || (← isDefEq t t')) && (b.hasLooseBVars || b'.hasLooseBVars) && (← isProp l) then
           let r? ← withLocalDecl n bi t fun x => do
-            let some p ← diffEq prove budget (b.instantiate1 x) (b'.instantiate1 x) | return none
+            let some p ← diffEq prove budget (b.instantiate1 x) (b'.instantiate1 x) hyps | return none
             return some (← mkAppM ``forall_congr #[← mkLambdaFVars #[x] p])
           if r?.isSome then return r?
         else if !b.hasLooseBVars && !b'.hasLooseBVars then
-          let some pt ← diffEq prove budget t t' | return ← whole
-          let some pb ← diffEq prove budget b b' | return ← whole
+          let some pt ← diffEq prove budget t t' hyps | return ← whole
+          let some pb ← diffEq prove budget b b' hyps | return ← whole
           return some (← mkAppM ``implies_congr #[pt, pb])
       | .lam n t b bi, .lam _ t' b' _ =>
-        if t == t' then
+        if t == t' || (← isDefEq t t') then
           let r? ← withLocalDecl n bi t fun x => do
-            let some p ← diffEq prove budget (b.instantiate1 x) (b'.instantiate1 x) | return none
+            let some p ← diffEq prove budget (b.instantiate1 x) (b'.instantiate1 x) hyps | return none
             return some (← mkFunExt (← mkLambdaFVars #[x] p))
           if r?.isSome then return r?
       | _, _ => pure ()
     return ← whole
-  -- conditionals (the instance depends on the condition)
-  if let some p ← iteCongr? l r (diffEq prove budget) then return some p
+  -- conditionals (the instance depends on the condition): the branches under the condition (resp. its negation)
+  if let some p ← iteCongrCtx? prove budget l r hyps then return some p
+  if l.isAppOfArity ``Decidable.decide 2 then
+    if let some p ← iteCongr? l r (diffEq prove budget · · hyps) then return some p
   let as := l.getAppArgs
   let bs := r.getAppArgs
   let info ← getFunInfoNArgs fl as.size
@@ -200,21 +292,137 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
       if pi.hasFwdDeps then return ← whole
     let ta ← inferType as[i]!
     if !(← isDefEq ta (← inferType bs[i]!)) then return ← whole
-    let some p ← diffEq prove budget as[i]! bs[i]! | return ← whole
+    let some p ← diffEq prove budget as[i]! bs[i]! hyps | return ← whole
     let ctx ← withLocalDeclD `z ta fun z => mkLambdaFVars #[z] (mkAppN fl (cur.set! i z))
     pf ← mkEqTrans pf (← mkCongrArg ctx p)
     cur := cur.set! i bs[i]!
   return some pf
 
+/-- `ite c x y = ite c' x' y'` (classical instances) from `c = c'`, `c → x = x'` and `¬c → y = y'`: the
+    differences of the branches are proved under the condition (resp. its negation), e.g., by substitution of
+    the equation of the condition (see `substProof?`). -/
+partial def iteCongrCtx? (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (l r : Expr)
+    (hyps : Array Expr) : TermElabM (Option Expr) := do
+  if !(l.isAppOfArity ``ite 5 && r.isAppOfArity ``ite 5) then return none
+  let la := l.getAppArgs
+  let ra := r.getAppArgs
+  if !(la[2]!.isAppOfArity ``Classical.propDecidable 1 && ra[2]!.isAppOfArity ``Classical.propDecidable 1) then return none
+  if la[0]! != ra[0]! then return none
+  let (c, c') := (la[1]!, ra[1]!)
+  let some pc ← (if c == c' then some <$> mkEqRefl c else diffEq prove budget c c' hyps) | return none
+  let branch (cond x x' : Expr) (subst : Bool) : TermElabM (Option Expr) :=
+    withLocalDeclD `h cond fun h => do
+      let p? ← if x == x' then some <$> mkEqRefl x
+        else if subst then do
+          match ← substProof? h x x' with
+          | some p => pure (some p)
+          | none => diffEq prove budget x x' (hyps.push h)
+        else diffEq prove budget x x' (hyps.push h)
+      match p? with
+      | some p => some <$> mkLambdaFVars #[h] p
+      | none => pure none
+  let some px ← branch c la[3]! ra[3]! true | return none
+  let some py ← branch (mkNot c) la[4]! ra[4]! false | return none
+  let u ← getLevel la[0]!
+  return some (mkAppN (mkConst ``classical_ite_congr_ctx [u]) #[la[0]!, c, c', la[3]!, ra[3]!, la[4]!, ra[4]!, pc, px, py])
+
+/-- `(ite c a b = k) = (c ∨ e)` (resp. `(¬c ∧ e)`) from `c → a = k` (resp. `c → a ≠ k`) and `¬c → (b = k) = e`,
+    also for `k = ite c a b` (Z3's rewrite of equalities with conditionals, simplifying the branches under the
+    condition). -/
+partial def iteEq? (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (l r : Expr)
+    (hyps : Array Expr) : TermElabM (Option Expr) := do
+  let some (α, x, y) := l.eq? | return none
+  let isIte (e : Expr) := e.isAppOfArity ``ite 5 && (e.getArg! 2).isAppOfArity ``Classical.propDecidable 1
+  -- `k = ite c a b`: symmetry
+  if !isIte x && isIte y then
+    let u ← getLevel α
+    let some p ← iteEq? prove budget (← mkEq y x) r hyps | return none
+    return some (← mkEqTrans (mkApp3 (mkConst ``eq_comm_eq [u]) α x y) p)
+  if !isIte x then return none
+  let args := x.getAppArgs
+  let (c, a, b, k) := (args[1]!, args[3]!, args[4]!, y)
+  let u ← getLevel α
+  let disj := r.isAppOfArity ``Or 2 && r.appFn!.appArg! == c
+  let conj := r.isAppOfArity ``And 2 && r.appFn!.appArg! == mkNot c
+  if !disj && !conj then return none
+  let e := r.appArg!
+  let some ha ← iteHead? prove budget hyps disj c a k | return none
+  let some hb ← withLocalDeclD `h (mkNot c) fun h => do
+      let some p ← diffEq prove budget (← mkEq b k) e (hyps.push h) | return none
+      some <$> mkLambdaFVars #[h] p
+    | return none
+  let lem := if disj then ``ite_eq_or else ``ite_eq_and
+  return some (mkAppN (mkConst lem [u]) #[α, c, a, b, k, e, ha, hb])
+
+/-- `c → a = k` (resp. `c → ¬a = k` when `!disj`): substitution of the equation of `c`, or the difference under
+    `c` (resp. `a` evaluated by substitution, then decided, e.g., `2 + x ≠ 3` under `0 = x`). -/
+partial def iteHead? (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (hyps : Array Expr)
+    (disj : Bool) (c a k : Expr) : TermElabM (Option Expr) :=
+  withLocalDeclD `h c fun h => do
+    let goal ← if disj then mkEq a k else pure (mkNot (← mkEq a k))
+    let p? ← if disj then do
+        if let some p ← substProof? h a k then pure (some p) else diffEq prove budget a k (hyps.push h)
+      else do
+        let some (_, s, t) := (← inferType h).eq? | pure none
+        let (tm, lit, toLit) ← if isNumLit s then pure (t, s, ← mkEqSymm h) else pure (s, t, h)
+        let abst ← kabstract a tm
+        if !abst.hasLooseBVars then pure none else
+        let some d ← decideTrue? (mkNot (← mkEq (abst.instantiate1 lit) k)) | pure none
+        -- `a = a[lit/tm]` by congruence, then `¬ a[lit/tm] = k`
+        let pa ← mkCongrArg (mkLambda `z .default (← inferType tm) abst) toLit
+        withLocalDeclD `h' (← mkEq a k) fun h' => do
+          let p ← mkLambdaFVars #[h'] (mkApp d (← mkEqTrans (← mkEqSymm pa) h'))
+          return some (← mkExpectedTypeHint p goal)
+    match p? with
+    | some p => some <$> mkLambdaFVars #[h] p
+    | none => pure none
+
+/-- A leaf `ite c a b = k` (or `k = ite c a b`) of a tree of `op` applications rewritten by Z3 into the leaves
+    `¬c`, `b = k` of a conjunction (resp. `c`, `b = k` of a disjunction) flattened with the tree, where `rs` are
+    the leaves of the rewritten tree: `(leaf = (¬c ∧ b = k), ¬c ∧ b = k)` (resp. with `c ∨ b = k`). -/
+partial def expandIteEq? (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (hyps : Array Expr)
+    (op : Name) (rs : Array Expr) (leaf : Expr) : TermElabM (Option (Expr × Expr)) := do
+  let some (α, x, y) := leaf.eq? | return none
+  let isIte (e : Expr) := e.isAppOfArity ``ite 5 && (e.getArg! 2).isAppOfArity ``Classical.propDecidable 1
+  let u ← getLevel α
+  let (i, k, sym?) ← if isIte x then pure (x, y, none)
+    else if isIte y then pure (y, x, some (mkApp3 (mkConst ``eq_comm_eq [u]) α x y))
+    else return none
+  let args := i.getAppArgs
+  let (c, a, b) := (args[1]!, args[3]!, args[4]!)
+  let disj := op == ``Or
+  if !(if disj then rs.contains c else rs.contains (mkNot c)) then return none
+  let some ha ← iteHead? prove budget hyps disj c a k | return none
+  let bk ← mkEq b k
+  let tree := if disj then mkOr c bk else mkAnd (mkNot c) bk
+  let hb ← withLocalDeclD `h (mkNot c) fun h => do mkLambdaFVars #[h] (← mkEqRefl bk)
+  let p := mkAppN (mkConst (if disj then ``ite_eq_or else ``ite_eq_and) [u]) #[α, c, a, b, k, bk, ha, hb]
+  let p ← match sym? with
+    | some s => mkEqTrans s p
+    | none => pure p
+  return some (p, tree)
+
 /-- `l = r` for trees of `op` applications of different shapes: the leaves of `l` (except the unit
     element, and the duplicates) are paired with the leaves of `r` in order and proved equal (`diffEq`),
     then `l` with the leaves of `r` is proved equal to `r` with the leaves generalized (`prove`). -/
-partial def acEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (op : Name) (l r : Expr) :
-    TermElabM (Option Expr) := do
+partial def acEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat) (op : Name) (l r : Expr)
+    (hyps : Array Expr) : TermElabM (Option Expr) := do
   let unit := if op == ``And then ``True else ``False
   let dedup (xs : Array Expr) : Array Expr := xs.foldl (fun acc x => if acc.contains x then acc else acc.push x) #[]
   let ls := dedup ((opLeaves op l).filter (!·.isConstOf unit))
   let rs := (opLeaves op r).filter (!·.isConstOf unit)
+  if ls.size < rs.size then
+    -- leaves of `l` rewritten by Z3 into several leaves (see `expandIteEq?`)
+    let mut proofs : Std.HashMap Expr Expr := {}
+    let mut trees : Std.HashMap Expr Expr := {}
+    for x in ls do
+      if let some (p, t) ← expandIteEq? prove budget hyps op rs x then
+        proofs := proofs.insert x p
+        trees := trees.insert x t
+    if proofs.isEmpty then return none
+    let l' := mapOpLeaves op (fun x => trees.getD x x) l
+    let some p ← acEq prove budget op l' r hyps | return none
+    return some (← mkEqTrans (← congrLeaves op proofs l) p)
   if ls.size != rs.size || ls.isEmpty then return none
   -- leaves of `l` rewritten into the leaves of `r`
   let mut m : Std.HashMap Expr Expr := {}
@@ -222,7 +430,7 @@ partial def acEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat
   for (x, y) in ls.zip rs do
     m := m.insert x y
     if x != y then
-      let some p ← diffEq prove budget x y | return none
+      let some p ← diffEq prove budget x y hyps | return none
       proofs := proofs.insert x p
   let l' := mapOpLeaves op (fun x => m.getD x x) l
   -- `l = l'` by congruence (the differences are the leaves)
@@ -231,8 +439,9 @@ partial def acEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref Nat
   if l' == r then return some p₁
   if (← budget.get) == 0 then return none
   budget.modify (· - 1)
-  let some p₂ ← prove (← mkEq l' r) | return none
-  return some (← mkEqTrans p₁ p₂)
+  let hs ← relevantHyps hyps
+  let some p₂ ← prove (← mkForallFVars hs (← mkEq l' r)) | return none
+  return some (← mkEqTrans p₁ (mkAppN p₂ hs))
 end
 
 end Blaster.Reconstruct.SmtProof.Local
@@ -273,9 +482,65 @@ partial def arithAtoms (e : Expr) : MetaM (Array Expr) := do
     | .mdata _ b => go b
     | _ =>
       let ty ← whnfR (← inferType e)
-      if !(ty.isSort && !ty.isProp) && !ty.isForall && !(← isProof e) then found.modify (·.push e)
+      if !(ty.isSort && !ty.isProp) && !ty.isForall && !(← isProof e) && (← isClass? ty).isNone then
+        found.modify (·.push e)
   go e
   found.get
+
+/-- Datatype terms of the propositional structure of `e` examined by a theory lemma: the sides of equalities and the
+    arguments of testers (`casesOn` or recursors into propositions), through constructor applications, when they are
+    not variables. -/
+partial def datatypeAtoms (e : Expr) : MetaM (Array Expr) := do
+  let visited ← IO.mkRef ({} : Std.HashSet Expr)
+  let found ← IO.mkRef (#[] : Array Expr)
+  let isInductive (t : Expr) : MetaM Bool := do
+    let .const n _ := (← whnfD t).getAppFn | return false
+    -- NOTE: arithmetic terms are left to the arithmetic tactics
+    if n == ``Int || n == ``Nat then return false
+    return (← getEnv).find? n matches some (.inductInfo _)
+  let rec term (x : Expr) : MetaM Unit := do
+    if (← visited.get).contains x || x.hasLooseBVars || isAtomic x then return
+    visited.modify (·.insert x)
+    if let .const c _ := x.getAppFn then
+      if let some (.ctorInfo info) := (← getEnv).find? c then
+        for a in x.getAppArgs.extract info.numParams x.getAppNumArgs do term a
+        return
+    if ← isInductive (← inferType x) then found.modify (·.push x)
+  let rec prop (e : Expr) : MetaM Unit := do
+    if e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 || e.isAppOfArity ``Iff 2 then
+      prop e.appFn!.appArg!; prop e.appArg!
+    else if e.isAppOfArity ``Not 1 then prop e.appArg!
+    else if let .forallE _ t b _ := e then
+      if !b.hasLooseBVars then prop t; prop b
+    else if e.isAppOfArity ``Eq 3 then
+      if (e.getArg! 0).isProp then prop (e.getArg! 1); prop (e.getArg! 2)
+      else if ← isInductive (e.getArg! 0) then term (e.getArg! 1); term (e.getArg! 2)
+    else if let some m ← matchMatcherApp? e (alsoCasesOn := true) then
+      for d in m.discrs do term d
+    else if let .const r _ := e.getAppFn then
+      if let some (.recInfo info) := (← getEnv).find? r then
+        if let some d := e.getAppArgs[info.getMajorIdx]? then term d
+  prop e
+  found.get
+
+/-- `(∀ zs, stmt[zs/atoms], atoms)` for the datatype terms of `stmt` (see `datatypeAtoms`), e.g., for datatype lemmas
+    whose premises relate different terms (`¬ is-nil a → ¬ is-cons b → a = b → False`). -/
+def generalizeDatatypeAtoms (stmt : Expr) : MetaM (Option (Expr × Array Expr)) := do
+  let ss ← datatypeAtoms stmt
+  if ss.isEmpty then return none
+  let types ← ss.mapM fun s => do
+    let t ← inferType s
+    let t' ← whnfD t
+    if let .const n _ := t'.getAppFn then
+      if (← getEnv).find? n matches some (.inductInfo _) then return t'
+    return t
+  let decls := (ss.zip types).mapIdx fun i (_, t) => (Name.mkSimple s!"d{i}", fun (_ : Array Expr) => pure t)
+  withLocalDeclsD decls fun zs => do
+    let m : Std.HashMap Expr Expr := (ss.zip zs).foldl (fun m (s, z) => m.insert s z) {}
+    let (stmt', _) := (replaceAll m stmt).run {}
+    let g ← mkForallFVars zs stmt'
+    if !(← isTypeCorrect g) then return none
+    return some (g, ss)
 
 /-- `(∀ zs, stmt[zs/atoms], atoms)` for the arithmetic atoms of `stmt` (see `arithAtoms`). -/
 def generalizeAtoms (stmt : Expr) : MetaM (Option (Expr × Array Expr)) := do
