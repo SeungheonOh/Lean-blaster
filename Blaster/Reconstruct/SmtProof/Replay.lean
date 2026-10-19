@@ -76,8 +76,8 @@ structure ReplayState where
   /-- steps that could not be replayed in the current scope -/
   scopeFailed : Std.HashSet Nat := {}
   directAttempts : Nat := 0
-  /-- direct proof attempts on large statements (see `replayCore'`) -/
-  largeDirectAttempts : Nat := 0
+  /-- time spent in direct proof attempts on large statements (see `replayCore'`) -/
+  largeDirectMs : Nat := 0
   stats : ReplayStats := {}
   /-- maximal sharing of the interpreted conclusions: structurally equal terms are pointer equal, such that the
       comparisons of the explicit constructions (e.g., `congrDescent` on large CEK terms) are constant time -/
@@ -604,14 +604,18 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   -- without the proof of the backend)
   if concl.isConstOf ``False then
     throwError "smt proof: could not replay step {i} ({step.rule}) concluding false"
-  -- NOTE: direct proofs are costly; they are attempted a bounded number of times, and fewer times on large
-  -- statements (e.g., the steps of a CEK evaluation depending on a failed step: each attempt exhausted the budgets
-  -- of the bridge tactics)
+  -- NOTE: direct proofs are costly; they are attempted a bounded number of times, and for a bounded total time on
+  -- large statements (e.g., the steps of a CEK evaluation depending on a failed step: each attempt exhausted the
+  -- budgets of the bridge tactics, about 15 s)
   let large := !Local.sizeLe concl 20000
-  if !ctx.prepass && (← get).directAttempts < ctx.maxDirect && (!large || (← get).largeDirectAttempts < 4) then
-    modify fun s => { s with directAttempts := s.directAttempts + 1,
-                             largeDirectAttempts := s.largeDirectAttempts + (if large then 1 else 0) }
-    if let some p ← ctx.cfg.proveDirect concl then
+  if !ctx.prepass && (← get).directAttempts < ctx.maxDirect && (!large || (← get).largeDirectMs < 60000) then
+    modify fun s => { s with directAttempts := s.directAttempts + 1 }
+    let start ← IO.monoMsNow
+    let p? ← try ctx.cfg.proveDirect concl finally
+      if large then
+        let ms := (← IO.monoMsNow) - start
+        modify fun s => { s with largeDirectMs := s.largeDirectMs + ms }
+    if let some p := p? then
       record step.rule "direct"
       return p
   throwError "smt proof: could not replay step {i} ({step.rule})"

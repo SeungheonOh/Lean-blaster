@@ -610,9 +610,14 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
       if cs.isEmpty then return mkConst ``True else foldBinRight mkAnd cs
   | "ite", 3 =>
       let (x, y) := (← interpInt? args[1]!, ← interpInt? args[2]!)
-      -- NOTE: the branches have the same type (e.g., `Option.none` of an undetermined instance, see `deferTypes`)
-      discard <| isDefEq (← inferType x) (← inferType y)
-      mkClassicalIte (← interpProp args[0]!) x y
+      let c ← interpProp args[0]!
+      -- NOTE: the branches have the same type: the parameters of nullary constructors in a branch (e.g.,
+      -- `Option.none` of an undetermined instance, see `deferTypes`) are given by the other branch, and the branches
+      -- may be interpreted in different instances of a datatype (e.g., `Option Nat` and `Option Int`)
+      let (tx, ty) := (← inferType x, ← inferType y)
+      if ← isDefEq tx ty then return ← mkClassicalIte c x y
+      if let some y' ← (try some <$> coerce y ty tx catch _ => pure none) then return ← mkClassicalIte c x y'
+      mkClassicalIte c (← coerce x tx ty) y
   | "+", _ => foldBin mkIntAdd (← args.mapM interpInt)
   | "-", 1 => return mkIntNeg (← interpInt args[0]!)
   | "-", _ => foldBin mkIntSub (← args.mapM interpInt)
