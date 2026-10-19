@@ -103,14 +103,16 @@ def isArithComparison (e : Expr) : Bool :=
   (e.isAppOfArity ``Eq 3 && numeric (e.getArg! 0)) || (e.isAppOfArity ``LE.le 4 && numeric (e.getArg! 0)) ||
   (e.isAppOfArity ``LT.lt 4 && numeric (e.getArg! 0))
 
-/-- Applications of the arithmetic operations of `Int` and `Nat` (not comparisons). -/
+/-- Applications of the arithmetic operations of `Int` and `Nat` (not comparisons), and conditionals of numbers. -/
 def isArithOperation (e : Expr) : Bool :=
   let ops := #[(``HAdd.hAdd, 6), (``HSub.hSub, 6), (``HMul.hMul, 6), (``HDiv.hDiv, 6), (``HMod.hMod, 6),
     (``Neg.neg, 3), (``Nat.cast, 3), (``Int.toNat, 1), (``Int.natAbs, 1), (``Int.add, 2), (``Int.mul, 2),
     (``Int.neg, 1), (``Int.sub, 2), (``Int.ediv, 2), (``Int.emod, 2), (``Int.tdiv, 2), (``Int.tmod, 2),
     (``Int.fdiv, 2), (``Int.fmod, 2), (``Nat.add, 2), (``Nat.mul, 2), (``Nat.sub, 2), (``Nat.div, 2), (``Nat.mod, 2),
     (``Nat.succ, 1)]
-  ops.any fun (n, k) => e.isAppOfArity n k
+  ops.any fun (n, k) => e.isAppOfArity n k ||
+    -- conditionals of numbers (e.g., the encodings of the divisions of Blaster's macros)
+    (e.isAppOfArity ``ite 5 && ((e.getArg! 0).isConstOf ``Int || (e.getArg! 0).isConstOf ``Nat))
 
 /-- Maximal subterms of `l` that also occur in `r` (and are neither atomic, types, arithmetic operations nor arithmetic
     comparisons). -/
@@ -245,6 +247,45 @@ def relevantHyps (hyps : Array Expr) : MetaM (Array Expr) :=
     let t' := t.not?.getD t
     return isArithComparison t' && sizeLe t 64
 
+/-- Arithmetic and propositional structure, traversed by `arithAtoms`. -/
+def isArithHead (e : Expr) : Bool :=
+  let ops := #[(``HAdd.hAdd, 6), (``HSub.hSub, 6), (``HMul.hMul, 6), (``HDiv.hDiv, 6), (``HMod.hMod, 6),
+    (``Neg.neg, 3), (``LE.le, 4), (``LT.lt, 4), (``GE.ge, 4), (``GT.gt, 4), (``Nat.cast, 3), (``Int.toNat, 1),
+    (``Int.natAbs, 1), (``And, 2), (``Or, 2), (``Not, 1), (``Iff, 2), (``ite, 5), (``Int.add, 2), (``Int.mul, 2),
+    (``Int.neg, 1), (``Int.sub, 2), (``Nat.add, 2), (``Nat.mul, 2), (``Nat.sub, 2), (``Int.ediv, 2), (``Int.emod, 2),
+    (``Nat.div, 2), (``Nat.mod, 2), (``Nat.succ, 1)]
+  ops.any fun (n, k) => e.isAppOfArity n k
+
+/-- Maximal subterms of `e` that are not arithmetic or propositional structure (arithmetic atoms), i.e., the
+    terms that linear arithmetic tactics treat as variables. -/
+partial def arithAtoms (e : Expr) : MetaM (Array Expr) := do
+  let visited ← IO.mkRef ({} : Std.HashSet Expr)
+  let found ← IO.mkRef (#[] : Array Expr)
+  let rec go (e : Expr) : MetaM Unit := do
+    if (← visited.get).contains e then return
+    visited.modify (·.insert e)
+    if isAtomic e || e.hasLooseBVars then
+      if let .forallE _ t b _ := e then go t; go b
+      return
+    if e.isAppOfArity ``Eq 3 then
+      go (e.getArg! 1); go (e.getArg! 2); return
+    if isArithHead e then
+      -- instances and types are not traversed
+      let args := e.getAppArgs
+      let info ← getFunInfoNArgs e.getAppFn args.size
+      for i in [:args.size] do
+        if info.paramInfo[i]?.any (·.isExplicit) then go args[i]!
+      return
+    match e with
+    | .forallE _ t b _ => go t; go b
+    | .mdata _ b => go b
+    | _ =>
+      let ty ← whnfR (← inferType e)
+      if !(ty.isSort && !ty.isProp) && !ty.isForall && !(← isProof e) && (← isClass? ty).isNone then
+        found.modify (·.push e)
+  go e
+  found.get
+
 mutual
 /-- Proof of `l = r` by congruence on the common structure of `l` and `r`, proving the remaining
     differences with `prove` (given the equality to prove, returns a proof). At most `budget` calls of
@@ -266,7 +307,13 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
   -- Z3's rewrite of `ite c a b = k` into `c ∨ b' = k` (resp. `¬c ∧ b' = k`) when `a = k` (resp. `a ≠ k`) under `c`
   if let some p ← iteEq? prove budget l r hyps then return some p
   -- normalized arithmetic: the congruence on the arguments would mostly produce false differences
-  if isArithOp l && isArithOp r && sizeLe l 400 && sizeLe r 400 then return ← whole
+  -- NOTE: also for large terms whose arithmetic atoms are common to both sides (generalized by the prover, e.g., Z3's
+  -- rewrites of the modulos of CEK terms)
+  if isArithOp l && isArithOp r then
+    if sizeLe l 400 && sizeLe r 400 then return ← whole
+    let al ← arithAtoms l
+    let ar ← arithAtoms r
+    if al.size ≤ 8 && al.all ar.contains && ar.all al.contains then return ← whole
   let fl := l.getAppFn
   let fr := r.getAppFn
   if !l.isApp || !r.isApp || fl != fr || l.getAppNumArgs != r.getAppNumArgs then
@@ -459,45 +506,6 @@ end
 end Blaster.Reconstruct.SmtProof.Local
 
 namespace Blaster.Reconstruct.SmtProof.Local
-
-/-- Arithmetic and propositional structure, traversed by `arithAtoms`. -/
-def isArithHead (e : Expr) : Bool :=
-  let ops := #[(``HAdd.hAdd, 6), (``HSub.hSub, 6), (``HMul.hMul, 6), (``HDiv.hDiv, 6), (``HMod.hMod, 6),
-    (``Neg.neg, 3), (``LE.le, 4), (``LT.lt, 4), (``GE.ge, 4), (``GT.gt, 4), (``Nat.cast, 3), (``Int.toNat, 1),
-    (``Int.natAbs, 1), (``And, 2), (``Or, 2), (``Not, 1), (``Iff, 2), (``ite, 5), (``Int.add, 2), (``Int.mul, 2),
-    (``Int.neg, 1), (``Int.sub, 2), (``Nat.add, 2), (``Nat.mul, 2), (``Nat.sub, 2), (``Int.ediv, 2), (``Int.emod, 2),
-    (``Nat.div, 2), (``Nat.mod, 2), (``Nat.succ, 1)]
-  ops.any fun (n, k) => e.isAppOfArity n k
-
-/-- Maximal subterms of `e` that are not arithmetic or propositional structure (arithmetic atoms), i.e., the
-    terms that linear arithmetic tactics treat as variables. -/
-partial def arithAtoms (e : Expr) : MetaM (Array Expr) := do
-  let visited ← IO.mkRef ({} : Std.HashSet Expr)
-  let found ← IO.mkRef (#[] : Array Expr)
-  let rec go (e : Expr) : MetaM Unit := do
-    if (← visited.get).contains e then return
-    visited.modify (·.insert e)
-    if isAtomic e || e.hasLooseBVars then
-      if let .forallE _ t b _ := e then go t; go b
-      return
-    if e.isAppOfArity ``Eq 3 then
-      go (e.getArg! 1); go (e.getArg! 2); return
-    if isArithHead e then
-      -- instances and types are not traversed
-      let args := e.getAppArgs
-      let info ← getFunInfoNArgs e.getAppFn args.size
-      for i in [:args.size] do
-        if info.paramInfo[i]?.any (·.isExplicit) then go args[i]!
-      return
-    match e with
-    | .forallE _ t b _ => go t; go b
-    | .mdata _ b => go b
-    | _ =>
-      let ty ← whnfR (← inferType e)
-      if !(ty.isSort && !ty.isProp) && !ty.isForall && !(← isProof e) && (← isClass? ty).isNone then
-        found.modify (·.push e)
-  go e
-  found.get
 
 /-- Datatype terms of the propositional structure of `e` examined by a theory lemma: the sides of equalities and the
     arguments of testers (`casesOn` or recursors into propositions), through constructor applications, when they are

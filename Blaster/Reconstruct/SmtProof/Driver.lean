@@ -716,6 +716,24 @@ syntax (name := blasterDivModSimp) "blaster_divmod_simp" : tactic
   evalTactic (← `(tactic| (intros; (repeat' split) <;> (try subst_vars) <;>
     simp_all [Int.emod_neg, Int.ediv_neg, Int.neg_one_mul, Int.ediv_self, ediv_self_of_zero_ne, Int.emod_self] <;> done)))
 
+theorem str_lt_total (a b : String) : a < b ∨ a = b ∨ b < a := by
+  by_cases h : a < b
+  · exact Or.inl h
+  · by_cases h' : b < a
+    · exact Or.inr (Or.inr h')
+    · exact Or.inr (Or.inl (String.le_antisymm h' h))
+
+theorem str_not_lt_empty (a : String) : ¬a < "" := fun h => List.not_lt_nil _ (String.lt_iff.mp h)
+
+syntax (name := blasterStringOrder) "blaster_string_order" : tactic
+
+/-- The order of strings (e.g., Z3's lemmas of the lexicographic order: irreflexivity, transitivity, totality). -/
+@[tactic blasterStringOrder] def evalBlasterStringOrder : Tactic := fun _ => withMainContext do
+  let isStrLt (e : Expr) : Bool := e.isAppOfArity ``LT.lt 4 && (e.getArg! 0).isConstOf ``String
+  if ((← instantiateMVars (← getMainTarget)).find? isStrLt).isNone then throwError "blaster_string_order: no string order"
+  evalTactic (← `(tactic| (intros; grind [String.lt_irrefl, String.lt_trans, String.lt_asymm, str_lt_total,
+    str_not_lt_empty])))
+
 syntax (name := blasterCasesNat) "blaster_cases_nat" : tactic
 
 /-- Case analysis (`0` / `n + 1`) on the local variables of type `Nat`. -/
@@ -834,7 +852,7 @@ def stepTactics (rule : String) : TermElabM (Array (String × TSyntax `tactic)) 
     -- associativity of the connectives (e.g., the flattening of n-ary connectives by Z3's rewriter)
     ("simp ac", ← `(tactic| (intros; simp_all [and_assoc, or_assoc] <;> done))),
     ("simp only", ← `(tactic| (intros; simp only [*] <;> done)))]
-  let grind := #[("grind", ← `(tactic| (intros; grind)))]
+  let grind := #[("grind", ← `(tactic| (intros; grind))), ("string order", ← `(tactic| blaster_string_order))]
   let quant := #[
     ("forall_congr", ← `(tactic| (intro h; exact forall_congr h))),
     ("forall_imp", ← `(tactic| (intro h h' x; exact h x (h' x))))]
