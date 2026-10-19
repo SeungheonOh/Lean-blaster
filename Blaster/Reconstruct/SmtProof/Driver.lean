@@ -258,9 +258,10 @@ def guardedLambda (tbl : SymTable) (n : String) (s : SExpr) (ys xs : Array (Stri
 
 /-- Interpretation of Blaster's polymorphic encoding (see `Poly`), given the sort variables of the goal with their
     SMT symbols: the membership predicates of the types with sort variables are the images of their worlds (e.g.,
-    `@isFun α β f` is `Img (liftFun (inj α) (inj β) _) f`), and the constants of the goal the images of their values
-    (e.g., `x : α` is `inj α x`). The sorts `@Type` and `@Instance` and the predicates `@isInstance` are interpreted by
-    `buildSymTable`. -/
+    `@isFun α β f` is `Img (liftFun (inj α) (inj β) _) f`), the constants of the goal the images of their values
+    (e.g., `x : α` is `inj α x`), and the lambda terms are guarded by the membership predicates of their parameters
+    (see `guardedLambda`). The sorts `@Type` and `@Instance`, the predicates `@isInstance` and the polymorphic
+    functions (at the universe, see `Poly.instantiateUniv`) are interpreted by `buildSymTable`. -/
 def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMap String Expr)
     (sortVars : Array (String × Expr)) : MetaM SymTable := do
   let mut tbl := tbl
@@ -291,20 +292,23 @@ def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (con
       if let some (w, _) ← Poly.mkWorld (← inferType x) d then
         tbl := { tbl with syms := tbl.syms.insert n (.expr (Poly.applyWorld w x)) }
     catch _ => pure ()
-  -- lambda terms, guarded by the membership predicates of their parameters
+  -- lambda terms, guarded by the membership predicates of their parameters (the first definition, as in
+  -- `buildSymTable`)
   let mut sorts : Std.HashMap String SExpr := {}
   for c in cmds do
     if let some #[SExpr.atom "declare-const", SExpr.atom n, s] := c.list? then sorts := sorts.insert n s
+  let mut guarded : Std.HashSet String := {}
   for c in cmds do
     let some #[SExpr.atom "assert", a] := c.list? | continue
     let some (n, ys, xs, guards, body) := guardedLambdaDef? a | continue
     let some s := sorts.get? n | continue
+    if guarded.contains n then continue
+    guarded := guarded.insert n
     try
       let (t, tbl') ← guardedLambda tbl n s ys xs guards body
       tbl := { tbl' with syms := tbl'.syms.insert n (.macro #[] t) }
     catch _ => pure ()
   return tbl
-
 
 /-- Build the interpretation of the symbols of the query `cmds`, given the translation environment
     and the map from SMT constants (`$k`) to Lean free variables. Blaster's polymorphic encoding is interpreted

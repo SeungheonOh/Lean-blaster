@@ -874,7 +874,7 @@ structure Cfg where
   facts : Array Expr := #[]
   /-- maximal number of nested unfoldings of the functions inlined by Blaster's optimizer (see `walkUnfold`) -/
   unfoldDepth : Nat := 2
-  /-- the polymorphic encoding is interpreted by `Poly` (see `walkReduced`) -/
+  /-- the polymorphic encoding is interpreted by `Poly` (see `walkPolyApp`, `walkPolyCasesOn` and `walkReduced`) -/
   polyWorld : Bool := false
 
 structure State where
@@ -1770,15 +1770,12 @@ partial def walkPoly (w h a b : Expr) : BridgeM (Option Expr) := do
   match a, b with
   | .mdata _ a', _ => return ← walk a' b
   | _, .mdata _ b' => return ← walk a b'
-  | _, .lam .. =>
-      if !a.isLambda then
-        -- η-expansion of the goal side (e.g., `Prod.mk` for `fun x y => (x, y)`)
-        let .forallE n t _ bi ← whnf (← inferType a) | return none
-        let a' := mkLambda n bi t (mkApp a (.bvar 0))
-        let some p ← walk a' b | return none
-        return some (← mkExpectedTypeHint p (← mkEq la b))
-      pure ()
   | _, _ => pure ()
+  -- η-expansion of the goal side (e.g., `Prod.mk` for `fun x y => (x, y)`)
+  if b.isLambda && !a.isLambda then
+    let .forallE n t _ bi ← whnf (← inferType a) | return none
+    let some p ← walk (mkLambda n bi t (mkApp a (.bvar 0))) b | return none
+    return some (← mkExpectedTypeHint p (← mkEq la b))
   match a, b with
   | .lam n t body _, .lam _ d body' _ =>
       -- functions: `liftFun wa wb dflt (fun x => t) = fun y => t'` from `wb t = t'[y := wa x]` and `t'` being
