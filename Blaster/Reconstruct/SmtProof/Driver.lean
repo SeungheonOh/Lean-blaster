@@ -178,6 +178,9 @@ def guardedLambdaDef? (e : SExpr) :
   if ann[0]? != some (SExpr.atom "!") then return none
   let some d₀ := ann[1]? | return none
   let mut d := d₀
+  let names := vs.filterMap fun v => match v with
+    | .list #[.atom x, _] => some x
+    | _ => none
   let mut guards : Std.HashMap String SExpr := {}
   for _ in [0:3 * vs.size] do
     match d with
@@ -185,7 +188,12 @@ def guardedLambdaDef? (e : SExpr) :
     | .list #[.atom "=>", g, b] =>
         let some h := g.head? | return none
         if !(unquote h).startsWith "@is" then return none
-        let some (.atom x) := g.list? >>= (·.back?) | return none
+        -- the guarded parameter (e.g., `(@isInstance x α)`, `(@isList α x)`)
+        let some args := g.list? | return none
+        let isParam (a : SExpr) : Option String := match a with
+          | .atom x => if names.contains x then some x else none
+          | _ => none
+        let some x := args.findSome? isParam | return none
         guards := guards.insert x g
         d := b
     | _ => break

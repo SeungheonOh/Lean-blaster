@@ -1673,6 +1673,16 @@ partial def walkPoly (w h a b : Expr) : BridgeM (Option Expr) := do
   match a, b with
   | .mdata _ a', _ => return ← walk a' b
   | _, .mdata _ b' => return ← walk a b'
+  | _, .lam .. =>
+      if !a.isLambda then
+        -- η-expansion of the goal side (e.g., `Prod.mk` for `fun x y => (x, y)`)
+        let .forallE n t _ bi ← whnf (← inferType a) | return none
+        let a' := mkLambda n bi t (mkApp a (.bvar 0))
+        let some p ← walk a' b | return none
+        return some (← mkExpectedTypeHint p (← mkEq la b))
+      pure ()
+  | _, _ => pure ()
+  match a, b with
   | .lam n t body _, .lam _ d body' _ =>
       -- functions: `liftFun wa wb dflt (fun x => t) = fun y => t'` from `wb t = t'[y := wa x]` and `t'` being
       -- `dflt` outside of the domain (e.g., the identity)

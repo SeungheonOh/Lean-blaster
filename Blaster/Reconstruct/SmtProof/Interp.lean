@@ -368,7 +368,7 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := fal
   -- chosen after the interpretation of the whole term (`deferDefault`, see `fillDefaults`)
   let dflt ← if ← isDefEq fieldTy xt then pure x
     else if deferDefault && (← instantiateMVars fieldTy).hasExprMVar then mkFreshExprMVar fieldTy (userName := defaultMVarName)
-    else mkDefault fieldTy
+    else mkDefault fieldTy (locals := deferDefault)
   let motive := mkLambda `x .default xt fieldTy
   let mut minors := #[]
   for c in iinfo.ctors do
@@ -381,11 +381,12 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := fal
   if casesOn.levelParams.length != lvls.length + 1 then throwError "smt proof: no large elimination for {cinfo.induct}"
   return mkAppN (mkConst (cinfo.induct ++ `casesOn) (u :: lvls)) (params ++ #[motive, x] ++ minors)
 where
-  mkDefault (t : Expr) : MetaM Expr := do
-    if let some v ← inhabitant? t 8 then return v
+  mkDefault (t : Expr) (locals := false) : MetaM Expr := do
+    if let some v ← inhabitant? t 8 locals then return v
     throwError "smt proof: no inhabitant found for {t}"
-  /-- An inhabitant of `t`: from an instance, or a constructor application with inhabited fields. -/
-  inhabitant? (t : Expr) (depth : Nat) : MetaM (Option Expr) := do
+  /-- An inhabitant of `t`: from an instance, or a constructor application with inhabited fields (or a variable of
+      the context when `locals`). -/
+  inhabitant? (t : Expr) (depth : Nat) (locals := false) : MetaM (Option Expr) := do
     let u ← getLevel t
     try
       let inst ← synthInstance (mkApp (mkConst ``Inhabited [u]) t)
@@ -395,8 +396,9 @@ where
       let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) t)
       return some (mkApp2 (mkConst ``Classical.ofNonempty [u]) t inst)
     catch _ => pure ()
-    -- a variable of the context (e.g., `x : α` for a sort variable `α` of the goal)
-    if !(← isProp t) then
+    -- in the interpretation: a variable of the context of type `α` (a sort variable of the goal, e.g., `x : α`)
+    -- NOTE: the first one, i.e., a variable of the goal when there is one (the variables of the replay come later)
+    if locals && t.isFVar then
       if let some d := (← getLCtx).findDecl? fun d =>
           if !d.isImplementationDetail && d.type == t then some d else none then
         return some d.toExpr
@@ -413,7 +415,7 @@ where
           let ft ← inferType f
           -- non-dependent fields only
           if ft.hasAnyFVar (fs.contains <| .fvar ·) then return none
-          match ← inhabitant? ft (depth - 1) with
+          match ← inhabitant? ft (depth - 1) locals with
           | some v => vals := vals.push v
           | none => return none
         return some (mkAppN (mkAppN (mkConst c lvls) params) vals)
@@ -428,7 +430,7 @@ def fillDefaults (e : Expr) : MetaM Expr := do
     if (← m.isAssigned) || (← m.getDecl).userName != defaultMVarName then continue
     let t ← instantiateMVars (← m.getType)
     if t.hasExprMVar || (← isProp t) then continue
-    if let some v ← mkSelector.inhabitant? t 8 then m.assign v
+    if let some v ← mkSelector.inhabitant? t 8 (locals := true) then m.assign v
   instantiateMVars e
 
 /-- Assign the remaining type metavariables of `e` with `dflt`: the type parameters that nothing determines (e.g.,

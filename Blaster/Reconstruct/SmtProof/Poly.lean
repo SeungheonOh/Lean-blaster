@@ -160,6 +160,26 @@ theorem ite_world {T : Sort u} {D : Sort v} (w : T → D) {c c' : Prop} [h : Dec
   · rw [if_pos hc, if_pos hc]; exact hx hc
   · rw [if_neg hc, if_neg hc]; exact hy hc
 
+/-- Case analyses (testers and selectors, see `Bridge.walkPolyCasesOn`) on lists in the world `List.map w`, with the
+    world `wr` of their results. -/
+theorem list_casesOn_world {A : Type u} {B : Type v} {w : A → B} {C : Sort x} {C' : Sort y} (wr : C → C')
+    {d : List A} {D : List B} (hd : List.map w d = D) {n : C} {n' : C'} {c : A → List A → C}
+    {c' : B → List B → C'} (hn : d = [] → wr n = n') (hc : ∀ h t, d = h :: t → wr (c h t) = c' (w h) (List.map w t)) :
+    wr (@List.casesOn A (fun _ => C) d n c) = @List.casesOn B (fun _ => C') D n' c' := by
+  subst hd
+  cases d with
+  | nil => exact hn rfl
+  | cons h t => exact hc h t rfl
+
+theorem option_casesOn_world {A : Type u} {B : Type v} {w : A → B} {C : Sort x} {C' : Sort y} (wr : C → C')
+    {d : Option A} {D : Option B} (hd : Option.map w d = D) {n : C} {n' : C'} {c : A → C} {c' : B → C'}
+    (hn : d = none → wr n = n') (hc : ∀ v, d = some v → wr (c v) = c' (w v)) :
+    wr (@Option.casesOn A (fun _ => C) d n c) = @Option.casesOn B (fun _ => C') D n' c' := by
+  subst hd
+  cases d with
+  | none => exact hn rfl
+  | some v => exact hc v rfl
+
 /-! ## Axioms of the encoding -/
 
 theorem img_liftFun {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
@@ -359,17 +379,17 @@ def genericParams (e : Expr) (arity : Nat) : MetaM Nat :=
       xs.filterM fun x => return (← x.fvarId!.getBinderInfo).isExplicit
     return ps.size + explicit.size - arity
 
-/-- `e` with fresh universe level metavariables for its (non-zero) levels, and the original levels. -/
+/-- `e` with fresh universe level metavariables for the levels of its constants and of its sorts (except `Prop`),
+    and the original levels. -/
 def freshLevels (e : Expr) : StateT (Array (LMVarId × Level)) MetaM Expr :=
   Core.transform e (pre := fun s => do
     let fresh (l : Level) : StateT (Array (LMVarId × Level)) MetaM Level := do
-      if l.isZero then return l
       let m ← mkFreshLevelMVar
       modify (·.push (m.mvarId!, l))
       return m
     match s with
     | .const n ls => return .done (.const n (← ls.mapM fresh))
-    | .sort l => return .done (.sort (← fresh l))
+    | .sort l => if l.isZero then return .done s else return .done (.sort (← fresh l))
     | _ => return .continue)
 
 /-- The Lean function `e` of the translation at the universe: its first `n` (generic) parameters are instantiated with
