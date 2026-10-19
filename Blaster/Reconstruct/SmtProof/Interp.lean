@@ -395,6 +395,11 @@ where
       let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) t)
       return some (mkApp2 (mkConst ``Classical.ofNonempty [u]) t inst)
     catch _ => pure ()
+    -- a variable of the context (e.g., `x : α` for a sort variable `α` of the goal)
+    if !(← isProp t) then
+      if let some d := (← getLCtx).findDecl? fun d =>
+          if !d.isImplementationDetail && d.type == t then some d else none then
+        return some d.toExpr
     if depth == 0 then return none
     let t ← whnfD t
     let .const n lvls := t.getAppFn | return none
@@ -588,7 +593,11 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
       for i in [:es.size] do
         for j in [i+1:es.size] do cs := cs.push (mkNot (← mkEqSmt es[i]! es[j]!))
       if cs.isEmpty then return mkConst ``True else foldBinRight mkAnd cs
-  | "ite", 3 => mkClassicalIte (← interpProp args[0]!) (← interpInt? args[1]!) (← interpInt? args[2]!)
+  | "ite", 3 =>
+      let (x, y) := (← interpInt? args[1]!, ← interpInt? args[2]!)
+      -- NOTE: the branches have the same type (e.g., `Option.none` of an undetermined instance, see `deferTypes`)
+      discard <| isDefEq (← inferType x) (← inferType y)
+      mkClassicalIte (← interpProp args[0]!) x y
   | "+", _ => foldBin mkIntAdd (← args.mapM interpInt)
   | "-", 1 => return mkIntNeg (← interpInt args[0]!)
   | "-", _ => foldBin mkIntSub (← args.mapM interpInt)

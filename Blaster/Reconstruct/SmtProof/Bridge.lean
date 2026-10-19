@@ -881,6 +881,8 @@ structure State where
   lemmas : Std.HashMap Expr (Option Expr) := {}
   /-- macro equations, per function -/
   macroLemmas : Std.HashMap Name (Option Expr) := {}
+  /-- naturality lemmas of the polymorphic functions, per statement (see `walkPolyApp`) -/
+  natLemmas : Std.HashMap Expr (Option Expr) := {}
   /-- pairs of terms that could not be related (for diagnostics) -/
   failures : Array (Expr × Expr) := #[]
 
@@ -1203,6 +1205,10 @@ partial def walkCore (a b : Expr) : BridgeM (Option Expr) := do
   -- applications of functions of the polymorphic encoding (e.g., `f x` with `f : α → β`)
   if a.isApp && b.isApp && !a.getAppFn.isConst then
     if let some p ← walkLiftedApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
+  -- polymorphic functions at sort variables, interpreted at the universe (e.g., `List.zipWith`)
+  if let .const f _ := a.getAppFn then
+    if b.getAppFn.isConstOf f && a.getAppNumArgs == b.getAppNumArgs && a != b then
+      if let some p ← walkPolyApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
   match w with
   | .same => walkSame a b
   | .nat => walkNat a b
@@ -1573,6 +1579,92 @@ partial def walkLiftedApp (a b : Expr) : BridgeM (Option Expr) := do
   let px ← mkExpectedTypeHint px (← mkEq (Poly.applyWorld wa xa) xb)
   return some (← mkAppM ``Poly.app_world #[hf.getArg! 5, pf, px])
 
+/-- `W(f ts xs) = f ts' ys` where `f` is a polymorphic function at sort variables in the goal (type arguments `ts`)
+    and at the universe in the interpretation (`ts'`, see `Poly.instantiateUniv`): from the naturality lemma
+    `∀ αs xs, f ts' (W xs) = W (f ts xs)` (`αs` the sort variables of `ts`, proved once per statement by
+    `blaster_poly_nat`) and `W(xᵢ) = yᵢ`. -/
+partial def walkPolyApp (a b : Expr) : BridgeM (Option Expr) := do
+  let fa := a.getAppFn
+  let fb := b.getAppFn
+  let .const f _ := fa | return none
+  -- relations, `ite` and matchers have their own lemmas
+  if [``Eq, ``Ne, ``HEq, ``ite, ``dite].contains f || (← isMatcher f) || isCasesOnRecursor (← getEnv) f then
+    return none
+  let as := a.getAppArgs
+  let bs := b.getAppArgs
+  let info ← getFunInfoNArgs fa as.size
+  -- type and instance arguments
+  let isType (i : Nat) : Bool := (info.paramInfo[i]?.map fun p => p.hasFwdDeps || p.isInstImplicit).getD false
+  let tpos := (List.range as.size).filter isType
+  if !(tpos.any fun i => Poly.hasUniv bs[i]!) || tpos.any (fun i => bs[i]!.hasFVar) then return none
+  -- the sort variables of the instantiation in the goal
+  let σ := (tpos.foldl (fun s i => collectFVars s as[i]!) {}).fvarIds.map mkFVar
+  if ← σ.anyM fun α => do return !(← inferType α).isSort || (← isProp (← inferType α)) then return none
+  -- domains of the value arguments (non-dependent)
+  let mut tyA ← inferType fa
+  let mut tyB ← inferType fb
+  let mut doms : Array (Expr × Expr) := #[]
+  for i in [:as.size] do
+    let .forallE _ dA bA _ ← whnf tyA | return none
+    let .forallE _ dB bB _ ← whnf tyB | return none
+    if isType i then
+      tyA := bA.instantiate1 as[i]!
+      tyB := bB.instantiate1 bs[i]!
+    else
+      if bA.hasLooseBVars || bB.hasLooseBVars then return none
+      doms := doms.push (dA, dB)
+      tyA := bA
+      tyB := bB
+  let (rA, rB) := (tyA, tyB)
+  let decls := doms.mapIdx fun k (dA, _) => (Name.mkSimple s!"x{k}", fun (_ : Array Expr) => pure dA)
+  let stmt? ← withLocalDeclsD decls fun xs => do
+    let mut argsA := #[]
+    let mut argsB := #[]
+    let mut k := 0
+    for i in [:as.size] do
+      if isType i then
+        argsA := argsA.push as[i]!
+        argsB := argsB.push bs[i]!
+      else
+        let (dA, dB) := doms[k]!
+        let x := xs[k]!
+        argsA := argsA.push x
+        argsB := argsB.push (← match ← Poly.mkWorld dA dB with
+          | some (w, _) => pure (Poly.applyWorld w x)
+          | none => do if ← isDefEq dA dB then pure x else throwError "walkPolyApp: no world for {dA}")
+        k := k + 1
+    let rhs ← match ← Poly.mkWorld rA rB with
+      | some (w, _) => pure (Poly.applyWorld w (mkAppN fa argsA))
+      | none => do if ← isDefEq rA rB then pure (mkAppN fa argsA) else throwError "walkPolyApp: no world for {rA}"
+    let stmt ← mkForallFVars (σ ++ xs) (← mkEq (mkAppN fb argsB) rhs)
+    return if stmt.hasFVar then none else some stmt
+  let some stmt := stmt? | return none
+  let lem? ← match (← get).natLemmas.get? stmt with
+    | some l => pure l
+    | none =>
+        let l ← try
+            -- NOTE: proved in the empty local context (the statement is closed)
+            let some pf ← withLCtx {} {} (Blaster.Reconstruct.proveWithTactic stmt (← `(tactic| blaster_poly_nat)))
+              | pure none
+            some <$> mkAuxTheorem stmt pf
+          catch _ => pure none
+        if l.isNone then dbg m!"bridge: naturality not proved: {stmt}"
+        modify fun s => { s with natLemmas := s.natLemmas.insert stmt l }
+        pure l
+  let some lem := lem? | return none
+  let vals := (List.range as.size).filter (!isType ·) |>.toArray.map (as[·]!)
+  -- `W(f ts xs) = f ts' (W xs)`, then congruence with `W(xᵢ) = yᵢ`
+  let mut pf ← mkEqSymm (mkAppN lem (σ ++ vals))
+  let mut cur := (← inferType pf).appArg!.getAppArgs
+  for i in [:as.size] do
+    if isType i || cur[i]! == bs[i]! then continue
+    let some p ← walk as[i]! bs[i]! | return none
+    let ta ← inferType cur[i]!
+    let ctx ← withLocalDeclD `z ta fun z => mkLambdaFVars #[z] (mkAppN fb (cur.set! i z))
+    pf ← mkEqTrans pf (← mkCongrArg ctx (← mkExpectedTypeHint p (← mkEq cur[i]! bs[i]!)))
+    cur := cur.set! i bs[i]!
+  return some pf
+
 /-- `w a = b` where `w` is the world of the type of `a` in the polymorphic encoding (see `Poly.mkWorld`), with
     `h` the proof of its injectivity. -/
 partial def walkPoly (w h a b : Expr) : BridgeM (Option Expr) := do
@@ -1586,6 +1678,21 @@ partial def walkPoly (w h a b : Expr) : BridgeM (Option Expr) := do
       -- `dflt` outside of the domain (e.g., the identity)
       if !(w.isAppOfArity ``Poly.liftFun 7 && h.isAppOfArity ``Poly.liftFun_injective 9) then return none
       let (wa, wb, dflt) := (w.getArg! 4, w.getArg! 5, w.getArg! 6)
+      let ts := #[w.getArg! 0, w.getArg! 1, w.getArg! 2, w.getArg! 3]
+      -- lambda terms guarded by the membership predicates of their parameters (see `Driver.guardedLambda`):
+      -- `liftFun wa wb dflt (fun x => t) = fun y => if Img wa y then t' else dflt y` from `wb t = t'[y := wa x]`
+      if let some (c, x', y', _) := classicalIte? body' then
+        if ← withLocalDeclD `y d fun y => do
+            withReducible (isDefEq (c.instantiate1 y) (← mkAppM ``Poly.Img #[wa, y])) then
+          let ok ← withLocalDeclD `y d fun y => do withReducible (isDefEq (y'.instantiate1 y) (Poly.applyWorld dflt y))
+          if ok then
+            let some hb ← withLocalDeclD n t fun x => do
+                let some p ← walk (body.instantiate1 x) (x'.instantiate1 (Poly.applyWorld wa x)) | return none
+                some <$> mkLambdaFVars #[x] p
+              | return none
+            let pf ← mkAppOptM ``Poly.lam_world_ite
+              ((ts ++ #[wa, h.getArg! 5, wb, dflt, a, .lam `y d x' .default, hb]).map some)
+            return some (← mkExpectedTypeHint pf (← mkEq la b))
       let some hb ← withLocalDeclD n t fun x => do
           let some p ← walk (body.instantiate1 x) (body'.instantiate1 (Poly.applyWorld wa x)) | return none
           some <$> mkLambdaFVars #[x] p
@@ -1597,7 +1704,6 @@ partial def walkPoly (w h a b : Expr) : BridgeM (Option Expr) := do
           if !(← withReducible (isDefEq l r)) then return none
           some <$> mkLambdaFVars #[y, hy] (← mkExpectedTypeHint (← mkEqRefl r) (← mkEq l r))
         | return none
-      let ts := #[w.getArg! 0, w.getArg! 1, w.getArg! 2, w.getArg! 3]
       return some (← mkAppOptM ``Poly.lam_world ((ts ++ #[wa, h.getArg! 5, wb, dflt, a, b, hb, hout]).map some))
   | _, _ => pure ()
   -- `ite` on the goal side
