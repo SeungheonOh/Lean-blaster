@@ -710,13 +710,15 @@ syntax (name := blasterDivModSimp) "blaster_divmod_simp" : tactic
 /-- The `Int` divisions and modulos by non-literal divisors of the goal normalized by case analyses on the
     conditionals and the signs (e.g., Z3's rewrites of `x % (-y)` into `x % y`, of `x / x` into
     `if x = 0 then 0 / 0 else 1`, of `x % (if c then a else b)` into `if c then x % a else x % b`). -/
-@[tactic blasterDivModSimp] def evalBlasterDivModSimp : Tactic := fun _ => withMainContext do
+@[tactic blasterDivModSimp] def evalBlasterDivModSimp : Tactic := fun _ => do
+  evalTactic (← `(tactic| intros))
+  withMainContext do
   if (evalBlasterDivMod.collect (← instantiateMVars (← getMainTarget))).isEmpty then
     throwError "blaster_divmod_simp: no division"
   -- NOTE: without case analyses first (e.g., `x % (-1 * y) = x % y` for large conditional terms `x` and `y`)
   evalTactic (← `(tactic| first
-    | (intros; simp only [Int.neg_one_mul, Int.emod_neg, Int.ediv_neg, Int.neg_neg]; done)
-    | (intros; (repeat' split) <;> (try subst_vars) <;>
+    | (simp only [Int.neg_one_mul, Int.emod_neg, Int.ediv_neg, Int.neg_neg]; done)
+    | ((repeat' split) <;> (try subst_vars) <;>
         simp_all [Int.emod_neg, Int.ediv_neg, Int.neg_one_mul, Int.ediv_self, ediv_self_of_zero_ne, Int.emod_self] <;> done)))
 
 theorem str_lt_total (a b : String) : a < b ∨ a = b ∨ b < a := by
