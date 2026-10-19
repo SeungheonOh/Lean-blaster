@@ -212,7 +212,8 @@ def mkAppCoerce (f : Expr) (args : Array Expr) (allowMVars := false) (allowTypeM
     let pending (m : MVarId) : MetaM Bool := do
       if (← m.getDecl).userName == defaultMVarName then return true
       return allowTypeMVars && (← instantiateMVars (← m.getType)).isSort
-    if r.hasLevelMVar || (← (← getMVars r).anyM fun m => return !(← pending m)) then
+    -- NOTE: the universe levels of the type parameters may be chosen later too (see `defaultTypes`)
+    if (r.hasLevelMVar && !allowTypeMVars) || (← (← getMVars r).anyM fun m => return !(← pending m)) then
       throwError "smt proof: can't infer implicit arguments of {f}"
   return r
 
@@ -455,7 +456,18 @@ def defaultTypes (e : Expr) (dflt : Expr := mkConst ``Unit) : MetaM Expr := do
     let t := apply subst (← instantiateMVars (← m.getType))
     if t.hasExprMVar || (← isProp t) then continue
     if let some v ← mkSelector.inhabitant? t 8 then subst := subst.insert m v
-  return apply subst e
+  -- NOTE: the universe levels of the substituted parameters are assigned (e.g., `?u` in `Option.{?u} ?α`)
+  instantiateMVars (apply subst e)
+
+/-- Assign the remaining type metavariables of `e` with `dflt` (see `defaultTypes`), e.g., the type parameters of the
+    constructors of an undetermined instance in the instantiations of quantifiers, which unification does not
+    determine when the constructor applications are reduced (e.g., `Either.Right.0 (Either.Right x)`). -/
+def assignDefaultTypes (e : Expr) (dflt : Expr) : MetaM Expr := do
+  if !e.hasExprMVar then return e
+  for m in (← getMVars e) do
+    if ← m.isAssigned then continue
+    if (← instantiateMVars (← m.getType)).isSort then discard <| isDefEq (mkMVar m) dflt
+  instantiateMVars e
 
 /-- Tester for constructor `ctor` applied to `x`: a proposition defined by case analysis. -/
 def mkTester (ctor : Name) (x : Expr) : MetaM Expr := do
@@ -590,7 +602,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   let ctx ← read
   if let some x := ctx.locals.get? f then
     if args.isEmpty then return x
-    return ← mkAppCoerce x (← args.mapM interp)
+    return ← mkAppCoerce x (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)
   match f, args.size with
   | "true", 0 => return mkConst ``True
   | "false", 0 => return mkConst ``False
@@ -656,7 +668,8 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
     | some .trueFun => return mkConst ``True
     | some (.lam e) =>
         if args.isEmpty then return e
-        return (← mkAppCoerce e (← args.mapM interp)).headBeta
+        -- NOTE: the arguments may be constructor applications of undetermined instances (see `deferTypes`)
+        return (← mkAppCoerce e (← args.mapM interp) (allowTypeMVars := ctx.deferTypes)).headBeta
     | some (.ctor n) =>
         let c ← mkConstWithFreshMVarLevels n
         if args.isEmpty then
@@ -685,7 +698,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
           return mkApp3 (mkConst ``Classical.epsilon [u]) ty inst p
     | some .apply =>
         let some fn := args[0]? | throwError "smt proof: apply without argument"
-        let r ← mkAppCoerce (← interp fn) (← (args.extract 1 args.size).mapM interp)
+        let r ← mkAppCoerce (← interp fn) (← (args.extract 1 args.size).mapM interp) (allowTypeMVars := ctx.deferTypes)
         toSmtWorld r
     | none => throwError "smt proof: unknown symbol {f}"
 

@@ -89,6 +89,13 @@ def liftInterp (x : InterpM α) : ReplayM α := do
   let ctx ← read
   x.run ctx.interp
 
+/-- The default of the undetermined type parameters of the interpretation (see `stepConcl`). -/
+def defaultTypeParam : ReplayM Expr := do
+  let instTy := (← read).interp.table.sorts.toList.find? (·.1.startsWith "@Instance") |>.map (·.2)
+  match instTy with
+  | some t => do if (← inferType t).isSort then pure t else pure (Lean.mkConst ``Unit)
+  | none => pure (Lean.mkConst ``Unit)
+
 /-- Interpretation of the conclusion of step `i`. -/
 def stepConcl (i : Nat) : ReplayM Expr := do
   let ctx ← read
@@ -105,11 +112,7 @@ def stepConcl (i : Nat) : ReplayM Expr := do
   let e ← instantiateMVars (← liftInterp (withReader (fun c => { c with deferTypes := true }) (interpProp c)))
   -- NOTE: undetermined type parameters are most likely the sort variable of a polymorphic goal (e.g., `List.nil`
   -- in a goal on `List α`), and otherwise irrelevant (e.g., `Option.none` under a tester)
-  let instTy := ctx.interp.table.sorts.toList.find? (·.1.startsWith "@Instance") |>.map (·.2)
-  let dflt ← match instTy with
-    | some t => do if (← inferType t).isSort then pure t else pure (Lean.mkConst ``Unit)
-    | none => pure (Lean.mkConst ``Unit)
-  let e ← defaultTypes (← fillDefaults e) dflt
+  let e ← defaultTypes (← fillDefaults e) (← defaultTypeParam)
   let t1 ← IO.monoMsNow
   modify fun s => { s with stats := s.stats.addTime "(interpretation)" (t1 - t0) }
   if e.hasExprMVar then
@@ -738,9 +741,11 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       let some (nq, inst) := orArgs? concl | throwError "quant-inst: disjunction expected"
       let some q := nq.not? | throwError "quant-inst: negated quantifier expected"
       let ts ← liftInterp (step.args.mapM interpInt?) >>= (·.mapM fun t => liftM (fillDefaults t))
+      let dflt ← defaultTypeParam
       let r ← withLocalDeclD `h q fun h => do
         let hi ← instantiateWithCoercion h ts
         if !(← propEq (← inferType hi) inst (deep := true)) then throwError "quant-inst: instance mismatch"
+        let hi ← assignDefaultTypes hi dflt
         mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inr) nq inst hi)
       let rn ← withLocalDeclD `h nq fun h => mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inl) nq inst h)
       record step.rule "exact"

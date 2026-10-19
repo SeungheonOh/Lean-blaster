@@ -1092,6 +1092,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let (pf, stats) := pf
     let proofBody := mkApp2 (mkConst ``Classical.byContradiction) body pf
     let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
+    -- NOTE: e.g., type parameters that nothing determines (the other interpretation is then tried)
+    if proof.hasMVar then throwError "smt proof: proof term contains metavariables"
     return .ok { proof, backend := backend.name, steps := sproof.steps.size, stats }
   catch ex =>
     return .error (← ex.toMessageData.toString)

@@ -249,10 +249,17 @@ Otherwise (several, possibly empty, or quantified sort variables; `Poly.lean`), 
 `Sort u`, `@Instance` as the always inhabited universe `Option (PSigma fun α : Sort u => α)`, values as their
 injections (lifted through lists, options, pairs and functions), and membership predicates as "lies in the
 image of the injection"; the bridge relates the goal to the asserted formula with an additional world for
-these injections. Polymorphic Lean functions instantiated at sort variables (e.g., `@List.zipWith α β γ`, whose
-SMT function is shared by all the instantiations of a universe) are interpreted at the universe
-(`@List.zipWith Univ Univ Univ`, with the universe levels inferred by type checking), such that their definitional
-axioms hold on all the values of the universe; the bridge relates their applications in the goal to their
+these injections. The values of the other inductive types over sort variables (e.g., `Term (List α)` for a
+nested or mutual datatype of the user) are mapped to their instances at the universe by maps defined with
+their recursors (each constructor to itself, its fields by their worlds, its nested occurrences, e.g.,
+`List (Term α)`, by the auxiliary recursors), auxiliary definitions per instance with the proofs of their
+injectivity (case analysis and injection) and, per constructor, its equation in the world (with the nested
+occurrences as `List.map`) and its image (`Img W (C ys) = Img Ŵ₁ y₁ ∧ …`), used by the bridge (constructors,
+case analyses, definitions of the membership predicates expanded by the backend) and by the tactics proving
+the axioms of the encoding and the naturality lemmas. Polymorphic Lean functions instantiated at sort
+variables (e.g., `@List.zipWith α β γ`, whose SMT function is shared by all the instantiations of a universe)
+are interpreted at the universe (`@List.zipWith Univ Univ Univ`, with the universe levels inferred by type
+checking), such that their definitional axioms hold on all the values of the universe; the bridge relates their applications in the goal to their
 interpretations by *naturality* lemmas, e.g., `List.zipWith (lift f) (List.map (inj α) xs) (List.map (inj β) ys) =
 List.map (inj γ) (List.zipWith f xs ys)`, stated from the types of the function and proved once per function and
 instantiation by functional induction (`blaster_poly_nat`), and relates the testers and selectors of lists and
@@ -308,9 +315,12 @@ adaptively by success rate per time unit for each rule and goal shape. Performan
 For instance, a 245-step Z3 proof involving a recursive function replays in ~6 s, and a 2458-step cvc5
 (Alethe) proof of the same goal in ~30 s.
 
-Limitations: polymorphic goals with several sort variables over datatypes of the user (no world), axioms and
-non-parametric functions; `match` patterns on `Nat`/`Int` with
-variables (e.g., `n + 1`, whose translation needs the conditions of the branch) and named patterns; cvc5's native CPC format (whose steps often leave their conclusion
+Limitations: polymorphic goals with several sort variables over datatypes of the user without world (indices,
+recursive fields of function types, proof fields whose propositions mention the sort variables, e.g., properties
+quantified over the instances of a class), `match` on datatypes with fields of sort variables in the universe
+interpretation (the `ite` encoding needs default values of the selectors), axioms and non-parametric functions;
+`match` patterns on `Nat`/`Int` with variables (e.g., `n + 1`, whose translation needs the conditions of the
+branch) and named patterns; cvc5's native CPC format (whose steps often leave their conclusion
 implicit) is not supported; Z3 may not find a proof without Blaster's `recfun-finder` tactic (incompatible
 with proof production), and proof production may time out where the verdict did not.
 
