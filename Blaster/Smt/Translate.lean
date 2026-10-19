@@ -4,6 +4,7 @@ import Blaster.Optimize.Basic
 import Blaster.Smt.Env
 import Blaster.Smt.Term
 import Blaster.Smt.Translate.Application
+import Blaster.Reconstruct.Profile
 
 open Lean Elab Command Term Meta Blaster.Optimize Blaster.Options
 
@@ -72,7 +73,7 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
         tryCatchRuntimeEx
           -- NOTE: the proof run starts with an empty hash-consing cache, i.e., `e'` must be hash-consed
           -- such that structural equality checks (e.g., on literals) remain valid.
-          (some <$> (Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv)
+          (some <$> Reconstruct.withProfile "proofRun" ((Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv))
           (fun _ => do s.restore; return none) : MetaM _)
       match r with
       | some ((optExprP, optPf), envP) =>

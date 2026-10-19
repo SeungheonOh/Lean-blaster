@@ -1,6 +1,7 @@
 import Lean
 import Blaster.Smt.Translate
 import Blaster.Reconstruct.Discharge
+import Blaster.Reconstruct.Profile
 import Blaster.Reconstruct.SmtProof.Driver
 
 open Lean Meta Elab Term Blaster.Options Blaster.Optimize Blaster.Smt
@@ -88,17 +89,51 @@ def logSmtProof (kind : String) (res : Except String SmtProof.SmtProofResult) : 
   h.putStrLn (Json.compress (Json.mkObj ([("file", toJson (← getFileName)), ("line", toJson line),
     ("kind", toJson kind)] ++ fields)))
 
+/-- Check the closed proof `proof` of `goal` with the Lean kernel and return the auxiliary theorem added to the
+    environment for it (applied to its universe levels), or the reason of the failure. Hence, a proof is checked
+    once by the kernel: the declarations using it only refer to the auxiliary theorem (e.g., the theorem proved
+    by `blaster`, or the proof of the original goal for a proof of the residual goal), such that its proof term
+    is neither checked again nor traversed by the subsequent phases (e.g., `dischargeHoles`).
+    Same as `kernelCheck` (i.e., `proof` is returned) when `goal` or `proof` is not closed.
+    The proof must not depend on `sorryAx`: the auxiliary theorems are recorded in `checked`, i.e., they are not
+    traversed again when checking the proofs referring to them (see `dependsOnSorry`).
+    NOTE: the state is restored on failure (`addDecl` then adds the declaration as an axiom).
+-/
+def checkedProof (checked : IO.Ref (Array (Name × Expr))) (goal proof : Expr) : TermElabM (Except MessageData Expr) := do
+  let goal ← instantiateMVars goal
+  let proof ← instantiateMVars proof
+  -- NOTE: `sorryAx` may occur in auxiliary declarations created by tactics (e.g., after an elaboration
+  -- error), which the kernel accepts.
+  if ← withProfile "sorryCheck" (dependsOnSorry proof (← checked.get)) then
+    return .error m!"the reconstructed proof depends on sorryAx"
+  if goal.hasMVar || goal.hasFVar || proof.hasMVar || proof.hasFVar then
+    return match ← kernelCheck goal proof with
+      | some msg => .error msg
+      | none => .ok proof
+  let s ← saveState
+  try
+    -- NOTE: the declaration is checked synchronously, i.e., kernel errors are reported as exceptions
+    let lvls := (collectLevelParams {} goal).params.toList
+    let n ← withOptions (fun o => Elab.async.set o false) <| mkAuxLemma lvls goal proof (cache := false)
+    checked.modify (·.push (n, proof))
+    return .ok (Lean.mkConst n (lvls.map mkLevelParam))
+  catch ex =>
+    s.restore
+    return .error m!"kernel rejected the reconstructed proof: {ex.toMessageData}"
+
 /-- Proof of the closed proposition `goal` by the replay of a proof of the SMT backend, checked by the
     kernel such that the other strategies can be tried otherwise (the state is restored on failure). -/
-def bySmtProofReplay (task : ReconTask) (kind : String) (goal : Expr) : TermElabM (Option (Expr × String)) := do
+def bySmtProofReplay (checked : IO.Ref (Array (Name × Expr))) (task : ReconTask) (kind : String) (goal : Expr) :
+    TermElabM (Option (Expr × String)) := do
   let st ← saveState
   let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
     (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
   let res ← match res with
     | .ok r =>
-        match ← kernelCheck goal r.proof with
-        | none => pure (.ok r)
-        | some msg => pure (.error s!"kernel: {← msg.toString}")
+        profileLog s!"smtProof.{kind}" 0 fun _ => s!"dag={dagSize r.proof} steps={r.steps}"
+        match ← withProfile s!"smtProof.{kind}.kernelCheck" (checkedProof checked goal r.proof) with
+        | .ok p => pure (.ok { r with proof := p })
+        | .error msg => pure (.error s!"kernel: {← msg.toString}")
     | err => pure err
   logSmtProof kind res
   match res with
@@ -108,7 +143,8 @@ def bySmtProofReplay (task : ReconTask) (kind : String) (goal : Expr) : TermElab
 /-- Proof of a proof obligation `type` of the optimizer (in the local context of the evidence) by the replay
     of an SMT proof: the obligation is closed over the variables it mentions and the hypotheses on them
     (e.g., the conditions under which the optimizer rewrote). -/
-def obligationBySmtProof (task : ReconTask) (type : Expr) : TermElabM (Option (Expr × String)) := do
+def obligationBySmtProof (checked : IO.Ref (Array (Name × Expr))) (task : ReconTask) (type : Expr) :
+    TermElabM (Option (Expr × String)) := do
   let type ← zetaReduce (← instantiateMVars type)
   let fvs ← SmtProof.usedFVars type
   let vars : FVarIdSet := fvs.foldl (fun s x => s.insert x.fvarId!) {}
@@ -120,11 +156,12 @@ def obligationBySmtProof (task : ReconTask) (type : Expr) : TermElabM (Option (E
   if ← xs.anyM fun x => return (← x.fvarId!.getDecl).isLet then return none
   let goal ← mkForallFVars xs type
   if goal.hasFVar || goal.hasMVar then return none
-  let some (pf, method) ← bySmtProofReplay task "obligation" goal | return none
+  let some (pf, method) ← bySmtProofReplay checked task "obligation" goal | return none
   return some (mkAppN pf xs, method)
 
-/-- Discharge the proof obligations in `proof` and check it against `goal` with the Lean kernel. -/
-def finishProof
+/-- Discharge the proof obligations in `proof` and check it against `goal` with the Lean kernel (see
+    `checkedProof`, which records the resulting auxiliary theorem in `checked`). -/
+def finishProof (checked : IO.Ref (Array (Name × Expr)))
   (out : ReconOutcome) (goal proof : Expr) (startTime : Nat) (holes : Array HoleInfo)
   (equivs : Array (Expr × Expr) := #[])
   (fallback : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) : TermElabM ReconOutcome := do
@@ -132,20 +169,18 @@ def finishProof
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
   -- NOTE: deeply nested subproofs are shared through `let` declarations such that the depth of the
   -- proof term checked by the kernel (and traversed when discharging proof obligations) is bounded.
-  let proof ← shareDeepProofs proof
-  let (proof, stats) ← dischargeHoles proof holes equivs fallback
+  profileLog "proof" 0 fun _ => s!"dag={dagSize proof} holes={holes.size}"
+  let proof ← withProfile "shareDeepProofs" (info := fun p => s!"dag={dagSize p}") (shareDeepProofs proof)
+  let (proof, stats) ← withProfile "dischargeHoles" (dischargeHoles proof holes equivs fallback)
+    (info := fun (p, s) => s!"dag={dagSize p} total={s.total} [{s.summary}]")
   let out := { out with stats }
   if !stats.failures.isEmpty || hasHoles proof then
     let shown := stats.failures.extract 0 3
     let msgs := shown.foldl (fun acc m => acc ++ m!"\n  • {m}") m!""
     return ← finish { out with failure := m!"{stats.failures.size} unresolved proof obligation(s) out of {stats.total}:{msgs}" }
-  -- NOTE: `sorryAx` may occur in auxiliary declarations created by tactics (e.g., after an
-  -- elaboration error), which the kernel accepts.
-  if proof.hasSorry || (← dependsOnSorry proof) then
-    return ← finish { out with failure := m!"the reconstructed proof depends on sorryAx" }
-  match ← kernelCheck goal proof with
-  | some msg => finish { out with failure := msg }
-  | none => finish { out with proof? := some proof }
+  match ← withProfile "kernelCheck" (checkedProof checked goal proof) with
+  | .error msg => finish { out with failure := msg }
+  | .ok proof => finish { out with proof? := some proof }
 
 /-- Try to reconstruct a proof for `e = optExpr` given the evidence `pf` obtained by the optimizer. -/
 def reconstructRewrite (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermElabM ReconOutcome := do
@@ -156,13 +191,15 @@ def reconstructRewrite (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermE
     | .defeq => mkEqRefl e
     | .proof p => alignEnds e optExpr p
     | _ => mkTopHole e optExpr
-  finishProof out goal proof startTime recon.holes recon.recFunEquivs
+  finishProof (← IO.mkRef #[]) out goal proof startTime recon.holes recon.recFunEquivs
 
 /-- Try to reconstruct a proof for `task` given the reconstruction environment `recon`
     obtained after optimization.
 -/
 def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome := do
   let startTime ← IO.monoMsNow
+  -- auxiliary theorems checked by the kernel (see `checkedProof`)
+  let checked ← IO.mkRef #[]
   let out : ReconOutcome := { nbExplicit := recon.nbExplicit, nbDefEq := recon.nbDefEq }
   let finish := reconstruct.finish startTime
   -- when to replay proofs of the SMT backend (see `BlasterOptions.smtProof`)
@@ -170,19 +207,19 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | some m => pure m
     | none => pure ((← IO.getEnv "BLASTER_SMT_PROOF").getD "last")
   -- Evidence for `fullGoal = optExpr`
-  let optPf? ← match task.optPf with
+  let optPf? ← withProfile "alignEnds" <| match task.optPf with
     | .defeq => pure none
     | .proof p => some <$> alignEnds task.fullGoal task.optExpr p
     | _ => some <$> mkTopHole task.fullGoal task.optExpr
   -- Proof of the residual goal
-  let (residual, residualMethod) ← match task.optExpr with
+  let (residual, residualMethod) ← withProfile "residual" (info := (·.2)) <| match task.optExpr with
     | .const ``True _ => pure (some (Lean.mkConst ``True.intro), "optimizer")
     | e => do
         -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
         -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
         let bySmtProof : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
-          let some (p, m) ← bySmtProofReplay task "residual" e | return none
+          let some (p, m) ← bySmtProofReplay checked task "residual" e | return none
           return some (p, s!"smt residual by {m}")
         let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
         match first? with
@@ -201,6 +238,8 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
                 | some (p, m) => pure (some p, m)
                 | none => pure (none, "none")
   let out := { out with residual := residualMethod }
+  profileLog "components" 0 fun _ =>
+    s!"evidence={(optPf?.map dagSize).getD 0} residual={(residual.map dagSize).getD 0}"
   let some residual := residual
     | finish { out with failure := m!"could not reconstruct a proof for the residual goal proved by the SMT solver{indentExpr task.optExpr}" }
   -- Proof of fullGoal
@@ -219,8 +258,8 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   -- unfolding of user definitions in large computations)
   let smtFallback (type : Expr) : TermElabM (Option (Expr × String)) := do
     if mode == "off" || !(← isProp type) then return none
-    obligationBySmtProof task type
-  finishProof out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes recon.recFunEquivs smtFallback
+    obligationBySmtProof checked task type
+  finishProof checked out task.goal (mkAppN pFull axioms.toArray) startTime recon.holes recon.recFunEquivs smtFallback
 
 where
   finish (startTime : Nat) (o : ReconOutcome) : TermElabM ReconOutcome := do
@@ -253,7 +292,7 @@ def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutco
   -- fallback: prove the original goal directly with Lean's decision procedures
   let startTime ← IO.monoMsNow
   let s ← saveState
-  let direct ← tryCatchRuntimeEx (withReconContext (proveDirect task.goal task.axioms)) fun _ => do
+  let direct ← withProfile "proveDirect" <| tryCatchRuntimeEx (withReconContext (proveDirect task.goal task.axioms)) fun _ => do
     s.restore
     return none
   match direct with
