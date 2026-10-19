@@ -716,16 +716,17 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
     let cmds := cmds.map guardNatQuantifiers
     -- 2. backend
     -- backends tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`)
-    -- (`z3+`: Z3 with the simplifiers of the query, tried after `z3`)
-    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3+").splitOn ","
+    -- (`z3+`: Z3 with the simplifiers of the query; `z3rec`: Z3 on the query with its recursive functions defined by
+    -- `define-funs-rec` (see `RecFun`), skipped when the query has no recursive function)
+    -- NOTE: `z3rec` finds proofs when Z3 gets lost in the instantiations of the axioms of recursive functions (e.g., on
+    -- the CEK evaluation of validators), but may time out where `z3` succeeds
+    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3rec,z3+").splitOn ","
     let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
-    -- `z3rec`: Z3 on the query with its recursive functions defined by `define-funs-rec` (see `RecFun`), skipped
-    -- when the query has no recursive function
-    let recQuery := if names.any (·.trim == "z3rec") then (RecFun.rewriteQuery cmds).toOption else none
     let mut res : Option (Backend × Proof) := none
     let mut recPairs : Array RecFun.Pair := #[]
     let mut errors := #[]
     for n in names do
+      let recQuery := if n.trim == "z3rec" then (RecFun.rewriteQuery cmds).toOption else none
       if n.trim == "z3rec" && recQuery.isNone then continue
       let backend ← match n.trim with
         | "z3" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout)

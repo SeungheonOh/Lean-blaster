@@ -340,6 +340,23 @@ partial def blockingVars (e : Expr) : MetaM (Array FVarId) := do
     | _ => pure ()
   return acc
 
+/-- Variables of structure types (non-recursive inductive types with one constructor) of the local context, e.g.,
+    whose fields are compared to the literals of patterns (their case analysis does not split the goal). -/
+def structVars : MetaM (Array FVarId) := do
+  let mut acc := #[]
+  for d in ← getLCtx do
+    if d.isImplementationDetail then continue
+    let t ← whnfD d.type
+    let .const n _ := t.getAppFn | continue
+    let some (.inductInfo info) := (← getEnv).find? n | continue
+    if info.ctors.length != 1 || info.isRec || info.numIndices != 0 || isClass (← getEnv) n then continue
+    -- NOTE: types with builtin representations (e.g., string literals) are kept
+    if [``String, ``Char, ``Fin, ``UInt8, ``UInt16, ``UInt32, ``UInt64, ``USize, ``BitVec, ``Float, ``Array,
+        ``ByteArray, ``Subtype].contains n then continue
+    if ← isProp d.type then continue
+    acc := acc.push d.fvarId
+  return acc
+
 /-- Maximal number of goals of the case analyses of `blaster_rec_eqn`. -/
 def maxEqnGoals : Nat := 512
 
@@ -387,6 +404,7 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
       for d in ← getLCtx do
         if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
       blockingVars e
+    let vars ← if !vars.isEmpty then pure vars else g.withContext structVars
     if let some x := vars[0]? then
       let subgoals ← g.cases x
       count := count + subgoals.size
