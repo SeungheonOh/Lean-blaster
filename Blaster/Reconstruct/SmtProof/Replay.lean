@@ -985,6 +985,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
         if let some (pf, method) ← timed "datatype" (proveClosed cfg "datatype" g) then
           record step.rule s!"{method} (common)"
           return applyPremises (mkAppN pf vals)
+        if (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then debugLog m!"th-lemma (common) failed: {← dagString g}"
     -- arithmetic lemmas over large atoms: the atoms are generalized
     if stmt.approxDepth.toNat > 8 then
       if let some (g, vals) ← Local.generalizeAtoms stmt then

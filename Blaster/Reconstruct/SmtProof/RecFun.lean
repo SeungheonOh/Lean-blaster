@@ -388,7 +388,9 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     g'.withContext do g'.replaceTargetDefEq (← deltaExpand (← instantiateMVars (← g'.getType)) aux.contains)
   replaceMainGoal [g]
   try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
-  -- case analyses: the goals are reduced (`dsimp`), split on their blocking variables, and closed by `simp`
+  -- case analyses: the goals are reduced (`dsimp`) and split, the eliminators of the left-hand side (the Lean
+  -- definition) first, those of the right-hand side (the SMT definition, whose testers may examine more constructors
+  -- than the patterns of the definition) when the left-hand side is reduced
   let mut todo := ← getGoals
   let mut count := todo.length
   let mut unfolded : Std.HashSet MVarId := {}
@@ -399,23 +401,37 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     setGoals [g]
     try evalTactic (← `(tactic| dsimp only)) catch _ => pure ()
     let some g ← (do return (← getGoals).head?) | continue
-    let vars ← g.withContext do
-      let mut e ← instantiateMVars (← g.getType)
+    setGoals [g]
+    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done))) catch _ => pure ()
+    if (← getGoals).isEmpty then continue
+    let (lhs, all) ← g.withContext do
+      let t ← instantiateMVars (← g.getType)
+      let mut e := t
       for d in ← getLCtx do
         if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
-      blockingVars e
-    let vars ← if !vars.isEmpty then pure vars else g.withContext structVars
-    if let some x := vars[0]? then
-      let subgoals ← g.cases x
-      count := count + subgoals.size
+      return ((t.eq?.map (·.2.1)).getD t, e)
+    -- blocking variables of the left-hand side, conditions of its `match` and `if`, other blocking variables
+    let mut subgoals? : Option (List MVarId) := none
+    let env ← getEnv
+    let lhsCond := lhs.find? fun e => e.isAppOf ``ite || e.isAppOf ``dite || isMatcherCore env e.getAppFn.constName
+    if let some x := (← g.withContext (blockingVars lhs))[0]? then
+      subgoals? := some ((← g.cases x).toList.map (·.mvarId))
+    else if lhsCond.isSome then
+      subgoals? ← observing? (do evalTactic (← `(tactic| split)); getGoals)
+    if subgoals?.isNone then
+      let vars ← g.withContext (blockingVars all)
+      let vars ← if !vars.isEmpty then pure vars else g.withContext structVars
+      if let some x := vars[0]? then subgoals? := some ((← g.cases x).toList.map (·.mvarId))
+    if let some gs := subgoals? then
+      count := count + gs.length
       if count > maxEqnGoals then
         debugLog m!"blaster_rec_eqn: too many cases\n{← Meta.ppGoal g}"
         throwError "blaster_rec_eqn: too many cases"
-      todo := subgoals.toList.map (·.mvarId) ++ todo
+      todo := gs ++ todo
       continue
     setGoals [g]
     -- NOTE: e.g., `grind` for the orientations of equalities and the orders of conjunctions of Blaster's normal forms
-    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done) | rfl | (simp_all <;> grind) | grind))
+    try evalTactic (← `(tactic| first | (simp_all; done) | rfl | (simp_all <;> grind) | grind))
     catch _ => pure ()
     if (← getGoals).isEmpty then continue
     if !unfolded.contains g then
@@ -425,7 +441,7 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
         unfolded := unfolded.insert g'
         todo := g' :: todo
       continue
-    -- case analyses on the conditions of `match` (e.g., literal patterns) and `if`
+    -- case analyses on the conditions of the right-hand side
     let some gs ← observing? (do evalTactic (← `(tactic| split)); getGoals) | remaining := remaining ++ [g]; continue
     count := count + gs.length
     if count > maxEqnGoals then throwError "blaster_rec_eqn: too many cases"
