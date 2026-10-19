@@ -1098,16 +1098,142 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         return goalTerm : TranslateEnvT Expr).run env
     let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
     let cmds := cmds.map guardNatQuantifiers
+    -- 3.-4. interpretation and replay of the proof `sproof` of `backend`
+    let replayWith (backend : Backend) (sproof : Proof) (recPairs : Array RecFun.Pair) : TermElabM SmtProofResult := do
+      -- 3. interpretation
+      -- SMT constants of the free variables of the goal (the introduced variables, as well as the
+      -- variables of the local context, e.g., section variables)
+      let mut consts : Std.HashMap String Expr := {}
+      let lctx ← getLCtx
+      for (v, idx) in tenv.smtEnv.fvarsCache.toList do
+        if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
+      let tbl ← if poly then polyBuildSymTable cmds tenv consts sortVars else buildSymTable cmds tenv consts sortVars[0]?
+      let tbl ← addSkolems sproof tbl
+      -- auxiliary functions and case predicates of recursive functions (Z3)
+      let (tbl, recAux) ← RecFun.addProofDefs sproof tbl
+      -- 4. replay
+      let bridge ← bridgeTactics
+      -- axioms of the polymorphic encoding (see `Poly`)
+      let polyTac := #[("poly", ← `(tactic| blaster_poly))]
+      let bridge := if poly then polyTac ++ bridge else bridge
+      -- matcher instances optimized by Blaster (whose patterns are the translated ones)
+      let mut insts : Std.HashMap Name Expr := {}
+      for (k, v) in tenv.optEnv.memCache.isMatcherCache.toList do insts := insts.insert k.name v.instApp
+      -- SMT macros of Lean functions (e.g., `@Nat.sub`), expanded by the backends in asserted formulas
+      let mut macros : Std.HashMap Name (Array (String × SExpr) × STerm) := {}
+      for (k, v) in tenv.smtEnv.funInstCache.toList do
+        let nm := match v with
+          | .SimpleIdent s => toString s
+          | .QualifiedIdent s _ => toString s
+        if let .const n _ := k.expr then
+          if let some (.macro params body) := tbl.syms.get? nm then macros := macros.insert n (params, body)
+      let macroOf (n : Name) : Option (Array Expr → MetaM Expr) := (macros.get? n).map fun (params, body) vals => do
+        let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) {}
+        (interp body).run { table := tbl, locals }
+      let macroTacs ← macroTactics
+      let bcfg : Bridge.Cfg := {
+        matchInst := insts.get?, macroOf, polyWorld := poly
+        proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
+      let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
+      let proveStep (rule : String) (stmt : Expr) : TermElabM (Option (Expr × String)) := do
+        -- NOTE: the tactic syntax of each rule is built once per replay
+        let tacs ← match (← tacCache.get).get? rule with
+          | some t => pure t
+          | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+        -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
+        let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
+        portfolio tacs stmt rule
+      -- recursive functions (`z3rec`): definitional equations, proved with the bridge tactics in the empty local
+      -- context when closed (see `proveClosed`), and differences of normal forms in their unfoldings
+      let recCtx ← RecFun.mkCtx tbl recAux recPairs sproof.defs
+        (fun stmt => do
+          let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
+          if stmt.hasFVar then run else withLCtx {} {} run)
+        (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
+        (fun a b => do Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite") (← IO.mkRef 6) a b)
+      let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
+      let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
+        let cfg : ReplayConfig := {
+          proveDirect := fun c => do
+            if ← withReducible (isDefEq c (mkNot body)) then return some (← mkExpectedTypeHint hneg c)
+            -- e.g., projections vs. case analyses, casts of literals (with a budget)
+            let defeq (a b : Expr) : TermElabM Bool := do
+              try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
+                    withCurrHeartbeats <| withDefault <| isDefEq a b
+              catch _ => return false
+            if c.isAppOfArity ``Not 1 then
+              if ← defeq c (mkNot body) then return some (← mkExpectedTypeHint hneg c)
+            -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
+            -- NOTE: the translated goal is definitionally equal to the goal (see the translation above)
+            let (r, fails) ← Bridge.prove bcfg (mkNot goalTerm) c
+            if let some p := r then
+              return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot goalTerm)))
+            if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
+              let h ← IO.FS.Handle.mk f .append
+              -- NOTE: only for the translation of the negated goal
+              -- NOTE: the number of failed pairs is given by `BLASTER_SMTPROOF_BRIDGE_DUMP_N` (default 3)
+              let n := ((← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP_N").bind String.toNat?).getD 3
+              for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 n else #[] do
+                h.putStrLn s!"=== bridge mismatch:\n{← ppExpr a}\n--- interpretation:\n{← ppExpr b}\n"
+            -- definitions of Lean functions (e.g., by `match`): the traversal of their unfolding
+            if !c.isAppOfArity ``Not 1 then
+              if let some p ← (try Bridge.proveDefinition? bcfg c catch _ => pure none) then return some p
+            -- definitional axioms of recursive functions (backends without `define-funs-rec`)
+            if !c.isAppOfArity ``Not 1 then
+              if let some p ← RecFun.proveDefAxiom? c then return some p
+            let r ← portfolio bridge c "bridge"
+            if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then debugLog m!"bridge failed: {← dagString c 4000}"
+            if r.isNone then
+              if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
+                let h ← IO.FS.Handle.mk f .append
+                h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot goalTerm)}\n"
+            return r.map (·.1)
+          proveStep
+          proveRecFun := fun c n => do
+            -- NOTE: the lemmas have no premises (a failure is not retried)
+            if let some r := (← recCache.get).get? c then return r
+            let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
+            if r.isNone then debugLog m!"recfun lemma failed: {RecFun.brief c}"
+            recCache.modify (·.insert c r)
+            return r
+          recFunOnly := !recPairs.isEmpty }
+        let cache ← IO.mkRef {}
+        let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
+        let global := (scopedSteps sproof).map (!·)
+        let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
+                                 openHyps := openHypotheses sproof,
+                                 baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
+        let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
+                              catch ex => return Except.error ex) |>.run ctx).run {}
+        let p ← match p? with
+          | .ok p => pure p
+          | .error ex =>
+              -- report the first steps that could not be replayed (i.e., the deepest failures)
+              let fs := st.stats.failures.extract 0 3
+              let ms := (st.stats.msByRule.toArray.qsort (·.2 > ·.2)).extract 0 6
+              let methods := st.stats.byRule.toList.map fun (r, m) => (r, m.toList)
+              throwError "{ex.toMessageData}; first failures: {fs}; time per rule: {ms}; methods: {methods}"
+        let pt ← inferType p
+        if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
+        -- NOTE: the proofs of the steps are instantiated once (see `replay`)
+        return (← mkLambdaFVars #[hneg] (← instantiateMVars p), st.stats)
+      let (pf, stats) := pf
+      let proofBody := mkApp2 (mkConst ``Classical.byContradiction) body pf
+      let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
+      -- NOTE: e.g., type parameters that nothing determines (the other interpretation is then tried)
+      if proof.hasMVar then throwError "smt proof: proof term contains metavariables"
+      -- debugging: free variables escaping their scopes (environment variable `BLASTER_SMTPROOF_CHECKFINAL`)
+      if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then reportEscapedFVars proof
+      return { proof, backend := backend.name, steps := sproof.steps.size, stats }
     -- 2. backend
     -- backends tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`)
     -- (`z3+`: Z3 with the simplifiers of the query; `z3rec`: Z3 on the query with its recursive functions defined by
     -- `define-funs-rec` (see `RecFun`), skipped when the query has no recursive function)
     -- NOTE: `z3rec` finds proofs when Z3 gets lost in the instantiations of the axioms of recursive functions (e.g., on
-    -- the CEK evaluation of validators), but may time out where `z3` succeeds
+    -- the CEK evaluation of validators), but may time out where `z3` succeeds; the next backends are tried when the
+    -- replay of a proof fails
     let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3rec,z3+").splitOn ","
     let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
-    let mut res : Option (Backend × Proof) := none
-    let mut recPairs : Array RecFun.Pair := #[]
     let mut errors := #[]
     let seedsEnv ← IO.getEnv "BLASTER_SMTPROOF_SEEDS"
     for n in names do
@@ -1129,134 +1255,15 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       | .error msg => errors := errors.push msg
       | .ok out =>
           match backend.parseProof out with
-          | .ok p => res := some (backend, p); recPairs := pairs; break
+          | .ok p =>
+              -- NOTE: the next backends are tried when the replay fails (e.g., `z3rec` after `z3`)
+              let s ← saveState
+              try return .ok (← replayWith backend p pairs)
+              catch ex =>
+                s.restore
+                errors := errors.push s!"{backend.name}: {← ex.toMessageData.toString}"
           | .error msg => errors := errors.push s!"{backend.name}: {msg}"
-    let some (backend, sproof) := res | throwError "no proof: {errors}"
-    -- 3. interpretation
-    -- SMT constants of the free variables of the goal (the introduced variables, as well as the
-    -- variables of the local context, e.g., section variables)
-    let mut consts : Std.HashMap String Expr := {}
-    let lctx ← getLCtx
-    for (v, idx) in tenv.smtEnv.fvarsCache.toList do
-      if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
-    let tbl ← if poly then polyBuildSymTable cmds tenv consts sortVars else buildSymTable cmds tenv consts sortVars[0]?
-    let tbl ← addSkolems sproof tbl
-    -- auxiliary functions and case predicates of recursive functions (Z3)
-    let (tbl, recAux) ← RecFun.addProofDefs sproof tbl
-    -- 4. replay
-    let bridge ← bridgeTactics
-    -- axioms of the polymorphic encoding (see `Poly`)
-    let polyTac := #[("poly", ← `(tactic| blaster_poly))]
-    let bridge := if poly then polyTac ++ bridge else bridge
-    -- matcher instances optimized by Blaster (whose patterns are the translated ones)
-    let mut insts : Std.HashMap Name Expr := {}
-    for (k, v) in tenv.optEnv.memCache.isMatcherCache.toList do insts := insts.insert k.name v.instApp
-    -- SMT macros of Lean functions (e.g., `@Nat.sub`), expanded by the backends in asserted formulas
-    let mut macros : Std.HashMap Name (Array (String × SExpr) × STerm) := {}
-    for (k, v) in tenv.smtEnv.funInstCache.toList do
-      let nm := match v with
-        | .SimpleIdent s => toString s
-        | .QualifiedIdent s _ => toString s
-      if let .const n _ := k.expr then
-        if let some (.macro params body) := tbl.syms.get? nm then macros := macros.insert n (params, body)
-    let macroOf (n : Name) : Option (Array Expr → MetaM Expr) := (macros.get? n).map fun (params, body) vals => do
-      let locals := (params.zip vals).foldl (fun m ((x, _), v) => m.insert x v) {}
-      (interp body).run { table := tbl, locals }
-    let macroTacs ← macroTactics
-    let bcfg : Bridge.Cfg := {
-      matchInst := insts.get?, macroOf, polyWorld := poly
-      proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
-    let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
-    let proveStep (rule : String) (stmt : Expr) : TermElabM (Option (Expr × String)) := do
-      -- NOTE: the tactic syntax of each rule is built once per replay
-      let tacs ← match (← tacCache.get).get? rule with
-        | some t => pure t
-        | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
-      -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
-      let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
-      portfolio tacs stmt rule
-    -- recursive functions (`z3rec`): definitional equations, proved with the bridge tactics in the empty local
-    -- context when closed (see `proveClosed`), and differences of normal forms in their unfoldings
-    let recCtx ← RecFun.mkCtx tbl recAux recPairs sproof.defs
-      (fun stmt => do
-        let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
-        if stmt.hasFVar then run else withLCtx {} {} run)
-      (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
-      (fun a b => do Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite") (← IO.mkRef 6) a b)
-    let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
-    let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
-      let cfg : ReplayConfig := {
-        proveDirect := fun c => do
-          if ← withReducible (isDefEq c (mkNot body)) then return some (← mkExpectedTypeHint hneg c)
-          -- e.g., projections vs. case analyses, casts of literals (with a budget)
-          let defeq (a b : Expr) : TermElabM Bool := do
-            try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
-                  withCurrHeartbeats <| withDefault <| isDefEq a b
-            catch _ => return false
-          if c.isAppOfArity ``Not 1 then
-            if ← defeq c (mkNot body) then return some (← mkExpectedTypeHint hneg c)
-          -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
-          -- NOTE: the translated goal is definitionally equal to the goal (see the translation above)
-          let (r, fails) ← Bridge.prove bcfg (mkNot goalTerm) c
-          if let some p := r then
-            return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot goalTerm)))
-          if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
-            let h ← IO.FS.Handle.mk f .append
-            -- NOTE: only for the translation of the negated goal
-            -- NOTE: the number of failed pairs is given by `BLASTER_SMTPROOF_BRIDGE_DUMP_N` (default 3)
-            let n := ((← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP_N").bind String.toNat?).getD 3
-            for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 n else #[] do
-              h.putStrLn s!"=== bridge mismatch:\n{← ppExpr a}\n--- interpretation:\n{← ppExpr b}\n"
-          -- definitions of Lean functions (e.g., by `match`): the traversal of their unfolding
-          if !c.isAppOfArity ``Not 1 then
-            if let some p ← (try Bridge.proveDefinition? bcfg c catch _ => pure none) then return some p
-          -- definitional axioms of recursive functions (backends without `define-funs-rec`)
-          if !c.isAppOfArity ``Not 1 then
-            if let some p ← RecFun.proveDefAxiom? c then return some p
-          let r ← portfolio bridge c "bridge"
-          if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then debugLog m!"bridge failed: {← dagString c 4000}"
-          if r.isNone then
-            if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
-              let h ← IO.FS.Handle.mk f .append
-              h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot goalTerm)}\n"
-          return r.map (·.1)
-        proveStep
-        proveRecFun := fun c n => do
-          -- NOTE: the lemmas have no premises (a failure is not retried)
-          if let some r := (← recCache.get).get? c then return r
-          let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
-          if r.isNone then debugLog m!"recfun lemma failed: {RecFun.brief c}"
-          recCache.modify (·.insert c r)
-          return r
-        recFunOnly := !recPairs.isEmpty }
-      let cache ← IO.mkRef {}
-      let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
-      let global := (scopedSteps sproof).map (!·)
-      let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
-                               openHyps := openHypotheses sproof,
-                               baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
-      let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
-                            catch ex => return Except.error ex) |>.run ctx).run {}
-      let p ← match p? with
-        | .ok p => pure p
-        | .error ex =>
-            -- report the first steps that could not be replayed (i.e., the deepest failures)
-            let fs := st.stats.failures.extract 0 3
-            let ms := (st.stats.msByRule.toArray.qsort (·.2 > ·.2)).extract 0 6
-            let methods := st.stats.byRule.toList.map fun (r, m) => (r, m.toList)
-            throwError "{ex.toMessageData}; first failures: {fs}; time per rule: {ms}; methods: {methods}"
-      let pt ← inferType p
-      if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
-      -- NOTE: the proofs of the steps are instantiated once (see `replay`)
-      return (← mkLambdaFVars #[hneg] (← instantiateMVars p), st.stats)
-    let (pf, stats) := pf
-    let proofBody := mkApp2 (mkConst ``Classical.byContradiction) body pf
-    let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
-    -- NOTE: e.g., type parameters that nothing determines (the other interpretation is then tried)
-    if proof.hasMVar then throwError "smt proof: proof term contains metavariables"
-    -- debugging: free variables escaping their scopes (environment variable `BLASTER_SMTPROOF_CHECKFINAL`)
-    if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then reportEscapedFVars proof
-    return .ok { proof, backend := backend.name, steps := sproof.steps.size, stats }
+    throwError "no proof: {errors}"
   catch ex =>
     return .error (← ex.toMessageData.toString)
 
