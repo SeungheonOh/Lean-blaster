@@ -991,6 +991,42 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       return r
   | _ => replayByTactic step concl
 
+/-- Whether the metavariable `m` occurs in `e` (the subterms without metavariables are not traversed). -/
+partial def containsMVar (e : Expr) (m : MVarId) : Bool :=
+  (go e).run' {}
+where
+  go (e : Expr) : StateM (Std.HashSet Expr) Bool := do
+    if !e.hasMVar || (← get).contains e then return false
+    modify (·.insert e)
+    match e with
+    | .mvar m' => return m' == m
+    | .app f a => return (← go f) || (← go a)
+    | .lam _ t b _ | .forallE _ t b _ => return (← go t) || (← go b)
+    | .letE _ t v b _ => return (← go t) || (← go v) || (← go b)
+    | .mdata _ b | .proj _ _ b => go b
+    | _ => return false
+
+/-- `e` with the metavariable `m` replaced by the loose bound variable of index 0 (the body of `fun x => e[m := x]`):
+    only the subterms with metavariables are traversed (`Expr.abstract` traverses the subterms with free variables,
+    e.g., all the large terms over the variables of the goal in the proofs of the steps). -/
+partial def abstractMVar (e : Expr) (m : MVarId) : Expr :=
+  (go e 0).run' {}
+where
+  go (e : Expr) (off : Nat) : StateM (Std.HashMap (Expr × Nat) Expr) Expr := do
+    if !e.hasMVar then return e
+    if let some r := (← get).get? (e, off) then return r
+    let r ← match e with
+      | .mvar m' => pure (if m' == m then .bvar off else e)
+      | .app f a => return e.updateApp! (← go f off) (← go a off)
+      | .lam _ t b _ => return e.updateLambdaE! (← go t off) (← go b (off + 1))
+      | .forallE _ t b _ => return e.updateForallE! (← go t off) (← go b (off + 1))
+      | .letE _ t v b _ => return e.updateLetE! (← go t off) (← go v off) (← go b (off + 1))
+      | .mdata _ b => return e.updateMData! (← go b off)
+      | .proj _ _ b => return e.updateProj! (← go b off)
+      | _ => pure e
+    modify (·.insert (e, off) r)
+    return r
+
 /-- `lemma`: the premise derives `false` under hypotheses; the conclusion is the disjunction of the
     negations of the hypotheses. -/
 partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
@@ -998,7 +1034,10 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let some j := step.premises[0]? | throwError "lemma: premise expected"
   let n := step.clauseSize
   let lits := disjuncts concl n
-  let r ← timed "lemma" <| withLocalDeclD `hn (mkNot concl) fun hn => timed "lemma body" do
+  -- NOTE: the hypothesis `hn` is a metavariable (abstracted at the end by `abstractMVar`), such that the abstraction
+  -- does not traverse the large terms of the proof of the subproof
+  let hn ← mkFreshExprMVar (mkNot concl) (kind := .syntheticOpaque) (userName := `hn)
+  let r ← timed "lemma" <| timed "lemma body" do
     let t0 ← IO.monoMsNow
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
     let facts ← timed "lemma facts" do
@@ -1019,7 +1058,7 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
     let disch : Std.HashSet Nat := (ctx.openHyps.getD j #[]).foldl (fun s h => if own.contains h then s else s.insert h) {}
     -- NOTE: `containsFVar` skips the closed subterms (e.g., the large terms of a CEK evaluation)
     let keep (k : Nat) (p : Expr) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·) &&
-      !p.containsFVar hn.fvarId!
+      !containsMVar p hn.mvarId!
     let inherit := (← IO.getEnv "BLASTER_SMTPROOF_NOINHERIT").isNone
     let ms := (← IO.monoMsNow) - t0
     if ms > 100 then
@@ -1040,7 +1079,7 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
     timed "lemma abstract" do
       -- NOTE: `hn'` bound in the computation, such that the abstraction is computed in it (timing)
       let hn' ← pure hn
-      return mkLambda `hn .default (mkNot concl) (pf.abstract #[hn'])
+      return mkLambda `hn .default (mkNot concl) (abstractMVar pf hn'.mvarId!)
   record step.rule "exact"
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) concl r
 
