@@ -74,4 +74,12 @@ def nested (d : D) : Bool :=
 #blaster (reconstruct: 2) (smt-proof: 3)
   [(∀ (β : Type) (xs : List β) (f : List β → Nat), f xs > 10) → ∀ (α : Type) (xs : List α) (f : List α → Nat), f xs > 5]
 
+-- polymorphic functions at several sort variables (interpreted at the universe and related to the goal by naturality
+-- lemmas), lambda terms guarded by the membership predicates of their parameters (e.g., constant functions)
+#blaster (reconstruct: 2) (smt-proof: 3) [∀ (α β : Type) (xs : List α) (c : β), List.map (fun _ => c) xs = [] → xs = []]
+
+theorem zipWith_map_left {l₁ : List α} {l₂ : List β} {f : α → α'} {g : α' → β → γ} :
+    List.zipWith g (l₁.map f) l₂ = List.zipWith (fun a b => g (f a) b) l₁ l₂ := by
+  induction l₁ generalizing l₂ <;> blaster (reconstruct: 2) (smt-proof: 3)
+
 end Tests.Reconstruct.SmtProof

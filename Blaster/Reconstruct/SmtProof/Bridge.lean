@@ -890,6 +890,10 @@ structure State where
 
 abbrev BridgeM := ReaderT Cfg (StateRefT State Term.TermElabM)
 
+/-- Naturality lemmas of the polymorphic functions (see `walkPolyApp`), per statement, across the calls of the bridge
+    (reused while the environment contains them). -/
+initialize natLemmaCache : IO.Ref (Std.HashMap Expr Expr) ← IO.mkRef {}
+
 /-- `(∀ xs alts, M params motive xs alts = ite ..., proof)` (see `iteOf` and `proveMatchIte`), where `inst?` is
     Blaster's optimized instance of the matcher. -/
 def matcherEquation (m : Name) (lvls : List Level) (info : MatcherInfo) (inst? : Option Expr) (params : Array Expr)
@@ -1209,7 +1213,7 @@ partial def walkCore (a b : Expr) : BridgeM (Option Expr) := do
     if let some p ← walkLiftedApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
   -- polymorphic functions at sort variables, interpreted at the universe (e.g., `List.zipWith`), and case analyses
   if let .const f _ := a.getAppFn then
-    if b.getAppFn.isConstOf f && a.getAppNumArgs == b.getAppNumArgs && a != b then
+    if (← read).polyWorld && b.getAppFn.isConstOf f && a.getAppNumArgs == b.getAppNumArgs && a != b then
       if f == ``List.casesOn || f == ``Option.casesOn then
         if let some p ← walkPolyCasesOn a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
       else if let some p ← walkPolyApp a b then return some (← mkExpectedTypeHint p (← mkEq (w.lift a) b))
@@ -1670,11 +1674,19 @@ partial def walkPolyApp (a b : Expr) : BridgeM (Option Expr) := do
   let lem? ← match (← get).natLemmas.get? stmt with
     | some l => pure l
     | none =>
-        let l ← try
+        let cached := (← natLemmaCache.get).get? stmt
+        let env ← getEnv
+        let valid (l : Expr) : Bool := match l.getAppFn with
+          | .const n _ => env.contains n
+          | _ => false
+        let l ← if let some l := cached.filter valid then pure (some l) else
+          try
             -- NOTE: proved in the empty local context (the statement is closed)
             let some pf ← withLCtx {} {} (Blaster.Reconstruct.proveWithTactic stmt (← `(tactic| blaster_poly_nat)))
               | pure none
-            some <$> mkAuxTheorem stmt pf
+            let l ← mkAuxTheorem stmt pf
+            natLemmaCache.modify (·.insert stmt l)
+            pure (some l)
           catch _ => pure none
         if l.isNone then dbg m!"bridge: naturality not proved: {stmt}"
         modify fun s => { s with natLemmas := s.natLemmas.insert stmt l }
