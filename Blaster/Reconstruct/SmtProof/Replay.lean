@@ -76,6 +76,8 @@ structure ReplayState where
   /-- steps that could not be replayed in the current scope -/
   scopeFailed : Std.HashSet Nat := {}
   directAttempts : Nat := 0
+  /-- direct proof attempts on large statements (see `replayCore'`) -/
+  largeDirectAttempts : Nat := 0
   stats : ReplayStats := {}
   /-- maximal sharing of the interpreted conclusions: structurally equal terms are pointer equal, such that the
       comparisons of the explicit constructions (e.g., `congrDescent` on large CEK terms) are constant time -/
@@ -602,9 +604,13 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   -- without the proof of the backend)
   if concl.isConstOf ``False then
     throwError "smt proof: could not replay step {i} ({step.rule}) concluding false"
-  -- NOTE: direct proofs are costly; they are attempted a bounded number of times
-  if !ctx.prepass && (← get).directAttempts < ctx.maxDirect then
-    modify fun s => { s with directAttempts := s.directAttempts + 1 }
+  -- NOTE: direct proofs are costly; they are attempted a bounded number of times, and fewer times on large
+  -- statements (e.g., the steps of a CEK evaluation depending on a failed step: each attempt exhausted the budgets
+  -- of the bridge tactics)
+  let large := !Local.sizeLe concl 20000
+  if !ctx.prepass && (← get).directAttempts < ctx.maxDirect && (!large || (← get).largeDirectAttempts < 4) then
+    modify fun s => { s with directAttempts := s.directAttempts + 1,
+                             largeDirectAttempts := s.largeDirectAttempts + (if large then 1 else 0) }
     if let some p ← ctx.cfg.proveDirect concl then
       record step.rule "direct"
       return p
