@@ -98,43 +98,127 @@ def cvc5Backend (cmd : String) (timeoutSec : Nat) : Backend where
   dropCommand := isZ3OnlyCommand
   parseProof := Alethe.parseProof
 
+/-- The input of `backend` for the query `cmds`. -/
+def backendInput (backend : Backend) (cmds : Array SExpr) : String :=
+  String.intercalate "\n" (backend.preamble.toList ++
+    (cmds.filter (!backend.dropCommand ·)).toList.map toString ++ ["(check-sat)", "(get-proof)", "(exit)"])
+
+/-- The proof output of `backend` given its standard output (the output following `unsat`), or the reason of the
+    failure. -/
+def backendResult (backend : Backend) (stdout stderr : String) : Except String String :=
+  -- the first line among `sat`, `unsat` and `unknown` (e.g., after warnings on unsupported options)
+  let lines := stdout.splitOn "\n"
+  -- errors on the query (e.g., unsupported declarations): its verdict and proof are not used
+  let errors := lines.filter (·.trimLeft.startsWith "(error")
+  if !errors.isEmpty then
+    .error s!"{backend.name}: {String.intercalate " " (errors.take 3) |>.take 600}"
+  else match lines.findIdx? (fun l => ["sat", "unsat", "unknown"].contains l.trim) with
+    | some i =>
+        if lines[i]!.trim == "unsat" then .ok (String.intercalate "\n" (lines.drop (i + 1)))
+        else .error s!"{backend.name}: {lines[i]!.trim}"
+    | none => .error s!"{backend.name}: {stdout.take 300} {stderr.take 300}"
+
 /-- Run `backend` on the query `cmds`, returning the raw proof output. The query is written to a
     temporary file (no interaction with the solver's pipes during the run). -/
 def runBackend (backend : Backend) (cmds : Array SExpr) : IO (Except String String) := do
-  let query := String.intercalate "\n" (backend.preamble.toList ++
-    (cmds.filter (!backend.dropCommand ·)).toList.map toString ++ ["(check-sat)", "(get-proof)", "(exit)"])
+  let query := backendInput backend cmds
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_DUMP" then IO.FS.writeFile f query
   let (h, path) ← IO.FS.createTempFile
   try
     h.putStr query
     h.flush
     let out ← IO.Process.output { cmd := backend.cmd, args := backend.args.push path.toString }
-    -- the first line among `sat`, `unsat` and `unknown` (e.g., after warnings on unsupported options)
-    let lines := out.stdout.splitOn "\n"
-    -- errors on the query (e.g., unsupported declarations): its verdict and proof are not used
-    let errors := lines.filter (·.trimLeft.startsWith "(error")
-    if !errors.isEmpty then
-      return .error s!"{backend.name}: {String.intercalate " " (errors.take 3) |>.take 600}"
-    match lines.findIdx? (fun l => ["sat", "unsat", "unknown"].contains l.trim) with
-    | some i =>
-        if lines[i]!.trim == "unsat" then
-          return .ok (String.intercalate "\n" (lines.drop (i + 1)))
-        return .error s!"{backend.name}: {lines[i]!.trim}"
-    | none => return .error s!"{backend.name}: {out.stdout.take 300} {out.stderr.take 300}"
+    return backendResult backend out.stdout out.stderr
   finally
     IO.FS.removeFile path
+
+/-- Whether `c` sets Z3's random seed. -/
+def isSeedCommand (c : SExpr) : Bool :=
+  match c with
+  | .list #[.atom "set-option", .atom o, _] => o == ":smt.random-seed" || o == ":random-seed" || o == ":sat.random_seed"
+  | _ => false
+
+/-- Random seed of Z3 set by the query `cmds` (`0` by default). -/
+def querySeed (cmds : Array SExpr) : Nat := Id.run do
+  for c in cmds do
+    if let .list #[.atom "set-option", .atom ":smt.random-seed", .atom n] := c then
+      if let some k := n.toNat? then return k
+  return 0
+
+/-- The query `cmds` with Z3's random seed set to `seed`. -/
+def withSeed (cmds : Array SExpr) (seed : Nat) : Array SExpr :=
+  #[SExpr.list #[.atom "set-option", .atom ":smt.random-seed", .atom (toString seed)]] ++ cmds.filter (!isSeedCommand ·)
+
+/-- Standard streams of the solver runs of a portfolio (see `runPortfolio`). -/
+abbrev PortfolioStdio : IO.Process.StdioConfig := { stdin := .null, stdout := .piped, stderr := .null }
+
+/-- Run `backend` (Z3, with its timeout given by an argument `-T:n`) on the queries `variants` concurrently (e.g., the
+    query with different random seeds, whose time to find a proof may vary by an order of magnitude on the CEK
+    evaluation of validators): the variant `i` is started after `i * delayMs` ms when no proof was found yet, with
+    the timeout reduced accordingly (the portfolio takes at most the timeout of `backend`). Returns the first proof
+    output (the other runs are then killed), or the result of the first variant when no variant finds a proof. -/
+def runPortfolio (backend : Backend) (variants : Array (Array SExpr)) (delayMs : Nat) : IO (Except String String) := do
+  if variants.size ≤ 1 then return ← runBackend backend (variants.getD 0 #[])
+  if let some f ← IO.getEnv "BLASTER_SMTPROOF_DUMP" then IO.FS.writeFile f (backendInput backend variants[0]!)
+  let timeoutMs := (backend.args.findSome? fun a => if a.startsWith "-T:" then (a.drop 3).toNat? else none).getD 0 * 1000
+  let start ← IO.monoMsNow
+  let mut runs : Array (IO.Process.Child PortfolioStdio × Task (Except IO.Error String) × System.FilePath) := #[]
+  let mut results : Array (Option (Except String String)) := #[]
+  let mut proof := none
+  try
+    repeat
+      let now ← IO.monoMsNow
+      -- the next variant, unless its reduced timeout would be less than a second
+      let i := runs.size
+      if i < variants.size && now - start ≥ i * delayMs && (i == 0 || timeoutMs ≥ i * delayMs + 1000) then
+        let (h, path) ← IO.FS.createTempFile
+        h.putStr (backendInput backend variants[i]!)
+        h.flush
+        let args := backend.args.map fun a =>
+          if a.startsWith "-T:" && i > 0 then s!"-T:{(timeoutMs - i * delayMs) / 1000}" else a
+        let child ← IO.Process.spawn { toStdioConfig := PortfolioStdio, cmd := backend.cmd, args := args.push path.toString }
+        let task ← IO.asTask (prio := .dedicated) do
+          let out ← child.stdout.readToEnd
+          discard <| child.wait
+          return out
+        runs := runs.push (child, task, path)
+        results := results.push none
+      for j in [:runs.size] do
+        if results[j]!.isSome then continue
+        let some (_, task, _) := runs[j]? | continue
+        if !(← IO.hasFinished task) then continue
+        let r : Except String String := match task.get with
+          | Except.ok out => backendResult backend out ""
+          | Except.error e => .error s!"{backend.name}: {e}"
+        results := results.set! j (some r)
+        if r matches .ok _ then proof := some r
+      if proof.isSome then break
+      if runs.size == variants.size && results.all (·.isSome) then break
+      -- no other variant to start (its timeout would be too short): the remaining runs only
+      if runs.size < variants.size && results.all (·.isSome) && timeoutMs < runs.size * delayMs + 1000 then break
+      IO.sleep 20
+  finally
+    for (child, task, path) in runs do
+      if !(← IO.hasFinished task) then try child.kill catch _ => pure ()
+      try IO.FS.removeFile path catch _ => pure ()
+  if let some r := proof then return r
+  return (results[0]?.bind id).getD (.error s!"{backend.name}: no result")
 
 /-- Results of the backends on the last query, reused by the replays of a goal with the different interpretations
     of the polymorphic encoding (see `proveBySmtProof`). -/
 initialize backendRuns : IO.Ref (String × Std.HashMap String (Except String String)) ← IO.mkRef ("", {})
 
-/-- `runBackend`, reusing the result of a previous run of `backend` on the same query. -/
-def runBackendCached (backend : Backend) (cmds : Array SExpr) : IO (Except String String) := do
+/-- `runBackend`, reusing the result of a previous run of `backend` on the same query. With `seeds > 1`, a portfolio
+    of `seeds` runs of Z3 with consecutive random seeds from the seed of the query (see `runPortfolio`). -/
+def runBackendCached (backend : Backend) (cmds : Array SExpr) (seeds := 1) (delayMs := 0) :
+    IO (Except String String) := do
   let query := String.intercalate "\n" (cmds.toList.map toString)
   let (q, runs) ← backendRuns.get
   let runs := if q == query then runs else {}
   if let some r := runs.get? backend.name then return r
-  let r ← runBackend backend cmds
+  let r ← if seeds ≤ 1 then runBackend backend cmds else
+    let seed := querySeed cmds
+    runPortfolio backend ((List.range seeds).toArray.map fun k => if k == 0 then cmds else withSeed cmds (seed + k)) delayMs
   backendRuns.set (query, runs.insert backend.name r)
   return r
 
@@ -990,6 +1074,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let mut res : Option (Backend × Proof) := none
     let mut recPairs : Array RecFun.Pair := #[]
     let mut errors := #[]
+    let seedsEnv ← IO.getEnv "BLASTER_SMTPROOF_SEEDS"
     for n in names do
       let recQuery := if n.trim == "z3rec" then (RecFun.rewriteQuery cmds).toOption else none
       if n.trim == "z3rec" && recQuery.isNone then continue
@@ -1000,7 +1085,12 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
         | b => throwError "unknown proof backend {b}"
       let (query, pairs) := if n.trim == "z3rec" then recQuery.getD (cmds, #[]) else (cmds, #[])
-      match ← runBackendCached backend query with
+      -- Z3: portfolio of random seeds (environment variable `BLASTER_SMTPROOF_SEEDS`, default 3), started every
+      -- `BLASTER_SMTPROOF_SEED_DELAY` ms (default: a quarter of the timeout, at most 10 s) while no proof is found
+      -- NOTE: e.g., Z3 finds a proof of a CEK evaluation of a validator in 30 to 170 s depending on the seed
+      let seeds := if n.trim == "cvc5" then 1 else (seedsEnv.bind String.toNat?).getD 3
+      let delayMs := ((← IO.getEnv "BLASTER_SMTPROOF_SEED_DELAY").bind String.toNat?).getD (min 10000 (timeout * 250))
+      match ← runBackendCached backend query seeds delayMs with
       | .error msg => errors := errors.push msg
       | .ok out =>
           match backend.parseProof out with
@@ -1078,13 +1168,15 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
             let h ← IO.FS.Handle.mk f .append
             -- NOTE: only for the translation of the negated goal
-            for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 3 else #[] do
+            -- NOTE: the number of failed pairs is given by `BLASTER_SMTPROOF_BRIDGE_DUMP_N` (default 3)
+            let n := ((← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP_N").bind String.toNat?).getD 3
+            for (a, b) in if c.isAppOfArity ``Not 1 then fails.extract 0 n else #[] do
               h.putStrLn s!"=== bridge mismatch:\n{← ppExpr a}\n--- interpretation:\n{← ppExpr b}\n"
           -- definitions of Lean functions (e.g., by `match`): the traversal of their unfolding
           if !c.isAppOfArity ``Not 1 then
             if let some p ← (try Bridge.proveDefinition? bcfg c catch _ => pure none) then return some p
           let r ← portfolio bridge c "bridge"
-          if r.isNone then debugLog m!"bridge failed: {c}"
+          if r.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then debugLog m!"bridge failed: {← dagString c 4000}"
           if r.isNone then
             if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
               let h ← IO.FS.Handle.mk f .append
