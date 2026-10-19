@@ -217,6 +217,36 @@ def rewriteQuery (cmds : Array SExpr) : Except String (Array SExpr × Array Pair
     else rest := rest.push c
   return (opts ++ sorts ++ decls ++ #[blockCmd] ++ rest, pairs)
 
+/-! ## Normal forms -/
+
+theorem smt_int_lt (a b : Int) : (a < b) = ¬ (b ≤ a) := propext Int.not_le.symm
+
+theorem smt_str_empty_lt (s : String) : ("" < s) = ¬ ("" = s) := by
+  apply propext
+  rw [String.lt_iff]
+  cases s with
+  | mk l =>
+    cases l with
+    | nil => simp
+    | cons c cs =>
+      constructor
+      · intro _ h
+        have := congrArg String.data h
+        simp at this
+      · intro _; exact List.Lex.nil
+
+/-- The normal forms of Z3's rewriter in the cases of recursive functions: `a < b` as `¬ b ≤ a` (integers), `"" < s`
+    as `¬ "" = s` (see `smt_int_lt`, `smt_str_empty_lt`). -/
+def z3Normalize (e : Expr) : MetaM Expr :=
+  Meta.transform e (post := fun t => do
+    if t.isAppOfArity ``LT.lt 4 then
+      let (ty, a, b) := (t.getArg! 0, t.getArg! 2, t.getArg! 3)
+      if ty.isConstOf ``Int then return .done (mkNot (mkIntLe b a))
+      -- NOTE: through the projections of constructor applications (e.g., `(ByteString.mk "").data`)
+      if ty.isConstOf ``String && (← whnfCore a) == mkStrLit "" then
+        return .done (mkNot (mkApp3 (mkConst ``Eq [1]) ty (mkStrLit "") b))
+    return .done t)
+
 /-! ## Interpretation -/
 
 /-- Auxiliary definitions interpreting Z3's `fold-rec-n` functions (see `addProofDefs`), expanded by
@@ -262,6 +292,8 @@ def addProofDefs (proof : Proof) (tbl : SymTable) : TermElabM (SymTable × NameS
     let r ← try
         let lam ← instantiateMVars (← (interpQuant .lambda d.params d.body).run { table := tbl })
         if lam.hasMVar || lam.hasFVar then pure none else
+        -- NOTE: in the normal forms of Z3's rewriter, as in Z3's lemmas (an equivalent interpretation)
+        let lam ← z3Normalize lam
         let n ← Term.mkAuxName `smtFoldRec
         let e ← mkAuxDefinition n (← inferType lam) lam (compile := false)
         pure (some e)
@@ -285,34 +317,6 @@ def addProofDefs (proof : Proof) (tbl : SymTable) : TermElabM (SymTable × NameS
   return (tbl, aux)
 
 /-! ## Definitional equations -/
-
-theorem smt_int_lt (a b : Int) : (a < b) = ¬ (b ≤ a) := propext Int.not_le.symm
-
-theorem smt_str_empty_lt (s : String) : ("" < s) = ¬ ("" = s) := by
-  apply propext
-  rw [String.lt_iff]
-  cases s with
-  | mk l =>
-    cases l with
-    | nil => simp
-    | cons c cs =>
-      constructor
-      · intro _ h
-        have := congrArg String.data h
-        simp at this
-      · intro _; exact List.Lex.nil
-
-/-- The normal forms of Z3's rewriter in the cases of recursive functions: `a < b` as `¬ b ≤ a` (integers), `"" < s`
-    as `¬ "" = s` (see `smt_int_lt`, `smt_str_empty_lt`). -/
-def z3Normalize (e : Expr) : MetaM Expr :=
-  Meta.transform e (post := fun t => do
-    if t.isAppOfArity ``LT.lt 4 then
-      let (ty, a, b) := (t.getArg! 0, t.getArg! 2, t.getArg! 3)
-      if ty.isConstOf ``Int then return .done (mkNot (mkIntLe b a))
-      -- NOTE: through the projections of constructor applications (e.g., `(ByteString.mk "").data`)
-      if ty.isConstOf ``String && (← whnfCore a) == mkStrLit "" then
-        return .done (mkNot (mkApp3 (mkConst ``Eq [1]) ty a b))
-    return .done t)
 
 /-- The application `f a⃗` of the left-hand side of a definitional equation, through the conversions of the
     interpretation (`↑(f a⃗)` for functions returning `Nat`, `f a⃗ = true` for functions returning `Bool`). -/
@@ -432,8 +436,9 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     setGoals [g]
     -- NOTE: `simp_all` closes the contradictory cases (e.g., the patterns excluded by the hypotheses of `split`)
     let hasHyps ← g.withContext do (← getLCtx).anyM fun d => do return !d.isImplementationDetail && (← isProp d.type)
-    try evalTactic (← if hasHyps then `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done))
-                       else `(tactic| first | (simp only []; done) | (simp; done)))
+    try evalTactic (← if hasHyps then `(tactic| first | (simp only []; done) | (simp [smt_str_empty_lt]; done) |
+                                          (simp_all [smt_str_empty_lt]; done))
+                       else `(tactic| first | (simp only []; done) | (simp [smt_str_empty_lt]; done)))
     catch _ => pure ()
     if (← getGoals).isEmpty then continue
     let (lhs, all) ← g.withContext do
@@ -463,7 +468,7 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
       continue
     setGoals [g]
     -- NOTE: e.g., `grind` for the orientations of equalities and the orders of conjunctions of Blaster's normal forms
-    try evalTactic (← `(tactic| first | (simp_all; done) | rfl | (simp_all <;> grind) | grind))
+    try evalTactic (← `(tactic| first | (simp_all [smt_str_empty_lt]; done) | rfl | (simp_all [smt_str_empty_lt] <;> grind) | grind))
     catch _ => pure ()
     if (← getGoals).isEmpty then continue
     if !unfolded.contains g then
