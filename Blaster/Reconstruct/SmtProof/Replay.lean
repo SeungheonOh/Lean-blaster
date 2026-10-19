@@ -1037,7 +1037,10 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
         if let some a := t.not? then
           if ← propEq a cj then return mkApp p pj
       throwError "lemma: the premise is not refuted by the hypotheses")
-    timed "lemma abstract" do return mkLambda `hn .default (mkNot concl) (pf.abstract #[hn])
+    timed "lemma abstract" do
+      -- NOTE: `hn'` bound in the computation, such that the abstraction is computed in it (timing)
+      let hn' ← pure hn
+      return mkLambda `hn .default (mkNot concl) (pf.abstract #[hn'])
   record step.rule "exact"
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) concl r
 
@@ -1269,7 +1272,10 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   if ps.isEmpty then
     if let some (_, a, b) := concl.eq? then
       if a.approxDepth.toNat > 8 || b.approxDepth.toNat > 8 then
-        if let some p ← timed "local" (Local.diffEq (localProof cfg step.rule) (← IO.mkRef 6) a b) then
+        -- NOTE: a budget of tactic attempts on the differences, larger for the large statements (e.g., the many
+        -- simplifications of a CEK evaluation under the conditions of its conditionals)
+        let budget := if large then 24 else 6
+        if let some p ← timed "local" (Local.diffEq (localProof cfg step.rule) (← IO.mkRef budget) a b) then
           record step.rule "local"
           return ← mkExpectedTypeHint p concl
   -- theory lemmas over large terms: the subterms common to the literals are generalized (e.g., datatype
