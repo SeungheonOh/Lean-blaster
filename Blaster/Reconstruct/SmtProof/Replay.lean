@@ -808,7 +808,8 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
     -- the proofs of the steps not depending on the hypotheses discharged by the lemma stay valid after it
     let disch := (ctx.openHyps.getD j #[]).filter (discharges ctx.proof step ·)
     let keep (k : Nat) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·)
-    let pf ← timed "subproof" <| withScope (inherit := true) (keep := keep) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
+    let inherit := (← IO.getEnv "BLASTER_SMTPROOF_NOINHERIT").isNone
+    let pf ← timed "subproof" <| withScope (inherit := inherit) (keep := keep) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
       -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
       let cj ← stepConcl j
