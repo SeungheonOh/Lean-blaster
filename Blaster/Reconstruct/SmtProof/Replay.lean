@@ -389,23 +389,18 @@ def openHypotheses (p : Proof) : Array (Array Nat) := Id.run do
 
 /-- Run `x` in a new scope (hypotheses or bound variables): the proofs (and failures) of the
     current scope are saved and restored, also when `x` fails. -/
-def withScope (x : ReplayM α) (inherit := false) (keep : Nat → Bool := fun _ => false) : ReplayM α := do
+def withScope (x : ReplayM α) (inherit := false) (keep : Nat → Expr → Bool := fun _ _ => false) : ReplayM α := do
   let saved := ((← get).scopeCache, (← get).scopeFailed)
   -- NOTE: with `inherit`, the proofs of the current scope stay available in the new scope (e.g., for the hypotheses
-  -- of nested lemmas, which extend the context of the enclosing ones), and the proofs of the new scope satisfying
-  -- `keep` (e.g., not depending on the hypotheses of a nested lemma) are kept, such that the steps shared by the
-  -- subproofs of nested lemmas are not replayed in each of them
+  -- of nested lemmas, which extend the context of the enclosing ones), and the new proofs satisfying `keep` (e.g., not
+  -- using the hypothesis of a nested lemma) are kept, such that the steps shared by the subproofs of nested lemmas are
+  -- not replayed in each of them
   modify fun s => { s with scopeCache := if inherit then s.scopeCache else {}, scopeFailed := {} }
-  let lctx ← getLCtx
   try x finally
-    -- debugging: kept proofs with free variables of the new scope
-    if inherit && (← IO.getEnv "BLASTER_SMTPROOF_CHECKSCOPE").isSome then
-      for (i, p) in (← get).scopeCache.toList do
-        if keep i && !saved.1.contains i then
-          let p' ← instantiateMVars p
-          if p'.hasAnyFVar (!lctx.contains ·) then IO.eprintln s!"scope: kept step {i} has free variables of its scope"
     modify fun s =>
-      let inner := if inherit then s.scopeCache.fold (fun m i p => if keep i then m.insert i p else m) saved.1 else saved.1
+      let inner := if inherit then
+          s.scopeCache.fold (fun m i p => if saved.1.contains i || !keep i p then m else m.insert i p) saved.1
+        else saved.1
       { s with scopeCache := inner, scopeFailed := saved.2 }
 
 /-- Definitional equality with a heartbeat budget (default transparency when `unfold`, reducible otherwise). -/
@@ -806,8 +801,10 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
       if let some a := l.not? then
         facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
     -- the proofs of the steps not depending on the hypotheses discharged by the lemma stay valid after it
+    -- NOTE: the hypotheses are matched on their propositions (see `hypothesis`), hence the occurrences of `hn`
     let disch := (ctx.openHyps.getD j #[]).filter (discharges ctx.proof step ·)
-    let keep (k : Nat) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·)
+    let keep (k : Nat) (p : Expr) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·) &&
+      (p.find? fun e => e.isFVarOf hn.fvarId!).isNone
     let inherit := (← IO.getEnv "BLASTER_SMTPROOF_NOINHERIT").isNone
     let pf ← timed "subproof" <| withScope (inherit := inherit) (keep := keep) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
