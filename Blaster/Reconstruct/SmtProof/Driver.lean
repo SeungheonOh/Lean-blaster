@@ -821,7 +821,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) : TermElabM (Exc
           -- NOTE: the lemmas have no premises (a failure is not retried)
           if let some r := (← recCache.get).get? c then return r
           let r ← try RecFun.proveLemma recCtx c n catch _ => pure none
-          if r.isNone then debugLog m!"recfun lemma failed: {c}"
+          if r.isNone then debugLog m!"recfun lemma failed: {RecFun.brief c}"
           recCache.modify (·.insert c r)
           return r
         recFunOnly := !recPairs.isEmpty }

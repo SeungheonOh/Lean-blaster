@@ -298,9 +298,12 @@ partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr
 
 /-- Run `x` in a new scope (hypotheses or bound variables): the proofs (and failures) of the
     current scope are saved and restored, also when `x` fails. -/
-def withScope (x : ReplayM α) : ReplayM α := do
+def withScope (x : ReplayM α) (inherit := false) : ReplayM α := do
   let saved := ((← get).scopeCache, (← get).scopeFailed)
-  modify fun s => { s with scopeCache := {}, scopeFailed := {} }
+  -- NOTE: with `inherit`, the proofs of the current scope stay available in the new scope (e.g., for the hypotheses
+  -- of nested lemmas, which extend the context of the enclosing ones), such that the steps shared by the subproofs
+  -- of nested lemmas are not replayed in each of them
+  modify fun s => { s with scopeCache := if inherit then s.scopeCache else {}, scopeFailed := {} }
   try x finally modify fun s => { s with scopeCache := saved.1, scopeFailed := saved.2 }
 
 /-- Definitional equality with a heartbeat budget (default transparency when `unfold`, reducible otherwise). -/
@@ -692,7 +695,7 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
       facts := facts.push (mkNot l, nl)
       if let some a := l.not? then
         facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
-    let pf ← timed "subproof" <| withScope (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
+    let pf ← timed "subproof" <| withScope (inherit := true) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
       -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
       let cj ← stepConcl j

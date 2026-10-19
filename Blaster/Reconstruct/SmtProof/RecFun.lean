@@ -438,6 +438,10 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
 
 /-! ## Lemmas -/
 
+/-- Short form of `e` for debugging messages (large terms are not printed). -/
+def brief (e : Expr) : String :=
+  if Local.sizeLe e 2000 then toString e else "<large term>"
+
 /-- Definitional equation `∀ x⃗, f x⃗ = body` of a recursive function, proved on first use. The candidate
     statements are tried in order: the body of the function in the header of Z3's proof (on which Z3's lemmas
     are expressed), then the body of the query (Blaster's normal form). -/
@@ -520,7 +524,7 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       m.mvarId!.assign p
       r := some (stmt, m)
       break
-    debugLog m!"recfun: definitional equation not proved: {stmt}"
+    debugLog m!"recfun: definitional equation not proved: {brief stmt}"
   eq.proof.set (some r)
   return r
 
@@ -626,7 +630,7 @@ def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (hyps : Array (Expr × 
     let (y, py) := cb.back!
     if let some p ← proveUnder ctx hyps (← mkEq x y) then
       return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
-    debugLog m!"recfun: no common rewrite of {ca.map (·.1)} and {cb.map (·.1)} (facts {facts.toArray.map (·.1)})"
+    debugLog m!"recfun: no common rewrite of {ca.map (brief ·.1)} and {cb.map (brief ·.1)}"
     return none
   if let some q := l.not? then
     let cq ← rewriteChain ctx facts q
