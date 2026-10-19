@@ -403,7 +403,10 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     let some g ← (do return (← getGoals).head?) | continue
     setGoals [g]
     -- NOTE: `simp_all` closes the contradictory cases (e.g., the patterns excluded by the hypotheses of `split`)
-    try evalTactic (← `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done))) catch _ => pure ()
+    let hasHyps ← g.withContext do (← getLCtx).anyM fun d => do return !d.isImplementationDetail && (← isProp d.type)
+    try evalTactic (← if hasHyps then `(tactic| first | (simp only []; done) | (simp; done) | (simp_all; done))
+                       else `(tactic| first | (simp only []; done) | (simp; done)))
+    catch _ => pure ()
     if (← getGoals).isEmpty then continue
     let (lhs, all) ← g.withContext do
       let t ← instantiateMVars (← g.getType)
@@ -521,8 +524,8 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
     let prove : TermElabM (Option Expr) := do
       let t0 ← IO.monoMsNow
       let p ← if stmt.hasFVar then pure none else
-        withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 400000)
-      debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} ({(← IO.monoMsNow) - t0} ms)"
+        withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
+      debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for {eq.head} ({(← IO.monoMsNow) - t0} ms)"
       -- the reason of the failure (debugging)
       if p.isNone && !stmt.hasFVar && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
         withoutModifyingState <| withLCtx {} {} do
