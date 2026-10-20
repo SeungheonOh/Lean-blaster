@@ -175,4 +175,81 @@ structure MixedInv where
 #blaster (solve-result: 2)
   [ ∀ (s t : MixedInv), s.n = 0 → t.n = 1 → s.c = true ∨ t.c = true ]
 
+/-! Test cases to ensure that functions with a proposition domain are guarded by the truth of the proposition.
+    An inductive proposition (e.g., a structure in `Prop`) is translated to an smt datatype, which is never empty.
+    However, `P → β` is inhabited whenever `P` does not hold, even when `β` is empty. -/
+
+structure FalseInv : Prop where
+  inv : 1 > 2
+
+structure TrueInv : Prop where
+  inv : 1 < 2
+
+structure SortInv : Prop where
+  inv : ∀ (α : Type), ∃ (_x : α), True
+
+inductive NoNeg : Prop
+  | intro (n : Nat) (h : n < 0)
+
+inductive SomeBig : Prop
+  | intro (n : Nat) (h : n > 5)
+
+structure FalseInvFun where
+  f : FalseInv → Empty
+
+class EmptyFrom (α : Type) where
+  elim : FalseInv → α
+
+-- Not a theorem (`FalseInv` does not hold, take `f := λ h => absurd h.inv (by decide)`).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_f : FalseInv → Empty), False ]
+
+-- Not a theorem (`FalseInv → Empty` has exactly one function).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (f g : FalseInv → Empty), f = g → False ]
+
+-- Not a theorem (proposition domain after the first argument).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_f : Nat → FalseInv → Empty), False ]
+
+-- Not a theorem (proposition domain before a non empty domain).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_f : FalseInv → Nat → Empty), False ]
+
+-- Not a theorem (inductive proposition with a data field).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_f : NoNeg → Empty), False ]
+
+-- Not a theorem (`TrueInv → FalseInv` does not hold).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_f : (TrueInv → FalseInv) → Empty), False ]
+
+-- Not a theorem (ctor field with a proposition domain).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_w : FalseInvFun), False ]
+
+-- Not a theorem (`α := Empty`, `elim := λ h => absurd h.inv (by decide)`, `g := elim`).
+-- Test case: co-domain constraint of an undeclared class function.
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (α : Type) [EmptyFrom α] (g : FalseInv → α), g = EmptyFrom.elim → (∀ (_x : α), False) → False ]
+
+-- Not a theorem (`1 = 2` is reduced to `False`, which has no ctor).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_f : (1 = 2) → Empty), False ]
+
+-- Not a theorem (`False` has no ctor).
+#blaster (gen-cex: 0) (solve-result: 1) [ ∀ (_f : False → Empty), False ]
+
+-- Not a theorem (`SortInv` does not hold, take `α := Empty`).
+-- The predicate qualifier of `SortInv` is a negative only predicate qualifier (see `withQualifierBody`),
+-- which cannot guard a co-domain constraint: `unsat` is reported as `Undetermined`.
+#blaster (gen-cex: 0) (solve-result: 2) [ ∀ (_f : SortInv → Empty), False ]
+
+-- Not a theorem (`SortInv → Empty` has exactly one function).
+#blaster (gen-cex: 0) (solve-result: 2) [ ∀ (f g : SortInv → Empty), f = g → False ]
+
+#blaster [ ∃ (_f : FalseInv → Empty), True ]
+
+#blaster [ ∀ (_f : TrueInv → Empty), False ]
+
+#blaster [ ∀ (_f : True → Empty), False ]
+
+#blaster [ ∀ (_f : Nat → TrueInv → Empty), False ]
+
+#blaster [ ∀ (_f : SomeBig → Empty), False ]
+
+#blaster [ ∀ (_f : (FalseInv → TrueInv) → Empty), False ]
+
 end Test.SmtUninhabited

@@ -547,20 +547,46 @@ def createPredQualifierApp (smtSym : SmtSymbol) (t : Expr) (pol : Polarity) : Tr
     the domain of a function may be empty (e.g., `α → β` with `α` and `β` both instantiated with `Empty`).
     No predicate qualifier is generated for `tᵢ` when:
       - `tᵢ` is a dependent type (i.e., has loose bound variables); or
-      - `tᵢ` is a proposition; or
-      - no predicate qualifier has been declared for `tᵢ`.
+      - no predicate qualifier has been declared for `tᵢ` and `tᵢ` is not a proposition.
     The domain qualifiers occur in positive position w.r.t. the goal (i.e., they restrict an assumed
     co-domain constraint). Flag `unsupportedSortQuantifier` is therefore set when one of them is a negative only
     predicate qualifier (see `checkQualifierPolarity`), whatever the polarity of the co-domain constraint.
+
+    A proposition `tᵢ` is guarded as any other type. It is translated to an smt sort only when it is an
+    inductive proposition (e.g., a structure in `Prop`, `True` or `False`) or an implication between such
+    propositions, whose values represent the proofs of `tᵢ` and whose predicate qualifier `@isTypeᵢ x` holds
+    only when `x` represents a proof of `tᵢ` (e.g., the Prop fields of the ctor hold, see `defineInstPredicateQualifier`).
+    The guard is required as an smt datatype is never empty while `tᵢ` may be false, in which case `tᵢ → β`
+    is inhabited even when `β` is empty. For instance, given `structure Bad : Prop where inv : 1 > 2`,
+    the co-domain constraint of `Bad → Empty` without guard is `(forall ((@x0 @Bad)) (@isEmpty (@apply @f @x0)))`,
+    which is unsatisfiable, i.e., no function of type `Bad → Empty` exists at the smt level, and
+    `∀ (_f : Bad → Empty), False` would be reported as valid.
+    With the guard, the co-domain constraint is vacuous when the Prop fields of `Bad` cannot hold,
+    and requires the co-domain value only on proofs of `tᵢ` otherwise. This is sound:
+      - when `tᵢ` holds, a function of type `tᵢ → β` is characterized by its value on the (unique up to
+        proof irrelevance) proof of `tᵢ`, which is a value of `β`;
+      - when `tᵢ` does not hold, `tᵢ → β` has exactly one function, which satisfies the vacuous constraint.
+    When a Prop field of `tᵢ` contains a sort quantifier, `@isTypeᵢ` is a negative only predicate qualifier
+    (see `withQualifierBody`), i.e., it may hold on a value that does not represent a proof of `tᵢ`, and flag
+    `unsupportedSortQuantifier` is set as for any other negative only domain qualifier.
+    An error is triggered when no predicate qualifier has been declared for a proposition `tᵢ`, as the
+    co-domain constraint cannot be guarded with the truth of `tᵢ`.
 -/
 def guardWithDomainQualifiers (xs : Array SmtTerm) (ts : Array Expr) (cstr : SmtTerm) : TranslateEnvT SmtTerm := do
   let mut guards := #[]
   for h : i in [:ts.size] do
     let t := ts[i]
-    if t.hasLooseBVars || (← isPropEnv t) then continue
-    if let some decl ← getPredicateDeclaration t then
-      if ← isNegativeOnlyQualifier decl then setUnsupportedSortQuantifier
-      guards := guards.push (mkSimpleSmtAppN decl.instName #[xs[i]!])
+    if t.hasLooseBVars then continue
+    let isProp ← isPropEnv t
+    -- NOTE: `getPredicateDeclaration` returns the predicate qualifier of the type of an fvar.
+    let decl? ← if isProp && t.isFVar then pure none else getPredicateDeclaration t
+    match decl? with
+    | some decl =>
+        if ← isNegativeOnlyQualifier decl then setUnsupportedSortQuantifier
+        guards := guards.push (mkSimpleSmtAppN decl.instName #[xs[i]!])
+    | none =>
+        if isProp then
+          throwEnvError "guardWithDomainQualifiers: predicate qualifier expected for proposition domain {reprStr t}"
   return guards.foldr (fun g acc => impliesSmt g acc) cstr
 
 
@@ -903,6 +929,10 @@ Given `indValStart` an inductive value info for an inductive datatype,
     Note that `optimizer` is called on each constructor `rhs` to apply proper formalization
     when at least one of the arguments is a proposition.
 
+    A (non mutual) inductive datatype without ctor (e.g., `False`) is translated to an uninterpreted sort
+    (i.e., `(declare-sort @False 0)`), as an smt datatype must have at least one ctor. Its predicate qualifier
+    is `false` (see `defineInstPredicateQualifier`), i.e., no smt value of this sort is a member of the type.
+
     An error is triggered when:
      - ∀ n ∈ indValStart.all
         - no inductive info is found for `n`;
@@ -930,7 +960,12 @@ def translateInductiveType
     let sortDecl := {name := indNameToSmtSymbol indName, arity}
     sortDecls := sortDecls.push sortDecl
     dataTypeDecls := dataTypeDecls.push {params, ctors}
-  defineDataType sortDecls dataTypeDecls
+  if indValStart.all.length == 1 && indValStart.ctors.isEmpty then
+    -- inductive datatype without ctor (e.g., `False`): an smt datatype must have at least one ctor.
+    -- An uninterpreted sort is declared instead, with a `false` predicate qualifier
+    -- (see `defineInstPredicateQualifier`).
+    declareSort sortDecls[0]!.name sortDecls[0]!.arity
+  else defineDataType sortDecls dataTypeDecls
 
  where
   defineDataType (sortDecls : Array SmtSortDecl) (typeDecls : Array SmtDatatypeDecl) : TranslateEnvT Unit := do
@@ -1031,7 +1066,8 @@ def withQualifierBody (instName : SmtSymbol) (k : TranslateEnvT α) : TranslateE
      - Otherwise:
         - let {instName, instSort} ← generateIndInstDecl t args typeTranslator
         - When `∀ c ∈ Ctors(t), c = C (i.e., nullary constructors)
-           - declare smt predicate (declare-fun @is{instName} ((instSort)) Bool)`
+           - define smt predicate (define-fun @is{instName} ((@x instSort)) Bool true)`
+             (or `false` when `t` has no ctor, e.g., `False`, see `translateInductiveType`)
         - Otherwise:
            - declare smt predicate (declare-fun @is{instName} ((instSort)) Bool)`
            - For each c ∈ Ctors(t),
@@ -1078,8 +1114,9 @@ where
      let ConstantInfo.inductInfo indVal ← getConstEnvInfo indName
        | throwEnvError "declareIndInst: inductive info expected for {indName}"
      if (← isEnumeration indVal) then
-       -- only declare smt predicate
-       discard $ generateIndInstDecl t args (some true) typeTranslator
+       -- only declare smt predicate, which is `false` for an inductive datatype without ctor (e.g., `False`),
+       -- as such a datatype is translated to an uninterpreted (i.e., non empty) sort (see `translateInductiveType`).
+       discard $ generateIndInstDecl t args (some !indVal.ctors.isEmpty) typeTranslator
      else if indVal.isRec && indVal.all.length > 1 then
        -- generate inductive instance for all mutually inductive datatypes
        -- NOTE: Lean4 imposes that all inductive data type within a mutual block
