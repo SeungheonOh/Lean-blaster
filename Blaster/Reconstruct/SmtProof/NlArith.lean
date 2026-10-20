@@ -4,7 +4,7 @@ import Lean
 # Nonlinear integer arithmetic
 
 The tactic `blaster_nlarith` proves goals of nonlinear integer arithmetic (e.g., the theory lemmas and
-rewrites of Z3's nonlinear arithmetic, see `stepTactics`), in the spirit of Mathlib's `nlinarith`
+rewrites of Z3's nonlinear arithmetic, see `Driver.stepTactics`), in the spirit of Mathlib's `nlinarith`
 (Positivstellensatz certificates of degree 2), with `omega` as linear procedure:
  1. the negated goal and the hypotheses are split into cases (see `refute`), each a conjunction of literals over
     `Int` stated as `0 ≤ e`, `0 < e` or `e = 0` (disequalities are split into `<` and `>`); the `if-then-else`
@@ -90,6 +90,7 @@ structure Lit where
 /-- The term `e` of the literal `ty` (`0 ≤ e`, `0 < e` or `e = 0`). -/
 def litTerm (kind : Kind) (ty : Expr) : Expr := if kind == .zero then ty.appFn!.appArg! else ty.appArg!
 
+/-- State of a case (see `refute`). -/
 structure State where
   lits : Array Lit := #[]
   /-- propositions of the processed facts, with their proofs (decided conditions of `if-then-else` terms) -/
@@ -179,9 +180,12 @@ def closingFVars (e : Expr) : MetaM (Array Expr) := do
 /-- Polynomials over atoms (indices): monomials (sorted lists of atoms) with nonzero coefficients, sorted. -/
 abbrev Poly := Array (List Nat × Int)
 
+/-- Order of the monomials: by degree, then lexicographically. -/
 def monLt (m₁ m₂ : List Nat) : Bool :=
   m₁.length < m₂.length || (m₁.length == m₂.length && compare m₁ m₂ == .lt)
 
+/-- The polynomial of a sum of monomials (coefficients of equal monomials added, zero ones removed, sorted by
+    `monLt`). -/
 def Poly.ofArray (xs : Array (List Nat × Int)) : Poly :=
   let m : Std.HashMap (List Nat) Int := xs.foldl (fun m (k, c) => m.insert k (m.getD k 0 + c)) {}
   (m.toArray.filter (·.2 != 0)).qsort fun a b => monLt a.1 b.1
@@ -194,6 +198,7 @@ def Poly.mul (p q : Poly) : Poly :=
 
 abbrev RExpr := Lean.Grind.CommRing.Expr
 
+/-- The term of a ring expression. -/
 def rexprToExpr : RExpr → Expr
   | .num k => mkApp (mkConst ``Lean.Grind.CommRing.Expr.num) (ToExpr.toExpr k)
   | .var x => mkApp (mkConst ``Lean.Grind.CommRing.Expr.var) (mkNatLit x)
@@ -210,6 +215,7 @@ structure Atoms where
 
 abbrev NormM := StateT Atoms MetaM
 
+/-- The index of the atom `e` (added when new). -/
 def atomIdx (e : Expr) : NormM Nat := do
   let s ← get
   if let some i := s.idx.get? e then return i
