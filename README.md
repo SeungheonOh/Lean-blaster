@@ -62,7 +62,7 @@ Please follow the official installation guidelines from the [Lean4 GitHub reposi
 
 We do our best to stay updated with the latest release of Z3. However, regressions can occur and often require extensive research and resolution, so Blaster might be slightly behind the latest version.
 
-**Currently tested version:** Z3 v4.15.2
+**Currently supported version:** Z3 v5.3.1
 
 > **Note:** Blaster should work with later releases, though no guarantees are made.
 

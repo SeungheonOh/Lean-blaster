@@ -13,7 +13,7 @@ private def normalizeLine (s : String) : String :=
   s.replace "\r" ""
 
 /-- Minimal version of z3 we support -/
-private def minZ3Version : String := "4.15.2"
+private def minZ3Version : String := "5.3.1"
 
 /-- Result of an Smt query. -/
 inductive Result where
