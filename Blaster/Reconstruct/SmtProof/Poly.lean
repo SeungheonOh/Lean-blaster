@@ -954,14 +954,34 @@ def indWorldSimpTerms (e : Expr) : TermElabM (Array (TSyntax ``Lean.Parser.Tacti
         res := res.push (← `(Lean.Parser.Tactic.simpLemma| $(← Term.exprToSyntax t):term))
   return res
 
+/-- The theorems of the worlds of the inductive types occurring in the main goal (target and hypotheses), see
+    `indWorldSimpTerms`. -/
+def goalIndWorldSimpTerms : TacticM (Array (TSyntax ``Lean.Parser.Tactic.simpLemma)) := withMainContext do
+  let mut e ← instantiateMVars (← getMainTarget)
+  for d in ← getLCtx do
+    if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
+  indWorldSimpTerms e
+
+/-- Whether one of the tactics `attempts` (tried in order, the state being restored after each failure) closes all
+    the goals. -/
+def closeWithFirst (attempts : Array (TSyntax `tactic)) : TacticM Bool := do
+  for t in attempts do
+    let s ← saveState
+    try
+      evalTactic t
+      if (← getGoals).isEmpty then return true
+    catch _ => pure ()
+    s.restore
+  return false
+
 syntax (name := blasterPolyInj) "blaster_poly_inj" : tactic
 
 /-- Proofs of the injectivity of worlds (`Function.Injective w`, see `worldInjective?`). -/
 @[tactic blasterPolyInj] def evalBlasterPolyInj : Tactic := fun _ => do
   let g ← getMainGoal
   let t ← whnfR (← instantiateMVars (← g.getType))
-  let some w := if t.isAppOfArity ``Function.Injective 3 then some t.appArg! else none
-    | throwError "blaster_poly_inj: injectivity expected"
+  if !t.isAppOfArity ``Function.Injective 3 then throwError "blaster_poly_inj: injectivity expected"
+  let w := t.appArg!
   let some p ← worldInjective? (← instantiateMVars w) | throwError "blaster_poly_inj: unknown world {w}"
   g.assign p
   replaceMainGoal []
@@ -971,13 +991,9 @@ syntax (name := blasterPolySimp) "blaster_poly_simp" : tactic
 /-- Simplification of the naturality statements (see `blaster_poly_nat`), with the lemmas of the worlds of the
     inductive types of the goal (see `IndWorldLemmas`). -/
 @[tactic blasterPolySimp] def evalBlasterPolySimp : Tactic := fun _ => withMainContext do
-  let mut e ← instantiateMVars (← getMainTarget)
-  for d in ← getLCtx do
-    if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
-  let extra ← indWorldSimpTerms e
+  let extra ← goalIndWorldSimpTerms
   evalTactic (← `(tactic| simp_all [liftFun_apply, inj_injective, liftFun_injective, listMap_injective,
     optionMap_injective, prodMap_injective, id_injective, natCast_injective, boolTrue_injective, $extra,*]))
-
 
 syntax (name := blasterPolyNat) "blaster_poly_nat" : tactic
 
@@ -996,16 +1012,10 @@ syntax (name := blasterPolyNat) "blaster_poly_nat" : tactic
   let attempts : Array (TSyntax `tactic) := #[
     ← `(tactic| (fun_induction $stx <;> blaster_poly_simp)),
     ← `(tactic| (fun_induction $stx <;> (try blaster_poly_simp) <;> blaster_poly_cases <;> blaster_poly_simp)),
-    ← `(tactic| (fun_induction $stx <;> (try simp_all [$fId:ident]) <;> (try blaster_poly_cases) <;> blaster_poly_simp)),
+    ← `(tactic| (fun_induction $stx <;> (try simp_all [$fId:ident]) <;> (try blaster_poly_cases) <;>
+          blaster_poly_simp)),
     ← `(tactic| blaster_poly_simp)]
-  for t in attempts do
-    let s ← saveState
-    try
-      evalTactic t
-      if (← getGoals).isEmpty then return
-    catch _ => pure ()
-    s.restore
-  throwError "blaster_poly_nat: failed"
+  if !(← closeWithFirst attempts) then throwError "blaster_poly_nat: failed"
 
 syntax (name := blasterPoly) "blaster_poly" : tactic
 
@@ -1014,11 +1024,7 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
 @[tactic blasterPoly] def evalBlasterPoly : Tactic := fun _ => do
   evalTactic (← `(tactic| intros))
   -- the lemmas of the worlds of the inductive types of the goal (see `IndWorldLemmas`)
-  let extra ← withMainContext do
-    let mut e ← instantiateMVars (← getMainTarget)
-    for d in ← getLCtx do
-      if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
-    indWorldSimpTerms e
+  let extra ← goalIndWorldSimpTerms
   let attempts : Array (TSyntax `tactic) := #[
     ← `(tactic| exact img_self _ _),
     ← `(tactic| exact img_id (inj_injective _)),
@@ -1036,13 +1042,7 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
     ← `(tactic| ((apply ext_liftFun₂ <;> try assumption) <;> blaster_poly_inj)),
     ← `(tactic| ((apply img_liftFun₂ <;> try assumption) <;> blaster_poly_inj)),
     ← `(tactic| ((apply img_liftFun <;> try assumption) <;> blaster_poly_inj))]
-  for t in attempts do
-    let s ← saveState
-    try
-      evalTactic t
-      if (← getGoals).isEmpty then return
-    catch _ => pure ()
-    s.restore
+  if ← closeWithFirst attempts then return
   -- membership hypotheses on variables: the variables are substituted by their witnesses
   for _ in [0:16] do
     let h? ← withMainContext do
@@ -1057,6 +1057,7 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
     -- NOTE: `rfl` patterns are not recognized in quotations (hygiene)
     evalTactic (← `(tactic| (obtain ⟨_, h⟩ := $hs; subst h)))
   evalTactic (← `(tactic| (simp only [liftFun_apply, inj_injective, listMap_injective, optionMap_injective,
-    id_injective, natCast_injective, boolTrue_injective, img_self, $extra,*] <;> first | done | omega | rfl | simp_all | grind)))
+    id_injective, natCast_injective, boolTrue_injective, img_self, $extra,*] <;>
+      first | done | omega | rfl | simp_all | grind)))
 
 end Blaster.Reconstruct.SmtProof.Poly
