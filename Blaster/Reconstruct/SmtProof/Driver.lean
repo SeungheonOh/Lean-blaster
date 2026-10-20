@@ -1204,7 +1204,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           recFunOnly := !recPairs.isEmpty
           recHeads := recCtx.eqs.foldl (fun s eq => s.insert eq.head) {} }
         let cache ← IO.mkRef {}
-        let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 300)
+        -- NOTE: the replay of the proofs of large goals takes minutes (e.g., about 5 minutes for the validators of
+        -- CardanoLedgerApiBlaster's Governance); seconds (environment variable `BLASTER_SMTPROOF_DEADLINE`)
+        let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 1800)
         let global := (scopedSteps sproof).map (!·)
         let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
                                  openHyps := openHypotheses sproof,
