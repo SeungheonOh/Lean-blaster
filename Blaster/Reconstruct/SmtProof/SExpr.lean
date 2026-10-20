@@ -129,23 +129,30 @@ partial def parseString : ParserM String := do
   | some s => return s
   | none => throw "invalid UTF-8 in string literal"
 
+/-- Parse an S-expression. The open lists are kept on an explicit stack, such that deeply nested terms (e.g., the
+    chains of tens of thousands of nested `let`s in Z3's proofs) don't overflow the call stack. -/
 partial def parseSExpr : ParserM SExpr := do
-  skipWs
-  match ← peek? with
-  | none => throw "unexpected end of input"
-  | some 40 => -- '('
-      advance
-      let rec items (acc : Array SExpr) : ParserM (Array SExpr) := do
-        skipWs
-        match ← peek? with
-        | some 41 => advance; return acc
-        | none => throw "unexpected end of input (missing ')')"
-        | _ => items (acc.push (← parseSExpr))
-      return .list (← items #[])
-  | some 41 => throw s!"unexpected ')' at position {(← get).pos}"
-  | some 34 => return .str (← parseString)
-  | some 124 => return .atom (← parseQuoted)
-  | some _ => return .atom (← parseAtom)
+  let mut stack : Array (Array SExpr) := #[]
+  repeat
+    skipWs
+    let e ← match ← peek? with
+      | none => throw "unexpected end of input"
+      | some 40 => -- '('
+          advance
+          stack := stack.push #[]
+          continue
+      | some 41 => -- ')'
+          if stack.isEmpty then throw s!"unexpected ')' at position {(← get).pos}"
+          advance
+          let items := stack.back!
+          stack := stack.pop
+          pure (SExpr.list items)
+      | some 34 => pure (.str (← parseString))
+      | some 124 => pure (.atom (← parseQuoted))
+      | some _ => pure (.atom (← parseAtom))
+    if stack.isEmpty then return e
+    stack := stack.modify (stack.size - 1) (·.push e)
+  throw "unreachable"
 
 partial def parseAll : ParserM (Array SExpr) := do
   let rec loop (acc : Array SExpr) : ParserM (Array SExpr) := do

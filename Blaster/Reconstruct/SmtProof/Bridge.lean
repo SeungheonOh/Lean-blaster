@@ -197,6 +197,67 @@ theorem nat_exists {p : Nat → Prop} {q : Int → Prop} (h : ∀ n : Nat, p n =
 theorem true_imp {p p' : Prop} (h : p = p') : p = (True → p') := by
   subst h; exact propext ⟨fun h _ => h, fun h => h trivial⟩
 
+/-! ### Macros of the `Int` divisions
+
+The equations of the SMT macros translating the divisions and modulos of `Int` (see `Blaster.Smt.defineIntTDiv`, etc.),
+with the conditionals of the interpretation (classical instances). -/
+
+theorem ediv_macro (x y : Int) :
+    x / y = @ite Int (0 = y) (Classical.propDecidable _) 0 (x / y) := by
+  split
+  · subst_vars; simp
+  · rfl
+
+theorem emod_macro (x y : Int) :
+    x % y = @ite Int (0 = y) (Classical.propDecidable _) x (x % y) := by
+  split
+  · subst_vars; simp
+  · rfl
+
+theorem tdiv_macro (x y : Int) :
+    Int.tdiv x y = @ite Int (0 = y) (Classical.propDecidable _) 0
+      (@ite Int (0 ≤ x) (Classical.propDecidable _) (x / y) (-((-x) / y))) := by
+  split
+  · subst_vars; simp
+  · split
+    · rw [Int.tdiv_eq_ediv_of_nonneg (by assumption)]
+    · have h := Int.neg_tdiv (-x) y
+      rw [Int.neg_neg] at h
+      rw [h, Int.tdiv_eq_ediv_of_nonneg (by omega)]
+
+theorem tmod_macro (x y : Int) :
+    Int.tmod x y = @ite Int (0 = y) (Classical.propDecidable _) x
+      (@ite Int (0 ≤ x) (Classical.propDecidable _) (x % y) (-((-x) % y))) := by
+  split
+  · subst_vars; simp
+  · split
+    · rw [Int.tmod_eq_emod_of_nonneg (by assumption)]
+    · have h := Int.neg_tmod (-x) y
+      rw [Int.neg_neg] at h
+      rw [h, Int.tmod_eq_emod_of_nonneg (by omega)]
+
+theorem fdiv_macro (x y : Int) :
+    Int.fdiv x y = @ite Int (0 = y) (Classical.propDecidable _) 0
+      (@ite Int (y < 0) (Classical.propDecidable _) ((-x) / (-y)) (x / y)) := by
+  split
+  · subst_vars; simp
+  · split
+    · have h := Int.neg_fdiv_neg (-x) (-y)
+      rw [Int.neg_neg, Int.neg_neg] at h
+      rw [h, Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
+    · rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
+
+theorem fmod_macro (x y : Int) :
+    Int.fmod x y = @ite Int (0 = y) (Classical.propDecidable _) x
+      (@ite Int (y < 0) (Classical.propDecidable _) (-((-x) % y)) (x % y)) := by
+  split
+  · subst_vars; simp
+  · split
+    · have h := Int.neg_fmod_neg (-x) (-y)
+      rw [Int.neg_neg, Int.neg_neg] at h
+      rw [h, Int.fmod_eq_emod_of_nonneg _ (by omega), Int.emod_neg]
+    · rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
+
 /-! ## Worlds -/
 
 /-- Relation between a goal term and the interpretation of its translation. -/
@@ -1411,17 +1472,24 @@ partial def walkApp (a b : Expr) : BridgeM (Option Expr) := do
   let mut cur := as
   for i in [:as.size] do
     if as[i]! == bs[i]! then continue
+    let mut resultDep := false
     if let some pi := info.paramInfo[i]? then
       if pi.hasFwdDeps then
         -- dependent argument: only definitionally equal arguments
         if ← isDefEq as[i]! bs[i]! then cur := cur.set! i bs[i]!; continue
-        return none
+        -- NOTE: an argument on which only the result type depends (e.g., the major premise of a `casesOn` with a
+        -- constant motive) is related when the type of the application does not depend on it (see below)
+        if (info.paramInfo.extract (i + 1) info.paramInfo.size).any (·.backDeps.contains i) then return none
+        resultDep := true
     let ta ← inferType as[i]!
     let tb ← inferType bs[i]!
     if !(← isDefEq ta tb) then return none
     let some p ← walk as[i]! bs[i]! | return none
     -- `fun z => f cur[0..i) z as(i..n]`
     let ctx ← withLocalDeclD `z ta fun z => mkLambdaFVars #[z] (mkAppN fa (cur.set! i z))
+    if resultDep then
+      let .forallE _ _ body _ ← whnfR (← inferType ctx) | return none
+      if body.hasLooseBVars then return none
     pf ← mkEqTrans pf (← mkCongrArg ctx p)
     cur := cur.set! i bs[i]!
   return some (← mkExpectedTypeHint pf (← mkEq a b))

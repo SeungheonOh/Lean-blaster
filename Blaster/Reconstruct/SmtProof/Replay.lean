@@ -49,6 +49,8 @@ structure ReplayConfig where
   /-- whether the lemmas of recursive functions are only replayed by `proveRecFun` (the generic tactics being
       costly and unlikely to succeed on them) -/
   recFunOnly : Bool := false
+  /-- the recursive functions with definitional equations (see `proveRecFun`) -/
+  recHeads : NameSet := {}
 
 structure ReplayCtx where
   proof : Proof
@@ -68,6 +70,8 @@ structure ReplayCtx where
   global : Array Bool := #[]
   /-- open hypotheses of the steps (see `openHypotheses`) -/
   openHyps : Array (Array Nat) := #[]
+  /-- index of the step being replayed (see `replayCore'`) -/
+  stepIdx : Nat := 0
   /-- local context at depth 0, in which the steps that don't depend on a scope are replayed -/
   baseLCtx : LocalContext := {}
   baseInsts : LocalInstances := #[]
@@ -140,6 +144,19 @@ def timed (phase : String) (x : ReplayM α) : ReplayM α := do
       if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
         let h ← IO.FS.Handle.mk f .append
         h.putStrLn s!"  phase {phase}: {ms} ms"
+
+/-- Run `x`, recording its start and its duration in the file given by `BLASTER_SMTPROOF_TRACE` (if set), e.g., the
+    phases of the construction of the final proof. -/
+def traceTimed (phase : String) (x : TermElabM α) : TermElabM α := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" | x
+  let log (msg : String) : IO Unit := do
+    let h ← IO.FS.Handle.mk f .append
+    h.putStrLn s!"smtproof: {msg}"
+  log phase
+  let t0 ← IO.monoMsNow
+  let r ← x
+  log s!"{phase}: {(← IO.monoMsNow) - t0} ms"
+  return r
 
 /-- Debugging output (environment variable `BLASTER_SMTPROOF_DEBUG`: file receiving the failures of the steps;
     messages would be discarded with the state restored after a failed replay). -/
@@ -248,23 +265,31 @@ def propEq (a b : Expr) (deep := false) : MetaM Bool := do
   -- e.g., `Int.toNat (↑n)` and `n`
   if deep then withDefault <| isDefEq a b else return false
 
-/-- Proof of the `i`-th injection into the right-nested disjunction `lits` (of size `n`). -/
-def mkOrInj (lits : Array Expr) (i : Nat) (p : Expr) : MetaM Expr := do
-  -- lits = [l₀, ..., lₙ₋₁], disjunction l₀ ∨ (l₁ ∨ ... ∨ lₙ₋₁)
+/-- The suffixes `lⱼ ∨ (lⱼ₊₁ ∨ ... ∨ lₙ₋₁)` of the right-nested disjunction of `lits`, built once (and shared) for the
+    injections into the disjunction (see `mkOrInjWith`). -/
+def orSuffixes (lits : Array Expr) : Array Expr := Id.run do
+  let n := lits.size
+  if n == 0 then return #[]
+  let mut sfx := Array.replicate n lits[n-1]!
+  for k in (List.range (n - 1)).reverse do
+    sfx := sfx.set! k (mkOr lits[k]! sfx[k+1]!)
+  return sfx
+
+/-- Proof of the `i`-th injection into the right-nested disjunction `lits`, given its suffixes `sfx` (see
+    `orSuffixes`): `Or.inr^i (Or.inl p)` (`Or.inr^i p` for the last literal). -/
+def mkOrInjWith (lits sfx : Array Expr) (i : Nat) (p : Expr) : Expr := Id.run do
   let n := lits.size
   if n == 1 then return p
-  let rest (j : Nat) : Expr := Id.run do
-    let mut r := lits[n-1]!
-    for k in (List.range (n - 1 - j)).reverse do
-      r := mkOr lits[j + k]! r
-    r
-  -- proof for position i: Or.inr^i (Or.inl p) (or just Or.inr^i p for the last one)
-  let mut proof := if i == n - 1 then p else mkApp3 (Lean.mkConst ``Or.inl) lits[i]! (rest (i+1)) p
+  let mut proof := if i == n - 1 then p else mkApp3 (Lean.mkConst ``Or.inl) lits[i]! sfx[i+1]! p
   let mut j := i
   while j > 0 do
     j := j - 1
-    proof := mkApp3 (Lean.mkConst ``Or.inr) lits[j]! (rest (j+1)) proof
+    proof := mkApp3 (Lean.mkConst ``Or.inr) lits[j]! sfx[j+1]! proof
   return proof
+
+/-- Proof of the `i`-th injection into the right-nested disjunction `lits` (of size `n`). -/
+def mkOrInj (lits : Array Expr) (i : Nat) (p : Expr) : MetaM Expr :=
+  return mkOrInjWith lits (orSuffixes lits) i p
 
 /-- Case analysis on a proof `d` of the disjunction of `lits`: `k i hᵢ` builds a proof of `goal`
     from a proof `hᵢ` of the `i`-th literal. -/
@@ -281,16 +306,17 @@ partial def orElim (lits : Array Expr) (d : Expr) (goal : Expr) (k : Nat → Exp
 /-- Given a proof `d` of a clause with literals `lits`, refutations of some literals and the target
     clause `target`, build a proof of `target` (each literal is either refuted or occurs in `target`). -/
 def weakenClause (lits : Array Expr) (d : Expr) (refute : Expr → MetaM (Option Expr)) (targetLits : Array Expr) : MetaM Expr := do
-  let target := if targetLits.isEmpty then Lean.mkConst ``False else targetLits.pop.foldr mkOr targetLits.back!
+  let sfx := orSuffixes targetLits
+  let target := sfx[0]?.getD (Lean.mkConst ``False)
   orElim lits d target fun i h => do
     let l := lits[i]!
     -- NOTE: syntactic matches first (the definitional ones are costly on large literals)
     for j in [:targetLits.size] do
-      if targetLits[j]! == l then return ← mkOrInj targetLits j h
+      if targetLits[j]! == l then return mkOrInjWith targetLits sfx j h
     if let some r ← refute l then
       return mkApp2 (Lean.mkConst ``False.elim [levelZero]) target (mkApp r h)
     for j in [:targetLits.size] do
-      if ← propEq targetLits[j]! l then return ← mkOrInj targetLits j h
+      if ← propEq targetLits[j]! l then return mkOrInjWith targetLits sfx j h
     throwError "smt proof: literal {l} is neither refuted nor in the conclusion"
 
 /-- Proof built by `k` from the premises `ps` (propositions and proofs), given local hypotheses standing for the
@@ -325,14 +351,15 @@ def refuteBy (units : Array (Expr × Expr)) (l : Expr) : MetaM (Option Expr) := 
     and unit propagation on the clauses must derive a conflict. This justifies resolution steps
     (e.g., Alethe's `resolution`, Z3's `unit-resolution`) independently of pivot annotations. -/
 partial def rupProof (clauses : Array (Array Expr × Expr)) (target : Array Expr) : MetaM Expr := do
-  let goal := if target.isEmpty then Lean.mkConst ``False else target.pop.foldr mkOr target.back!
+  let sfx := orSuffixes target
+  let goal := sfx[0]?.getD (Lean.mkConst ``False)
   let r ← withLam `hn (mkNot goal) fun hn => do
     -- refuted propositions ↦ proof of their negation (refutations are computed once, when facts are added)
     let mut falses : Std.HashMap Expr Expr := {}
     let mut trues : Std.HashSet Expr := {}
     for k in [:target.size] do
       let l := target[k]!
-      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj target k h)
+      let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith target sfx k h)
       falses := falses.insert l nl
     let mut used := Array.replicate clauses.size false
     let mut changed := true
@@ -472,7 +499,7 @@ def usedFVars (e : Expr) : MetaM (Array Expr) := do
 def dumpGoal (g : Expr) : MetaM Unit := do
   let some f ← IO.getEnv "BLASTER_SMTPROOF_GOALDUMP" | return
   let s ← withOptions (fun o => o.setBool `pp.numericTypes true |>.setBool `pp.coercions.types true
-      |>.setBool `pp.fieldNotation false) do
+      |>.setBool `pp.fieldNotation false |>.setNat `pp.maxSteps 100000000 |>.setBool `pp.deepTerms true) do
     return toString (← ppExpr g)
   let h ← IO.FS.Handle.mk f .append
   h.putStrLn s!"example : {s} := by\n  blaster_nlarith\n"
@@ -518,13 +545,26 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
     | some p => some <$> mkLambdaFVars zs p
     | none => pure none
   if let some pp := pp? then return some (mkAppN pp vals)
-  let r ← proveClosed cfg rule g
+  let mut res ← proveClosed cfg rule g
+  let t2 ← IO.monoMsNow
+  -- the generalization without loss of the relations between the generalized subterms (see `Local.commonSubterms`)
+  let mut vals := vals
+  let mut lossless := ""
+  if res.isNone then
+    if let some (g', vals') ← Local.generalizeCommon eq l r (lossless := true) then
+      if g' != g then
+        let t3 ← IO.monoMsNow
+        res ← proveClosed cfg rule g'
+        vals := vals'
+        lossless := s!", lossless: generalization {t3 - t2} ms, tactics {(← IO.monoMsNow) - t3} ms"
+  if res.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
+    debugLog m!"local difference not proved:\n{← dagString eq 8000}"
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
-    let t2 ← IO.monoMsNow
-    if t2 - t0 > 100 then
+    let t4 ← IO.monoMsNow
+    if t4 - t0 > 100 then
       let h ← IO.FS.Handle.mk f .append
-      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({r.map (·.2)}): {(toString (← ppExpr g)).take 1500}"
-  return r.map fun (pf, _) => mkAppN pf vals
+      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms{lossless}, total {t4 - t0} ms ({res.map (·.2)}): {(toString (← ppExpr g)).take 1500}"
+  return res.map fun (pf, _) => mkAppN pf vals
 
 /-- `quant-intro` (Z3): from `h : ∀ xs, a xs = b xs` (resp. `∀ xs, a xs → b xs`), a proof of
     `(∀ xs, a xs) = (∀ xs, b xs)` (resp. `(∀ xs, a xs) → (∀ xs, b xs)`), when `concl` has this form. -/
@@ -645,6 +685,105 @@ where
     let pf := mkAppN (mkConst (T ++ `casesOn) (levelZero :: lvls)) (params ++ #[motive, x] ++ minors)
     return some (← mkExpectedTypeHint pf concl)
 
+/-- `f as = f bs` from the proofs `diffs` of `asᵢ = bsᵢ` for the arguments that differ: congruence on the partial
+    applications `f as[0..i)` when their types are not dependent, and otherwise on the full applications
+    `fun z => f bs[0..i) z as(i..n]` when only the type of the application depends on `z` and it reduces to a type
+    not depending on `z` (e.g., the major premise of a `casesOn` with a constant motive). -/
+def congrArgs (f : Expr) (as bs : Array Expr) (diffs : Array (Nat × Expr)) : MetaM (Option Expr) := do
+  let partialApps : MetaM (Option Expr) := do
+    let mut pf ← mkEqRefl f
+    let mut cur := f
+    let mut changed := false
+    let mut k := 0
+    for i in [:as.size] do
+      if k < diffs.size && diffs[k]!.1 == i then
+        let pi := diffs[k]!.2
+        k := k + 1
+        if !(← whnfR (← inferType cur)).isArrow then return none
+        pf ← if changed then mkCongr pf pi else mkCongrArg cur pi
+        cur := mkApp cur bs[i]!
+        changed := true
+      else
+        pf ← if changed then mkCongrFun pf as[i]! else pure pf
+        cur := mkApp cur as[i]!
+        if !changed then pf ← mkEqRefl cur
+    return some pf
+  if let some pf ← partialApps then return some pf
+  let info ← getFunInfoNArgs f as.size
+  let mut pf ← mkEqRefl (mkAppN f as)
+  let mut cur := as
+  for (i, pi) in diffs do
+    if (info.paramInfo.extract (i + 1) info.paramInfo.size).any (·.backDeps.contains i) then return none
+    let ctx ← withLocalDeclD `z (← inferType as[i]!) fun z => mkLambdaFVars #[z] (mkAppN f (cur.set! i z))
+    let .forallE _ _ body _ ← whnfR (← inferType ctx) | return none
+    if body.hasLooseBVars then return none
+    pf ← mkEqTrans pf (← mkCongrArg ctx pi)
+    cur := cur.set! i bs[i]!
+  return some pf
+
+
+/-- Implementation of `dagStats`: the cache is keyed by the addresses of the subterms (the structural equality of large
+    terms is costly). -/
+unsafe def dagStatsImpl (e : Expr) : Nat × Nat :=
+  let (d, s) := (go e).run {}
+  (s.size, d)
+where
+  go (e : Expr) : StateM (Std.HashMap USize Nat) Nat := do
+    if let some d := (← get).get? (ptrAddrUnsafe e) then return d
+    let d ← match e with
+      | .app f a => pure (max (← go f) (← go a))
+      | .lam _ t b _ | .forallE _ t b _ => pure (max (← go t) ((← go b) + 1))
+      | .letE _ t v b _ => pure (max (max (← go t) (← go v)) ((← go b) + 1))
+      | .mdata _ b | .proj _ _ b => go b
+      | _ => pure 0
+    modify (·.insert (ptrAddrUnsafe e) d)
+    return d
+
+/-- Number of distinct subterms (pointers) of `e` and maximal nesting of binders in `e` (e.g., for the trace of a
+    large proof). -/
+@[implemented_by dagStatsImpl] opaque dagStats (e : Expr) : Nat × Nat
+
+/-- Implementation of `abstractFVar`: the caches are keyed by the addresses of the subterms (the structural equality of
+    large terms is costly). -/
+unsafe def abstractFVarImpl (e : Expr) (x : FVarId) : Expr :=
+  (go e 0).run' ({}, {})
+where
+  contains (e : Expr) : StateM (Std.HashMap USize Bool × Std.HashMap (USize × Nat) Expr) Bool := do
+    if !e.hasFVar then return false
+    if let some b := (← get).1.get? (ptrAddrUnsafe e) then return b
+    let b ← match e with
+      | .fvar y => pure (y == x)
+      | .app f a => pure ((← contains f) || (← contains a))
+      | .lam _ t b _ | .forallE _ t b _ => pure ((← contains t) || (← contains b))
+      | .letE _ t v b _ => pure ((← contains t) || (← contains v) || (← contains b))
+      | .mdata _ b | .proj _ _ b => contains b
+      | _ => pure false
+    modify fun (c, m) => (c.insert (ptrAddrUnsafe e) b, m)
+    return b
+  go (e : Expr) (off : Nat) : StateM (Std.HashMap USize Bool × Std.HashMap (USize × Nat) Expr) Expr := do
+    if !(← contains e) then return e
+    if let some r := (← get).2.get? (ptrAddrUnsafe e, off) then return r
+    let r ← match e with
+      | .fvar _ => pure (.bvar off)
+      | .app f a => pure (e.updateApp! (← go f off) (← go a off))
+      | .lam _ t b _ => pure (e.updateLambdaE! (← go t off) (← go b (off + 1)))
+      | .forallE _ t b _ => pure (e.updateForallE! (← go t off) (← go b (off + 1)))
+      | .letE _ t v b _ => pure (e.updateLetE! (← go t off) (← go v off) (← go b (off + 1)))
+      | .mdata _ b => pure (e.updateMData! (← go b off))
+      | .proj _ _ b => pure (e.updateProj! (← go b off))
+      | _ => pure e
+    modify fun (c, m) => (c, m.insert (ptrAddrUnsafe e, off) r)
+    return r
+
+/-- `e` with the free variable `x` replaced by the loose bound variable of index 0 (the body of `fun x => e`): only the
+    subterms containing `x` are traversed (`Expr.abstract` traverses the subterms with free variables, e.g., in a proof
+    of the backend, the large terms over the variables of the goal, once per binder depth, i.e., per nested `lemma`). -/
+@[implemented_by abstractFVarImpl] opaque abstractFVar (e : Expr) (x : FVarId) : Expr
+
+/-- The steps being replayed (innermost last), written to the file given by `BLASTER_SMTPROOF_CURRENT` (if set)
+    when a step starts, e.g., to locate a step that takes long (the modification time of the file). -/
+initialize currentSteps : IO.Ref (Array String) ← IO.mkRef #[]
+
 mutual
 
 /-- Proof of the interpretation of the conclusion of step `i`. -/
@@ -711,8 +850,13 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
       try discard <| replay j catch _ => pure ()
   if (← IO.monoMsNow) > ctx.deadline then throwError "smt proof: replay deadline exceeded"
   let start ← IO.monoMsNow
+  let current ← IO.getEnv "BLASTER_SMTPROOF_CURRENT"
+  if let some f := current then
+    currentSteps.modify (·.push s!"step {i} ({step.rule}): {(toString step.concl).take 300}")
+    IO.FS.writeFile f ("\n".intercalate (← currentSteps.get).toList)
   try replayCore' i step
   finally
+    if current.isSome then currentSteps.modify (·.pop)
     let ms := (← IO.monoMsNow) - start
     modify fun s => { s with stats := s.stats.addTime step.rule ms }
     -- profiling (environment variable `BLASTER_SMTPROOF_TRACE`: file receiving the steps taking more than 100 ms)
@@ -724,8 +868,18 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
 partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   let ctx ← read
   let concl ← stepConcl i
+  -- debugging: the conclusions of the steps `BLASTER_SMTPROOF_STEPS` (indices) as Lean statements, in the file
+  -- `BLASTER_SMTPROOF_STEPDUMP`
+  if let some f ← IO.getEnv "BLASTER_SMTPROOF_STEPDUMP" then
+    if (((← IO.getEnv "BLASTER_SMTPROOF_STEPS").getD "").splitOn ",").contains (toString i) then
+      let g ← mkForallFVars (← usedFVars concl) concl
+      let s ← withOptions (fun o => o.setBool `pp.numericTypes true |>.setBool `pp.coercions.types true
+          |>.setBool `pp.fieldNotation false |>.setNat `pp.maxSteps 100000000 |>.setBool `pp.deepTerms true) do
+        return toString (← ppExpr g)
+      let h ← IO.FS.Handle.mk f .append
+      h.putStrLn s!"-- step {i} ({step.rule})\nexample : {s} := by\n  sorry\n"
   let attempt : ReplayM (Option Expr) := do
-    try some <$> replayRule step concl
+    try some <$> withReader (fun c => { c with stepIdx := i }) (replayRule step concl)
     catch ex =>
       debugLog m!"step {i} ({step.rule}) failed: {ex.toMessageData}"
       return none
@@ -774,6 +928,9 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       record step.rule "bridge"
       return p
   | "hypothesis" =>
+      -- NOTE: syntactic matches first (the definitional ones are costly on large propositions)
+      for (t, p) in ctx.facts do
+        if t == concl then record step.rule "exact"; return p
       for (t, p) in ctx.facts do
         if ← propEq t concl then record step.rule "exact"; return p
       throwError "hypothesis not found"
@@ -866,7 +1023,7 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       let n := ctx.proof.steps[step.premises[0]!]!.clauseSize
       let lits := disjuncts c n
       -- NOTE: the conclusion may be a single literal of the clause which is a disjunction
-      let single ← lits.anyM fun l => propEq l concl
+      let single ← pure (lits.any (· == concl)) <||> lits.anyM fun l => propEq l concl
       let targetLits :=
         if step.clauseSize == 0 then #[]
         else if single then #[concl]
@@ -919,6 +1076,42 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       return r
   | _ => replayByTactic step concl
 
+/-- Whether the metavariable `m` occurs in `e` (the subterms without metavariables are not traversed). -/
+partial def containsMVar (e : Expr) (m : MVarId) : Bool :=
+  (go e).run' {}
+where
+  go (e : Expr) : StateM (Std.HashSet Expr) Bool := do
+    if !e.hasMVar || (← get).contains e then return false
+    modify (·.insert e)
+    match e with
+    | .mvar m' => return m' == m
+    | .app f a => return (← go f) || (← go a)
+    | .lam _ t b _ | .forallE _ t b _ => return (← go t) || (← go b)
+    | .letE _ t v b _ => return (← go t) || (← go v) || (← go b)
+    | .mdata _ b | .proj _ _ b => go b
+    | _ => return false
+
+/-- `e` with the metavariable `m` replaced by the loose bound variable of index 0 (the body of `fun x => e[m := x]`):
+    only the subterms with metavariables are traversed (`Expr.abstract` traverses the subterms with free variables,
+    e.g., all the large terms over the variables of the goal in the proofs of the steps). -/
+partial def abstractMVar (e : Expr) (m : MVarId) : Expr :=
+  (go e 0).run' {}
+where
+  go (e : Expr) (off : Nat) : StateM (Std.HashMap (Expr × Nat) Expr) Expr := do
+    if !e.hasMVar then return e
+    if let some r := (← get).get? (e, off) then return r
+    let r ← match e with
+      | .mvar m' => pure (if m' == m then .bvar off else e)
+      | .app f a => pure (e.updateApp! (← go f off) (← go a off))
+      | .lam _ t b _ => pure (e.updateLambdaE! (← go t off) (← go b (off + 1)))
+      | .forallE _ t b _ => pure (e.updateForallE! (← go t off) (← go b (off + 1)))
+      | .letE _ t v b _ => pure (e.updateLetE! (← go t off) (← go v off) (← go b (off + 1)))
+      | .mdata _ b => pure (e.updateMData! (← go b off))
+      | .proj _ _ b => pure (e.updateProj! (← go b off))
+      | _ => pure e
+    modify (·.insert (e, off) r)
+    return r
+
 /-- `lemma`: the premise derives `false` under hypotheses; the conclusion is the disjunction of the
     negations of the hypotheses. -/
 partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
@@ -926,21 +1119,36 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
   let some j := step.premises[0]? | throwError "lemma: premise expected"
   let n := step.clauseSize
   let lits := disjuncts concl n
-  let r ← timed "lemma" <| withLam `hn (mkNot concl) fun hn => do
+  -- NOTE: the hypothesis `hn` is a metavariable (abstracted at the end by `abstractMVar`), such that the abstraction
+  -- does not traverse the large terms of the proof of the subproof
+  let hn ← mkFreshExprMVar (mkNot concl) (kind := .syntheticOpaque) (userName := `hn)
+  let r ← timed "lemma" <| timed "lemma body" do
+    let t0 ← IO.monoMsNow
     -- facts derived from `¬ (l₁ ∨ ... ∨ lₙ)`: `¬ lᵢ`, and `a` when `lᵢ = ¬ a`
-    let mut facts := ctx.facts.push (mkNot concl, hn)
-    for k in [:lits.size] do
-      let l := lits[k]!
-      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj lits k h)
-      facts := facts.push (mkNot l, nl)
-      if let some a := l.not? then
-        facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
+    let facts ← timed "lemma facts" do
+      let mut facts := ctx.facts.push (mkNot concl, hn)
+      let sfx := orSuffixes lits
+      for k in [:lits.size] do
+        let l := lits[k]!
+        let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith lits sfx k h)
+        facts := facts.push (mkNot l, nl)
+        if let some a := l.not? then
+          facts := facts.push (a, mkApp2 (Lean.mkConst ``Classical.byContradiction) a nl)
+      return facts
     -- the proofs of the steps not depending on the hypotheses discharged by the lemma stay valid after it
     -- NOTE: the hypotheses are matched on their propositions (see `hypothesis`), hence the occurrences of `hn`
-    let disch := (ctx.openHyps.getD j #[]).filter (discharges ctx.proof step ·)
+    -- NOTE: the open hypotheses of the premise that are not open hypotheses of the lemma (see `openHypotheses`; the
+    -- matching of the hypotheses with the literals, see `discharges`, is costly on large clauses)
+    let own : Std.HashSet Nat := (ctx.openHyps.getD ctx.stepIdx #[]).foldl (·.insert ·) {}
+    let disch : Std.HashSet Nat := (ctx.openHyps.getD j #[]).foldl (fun s h => if own.contains h then s else s.insert h) {}
+    -- NOTE: `containsFVar` skips the closed subterms (e.g., the large terms of a CEK evaluation)
     let keep (k : Nat) (p : Expr) : Bool := !ctx.openHyps.isEmpty && (ctx.openHyps.getD k #[]).all (!disch.contains ·) &&
-      (p.find? fun e => e.isFVarOf hn.fvarId!).isNone
+      !containsMVar p hn.mvarId!
     let inherit := (← IO.getEnv "BLASTER_SMTPROOF_NOINHERIT").isNone
+    let ms := (← IO.monoMsNow) - t0
+    if ms > 100 then
+      if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
+        (← IO.FS.Handle.mk f .append).putStrLn s!"  phase lemma setup: {ms} ms"
     let pf ← timed "subproof" <| withScope (inherit := inherit) (keep := keep) (withReader (fun c => { c with facts, depth := c.depth + 1 }) do
       let pj ← replay j
       -- the premise derives `false` (Z3's `lemma`) or a literal of the conclusion (Alethe's `subproof`)
@@ -948,9 +1156,15 @@ partial def replayLemma (step : Step) (concl : Expr) : ReplayM Expr := do
       if cj.isConstOf ``False then return pj
       for (t, p) in facts do
         if let some a := t.not? then
+          if a == cj then return mkApp p pj
+      for (t, p) in facts do
+        if let some a := t.not? then
           if ← propEq a cj then return mkApp p pj
       throwError "lemma: the premise is not refuted by the hypotheses")
-    return pf
+    timed "lemma abstract" do
+      -- NOTE: `hn'` bound in the computation, such that the abstraction is computed in it (timing)
+      let hn' ← pure hn
+      return mkLambda `hn .default (mkNot concl) (abstractMVar pf hn'.mvarId!)
   record step.rule "exact"
   return mkApp2 (Lean.mkConst ``Classical.byContradiction) concl r
 
@@ -989,20 +1203,12 @@ partial def congrDescent (eqs : Array (Expr × Expr × Expr)) (l r : Expr) (fuel
   -- conditionals (the instance depends on the condition)
   if let some p ← Local.iteCongr? l r (congrDescent eqs · · (fuel - 1)) then return some p
   -- congruence on each argument (dependent arguments must be equal)
-  let mut pf ← mkEqRefl (mkAppN lf #[])
-  let mut cur := lf
-  let mut changed := false
+  let mut diffs := #[]
   for i in [:las.size] do
-    if las[i]! == ras[i]! then
-      pf ← if changed then mkCongrFun pf las[i]! else pure pf
-      cur := mkApp cur las[i]!
-      if !changed then pf ← mkEqRefl cur
-      continue
+    if las[i]! == ras[i]! then continue
     let some pi ← congrDescent eqs las[i]! ras[i]! (fuel - 1) | return none
-    pf ← if changed then mkCongr pf pi else mkCongrArg cur pi
-    cur := mkApp cur ras[i]!
-    changed := true
-  return some pf
+    diffs := diffs.push (i, pi)
+  congrArgs lf las ras diffs
 
 /-- Congruence (`monotonicity`): from premises `aᵢ = bᵢ`, prove `L = R` by abstracting the
     occurrences of each `aᵢ` in `L` and applying `congrArg` (premises not occurring are ignored). -/
@@ -1158,6 +1364,19 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
     if ← timed "defeq" (defeqBudget a b 20000 unfoldable) then
       record step.rule "defeq"
       return ← mkExpectedTypeHint (← mkEqRefl a) concl
+  -- unfoldings of recursive functions by Z3's rewriter (e.g., applications to constructors): instances of their
+  -- definitional equations (see `RecFun.proveLemma`)
+  if step.rule == "rewrite" && step.premises.isEmpty && cfg.recFunOnly then
+    -- the head function of an application, through the conversions of the interpretation
+    let head? (e : Expr) : Option Name :=
+      let e := if e.isAppOfArity ``Eq 3 && (e.getArg! 2).isConstOf ``Bool.true then e.getArg! 1 else e
+      let e := if e.isAppOfArity ``Nat.cast 3 then e.appArg! else e
+      e.getAppFn.constName?
+    if let some (_, l, r) := concl.eq? then
+      if [l, r].any fun e => (head? e).any cfg.recHeads.contains then
+        if let some p ← timed "recfun" (cfg.proveRecFun concl 1) then
+          record step.rule "recfun"
+          return p
   let ps ← premises step
   -- NOTE: premises with a bound-variable body (`proof-bind`) are universally quantified propositions
   let stmt := ps.foldr (fun (t, _) acc => mkForall `h .default t acc) concl
@@ -1177,7 +1396,10 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   if ps.isEmpty then
     if let some (_, a, b) := concl.eq? then
       if a.approxDepth.toNat > 8 || b.approxDepth.toNat > 8 then
-        if let some p ← timed "local" (Local.diffEq (localProof cfg step.rule) (← IO.mkRef 6) a b) then
+        -- NOTE: a budget of tactic attempts on the differences, larger for the large statements (e.g., the many
+        -- simplifications of a CEK evaluation under the conditions of its conditionals)
+        let budget := if large then 24 else 6
+        if let some p ← timed "local" (Local.diffEq (localProof cfg step.rule) (← IO.mkRef budget) a b) then
           record step.rule "local"
           return ← mkExpectedTypeHint p concl
   -- theory lemmas over large terms: the subterms common to the literals are generalized (e.g., datatype

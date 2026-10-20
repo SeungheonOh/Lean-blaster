@@ -72,6 +72,19 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
   | .ok _ => return none
   | .error ex => return some m!"kernel rejected the reconstructed proof: {ex.toMessageData (← getOptions)}"
 
+/-- Run `x`, recording its start and its duration in the file given by `BLASTER_SMTPROOF_TRACE` (if set), e.g., to
+    locate the phases of a reconstruction that take long. -/
+def withReconTrace (phase : String) (x : TermElabM α) : TermElabM α := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" | x
+  let log (msg : String) : IO Unit := do
+    let h ← IO.FS.Handle.mk f .append
+    h.putStrLn s!"recon: {msg}"
+  log s!"{phase}"
+  let t0 ← IO.monoMsNow
+  let r ← x
+  log s!"{phase}: {(← IO.monoMsNow) - t0} ms"
+  return r
+
 /-- Record the outcome of the replay of an SMT proof (`kind`: `residual` or `obligation`) in the file given by
     `BLASTER_SMTPROOF_LOG` (JSON lines). -/
 def logSmtProof (kind : String) (res : Except String SmtProof.SmtProofResult) : TermElabM Unit := do
@@ -126,7 +139,11 @@ def checkedProof (checked : IO.Ref (Array (Name × Expr))) (goal proof : Expr) :
 def bySmtProofReplay (checked : IO.Ref (Array (Name × Expr))) (task : ReconTask) (kind : String) (goal : Expr) :
     TermElabM (Option (Expr × String)) := do
   let st ← saveState
-  let res ← tryCatchRuntimeEx (SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
+  -- NOTE: the auxiliary declarations of the replay (e.g., the definitional equations of recursive functions) are
+  -- checked by the kernel synchronously (`Elab.async` false), such that an ill-typed one fails the replay (instead of
+  -- an error reported after the reconstruction)
+  let res ← tryCatchRuntimeEx (withOptions (Elab.async.set · false) <| withReconTrace s!"{kind} replay" <|
+      SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
     (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
   let res ← match res with
     | .ok r =>
