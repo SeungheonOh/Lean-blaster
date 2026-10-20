@@ -323,12 +323,6 @@ partial def mkDefault (t : Expr) : MetaM Expr := do
     let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) t)
     return mkApp2 (mkConst ``Classical.ofNonempty [u]) t inst
 
-/-- The universe level `u` of `Univ.{u}`. -/
-def univLevel? (t : Expr) : Option Level :=
-  match t with
-  | .const ``Univ [u] => some u
-  | _ => none
-
 /-- Whether `t` is (or contains) the universe of the interpretation. -/
 def hasUniv (t : Expr) : Bool := (t.find? fun s => s.isConstOf ``Univ).isSome
 
@@ -803,6 +797,7 @@ partial def mkWorld (t d : Expr) : MetaM (Option (Expr × Expr)) := do
   if !hasUniv d then return none
   go t d
 where
+  /-- whether `t` is interpreted as itself -/
   same (t d : Expr) : MetaM Bool := do
     if t == d then return true
     withReducible (isDefEq t d)
@@ -814,7 +809,7 @@ where
     go t d
   go (t d : Expr) : MetaM (Option (Expr × Expr)) := do
     if ← same t d then return none
-    if let some u := univLevel? d then
+    if let .const ``Univ [u] := d then
       if ← isDefEq (← inferType t) (mkSort u) then
         return some (mkApp (mkConst ``inj [u]) t, mkApp (mkConst ``inj_injective [u]) t)
       return none
@@ -944,9 +939,11 @@ partial def worldInjective? (w : Expr) : MetaM (Option Expr) := do
         let some hb ← worldInjective? args[5]! | return none
         return some (← mkAppM ``liftFun_injective #[ha, hb, args[6]!])
   | .const ``List.map _ =>
-      if args.size == 3 then if let some h ← worldInjective? args[2]! then return some (← mkAppM ``listMap_injective #[h])
+      if args.size == 3 then
+        if let some h ← worldInjective? args[2]! then return some (← mkAppM ``listMap_injective #[h])
   | .const ``Option.map _ =>
-      if args.size == 3 then if let some h ← worldInjective? args[2]! then return some (← mkAppM ``optionMap_injective #[h])
+      if args.size == 3 then
+        if let some h ← worldInjective? args[2]! then return some (← mkAppM ``optionMap_injective #[h])
   | .const ``Prod.map _ =>
       if args.size == 6 then
         let some h₁ ← worldInjective? args[4]! | return none
