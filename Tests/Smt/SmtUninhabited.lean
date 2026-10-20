@@ -122,4 +122,57 @@ class ToNat (α : Type) where
 
 #blaster [ ∀ (p : Prop), p ∨ ((∃ (α : Type) (x y : α), x ≠ y) → ∃ (β : Type) (u v : β), u ≠ v) ]
 
+#blaster [ ∀ (p : Prop), p ∨ ∀ (n : Nat) (α : Type) (_a : α), (∀ (_x : α), n > 5) → n > 5 ]
+
+-- Not a theorem (for every `m` take `n := m`).
+-- Sort quantifier depending on a universal variable in the scope of an existential one:
+-- `unsat` is reported as `Undetermined`.
+#blaster (solve-result: 2)
+  [ ∃ (m : Nat), ∀ (n : Nat), n ≠ m ∨
+      ∀ (α : Type), (n = 0 → ∀ (_x : α), False) ∧ (n ≠ 0 → ∃ (_x : α), True) ]
+
+/-! Test cases to ensure that sort quantifiers in the propositions of ctor fields are soundly translated.
+    The predicate qualifier of a datatype is defined once and expanded at each of its applications,
+    whatever their polarity. -/
+
+structure FunRel where
+  f [LT α] : α → α
+  inv : ∀ (x y : α), [LT α] → x < y → f x < f y
+
+structure FunRelWrap where
+  r : FunRel
+  n : Nat
+
+-- predicate qualifier in negative position (see `Tests/FixedIssues/Issue15.lean`)
+#blaster [ ∀ (α : Type) (r : FunRel) (x y : α) [LT α], x < y → r.f x < r.f y ]
+
+-- nested predicate qualifier in negative position
+#blaster [ ∀ (α : Type) (w : FunRelWrap) (x y : α) [LT α], x < y → w.r.f x < w.r.f y ]
+
+-- predicate qualifier as function co-domain in negative position
+#blaster [ ∀ (α : Type) (g : Nat → FunRel) (x y : α) [LT α], x < y → (g 0).f x < (g 0).f y ]
+
+structure Positive where
+  n : Nat
+  inv : ∀ (α : Type), (∀ (_x : α), n > 5) → n > 5
+
+-- Not a theorem (`n > 5` for any `Positive`, take `α := Empty`).
+-- Predicate qualifier with a sort quantifier in positive position: `unsat` is reported as `Undetermined`.
+#blaster (solve-result: 2) [ ∃ (p : Positive), p.n = 0 ]
+
+-- Not a theorem (the hypothesis holds as `n > 5` for any `Positive`).
+-- Predicate qualifier with a sort quantifier in positive position: `unsat` is reported as `Undetermined`.
+#blaster (solve-result: 2) [ (∀ (p : Positive), p.n ≠ 0) → False ]
+
+structure MixedInv where
+  n : Nat
+  c : Bool
+  inv : c = true ↔ ∀ (α : Type), (n = 0 → ∀ (_x : α), False) ∧ (n = 1 → ∃ (_x : α), True)
+
+-- Not a theorem (`c = true ↔ n ≥ 2` for any `MixedInv`).
+-- Sort quantifier with mixed polarity depending on the predicate qualifier parameter:
+-- `unsat` is reported as `Undetermined`.
+#blaster (solve-result: 2)
+  [ ∀ (s t : MixedInv), s.n = 0 → t.n = 1 → s.c = true ∨ t.c = true ]
+
 end Test.SmtUninhabited

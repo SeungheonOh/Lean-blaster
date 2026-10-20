@@ -473,18 +473,30 @@ structure SmtEnv where
   polarity : Polarity
 
   /-- Non top level fvars bound by a quantifier that is universal w.r.t. the goal,
-      i.e., a `∀` in positive position or an `∃` in negative position (see `sortQuantifierMembership`).
+      i.e., a `∀` in positive position or an `∃` in negative position, and that is not in the scope
+      of a quantifier that is existential w.r.t. the goal (see `sortQuantifierMembership`).
   -/
   univFVars : Std.HashSet FVarId
 
-  /-- Flag set to `true` when a sort quantifier has been translated, as its translation depends on its
-      polarity. Expressions containing sort quantifiers are therefore not memoized in `translateCache`
-      (see `withTranslateEnvCache`).
+  /-- Flag set to `true` when translating the scope of a quantifier that is existential w.r.t. the goal
+      (i.e., a `∀` in negative position or an `∃` in positive position) or the body of a predicate qualifier
+      (see `withQualifierBody`). Variables bound in such a scope are not added to `univFVars`.
   -/
-  sortQuantifierSeen : Bool
+  underExistential : Bool
+
+  /-- Flag set to `true` when the translation of an expression depends on its polarity, e.g., when a sort quantifier
+      or a negative only predicate qualifier (see `negativeOnlyQualifiers`) has been translated.
+      Such expressions are not memoized in `translateCache` (see `withTranslateEnvCache`).
+  -/
+  polarityDependent : Bool
+
+  /-- Predicate qualifiers (i.e., `IndTypeDeclaration.instName`) that are only implied by the type
+      membership they characterize, i.e., that can only be used in negative position (see `withQualifierBody`).
+  -/
+  negativeOnlyQualifiers : Std.HashSet SmtSymbol
 
   /-- Flag set to `true` when a sort quantifier could not be soundly translated
-      (see `sortQuantifierMembership`). An `unsat` result is then reported as `Undetermined`.
+      (see `sortQuantifierMembership` and `checkQualifierPolarity`). An `unsat` result is then reported as `Undetermined`.
   -/
   unsupportedSortQuantifier : Bool
 
@@ -506,7 +518,9 @@ instance : Inhabited SmtEnv where
      funCtorCache := Std.HashMap.emptyWithCapacity,
      polarity := .mixed,
      univFVars := Std.HashSet.emptyWithCapacity,
-     sortQuantifierSeen := false,
+     underExistential := false,
+     polarityDependent := false,
+     negativeOnlyQualifiers := Std.HashSet.emptyWithCapacity,
      unsupportedSortQuantifier := false
    }
 

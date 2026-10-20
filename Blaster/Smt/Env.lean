@@ -120,20 +120,20 @@ def updateTranslateCache (a : Expr) (b : SmtTerm) : TranslateEnvT Unit := do
       - execute `b ← fun ()`
       - update cache with `a := b`
       - return b
-    The cache is not updated when a sort quantifier has been translated by `f ()`,
-    as the translation of a sort quantifier depends on its polarity (see `sortQuantifierMembership`).
+    The cache is not updated when the translation performed by `f ()` depends on the polarity of `a`
+    (e.g., `a` contains a sort quantifier), see `markPolarityDependent`.
 -/
 def withTranslateEnvCache (a : Expr) (f : Unit → TranslateEnvT SmtTerm) : TranslateEnvT SmtTerm := do
   let env ← get
   match env.smtEnv.translateCache.get? a with
   | some b => return b
   | none => do
-     let seen := env.smtEnv.sortQuantifierSeen
-     modify (fun env => { env with smtEnv.sortQuantifierSeen := false })
+     let seen := env.smtEnv.polarityDependent
+     modify (fun env => { env with smtEnv.polarityDependent := false })
      let b ← f ()
-     let seenInA := (← get).smtEnv.sortQuantifierSeen
+     let seenInA := (← get).smtEnv.polarityDependent
      unless seenInA do updateTranslateCache a b
-     modify (fun env => { env with smtEnv.sortQuantifierSeen := seen || seenInA })
+     modify (fun env => { env with smtEnv.polarityDependent := seen || seenInA })
      return b
 
 /-- Return the polarity of the next expression to be translated. -/
@@ -144,6 +144,30 @@ def withPolarity (p : Polarity) (k : TranslateEnvT α) : TranslateEnvT α := do
   let saved := (← get).smtEnv.polarity
   modify (fun env => { env with smtEnv.polarity := p })
   try k finally modify (fun env => { env with smtEnv.polarity := saved })
+
+/-- Specify that the translation of the current expression depends on its polarity
+    (see `withTranslateEnvCache` and `withQualifierBody`).
+-/
+def markPolarityDependent : TranslateEnvT Unit :=
+  modify (fun env => { env with smtEnv.polarityDependent := true })
+
+/-- Specify that a sort quantifier could not be soundly translated, i.e., an `unsat` result
+    is reported as `Undetermined` (see `sortQuantifierMembership` and `checkQualifierPolarity`).
+-/
+def setUnsupportedSortQuantifier : TranslateEnvT Unit :=
+  modify (fun env => { env with smtEnv.unsupportedSortQuantifier := true })
+
+/-- Execute `k` with `underExistential` set to `true` when `b` is `true`, i.e., when `k` translates the scope
+    of a quantifier that is existential w.r.t. the goal (see `univFVars`). The current flag is restored afterwards.
+-/
+def withUnderExistential [Monad m] [MonadLiftT TranslateEnvT m] [MonadFinally m]
+  (b : Bool) (k : m α) : m α := do
+  if !b then k
+  else
+    let saved := (← (get : TranslateEnvT TranslateEnv)).smtEnv.underExistential
+    let setFlag (v : Bool) : TranslateEnvT Unit := modify (fun env => { env with smtEnv.underExistential := v })
+    setFlag true
+    try k finally setFlag saved
 
 /-- Check if cancel token has been triggered and kill corresponding running
     Solver instance (if necessary).

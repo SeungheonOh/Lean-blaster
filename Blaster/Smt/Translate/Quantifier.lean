@@ -490,6 +490,25 @@ def getPredicateDeclaration (t : Expr) : TranslateEnvT (Option IndTypeDeclaratio
    | _ => pure e
 
 
+/-- Return `true` when `decl` is a negative only predicate qualifier (see `withQualifierBody`). -/
+def isNegativeOnlyQualifier (decl : IndTypeDeclaration) : TranslateEnvT Bool :=
+  return (← get).smtEnv.negativeOnlyQualifiers.contains decl.instName
+
+/-- Add predicate qualifier `instName` to the negative only predicate qualifiers (see `withQualifierBody`). -/
+def setNegativeOnlyQualifier (instName : SmtSymbol) : TranslateEnvT Unit :=
+  modify (fun env => { env with smtEnv.negativeOnlyQualifiers := env.smtEnv.negativeOnlyQualifiers.insert instName })
+
+/-- Given `decl` the predicate qualifier of a type `T` applied in polarity `pol` w.r.t. the goal,
+    set flag `unsupportedSortQuantifier` when `decl` is a negative only predicate qualifier and `pol` is not negative.
+    Indeed, a negative only predicate qualifier `@isT` only satisfies `x ∈ T → @isT x` (see `withQualifierBody`),
+    i.e., `@isT x` can only be assumed. The translation of the application then depends on `pol`
+    (see `markPolarityDependent`).
+-/
+def checkQualifierPolarity (decl : IndTypeDeclaration) (pol : Polarity) : TranslateEnvT Unit := do
+  unless (← isNegativeOnlyQualifier decl) do return
+  markPolarityDependent
+  unless pol == .negative do setUnsupportedSortQuantifier
+
 /-- Return `n` only when entry `t := decl` exists in `indTypeInstCache` and
     `decl.applyInstName := some n`.
     An error is triggered when:
@@ -504,20 +523,23 @@ def getApplyInstName (t : Expr) : TranslateEnvT SmtSymbol := do
         throwEnvError "getApplyInstName: @apply instance function expected to be defined for {reprStr t} !!!"
       return n
 
-/-- Given `st` an smt term and `t` its corresponding type expression, perform the following:
-     - retrieve predicate qualifier name `instName` for `t`
-     - return smt application (instName v)
+/-- Given `st` an smt term, `t` its corresponding type expression and `pol` the polarity of the
+    predicate qualifier application w.r.t. the goal, perform the following:
+     - retrieve predicate qualifier declaration `decl` for `t`
+     - check that `decl` can be applied in polarity `pol` (see `checkQualifierPolarity`)
+     - return smt application (decl.instName v)
     An error is triggered if the predicate qualifier name for `t` does not exists.
     Assume that there is no type abbreviation in `t`, i.e., call to `removeTypeAbbrev` has been applied.
 -/
-def createPredQualifierAppAux (st : SmtTerm) (t : Expr) : TranslateEnvT SmtTerm := do
+def createPredQualifierAppAux (st : SmtTerm) (t : Expr) (pol : Polarity) : TranslateEnvT SmtTerm := do
   let some decl ← getPredicateDeclaration t
     | throwEnvError "createPredQualifierApp: predicate declaration expected for {reprStr t}"
+  checkQualifierPolarity decl pol
   return (mkSimpleSmtAppN decl.instName #[st])
 
 /-- Same as `createPredQualifierAppAux` but accepts an SmtSymbol as argument. -/
-def createPredQualifierApp (smtSym : SmtSymbol) (t : Expr) : TranslateEnvT SmtTerm :=
-  createPredQualifierAppAux (smtSimpleVarId smtSym) t
+def createPredQualifierApp (smtSym : SmtSymbol) (t : Expr) (pol : Polarity) : TranslateEnvT SmtTerm :=
+  createPredQualifierAppAux (smtSimpleVarId smtSym) t pol
 
 /-- Given `xs := [x₀, ..., xₙ]` smt terms and `ts := [t₀, ..., tₙ]` their corresponding types,
     and `cstr` a co-domain constraint, return `(=> (@isType₀ x₀) ... (=> (@isTypeₙ xₙ) cstr))`.
@@ -527,6 +549,9 @@ def createPredQualifierApp (smtSym : SmtSymbol) (t : Expr) : TranslateEnvT SmtTe
       - `tᵢ` is a dependent type (i.e., has loose bound variables); or
       - `tᵢ` is a proposition; or
       - no predicate qualifier has been declared for `tᵢ`.
+    The domain qualifiers occur in positive position w.r.t. the goal (i.e., they restrict an assumed
+    co-domain constraint). Flag `unsupportedSortQuantifier` is therefore set when one of them is a negative only
+    predicate qualifier (see `checkQualifierPolarity`), whatever the polarity of the co-domain constraint.
 -/
 def guardWithDomainQualifiers (xs : Array SmtTerm) (ts : Array Expr) (cstr : SmtTerm) : TranslateEnvT SmtTerm := do
   let mut guards := #[]
@@ -534,6 +559,7 @@ def guardWithDomainQualifiers (xs : Array SmtTerm) (ts : Array Expr) (cstr : Smt
     let t := ts[i]
     if t.hasLooseBVars || (← isPropEnv t) then continue
     if let some decl ← getPredicateDeclaration t then
+      if ← isNegativeOnlyQualifier decl then setUnsupportedSortQuantifier
       guards := guards.push (mkSimpleSmtAppN decl.instName #[xs[i]!])
   return guards.foldr (fun g acc => impliesSmt g acc) cstr
 
@@ -601,6 +627,14 @@ def guardWithDomainQualifiers (xs : Array SmtTerm) (ts : Array Expr) (cstr : Smt
     Indeed, functions of distinct instances share the same smt sort and the co-domain constraint is
     trivially satisfied by any function when the domain is empty. The membership predicate is then
     asserted for each lambda term (see `translateLambda`).
+    When the co-domain qualifier `@isTypeₙ` is a negative only predicate qualifier (see `withQualifierBody`),
+    i.e., `@isTypeₙ` is only implied by the membership to type `αₙ`:
+      - `@is{instName}` is also a negative only predicate qualifier when it is defined by the co-domain constraint
+        (i.e., `isMembership` set to `false`), as `@is{instName} @f` is then only implied by the membership of `@f`
+        to the function type;
+      - otherwise, `@is{instName}` is uninterpreted and the co-domain constraint is only assumed, which remains
+        satisfied by any function of the function type.
+    Domain qualifiers are handled by `guardWithDomainQualifiers`.
 -/
 def generateFunInstDeclAux (t : Expr) (st : SortExpr) : TranslateEnvT IndTypeDeclaration := do
   let t' ← removeClassConstraintsInFunType t
@@ -664,7 +698,12 @@ def generateFunInstDeclAux (t : Expr) (st : SortExpr) : TranslateEnvT IndTypeDec
        arg_quantifiers := (arg_quantifiers.push (xsyms[i]!, smtTypes[i]!)).push (ysyms[i]!, smtTypes[i]!)
      -- isFun constraint
      -- Need to remove outParam on return type (if necessary) (see, translateLambda)
-     let coDomainCstr ← createPredQualifierAppAux f_applyTerm1 (removeOutParam funTypes[nbTypes]!)
+     let coDomainType := removeOutParam funTypes[nbTypes]!
+     let some coDomainDecl ← getPredicateDeclaration coDomainType
+       | throwEnvError "generateFunInstDeclAux: predicate declaration expected for {reprStr coDomainType}"
+     -- negative only co-domain qualifier (see note above)
+     if !isMembership && (← isNegativeOnlyQualifier coDomainDecl) then setNegativeOnlyQualifier instName
+     let coDomainCstr := mkSimpleSmtAppN coDomainDecl.instName #[f_applyTerm1]
      let domainTypes := funTypes.extract 0 nbTypes
      let coDomainCstr ← guardWithDomainQualifiers xIds domainTypes coDomainCstr
      let forallCoDomain := mkForallTerm none co_quantifiers coDomainCstr none
@@ -944,6 +983,45 @@ def translateInductiveType
      ctorDecls := ctorDecls.push ctorDecl
    return ctorDecls
 
+/-- Given `instName` the predicate qualifier `@isT` of an inductive datatype instance `T`, execute `k`
+    translating a proposition `p` of a ctor field of `T` in the body of `@isT` (see `generatePredicateAssertions`),
+    such that:
+      - `p` is translated in negative position, i.e., as if `@isT @x` were a hypothesis;
+      - flag `underExistential` is set to `true`, i.e., no variable bound in `p` is universal w.r.t. the goal
+        (see `univFVars`), as `@isT` may be applied in the scope of any quantifier;
+      - `instName` is added to `negativeOnlyQualifiers` when the translation of `p` depends on its polarity
+        (see `markPolarityDependent`), e.g., when `p` contains a sort quantifier.
+    `@isT` is defined once (i.e., `define-fun`) and expanded at each of its applications, which may occur in
+    any polarity. A polarity dependent translation of `p` is therefore only sound when `@isT` is applied in
+    negative position. For instance, given
+      `structure T where f : Nat → Nat; inv : ∀ (α : Type) (x y : α), ...`
+    the sort quantifier `∀ α` in field `inv` is existential w.r.t. the goal when `@isT` is a hypothesis
+    and is then instantiated with the universal sort `@@Type` (see `sortQuantifierMembership`).
+    The resulting `@isT` is only implied by the membership to `T` (i.e., `x ∈ T → @isT x`). It is a negative only
+    predicate qualifier and applying it in a non negative position sets flag `unsupportedSortQuantifier`
+    (see `checkQualifierPolarity`).
+
+    NOTE: A ctor selector in `p` (i.e., `C.i @x`) refers to the parameter `@x` of `@isT`, which may be
+    instantiated with any term (e.g., an existentially quantified variable) at an application of `@isT`.
+    A sort quantifier in `p` depending on a ctor selector is therefore never closed (see `isClosedSortScope`).
+-/
+def withQualifierBody (instName : SmtSymbol) (k : TranslateEnvT α) : TranslateEnvT α := do
+  let env := (← get).smtEnv
+  let (pol, underExistential, polDependent) := (env.polarity, env.underExistential, env.polarityDependent)
+  modify (fun env =>
+    { env with smtEnv.polarity := .negative, smtEnv.underExistential := true, smtEnv.polarityDependent := false })
+  try
+    let r ← k
+    if (← get).smtEnv.polarityDependent then setNegativeOnlyQualifier instName
+    return r
+  finally
+    -- NOTE: the qualifier body is not part of the expression being currently translated
+    modify (fun env =>
+      { env with
+          smtEnv.polarity := pol,
+          smtEnv.underExistential := underExistential,
+          smtEnv.polarityDependent := polDependent })
+
 /-- Given an instantiated inductive data type `t x₁ ... xₙ`, generate it's corresponding
     predicate qualifier predicate and propositional assertions when instance is not already
     in `indTypeInstCache`. In particular,
@@ -965,6 +1043,11 @@ def translateInductiveType
                  with ∀ i ∈ [1..n],
                         (isProp pᵢ → predTermᵢ = `(= (C.i @x) (← termTranslator (← optimizeExpr pᵢ)))`) ∧
                         (¬ isProp pᵢ → predTermᵢ = `(isTypeᵢ (C.i @x))`)
+    The propositions `pᵢ` are translated with `withQualifierBody`. The predicate qualifier of `t x₁ ... xₙ`
+    is a negative only predicate qualifier (see `withQualifierBody`) when the translation of one of the `pᵢ`
+    depends on its polarity or when one of the `isTypeᵢ` is a negative only predicate qualifier.
+    Indeed, the `isTypeᵢ (C.i @x)` occur in positive position w.r.t. the predicate qualifier body.
+    All the datatypes of a mutual block have a negative only predicate qualifier as soon as one of them has one.
     TODO: UPDATE SPEC
 -/
 partial def defineInstPredicateQualifier
@@ -1005,6 +1088,9 @@ where
                  (fun n => Prod.mk n <$> generateIndInstDecl (mkConst n l) args none typeTranslator)
                  indVal.all
        for d in decls do generatePredicates d.1 l d.2 args (mutualRec := true)
+       -- negative only predicate qualifiers in the mutual block (see `withQualifierBody`)
+       if ← decls.anyM (fun d => isNegativeOnlyQualifier d.2) then
+         for d in decls do setNegativeOnlyQualifier d.2.instName
      else
        -- define predicate qualifier for single inductive datatype
        let decl ← generateIndInstDecl t args none typeTranslator (declarePredicate := indVal.isRec)
@@ -1051,18 +1137,26 @@ where
     | some decl =>
         if currDecl.instName == decl.instName
         then return appendSymbol decl.instName "LRec"
-        else return decl.instName
+        else propagateNegativeOnly decl currDecl
     | none =>
         if t.isForall then -- function ctor parameter
           withInstantiatedImplicitArgs t fun t' => do
             let decl ← generateFunInstDeclAux t' (← typeTranslator t')
-            return decl.instName
+            propagateNegativeOnly decl currDecl
         else -- other inductive datatype
           let (f, args) := getAppFnWithArgs t
           defineInstPredicateQualifier typeTranslator termTranslator f args
           let some decl ← getPredicateDeclaration t
             | throwEnvError "predicate qualifier name expected for {reprStr t}"
-          return decl.instName
+          propagateNegativeOnly decl currDecl
+
+  /-- Given `decl` the predicate qualifier of a ctor field type in the body of predicate qualifier `currDecl`,
+      set `currDecl` as a negative only predicate qualifier when `decl` is one (see `withQualifierBody`)
+      and return `decl.instName`.
+  -/
+  propagateNegativeOnly (decl : IndTypeDeclaration) (currDecl : IndTypeDeclaration) : TranslateEnvT SmtSymbol := do
+    if ← isNegativeOnlyQualifier decl then setNegativeOnlyQualifier currDecl.instName
+    return decl.instName
 
 
   generatePredicateAssertions
@@ -1088,7 +1182,8 @@ where
         if (← isPropEnv decl.type) then
           let optExpr ← optimizeExpr' decl.type
           -- apply substitue list on optExpr before translation
-          let propTerm ← termTranslator (substituteList.foldr (fun a acc => acc.replace (substitutePred a)) optExpr)
+          let propTerm ← withQualifierBody declInd.instName $
+            termTranslator (substituteList.foldr (fun a acc => acc.replace (substitutePred a)) optExpr)
           predTermCond := updatePredTerm predTermCond (andSmt (eqSmt selTerms.2 propTerm) selTerms.2)
         else
           -- resolve type abbreviation first
@@ -1333,8 +1428,11 @@ def initialQuantifierEnv (topLevel : Bool) (polarity := Polarity.mixed) : Quanti
         pattern matching (i.e., declared at the top level when translated); or
       - a proof or a class constraint (for which only their types are considered); or
       - a variable in `univFVars` only when `allowUniv` is set to `true`.
+    `false` is also returned when `scope` contains a ctor selector, i.e., when `α` is in the body of a predicate
+    qualifier and depends on the qualifier parameter (see `withQualifierBody`).
 -/
 def isClosedSortScope (scope : Array Expr) (bound : Array Expr) (allowUniv : Bool) : TranslateEnvT Bool := do
+  if scope.any (fun e => (e.find? isTaggedCtorSelector).isSome) then return false
   let bound := bound.foldl (fun acc v => acc.insert v.fvarId!) (Std.HashSet.emptyWithCapacity : Std.HashSet FVarId)
   let mut todo := (scope.foldl (fun acc e => collectFVars acc e) {}).fvarIds
   let mut visited := (Std.HashSet.emptyWithCapacity : Std.HashSet FVarId)
@@ -1354,8 +1452,12 @@ def isClosedSortScope (scope : Array Expr) (bound : Array Expr) (allowUniv : Boo
     | none => if (← isPatternMatchFVar v) then return false
   return true
 
-/-- Add `v` to the set of non top level fvars bound by a quantifier that is universal w.r.t. the goal. -/
-def addUnivFVar (v : Expr) : TranslateEnvT Unit :=
+/-- Given `v` a non top level fvar bound by a quantifier that is universal w.r.t. the goal,
+    add `v` to `univFVars` only when `v` is not in the scope of a quantifier that is existential
+    w.r.t. the goal (see `underExistential`).
+-/
+def addUnivFVar (v : Expr) : TranslateEnvT Unit := do
+  if (← get).smtEnv.underExistential then return
   modify (fun env => { env with smtEnv.univFVars := env.smtEnv.univFVars.insert v.fvarId! })
 
 /-- Given a sort variable `α` bound by a non top level quantifier, with
@@ -1371,10 +1473,19 @@ def addUnivFVar (v : Expr) : TranslateEnvT Unit :=
           `α` is instantiated with `@@Type`, which is sound as `e[α/@@Type]` implies `∃ α, e`
           (resp. `∀ α, e` implies `e[α/@@Type]`) whatever the enclosing quantifiers.
       - Universal quantifier w.r.t. `G` (i.e., `∀ α` in positive position or `∃ α` in negative position):
-          `α` gets a global (i.e., declared at the top level) membership predicate when `α` does not depend on any
-          variable bound by an existential quantifier w.r.t. `G` (i.e., `isClosedSortScope scope bound true`).
-          This is sound as `∀ α` can then be moved to the top level of the goal (i.e., `α` is skolemized
-          in the negated goal), e.g., `p ∨ ∀ (x : Nat) (α : Type), e` is equivalent to `∀ (α : Type), p ∨ ∀ (x : Nat), e`.
+          `α` gets a global (i.e., declared at the top level) membership predicate when `α` only depends on
+          top level variables, sort variables and variables in `univFVars` (i.e., `isClosedSortScope scope bound true`),
+          that is, variables bound by a universal quantifier w.r.t. `G` that is not in the scope of an existential
+          quantifier w.r.t. `G`.
+          This is sound as `∀ α` can then be moved to the top level of the goal (i.e., `α` is skolemized with
+          a constant in the negated goal). Indeed, `∀ α` commutes with any connective in a non mixed position and
+          with any quantifier not binding a variable of its scope (e.g., `∃ x, p x ∨ ∀ α, e` is equivalent to
+          `∀ α, ∃ x, p x ∨ e` when `x` does not occur in `e`). It can therefore be moved right after the innermost
+          quantifier binding a variable it depends on, which is only in the scope of universal quantifiers,
+          e.g., `p ∨ ∀ (x : Nat) (α : Type), e` is equivalent to `∀ (α : Type), p ∨ ∀ (x : Nat), e`.
+          Depending on a universal variable in the scope of an existential quantifier is unsound, e.g., for
+          `∃ m, ∀ n, n ≠ m ∨ ∀ α, e`, with `n` occurring in `e`, the type witnessing `¬ e` in the negated goal
+          depends on `m` (i.e., `α` is skolemized with a function of `m`).
           Instantiating `α` with `@@Type` is unsound in this case as `@@Type` can never be empty.
       - Mixed polarity (e.g., `(∀ α, e) ↔ p`):
           `α` gets a global membership predicate `@is@α` when the quantified expression only depends on
@@ -1387,17 +1498,20 @@ def addUnivFVar (v : Expr) : TranslateEnvT Unit :=
     In any other case, `α` is instantiated with `@@Type` and flag `unsupportedSortQuantifier` is set
     such that an `unsat` result is reported as `Undetermined`.
 
+    In the body of a predicate qualifier `@isT`, `pol` is the polarity w.r.t. the goal when `@isT` is applied
+    in negative position. `@isT` is then a negative only predicate qualifier (see `withQualifierBody`).
+
     NOTE: The translation of an expression containing sort quantifiers depends on its polarity and is therefore
     not memoized (see `withTranslateEnvCache`).
 -/
 def sortQuantifierMembership
   (pol : Polarity) (isForall : Bool) (scope : Array Expr) (bound : Array Expr) : TranslateEnvT Bool := do
-  modify (fun env => { env with smtEnv.sortQuantifierSeen := true })
+  markPolarityDependent
   let isUniv := (isForall && pol == .positive) || (!isForall && pol == .negative)
   let isExists := (isForall && pol == .negative) || (!isForall && pol == .positive)
   if isExists then return false
   if ← isClosedSortScope scope bound isUniv then return true
-  modify (fun env => { env with smtEnv.unsupportedSortQuantifier := true })
+  setUnsupportedSortQuantifier
   return false
 
 /-- Translate a quantifier `(n : t)` by performing the following actions:
@@ -1416,12 +1530,14 @@ def sortQuantifierMembership
 
     Assume that `t` is not a proposition (i.e., !(← isPropEnv t)) nor a class constraint.
     An error is triggered if `n` is not an `fvar` expression.
+    `qualifierPol` is the polarity w.r.t. the goal of the predicate qualifier premise generated for `n`
+    (see `checkQualifierPolarity`), i.e., the opposite of the polarity of a `∀` and the polarity of an `∃`.
 
     TODO: UPDATE SPEC
 -/
 def translateQuantifier
   (n : Expr) (t : Expr) (termTranslator : Expr → TranslateEnvT SmtTerm)
-  (sortMembership := false) : QuantifierEnvT Unit := do
+  (sortMembership := false) (qualifierPol := Polarity.mixed) : QuantifierEnvT Unit := do
  let Expr.fvar v := n | throwEnvError "translateQuantifier: FVarExpr expected but got {reprStr n}"
  -- update quantified fvars cache
  updateQuantifiedFVarsCache v (← get).topLevel
@@ -1446,7 +1562,7 @@ def translateQuantifier
 
  where
    updatePredicateQualifiers (t : Expr) (smtSym : SmtSymbol) : QuantifierEnvT Unit := do
-     let pTerm ← withPolarity .mixed (createPredQualifierApp smtSym t)
+     let pTerm ← createPredQualifierApp smtSym t qualifierPol
      modify (fun env => { env with premises := env.premises.push pTerm})
 
    updateQuantifiers (smtSym : SmtSymbol) (smtType: SortExpr) : QuantifierEnvT Unit := do
@@ -1461,35 +1577,38 @@ def translateForAll
    let pol := (← get).polarity
    -- premises are translated once all sort variables with a membership predicate are known
    let deferPremises ← pure topLevel <||> fvars.anyM (fun v => return (← inferTypeEnv v).isType)
-   let mut deferredPremises := #[]
-   let mut sortVars := #[]
-   for h : i in [:fvars.size] do
-     let v := fvars[i]
-     let decl ← getFVarLocalDecl v
-     if (← isPropEnv decl.type) then
-       if deferPremises then deferredPremises := deferredPremises.push decl.type
-       else updatePremises (← withPolarity pol.flip (termTranslator decl.type))
-     -- need to filter out class constraints
-     else if !(← isClassConstraintExpr decl.type) then
-       if decl.type.isType then
-         let membership ←
-           if topLevel then pure true
-           else
-             let scope ← (fvars.extract (i+1) fvars.size).mapM (fun v => inferTypeEnv v)
-             sortQuantifierMembership pol (isForall := true) (scope.push b) (fvars.extract i fvars.size)
-         translateQuantifier v decl.type termTranslator membership
-         if membership then sortVars := sortVars.push v
-       else
-         translateQuantifier v decl.type termTranslator
-         if !topLevel && pol == .positive then addUnivFVar v
-   for h : i in [:deferredPremises.size] do
-     let p := deferredPremises[i]
-     let mut pTerm ← withPolarity pol.flip (termTranslator p)
-     for pInst in (← instantiateSortHyp p sortVars) do
-       pTerm := andSmt pTerm (← withPolarity pol.flip (termTranslator pInst))
-     updatePremises pTerm
-   let fbody ← withPolarity pol (termTranslator b)
-   genForAllTerm fbody
+   -- quantifier not universal w.r.t. the goal (see `univFVars`)
+   let existential ← pure (pol != .positive) <&&> fvars.anyM (fun v => isQuantifiedVar v)
+   withUnderExistential existential do
+     let mut deferredPremises := #[]
+     let mut sortVars := #[]
+     for h : i in [:fvars.size] do
+       let v := fvars[i]
+       let decl ← getFVarLocalDecl v
+       if (← isPropEnv decl.type) then
+         if deferPremises then deferredPremises := deferredPremises.push decl.type
+         else updatePremises (← withPolarity pol.flip (termTranslator decl.type))
+       -- need to filter out class constraints
+       else if !(← isClassConstraintExpr decl.type) then
+         if decl.type.isType then
+           let membership ←
+             if topLevel then pure true
+             else
+               let scope ← (fvars.extract (i+1) fvars.size).mapM (fun v => inferTypeEnv v)
+               sortQuantifierMembership pol (isForall := true) (scope.push b) (fvars.extract i fvars.size)
+           translateQuantifier v decl.type termTranslator membership
+           if membership then sortVars := sortVars.push v
+         else
+           translateQuantifier v decl.type termTranslator (qualifierPol := pol.flip)
+           if !topLevel && pol == .positive then addUnivFVar v
+     for h : i in [:deferredPremises.size] do
+       let p := deferredPremises[i]
+       let mut pTerm ← withPolarity pol.flip (termTranslator p)
+       for pInst in (← instantiateSortHyp p sortVars) do
+         pTerm := andSmt pTerm (← withPolarity pol.flip (termTranslator pInst))
+       updatePremises pTerm
+     let fbody ← withPolarity pol (termTranslator b)
+     genForAllTerm fbody
 
  where
    /-- Given `p := ∀ (β₁ : t₁) ... (βₙ : tₙ), e` a premise with `β₁ ... βₙ` sort variables
@@ -1514,6 +1633,13 @@ def translateForAll
            else if e != p then res := res.push e
        | _ => if e != p then res := res.push e
      return res
+
+   /-- Return `true` when `v` is translated as a quantified variable, i.e., `v` is neither a sort variable,
+       nor a proof, nor a class constraint.
+   -/
+   isQuantifiedVar (v : Expr) : TranslateEnvT Bool := do
+     let t ← inferTypeEnv v
+     return !t.isType && !(← isPropEnv t) && !(← isClassConstraintExpr t)
 
    genForAllTerm (fbody : SmtTerm) : QuantifierEnvT SmtTerm := do
     let env ← get
@@ -1560,7 +1686,8 @@ def translateFreeVar
    let smtType ← translateTypeAux termTranslator t'
    let smtSym ← fvarIdToSmtSymbol v
    declareConst smtSym smtType -- declare free variable at top level
-   let pTerm ← createPredQualifierApp smtSym t'
+   -- asserted predicate qualifier is in negative position
+   let pTerm ← createPredQualifierApp smtSym t' .negative
    assertTerm pTerm
    return (smtSimpleVarId smtSym)
 
