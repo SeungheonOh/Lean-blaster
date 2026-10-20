@@ -15,7 +15,7 @@ partial def eraseMatchRhsRewriteCache (mInfo : MatchInfo) : TranslateEnvT Unit :
     else
       freeRewriteCacheReuse mInfo.nameExpr (idx - offset)
       visit (idx + 1) stop offset
-  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _⟩, _, _, _⟩ := (← get).optEnv
+  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _, _⟩, _, _, _⟩ := (← get).optEnv
   if (← memCache.contextReuseCache.findRaw mInfo.nameExpr 0 curCtx).isSome then
     let start := mInfo.getFirstAltPos.toUSize
     visit start mInfo.arity.toUSize start
@@ -142,9 +142,13 @@ partial def isPatternMatch (lhs : Expr) (rhs : Expr) : TranslateEnvT MatchResult
            then return .NoMatch
            else return .PotentialMatch -- case when rhs is an expression
 
-  | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) pn) pe) _ph =>
+  | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) t) pn) pe) ph =>
        -- assigning named pattern mvars
-       assignMVar pn (← getNamedPatternExpr pe)
+       let np ← getNamedPatternExpr pe
+       assignMVar pn np
+       -- assigning named pattern hypothesis with `Eq.Refl`
+       let lvl ← getLevelEnv t
+       assignMVar ph (← mkApp2Expr (← mkEqRefl [lvl]) t np)
        isPatternMatch pe rhs
 
   | Expr.app f1 a1 =>
@@ -312,12 +316,12 @@ def reduceMatch? (args : Array Expr) (mInfo : MatchInfo) (resolveArgs := false) 
      go mInfo.getFirstDiscrPos mInfo.getFirstAltPos
 
     resolveArgsWithEqualityStack (args : Array Expr) : TranslateEnvT (Array Expr) := do
-     let ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, _, _, ⟨_, _, _, _, _, _, active, _⟩, _, _, _⟩ := (← get).optEnv
+     let ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, _, _, ⟨_, _, _, _, _, _, active, _, _⟩, _, _, _⟩ := (← get).optEnv
      let rec visit (idx : Nat) (stop : Nat) (args : Array Expr) : TranslateEnvT (Array Expr) := do
        if idx ≥ stop then return args
        else
          match (← ContextMap.findRaw equalityMap active args[idx]!) with
-         | some r => visit (idx + 1) stop (args.set! idx r)
+         | some r => visit (idx + 1) stop (args.set! idx r.rhs)
          | none => visit (idx + 1) stop args
      if resolveArgs then visit mInfo.getFirstDiscrPos mInfo.getFirstAltPos args
      else return args
@@ -497,7 +501,7 @@ private def propagateNotEqPatternContext (discr : Expr) (nextCtxId : CtxId) : Tr
         let refEntry ← IO.mkRef [(nextCtxId, pset)]
         modifyOptEnv
           fun ⟨o1, o2, o3, o4, o5, o6, o7, o8, matchInContext, o10, o11, o12, o13, o14⟩ =>
-              ⟨o1, o2, o3, o4, o5, o6, o7, o8, matchInContext.insert v refEntry, o10, o11, o12, o13, o14⟩
+              ⟨o1, o2, o3, o4, o5, o6, o7, o8, matchInContext.insert v.rhs refEntry, o10, o11, o12, o13, o14⟩
 
 def isFVarPattern (e : Expr) : Bool :=
  match e with
@@ -506,11 +510,20 @@ def isFVarPattern (e : Expr) : Bool :=
  | _ => false
 
 
+def updateEqMapWithNamedPattern
+  (t : Expr) (pn : Expr) (pe : Expr) (ph : Expr) (nextCtxId : CtxId) : TranslateEnvT Unit := do
+  let pe' ← removeNamedPatternExpr pe
+  updateEqualityMap pn pe' nextCtxId (restart := true)
+  -- Adding name pattern hypothesis to equality map
+  let lvl ← getLevelEnv t
+  let eqRefl ← mkApp2Expr (← mkEqRefl [lvl]) t pe'
+  updateEqualityMap ph eqRefl nextCtxId (restart := true)
+
+
 def addNamedPatternToEqualityMap (p : Expr) (nextCtxId : CtxId) (updatedCtx : Bool) : TranslateEnvT Bool := do
   match p with
-  | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) pn) pe) _ph =>
-       let pe' ← removeNamedPatternExpr pe
-       updateEqualityMap pn pe' nextCtxId
+  | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) t) pn) pe) ph =>
+       updateEqMapWithNamedPattern t pn pe ph nextCtxId
        addNamedPatternToEqualityMap pe nextCtxId true
   | Expr.app f a =>
        addNamedPatternToEqualityMap a nextCtxId (← addNamedPatternToEqualityMap f nextCtxId updatedCtx)
@@ -592,8 +605,8 @@ partial def unifyAndUpdateEqMap (lhs : Expr) (rhs : Expr) (nextCtxId : CtxId) (u
               | [] => return true
               | (lhs', rhs') :: xs => visit lhs' rhs' xs true
 
-    | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) pn) pe) _ph =>
-        updateEqualityMap pn (← removeNamedPatternExpr pe) nextCtxId
+    | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) t) pn) pe) ph =>
+        updateEqMapWithNamedPattern t pn pe ph nextCtxId
         visit pe rhs stk true
 
     | Expr.app f1 a1 =>
@@ -617,8 +630,8 @@ partial def unifyAndUpdateEqMap (lhs : Expr) (rhs : Expr) (nextCtxId : CtxId) (u
                else
                  updateEqualityMap rhs (← removeNamedPatternExpr lhs) nextCtxId
                  match stk with
-                 | [] => return updatedCtx
-                 | (lhs', rhs') :: xs => visit lhs' rhs' xs updatedCtx
+                 | [] => return true
+                 | (lhs', rhs') :: xs => visit lhs' rhs' xs true
 
           | Expr.app f2 a2 =>
               match f1, f2 with
@@ -662,7 +675,7 @@ partial def unifyAndUpdateEqMap (lhs : Expr) (rhs : Expr) (nextCtxId : CtxId) (u
                    | _ => return updatedCtx -- unreachable
 
               | _, _ =>
-                if ← isCtorExpr f2.getAppFn then
+                if ← (pure $ exprEq f1 f2) <||> isCtorExpr f2.getAppFn then
                    visit f1 f2 ((a1, a2) :: stk) updatedCtx
                 else if !(← isInductiveTypeExpr rhs) then
                   -- case when rhs is an expression
@@ -733,7 +746,7 @@ partial def optimizeMatchAlt
        return .InitOptimizeExpr body :: .MatchAltWaitForExpr reuse.fvars (some reuse.scope) currIdx matchInst :: stack
   | none =>
        let alts ← getMatchAlts args mInfo
-       let ⟨_, ⟨_, _, _, _, _, _, _, _, _,_, ⟨_, _, _, _, _, nextCtxId, _, _⟩, _, _, _⟩⟩ ← get
+       let ⟨_, ⟨_, _, _, _, _, _, _, _, _,_, ⟨_, _, _, _, _, nextCtxId, _, _, _⟩, _, _, _⟩⟩ ← get
        let updatedMCtx ← addNotEqPatternToContext args mInfo alts 0 currIdx nextCtxId false
        forallTelescope alts[currIdx]! fun xs b => do
          let lhs := b.getAppArgs
@@ -842,7 +855,7 @@ where
 
   @[always_inline, inline]
   lastPatternReduction? (mInfo : MatchInfo) (args : Array Expr) : TranslateEnvT (Option MatchElimResult) := do
-     let ⟨_, _, _, _, _, _, _, _, matchInContext, _, ⟨_, _, _, _, _, _, active, _⟩, _, _, _⟩ := (← get).optEnv
+     let ⟨_, _, _, _, _, _, _, _, matchInContext, _, ⟨_, _, _, _, _, _, active, _, _⟩, _, _, _⟩ := (← get).optEnv
      let h := (← get).optEnv.matchInContext
      let alts ← getMatchAlts args mInfo
      for i in [:alts.size - 1] do

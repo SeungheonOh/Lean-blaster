@@ -643,7 +643,7 @@ def isNotFunAux (e : Expr) : TranslateEnvT Bool := do
         if (← isMatchExpr e) then return true
         isClassConstraint n
  | .opaqueInfo _
- | .axiomInfo _ => return (← inferTypeEnv e).isForall
+ | .axiomInfo _ => return !(← inferTypeEnv e).isForall
  | _ => return true
 
 /-- Same as isNotFunAux but caches the result. -/

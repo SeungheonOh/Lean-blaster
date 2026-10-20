@@ -434,6 +434,12 @@ def isFalseExpr (e : Expr) : Bool :=
  | _ => false
 
 
+@[always_inline, inline]
+def isNamedPatternExpr (e : Expr) : Bool :=
+  match e with
+  | Expr.const ``namedPattern _ => true
+  | _ => false
+
 /-- Determine if `e` is an boolean `==` expression and return its corresponding arguments.
     Otherwise return `none`.
 -/

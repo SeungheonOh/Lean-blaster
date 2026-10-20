@@ -33,6 +33,7 @@ def optimizePattern (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
   | Expr.const ``Int.neg _ => optimizeIntNeg f args
   | _ => mkAppNExpr f args
 
+
 /-- Remove all namedPattern expression in `p` and apply optimizePattern whenever necessary.
     TODO: change function to pure tail rec call using stack-based approach
 -/
@@ -117,15 +118,15 @@ private partial def mkCstLet
    (e : Expr) (t : Expr) (k : Expr → TranslateEnvT Expr) := do
    if isCstLiteral e then return (← k t) -- case: isIntNatStrCst(e)
    match e with
-   | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) np@(Expr.fvar fv)) pe) _h
+   | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) pn) pe) _h
    | Expr.app (Expr.app (Expr.const ``Nat.add _) (Expr.lit (Literal.natVal _)))
-      (Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) np@(Expr.fvar fv)) pe) _h) =>
+      (Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) pn) pe) _h) =>
       -- case: e = namedPattern t n pe h
       -- case: e = N + (namedPattern t n pe h) ∧ Type(N) = Nat
       mkCstLet pe t
         fun t' => do
-          modifyFVarValue fv (← removeNamedPatternExpr pe)
-          k (← mkLetFVarsExpr #[np] t')
+          modifyFVarValue pn.fvarId! (← removeNamedPatternExpr pe)
+          k (← mkLetFVarsExpr #[pn] t')
 
    | Expr.app (Expr.const ``Int.ofNat _) pe
    | Expr.app (Expr.const ``Int.neg _) pe =>
@@ -170,14 +171,15 @@ private partial def mkLet
       modifyFVarValue fv e
       k (← mkLetFVarsExpr #[p] t)
 
-  | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) np@(Expr.fvar fv)) pe) _h =>
+  | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) pn) pe) _h =>
       -- case: p := namedPattern s n pe h
-      mkLet np pe t
+      mkLet pn pe t
        fun t' => do
-         modifyFVarValue fv e
-         k (← mkLetFVarsExpr #[np] t')
+         modifyFVarValue pn.fvarId! e
+         k (← mkLetFVarsExpr #[pn] t')
 
-  | Expr.app (Expr.app (Expr.const ``Nat.add _) n@(Expr.lit (Literal.natVal _))) a =>
+  | Expr.app (Expr.app (Expr.const ``Nat.add _) n) a =>
+      if !(isNatValue n) then throwEnvError "mkLet: unexpected pattern expression: {reprStr p}"
       let v ← mkApp2Expr (← mkNatSubOp) e n
       match a with
       | Expr.fvar fv =>
@@ -185,11 +187,11 @@ private partial def mkLet
           modifyFVarValue fv v
           k (← mkLetFVarsExpr #[a] t)
 
-      | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) np@(Expr.fvar fv)) pe) _h =>
-          mkLet np pe t
+      | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) pn) pe) _h =>
+          mkLet pn pe t
             fun t' => do
-              modifyFVarValue fv v
-              k (← mkLetFVarsExpr #[np] t')
+              modifyFVarValue pn.fvarId! v
+              k (← mkLetFVarsExpr #[pn] t')
 
       | _ => throwEnvError "mkLet: unexpected pattern expression: {reprStr p}"
 
@@ -201,14 +203,15 @@ private partial def mkLet
             modifyFVarValue fv v
             k (← mkLetFVarsExpr #[a] t)
 
-       | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) np@(Expr.fvar fv)) pe) _h =>
+       | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _t) pn) pe) _h =>
             -- case: p = Int.ofNat (namedPattern s n pe t)
-            mkLet np pe t
+            mkLet pn pe t
               fun t' => do
-                modifyFVarValue fv v
-                k (← mkLetFVarsExpr #[np] t')
+                modifyFVarValue pn.fvarId! v
+                k (← mkLetFVarsExpr #[pn] t')
 
-       | Expr.app (Expr.app (Expr.const ``Nat.add _) n@(Expr.lit (Literal.natVal _))) b =>
+       | Expr.app (Expr.app (Expr.const ``Nat.add _) n) b =>
+           if !(isNatValue n) then throwEnvError "mkLet: unexpected pattern expression: {reprStr p}"
            let bv ← mkApp2Expr (← mkNatSubOp) (← mkAppExpr (← mkIntToNatOp) e) n
            match b with
            | Expr.fvar fv =>
@@ -216,12 +219,12 @@ private partial def mkLet
                modifyFVarValue fv bv
                k (← mkLetFVarsExpr #[b] t)
 
-           | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) np@(Expr.fvar fv)) pe) _h =>
+           | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) pn) pe) _h =>
                -- case: p = Int.ofNat (N + namedPattern s n pe h)
-                mkLet np pe t
+                mkLet pn pe t
                   fun t' => do
-                    modifyFVarValue fv bv
-                    k (← mkLetFVarsExpr #[np] t')
+                    modifyFVarValue pn.fvarId! bv
+                    k (← mkLetFVarsExpr #[pn] t')
 
            | _ => throwEnvError "mkLet: unexpected pattern expression: {reprStr p}"
 
@@ -229,7 +232,8 @@ private partial def mkLet
 
   | Expr.app (Expr.const ``Int.neg _)
       (Expr.app (Expr.const ``Int.ofNat _)
-        (Expr.app (Expr.app (Expr.const ``Nat.add _) n@(Expr.lit (Literal.natVal _))) a)) =>
+        (Expr.app (Expr.app (Expr.const ``Nat.add _) n) a)) =>
+      if !(isNatValue n) then throwEnvError "mkLet: unexpected pattern expression: {reprStr p}"
       let v ← mkApp2Expr (← mkNatSubOp) (← mkAppExpr (← mkIntToNatOp) (← mkAppExpr (← mkIntNegOp) e)) n
       match a with
       | Expr.fvar fv =>
@@ -237,12 +241,12 @@ private partial def mkLet
            modifyFVarValue fv v
            k (← mkLetFVarsExpr #[a] t)
 
-      | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) np@(Expr.fvar fv)) pe) _h =>
+      | Expr.app (Expr.app (Expr.app (Expr.app (Expr.const ``namedPattern _) _s) pn) pe) _h =>
            -- case: p = Int.neg (Int.ofNat (N + namedPattern s n pe h))
-           mkLet np pe t
+           mkLet pn pe t
              fun t' => do
-               modifyFVarValue fv v
-               k (← mkLetFVarsExpr #[np] t')
+               modifyFVarValue pn.fvarId! v
+               k (← mkLetFVarsExpr #[pn] t')
 
       | _ => throwEnvError "mkLet: unexpected pattern expression: {reprStr p}"
 
@@ -275,18 +279,20 @@ private def mkCond (e : Expr) (p : Expr) (eType : Expr) (andTerms : Array Expr) 
   match p with
   | Expr.fvar _ => return andTerms -- case: p = v
 
-  | Expr.app (Expr.app (Expr.const ``Nat.add _) n@(Expr.lit (Literal.natVal _))) (Expr.fvar _fv) =>
+  | Expr.app (Expr.app (Expr.const ``Nat.add _) n) (Expr.fvar _fv) =>
      -- case: p = N + n ∧ Type(N) = Nat
-     return andTerms.push (← mkAppExpr (← mkPropNotOp) (← mkApp2Expr (← mkNatLtOp) e n))
+     if !(isNatValue n) then throwEnvError "mkCond: unexpected pattern: {reprStr p}"
+     else return andTerms.push (← mkAppExpr (← mkPropNotOp) (← mkApp2Expr (← mkNatLtOp) e n))
 
   | Expr.app (Expr.const ``Int.ofNat _) (Expr.fvar _fv) =>
       -- case: p = Int.ofNat n
       return andTerms.push (← mkAppExpr (← mkPropNotOp) (← mkApp2Expr (← mkIntLtOp) e (← mkIntLitExpr (Int.ofNat 0))))
 
   | Expr.app (Expr.const ``Int.ofNat _)
-     (Expr.app (Expr.app (Expr.const ``Nat.add _) n@(Expr.lit (Literal.natVal _))) (Expr.fvar _fv)) =>
+     (Expr.app (Expr.app (Expr.const ``Nat.add _) n) (Expr.fvar _fv)) =>
       -- case: p = Int.ofNat (N + n)
-      return andTerms.push (← mkAppExpr (← mkPropNotOp) (← mkApp2Expr (← mkIntLtOp) e (← mkAppExpr (← mkIntOfNat) n)))
+      if !(isNatValue n) then throwEnvError "mkCond: unexpected pattern: {reprStr p}"
+      else return andTerms.push (← mkAppExpr (← mkPropNotOp) (← mkApp2Expr (← mkIntLtOp) e (← mkAppExpr (← mkIntOfNat) n)))
 
   | Expr.app (Expr.const ``Int.neg _)
     (Expr.app (Expr.const ``Int.ofNat _)

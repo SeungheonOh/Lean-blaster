@@ -101,6 +101,9 @@ structure OptimizeOptions where
 
   resetOptions : ResetOptions
 
+  /-- Flag set to `true` only when normalizing match pattern -/
+  normalizeMatchInfo : Bool := false
+
 instance : Inhabited OptimizeOptions where
   default := { normalizeFunCall := true, inFunApp := false, mcDepth := 0, solverOptions := default, resetOptions := default }
 
@@ -136,6 +139,13 @@ abbrev BetaLambdaMap := HashMap InstKey BetaLambda -- with Nat corresponding to 
 abbrev ForallMetaMap := HashMap PtrExpr ForallMeta
 abbrev MVarAssignments := HashMap PtrExpr Lean.Expr
 
+
+structure EqualityEntry where
+  /-- rhs value to replace key -/
+  rhs : Expr
+  /-- Flag set to true when restart is required. This flag is set to `true` only when unification happens on named pattern. -/
+  restart : Bool
+
 /-- Type to keep hypothesis context -/
 structure HypothesisContext where
   /-- Map keeping track of hypotheses introduced by implications/ite.
@@ -157,7 +167,7 @@ structure HypothesisContext where
         - Expr := C x₁ ... xₙ
       Any occurrence of the key for a given context is replaced by the rhs value.
   -/
-  equalityMap : ContextMap Expr
+  equalityMap : ContextMap EqualityEntry
 
 
 instance : Inhabited HypothesisContext where
@@ -870,7 +880,7 @@ def updateGlobalRewriteCache (a : Expr) (b : Expr) (insertIfNew := false) : Tran
 /-- Update rewrite cache at curCtx with `a := b`. -/
 @[always_inline, inline]
 def updateLocalRewriteCache (a : Expr) (b : Expr) (insertIfNew := false) : TranslateEnvT Unit := do
-  let ⟨_, rewriteCache, _, _, _, _, _, _, _, _, ⟨_, _, _, _, curCtx, _, _, _⟩, _, _, _⟩ := (← get).optEnv
+  let ⟨_, rewriteCache, _, _, _, _, _, _, _, _, ⟨_, _, _, _, curCtx, _, _, _, _⟩, _, _, _⟩ := (← get).optEnv
   match rewriteCache.get? curCtx with
   | none =>
        let refEntry ← IO.mkRef $ (HashMap.emptyWithCapacity 256 : HashMap PtrExpr Expr).insert a b
@@ -892,20 +902,20 @@ def removeFromHashConsCache (a : SharedExpr) : TranslateEnvT Unit := do
                    ⟨hashConsCache.erase a, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14⟩
 
 @[always_inline, inline]
-def updateEqualityMap (lhs : Expr) (rhs : Expr) (ctxId : CtxId) : TranslateEnvT Unit := do
+def updateEqualityMap (lhs : Expr) (rhs : Expr) (ctxId : CtxId) (restart := false) : TranslateEnvT Unit := do
   match (← get).optEnv.hypothesisContext.equalityMap.get? lhs with
   | none =>
-       let refEntry ← IO.mkRef [(ctxId, rhs)]
+       let refEntry ← IO.mkRef [(ctxId, ⟨rhs, restart⟩)]
        modifyOptEnv
          fun ⟨o1, o2, o3, o4, o5, o6, o7, ⟨hypothesisMap, equalityMap⟩, o9, o10, o11, o12, o13, o14⟩ =>
              ⟨o1, o2, o3, o4, o5, o6, o7, ⟨hypothesisMap, equalityMap.insert lhs refEntry⟩, o9, o10, o11, o12, o13, o14⟩
-  | some refEntry => refEntry.modify (λ l => (ctxId, rhs) :: l)
+  | some refEntry => refEntry.modify (λ l => (ctxId, ⟨rhs, restart⟩) :: l)
 
 /-- Look up `lhs` in the context-aware equality map, returning the rhs of the
     newest entry visible in the current context (tag ∈ active). -/
 @[always_inline, inline]
-def eqMapFind? (lhs : Expr) : TranslateEnvT (Option Expr) := do
-  let ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, _, _, ⟨_, _, _, _, _, _, active, _⟩, _, _, _⟩ := (← get).optEnv
+def eqMapFind? (lhs : Expr) : TranslateEnvT (Option EqualityEntry) := do
+  let ⟨_, _, _, _, _, _, _, ⟨_, equalityMap⟩, _, _, ⟨_, _, _, _, _, _, active, _, _⟩, _, _, _⟩ := (← get).optEnv
   if equalityMap.size == 0
   then return none
   else ContextMap.findRaw equalityMap active lhs
@@ -915,7 +925,7 @@ def eqMapFind? (lhs : Expr) : TranslateEnvT (Option Expr) := do
     proof of the newest entry for `e` whose tag is active in the current context. -/
 @[always_inline, inline]
 def hypMapFind? (e : Expr) : TranslateEnvT (Option Expr) := do
-  let ⟨_, _, _, _, _, _, _, ⟨hypothesisMap, _⟩, _, _, ⟨_, _, _, _, _, _, active, _⟩, _, _, _⟩ := (← get).optEnv
+  let ⟨_, _, _, _, _, _, _, ⟨hypothesisMap, _⟩, _, _, ⟨_, _, _, _, _, _, active, _, _⟩, _, _, _⟩ := (← get).optEnv
   if hypothesisMap.size == 0
   then return none
   else ContextMap.findRaw hypothesisMap active e
@@ -945,9 +955,9 @@ def setAndCommitCtx (s : CtxScope) : TranslateEnvT Unit :=
 -/
 @[always_inline, inline]
 def endCtx (s : CtxScope) : TranslateEnvT Unit :=
-  modifyOptEnv fun ⟨o1, rewrite, o3, o4, o5, o6, o7, o8, o9, o10, ⟨s1, s2, s3, s4, _, s6, active, s7⟩, o12, o13, o14⟩ =>
+  modifyOptEnv fun ⟨o1, rewrite, o3, o4, o5, o6, o7, o8, o9, o10, ⟨s1, s2, s3, s4, _, s6, active, s7, s8⟩, o12, o13, o14⟩ =>
                    ⟨o1, rewrite.erase s.current, o3, o4, o5, o6, o7, o8, o9, o10,
-                   ⟨s1, s2, s3, s4, s.parent, s6, active.erase s.current, s7⟩, o12, o13, o14⟩
+                   ⟨s1, s2, s3, s4, s.parent, s6, active.erase s.current, s7, s8⟩, o12, o13, o14⟩
 
 
 
@@ -963,7 +973,7 @@ def ContextReuseMap.findRaw (m : ContextReuseMap) (e : Expr) (idx : USize) (curC
 
 @[always_inline, inline]
 def reuseContext? (e : Expr) (idx : USize) : TranslateEnvT (Option CtxReuseScope) := do
-  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _⟩, _, _, _⟩ := (← get).optEnv
+  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _, _⟩, _, _, _⟩ := (← get).optEnv
   memCache.contextReuseCache.findRaw e idx curCtx
 
 @[always_inline, inline]
@@ -1066,6 +1076,18 @@ def setIsCtorArg (b : Bool) : TranslateEnvT Unit :=
 @[always_inline, inline]
 def isCtorArg : TranslateEnvT Bool :=
   return (← get).optEnv.options.resetOptions.isCtorArg
+
+
+/-- set optimize option `normalizeMatchInfo` to `b`. -/
+@[always_inline, inline]
+def setNormalizeMatchInfo (b : Bool) : TranslateEnvT Unit :=
+  modify (fun env => { env with optEnv.options.normalizeMatchInfo := b })
+
+
+/-- Return `true` if optimize option `normalizeMatchInfo` is set to `true`. -/
+@[always_inline, inline]
+def isInNormalizeMatchInfo : TranslateEnvT Bool :=
+  return (← get).optEnv.options.normalizeMatchInfo
 
 /-- set optimize option `resetOptions` to `r`. -/
 @[always_inline, inline]
@@ -1208,7 +1230,7 @@ def updateContextReuseCache (e : Expr) (idx : USize) (s : CtxReuseScope) : Trans
 
 
 @[inline] def propagateReuseContext (current : Expr) (next : Expr) (idx : USize) : TranslateEnvT Unit := do
-  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _⟩, _, _, _⟩ := (← get).optEnv
+  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _, _⟩, _, _, _⟩ := (← get).optEnv
   match ← memCache.contextReuseCache.findRaw current idx curCtx with
   | some reuse => updateContextReuseCache next idx reuse
   | none => return ()
@@ -1222,7 +1244,7 @@ def updateContextReuseCache (e : Expr) (idx : USize) (s : CtxReuseScope) : Trans
                     ⟨o1, rewrite, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14⟩
 
 @[inline] def freeRewriteCacheReuse (e : Expr) (idx : USize) : TranslateEnvT Unit := do
-  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _⟩, _, _, _⟩ := (← get).optEnv
+  let ⟨_, _, _, _, _, _, _, _, _, memCache, ⟨_, _, _, _, curCtx, _, _, _, _⟩, _, _, _⟩ := (← get).optEnv
   match ← memCache.contextReuseCache.findRaw e idx curCtx with
   | some reuse =>
       modifyOptEnv
