@@ -266,15 +266,6 @@ theorem img_id {T : Sort u} {D : Sort v} {w : T → D} (hw : Function.Injective 
     Img (liftFun w w (fun x => x)) (fun x => x) :=
   ⟨fun x => x, (lam_world hw (fun _ => rfl) (fun _ _ => rfl)).symm⟩
 
-/-- Membership of the lambda terms guarded by the membership predicates of their parameters (see
-    `guardedLambda`). -/
-theorem img_lam_ite {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
-    {wa : A → D} (hw : Function.Injective wa) {wb : B → C} {dflt : D → C} {F : D → C}
-    (h : ∀ y, Img wa y → Img wb (F y)) :
-    Img (liftFun wa wb dflt) (fun y => @ite C (Img wa y) (Classical.propDecidable _) (F y) (dflt y)) :=
-  ⟨fun x => Classical.choose (h (wa x) ⟨x, rfl⟩),
-    (lam_world_ite hw fun x => (Classical.choose_spec (h (wa x) ⟨x, rfl⟩)).symm).symm⟩
-
 /-- One level of case analysis on the variables `fvs` of `g`. -/
 partial def casesVars (g : MVarId) (fvs : List FVarId) : MetaM (List MVarId) := do
   match fvs with
