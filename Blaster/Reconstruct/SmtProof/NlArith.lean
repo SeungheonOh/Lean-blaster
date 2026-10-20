@@ -251,6 +251,11 @@ def Poly.toExpr (atoms : Array Expr) (p : Poly) : Expr × RExpr :=
     (terms.extract 1 terms.size).foldl (fun (e, r) (e', r') => (mkIntAdd e e', .add r r')) terms[0]
   else (mkIntLit 0, .num 0)
 
+/-- The context of the ring expressions over the atoms `atoms` (see `eq_of_norm`). -/
+def ringContext (atoms : Array Expr) : MetaM Expr :=
+  if h : 0 < atoms.size then (RArray.ofArray atoms h).toExpr (mkConst ``Int) id
+  else pure (mkApp2 (mkConst ``RArray.leaf [levelZero]) (mkConst ``Int) (mkIntLit 0))
+
 /-- A normalized literal: its polynomial, canonical term, and proof. -/
 structure NLit where
   kind : Kind
@@ -310,6 +315,17 @@ def products (ctx : Expr) (atoms : Array Expr) (lits : Array NLit) : Array (Nat 
     changed := acc'.size < acc.size
     acc := acc'
   return acc.map fun (ms, p) => (ms.size, p)
+
+/-- The proofs of the literals `ls`, without duplicate facts (e.g., squares of opposite literals). -/
+def dedupFacts (ls : Array NLit) : MetaM (Array Expr) := do
+  let mut seen : Std.HashSet Expr := {}
+  let mut hs := #[]
+  for l in ls do
+    let t ← inferType l.pf
+    if seen.contains t then continue
+    seen := seen.insert t
+    hs := hs.push l.pf
+  return hs
 
 /-- `False` from the normalized facts `hs` of a case (over the atoms `atoms`), by `omega` on the statement
     closed over the atoms (as variables, such that `omega` doesn't compare the atoms up to definitional
@@ -429,19 +445,8 @@ partial def closeLits (ctx : Ctx) (lits : Array Lit) (splits : Nat)
     (split : Array Expr := #[]) (linear := true) : TacticM Expr := do
   let (rs, st) ← (lits.mapM fun l => reify l.e).run {}
   let atoms := st.atoms
-  let rctx ← if h : 0 < atoms.size then (RArray.ofArray atoms h).toExpr (mkConst ``Int) id
-    else pure (mkApp2 (mkConst ``RArray.leaf [levelZero]) (mkConst ``Int) (mkIntLit 0))
+  let rctx ← ringContext atoms
   let nlits ← (lits.zip rs).mapM fun (l, (p, r)) => normalize rctx atoms l.kind p l.e r l.pf
-  -- NOTE: duplicate facts are removed (e.g., squares of opposite literals)
-  let dedup (ls : Array NLit) : MetaM (Array Expr) := do
-    let mut seen : Std.HashSet Expr := {}
-    let mut hs := #[]
-    for l in ls do
-      let t ← inferType l.pf
-      if seen.contains t then continue
-      seen := seen.insert t
-      hs := hs.push l.pf
-    return hs
   -- NOTE: runtime exceptions (heartbeats of `omega`) are caught
   let attempt (x : TacticM Expr) (k : TacticM Expr) : TacticM Expr := tryCatchRuntimeEx x fun ex => do
     trace[blaster.nlarith] "failed: {ex.toMessageData}"
@@ -458,7 +463,7 @@ partial def closeLits (ctx : Ctx) (lits : Array Lit) (splits : Nat)
       if n ≤ prev then continue
       for c in cands.extract built.size n do built := built.push (← c.2)
       prev := n
-      try return ← closeCase ctx atoms (← dedup (nlits ++ built))
+      try return ← closeCase ctx atoms (← dedupFacts (nlits ++ built))
       catch ex => last := some ex
     throw (last.getD (.error .missing "blaster_nlarith: no products"))
   let withSigns : TacticM Expr := do
@@ -483,7 +488,7 @@ partial def closeLits (ctx : Ctx) (lits : Array Lit) (splits : Nat)
       zeroOrPos
   let nonlinear : TacticM Expr :=
     attempt withProducts (if splits > 0 then withSigns else throwError "blaster_nlarith: failed")
-  if linear then attempt (closeCase ctx atoms (← dedup nlits)) nonlinear else nonlinear
+  if linear then attempt (closeCase ctx atoms (← dedupFacts nlits)) nonlinear else nonlinear
 
 mutual
 
