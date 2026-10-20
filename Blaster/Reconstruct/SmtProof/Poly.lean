@@ -349,6 +349,10 @@ NOTE: there is no world for the types with indices, with proof fields whose prop
 (e.g., properties of function fields, whose proofs would have to be transported), with dependent fields mapped by a
 world, or with recursive fields of function types. -/
 
+/-- The worlds of the types of the fields of the constructors (`field t d` for the type `t` interpreted as `d`, see
+    `mkWorld`), with the proofs of their injectivity (`none` when there is none). -/
+abbrev FieldWorld := Expr → Expr → MetaM (Option (Expr × Expr))
+
 /-- Map of a field of a constructor (see `mkIndWorld`). -/
 inductive FieldMap where
   /-- same type in both instances -/
@@ -387,9 +391,28 @@ structure Block where
   /-- recursor of each motive (`T.rec` for the types of the block, `T.rec_i` for their nested occurrences) -/
   recs : Array Name
 
+/-- The recursor of the `k`-th motive of the block at the level `lvl`, applied to the motives `ms`, the minor premises
+    `mns` and `x`. -/
+def Block.recApp (b : Block) (k : Nat) (lvl : Level) (ms mns : Array Expr) (x : Expr) : Expr :=
+  mkAppN (mkConst b.recs[k]! (lvl :: b.us)) (b.as ++ ms ++ mns |>.push x)
+
 /-- The map of the `k`-th motive of the block applied to `x`. -/
-def Block.map (b : Block) (k : Nat) (x : Expr) : Expr :=
-  mkAppN (mkConst b.recs[k]! (b.lvl :: b.us)) (b.as ++ b.motives ++ b.minorVals |>.push x)
+def Block.map (b : Block) (k : Nat) (x : Expr) : Expr := b.recApp k b.lvl b.motives b.minorVals x
+
+/-- Proofs of the minor premises of the recursors of the block for the motives `props` (into `Prop`), by `prove` from
+    the type of each minor premise and its map. -/
+def Block.minorProofs (b : Block) (props : Array Expr) (prove : Expr → MinorMap → MetaM Expr) :
+    MetaM (Array Expr) := do
+  let recName := mkRecName b.info.all.head!
+  let mut ty ← instantiateForall ((← getConstInfo recName).instantiateTypeLevelParams (levelZero :: b.us))
+    (b.as ++ props)
+  let mut proofs := #[]
+  for mi in b.minors do
+    let .forallE _ mt body _ := ty | throwError "mkIndWorld: minor premise expected"
+    let p ← prove (← Core.betaReduce mt) mi
+    proofs := proofs.push p
+    ty := body.instantiate1 p
+  return proofs
 
 /-- Lemmas of the world `W` of an inductive type (see `mkIndWorld`), closed over the arguments of `W` (its free
     variables): its injectivity and, per constructor `C` (`C'` in the target instance), the equation
@@ -459,8 +482,7 @@ def mkImgIntro (w a x h : Expr) : MetaM Expr := do
     with their recursors, where the fields that are not recursive are mapped by `field` (the worlds of their types,
     `none` when there is none). The lemmas of the worlds (see `IndWorldLemmas`) are proved once the worlds of the
     block are known (e.g., `List.map W` for the nested occurrences). -/
-partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Expr × Expr))) :
-    MetaM (Option (Expr × Expr)) := do
+partial def mkIndWorld (t d : Expr) (field : FieldWorld) : MetaM (Option (Expr × Expr)) := do
   let .const I us := t.getAppFn | return none
   let .const I' vs := d.getAppFn | return none
   if I != I' then return none
@@ -473,7 +495,8 @@ partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Ex
   let closed (e : Expr) : MetaM (Option Expr) := do
     let e ← mkLambdaFVars fvs e
     return if e.hasFVar || e.hasMVar then none else some e
-  let some key ← closed (mkApp2 (mkConst `_blaster_world) t d) | return none
+  let cacheKey (t d : Expr) : MetaM (Option Expr) := closed (mkApp2 (mkConst `_blaster_world) t d)
+  let some key ← cacheKey t d | return none
   let env ← getEnv
   if (← noIndWorld.get).contains key then return none
   for (w, h) in (← indWorldCache.get).getD key #[] do
@@ -483,8 +506,7 @@ partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Ex
   let some (blk, worlds) := r | noIndWorld.modify (·.insert key); return none
   -- the worlds of the types of the block, then their lemmas
   for (n, w, h) in info.all.toArray.zip worlds do
-    let some k ← closed (mkApp2 (mkConst `_blaster_world) (mkAppN (mkConst n us) blk.as) (mkAppN (mkConst n vs) blk.bs))
-      | continue
+    let some k ← cacheKey (mkAppN (mkConst n us) blk.as) (mkAppN (mkConst n vs) blk.bs) | continue
     if let (some cw, some ch) := (← closed w, ← closed h) then
       indWorldCache.modify fun m => m.insert k ((m.getD k #[]).push (cw, ch))
   let auxEqns ← try auxEquations field blk catch _ => pure #[]
@@ -504,8 +526,8 @@ partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Ex
 where
   /-- The block of `info` (`I as` to `I bs`, where `lvl` is the level of the sort of the target types), with the
       worlds of its types and the proofs of their injectivity. -/
-  build (field : Expr → Expr → MetaM (Option (Expr × Expr))) (info : InductiveVal) (us vs : List Level)
-      (as bs : Array Expr) (lvl : Level) : MetaM (Block × Array (Expr × Expr)) := do
+  build (field : FieldWorld) (info : InductiveVal) (us vs : List Level) (as bs : Array Expr) (lvl : Level) :
+      MetaM (Block × Array (Expr × Expr)) := do
     let env ← getEnv
     let recName := mkRecName info.all.head!
     let some (.recInfo rinfo) := env.find? recName | throwError "mkIndWorld: no recursor"
@@ -536,7 +558,8 @@ where
         return (vals, infos)
     let minorVals ← minorVals.mapM fun v => Core.betaReduce (v.beta motives)
     let recs := (List.range ds.size).toArray.map fun k =>
-      if h : k < info.all.length then mkRecName info.all[k] else Name.str info.all.head! s!"rec_{k + 1 - info.all.length}"
+      if h : k < info.all.length then mkRecName info.all[k]
+      else Name.str info.all.head! s!"rec_{k + 1 - info.all.length}"
     for k in [:ds.size] do
       if !env.contains recs[k]! then throwError "mkIndWorld: recursor {recs[k]!}"
     let blk : Block := { info, us, vs, as, bs, lvl, ds, dt, motives, minorVals, minors, recs }
@@ -544,28 +567,19 @@ where
     let props ← (List.range ds.size).toArray.mapM fun k =>
       withLocalDeclD `x ds[k]! fun x => withLocalDeclD `y ds[k]! fun y => do
         mkLambdaFVars #[x] (← mkForallFVars #[y] (← mkArrow (← mkEq (blk.map k x) (blk.map k y)) (← mkEq x y)))
-    let mut ty ← recType recName (levelZero :: us) (as ++ props)
-    let mut proofs := #[]
-    for mi in minors do
-      let .forallE _ mt b _ := ty | throwError "mkIndWorld: minor premise expected"
-      let p ← proveMinor (← Core.betaReduce mt) mi
-      proofs := proofs.push p
-      ty := b.instantiate1 p
+    let proofs ← blk.minorProofs props proveMinor
     let mut res := #[]
-    for h : i in [:info.all.length] do
-      let n := info.all[i]
+    for i in [:info.all.length] do
       let value ← withLocalDeclD `x ds[i]! fun x => do mkLambdaFVars #[x] (blk.map i x)
       let w ← mkAuxDefinition (← mkAuxDeclName (kind := `_blaster_world)) (← mkArrow ds[i]! dt[i]!) value
         (compile := false)
       let stmt ← mkAppM ``Function.Injective #[w]
-      let pf ← withLocalDeclD `x ds[i]! fun x => do
-        mkLambdaFVars #[x] (mkAppN (mkConst (mkRecName n) (levelZero :: us)) (as ++ props ++ proofs |>.push x))
+      let pf ← withLocalDeclD `x ds[i]! fun x => do mkLambdaFVars #[x] (blk.recApp i levelZero props proofs x)
       res := res.push (w, ← mkAuxTheorem stmt (← mkExpectedTypeHint pf stmt))
     return (blk, res)
   /-- The minor premise of the map for the constructor of `concl` (`motive_k (C ps fs)`, where the `ms` are the
       motives, `xs` the binders of the minor premise and `dt` the target types of the motives). -/
-  minor (field : Expr → Expr → MetaM (Option (Expr × Expr))) (ms dt xs : Array Expr) (concl : Expr) :
-      MetaM (Expr × MinorMap) := do
+  minor (field : FieldWorld) (ms dt xs : Array Expr) (concl : Expr) : MetaM (Expr × MinorMap) := do
     let some k := ms.findIdx? (· == concl.getAppFn) | throwError "mkIndWorld: motive expected"
     let app := concl.appArg!
     let .const c _ := app.getAppFn | throwError "mkIndWorld: constructor expected"
@@ -641,7 +655,7 @@ where
       mkLambdaFVars xs (← instantiateMVars g)
   /-- Equations of the maps of the nested occurrences: `∀ l, map_j l = E_j l` where `E_j` is the world of the type of
       `l` (e.g., `List.map W` for `List (T α)`, see `mkWorld`), by the recursor of the block. -/
-  auxEquations (field : Expr → Expr → MetaM (Option (Expr × Expr))) (blk : Block) : MetaM (Array (Nat × Expr)) := do
+  auxEquations (field : FieldWorld) (blk : Block) : MetaM (Array (Nat × Expr)) := do
     let n := blk.info.all.length
     if blk.ds.size == n then return #[]
     let mut ws : Array (Option Expr) := #[]
@@ -653,13 +667,8 @@ where
         match ws[k]! with
         | some w => mkLambdaFVars #[x] (← mkEq (blk.map k x) (applyWorld w x))
         | none => mkLambdaFVars #[x] (mkConst ``True)
-    let recName := mkRecName blk.info.all.head!
-    let mut ty ← instantiateForall ((← getConstInfo recName).instantiateTypeLevelParams (levelZero :: blk.us))
-      (blk.as ++ props)
-    let mut proofs := #[]
-    for mi in blk.minors do
-      let .forallE _ mt b _ := ty | throwError "mkIndWorld: minor premise expected"
-      let p ← forallBoundedTelescope (← Core.betaReduce mt) mi.numBinders fun xs goal => do
+    let proofs ← blk.minorProofs props fun mt mi =>
+      forallBoundedTelescope mt mi.numBinders fun xs goal => do
         if goal.isConstOf ``True then return ← mkLambdaFVars xs (mkConst ``True.intro)
         let some (_, lhs, rhs) := goal.eq? | throwError "mkIndWorld: equation expected"
         -- the inductive hypotheses of the nested fields
@@ -670,20 +679,17 @@ where
             return none)
           | throwError "mkIndWorld: equation of a nested occurrence"
         mkLambdaFVars xs p
-      proofs := proofs.push p
-      ty := b.instantiate1 p
     let mut res := #[]
     for k in [n:blk.ds.size] do
       if ws[k]!.isNone then continue
       let stmt ← withLocalDeclD `x blk.ds[k]! fun x => do mkForallFVars #[x] (props[k]!.beta #[x])
-      let pf ← withLocalDeclD `x blk.ds[k]! fun x => do
-        mkLambdaFVars #[x] (mkAppN (mkConst blk.recs[k]! (levelZero :: blk.us)) (blk.as ++ props ++ proofs |>.push x))
+      let pf ← withLocalDeclD `x blk.ds[k]! fun x => do mkLambdaFVars #[x] (blk.recApp k levelZero props proofs x)
       res := res.push (k, ← mkAuxTheorem stmt pf)
     return res
   /-- The equation and the image of the constructor `c` of the `i`-th type of the block in its world `w` (see
       `IndWorldLemmas`). -/
-  ctorLemmas (field : Expr → Expr → MetaM (Option (Expr × Expr))) (blk : Block) (i : Nat) (w : Expr)
-      (auxEqns : Array (Nat × Expr)) (c : Name) : MetaM (Option (Expr × Expr)) := do
+  ctorLemmas (field : FieldWorld) (blk : Block) (i : Nat) (w : Expr) (auxEqns : Array (Nat × Expr)) (c : Name) :
+      MetaM (Option (Expr × Expr)) := do
     let tgt ← whnf blk.dt[i]!
     let src := mkAppN (mkConst c blk.us) blk.as
     let ctor' := mkAppN (mkConst c tgt.getAppFn.constLevels!) tgt.getAppArgs
