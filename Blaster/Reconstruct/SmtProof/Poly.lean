@@ -693,8 +693,13 @@ where
     let tgt ← whnf blk.dt[i]!
     let src := mkAppN (mkConst c blk.us) blk.as
     let ctor' := mkAppN (mkConst c tgt.getAppFn.constLevels!) tgt.getAppArgs
-    -- equation: `∀ xs, W (C xs) = C' (Ŵ xs)`
-    let some (eqn, ws) ← forallTelescope (← inferType src) fun xs _ => do
+    let some (eqn, ws) ← ctorEquation field blk w auxEqns src ctor' | return none
+    return some (eqn, ← ctorImage w c src ctor' eqn ws)
+  /-- The equation `∀ xs, W (C xs) = C' (Ŵ xs)` of the constructor `src` (`ctor'` in the target instance) in the
+      world `w`, with the worlds `Ŵ` of its fields (`none` for the fields of the same type in both instances). -/
+  ctorEquation (field : FieldWorld) (blk : Block) (w : Expr) (auxEqns : Array (Nat × Expr)) (src ctor' : Expr) :
+      MetaM (Option (Expr × Array (Option Expr))) := do
+    forallTelescope (← inferType src) fun xs _ => do
       let mut cty ← inferType ctor'
       let mut args := #[]
       let mut ws := #[]
@@ -704,7 +709,7 @@ where
         let (v, wi) ← if ← isDefEq ft g then pure (x, none)
           else if ft.hasAnyFVar (xs.contains <| mkFVar ·) then return none
           else match ← field ft g with
-            | some (wx, hx) => pure (applyWorld wx x, some (wx, hx))
+            | some (wx, _) => pure (applyWorld wx x, some wx)
             | none => return none
         args := args.push v
         ws := ws.push wi
@@ -719,11 +724,13 @@ where
           return none)
         | return none
       return some (← mkAuxTheorem (← mkForallFVars xs (← mkEq lhs rhs)) (← mkLambdaFVars xs p), ws)
-      | return none
-    -- image: `∀ ys, Img W (C' ys) = (Img Ŵᵢ yᵢ ∧ …)`
-    let img ← forallTelescope (← inferType ctor') fun ys _ => do
+  /-- The image `∀ ys, Img W (C' ys) = (Img Ŵᵢ yᵢ ∧ …)` of the constructor `c` (`src` in the source instance,
+      `ctor'` in the target instance) in the world `w`, from its equation `eqn` and the worlds `ws` of its fields (see
+      `ctorEquation`). -/
+  ctorImage (w : Expr) (c : Name) (src ctor' eqn : Expr) (ws : Array (Option Expr)) : MetaM Expr := do
+    forallTelescope (← inferType ctor') fun ys _ => do
       if ys.size != ws.size then throwError "mkIndWorld: fields"
-      let imgs ← (ys.zip ws).filterMapM fun (y, wi) => wi.mapM fun (wx, _) => mkAppM ``Img #[wx, y]
+      let imgs ← (ys.zip ws).filterMapM fun (y, wi) => wi.mapM fun wx => mkAppM ``Img #[wx, y]
       let conj := if imgs.isEmpty then mkConst ``True else imgs.pop.foldr mkAnd imgs.back!
       let lhs ← mkAppM ``Img #[w, mkAppN ctor' ys]
       let mkConj (pfs : Array Expr) : MetaM Expr := do
@@ -753,7 +760,7 @@ where
               if eqs.size != nonProof.size then throwError "mkIndWorld: image"
               let mut pfs := #[]
               for (e, j) in eqs.zip nonProof do
-                if let some (wx, _) := ws[j]! then
+                if let some wx := ws[j]! then
                   pfs := pfs.push (← mkImgIntro wx ys[j]! sg'.fields[j]! (mkFVar e))
               if pfs.size != imgs.size then throwError "mkIndWorld: image"
               g.assign (← mkConj pfs)
@@ -770,7 +777,7 @@ where
             rest ← mkAppM ``And.right #[rest]
         let rec elim (j k : Nat) (xs : Array Expr) (es : Array (Nat × Expr)) : MetaM Expr := do
           if h : j < ys.size then
-            let some (wx, _) := ws[j]! | elim (j + 1) k (xs.push ys[j]) es
+            let some wx := ws[j]! | elim (j + 1) k (xs.push ys[j]) es
             let some (srcTy, _) := (← whnfD (← inferType hs[k]!)).app2? ``Exists | throwError "mkIndWorld: image"
             withLocalDeclD `x srcTy fun x => do
             withLocalDeclD `e (← mkEq ys[j] (applyWorld wx x)) fun e => do
@@ -787,7 +794,7 @@ where
         mkLambdaFVars #[h] (← elim 0 0 #[] #[])
       let pf ← mkAppM ``propext #[← mkAppM ``Iff.intro #[mp, mpr]]
       mkAuxTheorem (← mkForallFVars ys (← mkEq lhs conj)) (← mkLambdaFVars ys pf)
-    return some (eqn, img)
+
 /-- The world of the Lean values of type `t` interpreted with type `d`, with a proof of its injectivity: `none` when
     `t` and `d` are the same type (worlds `Nat → Int` and `Bool → Prop` only occur below the type constructors, as
     in `α → Nat`; they are handled by the bridge otherwise). The construction is syntactic, such that the worlds
