@@ -145,6 +145,19 @@ def timed (phase : String) (x : ReplayM α) : ReplayM α := do
         let h ← IO.FS.Handle.mk f .append
         h.putStrLn s!"  phase {phase}: {ms} ms"
 
+/-- Run `x`, recording its start and its duration in the file given by `BLASTER_SMTPROOF_TRACE` (if set), e.g., the
+    phases of the construction of the final proof. -/
+def traceTimed (phase : String) (x : TermElabM α) : TermElabM α := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" | x
+  let log (msg : String) : IO Unit := do
+    let h ← IO.FS.Handle.mk f .append
+    h.putStrLn s!"smtproof: {msg}"
+  log phase
+  let t0 ← IO.monoMsNow
+  let r ← x
+  log s!"{phase}: {(← IO.monoMsNow) - t0} ms"
+  return r
+
 /-- Debugging output (environment variable `BLASTER_SMTPROOF_DEBUG`: file receiving the failures of the steps;
     messages would be discarded with the state restored after a failed replay). -/
 def debugLog (msg : MessageData) : MetaM Unit := do
@@ -533,20 +546,24 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
     | none => pure none
   if let some pp := pp? then return some (mkAppN pp vals)
   let mut res ← proveClosed cfg rule g
+  let t2 ← IO.monoMsNow
   -- the generalization without loss of the relations between the generalized subterms (see `Local.commonSubterms`)
   let mut vals := vals
+  let mut lossless := ""
   if res.isNone then
     if let some (g', vals') ← Local.generalizeCommon eq l r (lossless := true) then
       if g' != g then
+        let t3 ← IO.monoMsNow
         res ← proveClosed cfg rule g'
         vals := vals'
+        lossless := s!", lossless: generalization {t3 - t2} ms, tactics {(← IO.monoMsNow) - t3} ms"
   if res.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
     debugLog m!"local difference not proved:\n{← dagString eq 8000}"
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
-    let t2 ← IO.monoMsNow
-    if t2 - t0 > 100 then
+    let t4 ← IO.monoMsNow
+    if t4 - t0 > 100 then
       let h ← IO.FS.Handle.mk f .append
-      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms ({res.map (·.2)}): {(toString (← ppExpr g)).take 1500}"
+      h.putStrLn s!"    local difference: generalization {t1 - t0} ms, tactics {t2 - t1} ms{lossless}, total {t4 - t0} ms ({res.map (·.2)}): {(toString (← ppExpr g)).take 1500}"
   return res.map fun (pf, _) => mkAppN pf vals
 
 /-- `quant-intro` (Z3): from `h : ∀ xs, a xs = b xs` (resp. `∀ xs, a xs → b xs`), a proof of
@@ -704,6 +721,69 @@ def congrArgs (f : Expr) (as bs : Array Expr) (diffs : Array (Nat × Expr)) : Me
     cur := cur.set! i bs[i]!
   return some pf
 
+
+/-- Implementation of `dagStats`: the cache is keyed by the addresses of the subterms (the structural equality of large
+    terms is costly). -/
+unsafe def dagStatsImpl (e : Expr) : Nat × Nat :=
+  let (d, s) := (go e).run {}
+  (s.size, d)
+where
+  go (e : Expr) : StateM (Std.HashMap USize Nat) Nat := do
+    if let some d := (← get).get? (ptrAddrUnsafe e) then return d
+    let d ← match e with
+      | .app f a => pure (max (← go f) (← go a))
+      | .lam _ t b _ | .forallE _ t b _ => pure (max (← go t) ((← go b) + 1))
+      | .letE _ t v b _ => pure (max (max (← go t) (← go v)) ((← go b) + 1))
+      | .mdata _ b | .proj _ _ b => go b
+      | _ => pure 0
+    modify (·.insert (ptrAddrUnsafe e) d)
+    return d
+
+/-- Number of distinct subterms (pointers) of `e` and maximal nesting of binders in `e` (e.g., for the trace of a
+    large proof). -/
+@[implemented_by dagStatsImpl] opaque dagStats (e : Expr) : Nat × Nat
+
+/-- Implementation of `abstractFVar`: the caches are keyed by the addresses of the subterms (the structural equality of
+    large terms is costly). -/
+unsafe def abstractFVarImpl (e : Expr) (x : FVarId) : Expr :=
+  (go e 0).run' ({}, {})
+where
+  contains (e : Expr) : StateM (Std.HashMap USize Bool × Std.HashMap (USize × Nat) Expr) Bool := do
+    if !e.hasFVar then return false
+    if let some b := (← get).1.get? (ptrAddrUnsafe e) then return b
+    let b ← match e with
+      | .fvar y => pure (y == x)
+      | .app f a => pure ((← contains f) || (← contains a))
+      | .lam _ t b _ | .forallE _ t b _ => pure ((← contains t) || (← contains b))
+      | .letE _ t v b _ => pure ((← contains t) || (← contains v) || (← contains b))
+      | .mdata _ b | .proj _ _ b => contains b
+      | _ => pure false
+    modify fun (c, m) => (c.insert (ptrAddrUnsafe e) b, m)
+    return b
+  go (e : Expr) (off : Nat) : StateM (Std.HashMap USize Bool × Std.HashMap (USize × Nat) Expr) Expr := do
+    if !(← contains e) then return e
+    if let some r := (← get).2.get? (ptrAddrUnsafe e, off) then return r
+    let r ← match e with
+      | .fvar _ => pure (.bvar off)
+      | .app f a => pure (e.updateApp! (← go f off) (← go a off))
+      | .lam _ t b _ => pure (e.updateLambdaE! (← go t off) (← go b (off + 1)))
+      | .forallE _ t b _ => pure (e.updateForallE! (← go t off) (← go b (off + 1)))
+      | .letE _ t v b _ => pure (e.updateLetE! (← go t off) (← go v off) (← go b (off + 1)))
+      | .mdata _ b => pure (e.updateMData! (← go b off))
+      | .proj _ _ b => pure (e.updateProj! (← go b off))
+      | _ => pure e
+    modify fun (c, m) => (c, m.insert (ptrAddrUnsafe e, off) r)
+    return r
+
+/-- `e` with the free variable `x` replaced by the loose bound variable of index 0 (the body of `fun x => e`): only the
+    subterms containing `x` are traversed (`Expr.abstract` traverses the subterms with free variables, e.g., in a proof
+    of the backend, the large terms over the variables of the goal, once per binder depth, i.e., per nested `lemma`). -/
+@[implemented_by abstractFVarImpl] opaque abstractFVar (e : Expr) (x : FVarId) : Expr
+
+/-- The steps being replayed (innermost last), written to the file given by `BLASTER_SMTPROOF_CURRENT` (if set)
+    when a step starts, e.g., to locate a step that takes long (the modification time of the file). -/
+initialize currentSteps : IO.Ref (Array String) ← IO.mkRef #[]
+
 mutual
 
 /-- Proof of the interpretation of the conclusion of step `i`. -/
@@ -770,8 +850,13 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
       try discard <| replay j catch _ => pure ()
   if (← IO.monoMsNow) > ctx.deadline then throwError "smt proof: replay deadline exceeded"
   let start ← IO.monoMsNow
+  let current ← IO.getEnv "BLASTER_SMTPROOF_CURRENT"
+  if let some f := current then
+    currentSteps.modify (·.push s!"step {i} ({step.rule}): {(toString step.concl).take 300}")
+    IO.FS.writeFile f ("\n".intercalate (← currentSteps.get).toList)
   try replayCore' i step
   finally
+    if current.isSome then currentSteps.modify (·.pop)
     let ms := (← IO.monoMsNow) - start
     modify fun s => { s with stats := s.stats.addTime step.rule ms }
     -- profiling (environment variable `BLASTER_SMTPROOF_TRACE`: file receiving the steps taking more than 100 ms)
@@ -1017,12 +1102,12 @@ where
     if let some r := (← get).get? (e, off) then return r
     let r ← match e with
       | .mvar m' => pure (if m' == m then .bvar off else e)
-      | .app f a => return e.updateApp! (← go f off) (← go a off)
-      | .lam _ t b _ => return e.updateLambdaE! (← go t off) (← go b (off + 1))
-      | .forallE _ t b _ => return e.updateForallE! (← go t off) (← go b (off + 1))
-      | .letE _ t v b _ => return e.updateLetE! (← go t off) (← go v off) (← go b (off + 1))
-      | .mdata _ b => return e.updateMData! (← go b off)
-      | .proj _ _ b => return e.updateProj! (← go b off)
+      | .app f a => pure (e.updateApp! (← go f off) (← go a off))
+      | .lam _ t b _ => pure (e.updateLambdaE! (← go t off) (← go b (off + 1)))
+      | .forallE _ t b _ => pure (e.updateForallE! (← go t off) (← go b (off + 1)))
+      | .letE _ t v b _ => pure (e.updateLetE! (← go t off) (← go v off) (← go b (off + 1)))
+      | .mdata _ b => pure (e.updateMData! (← go b off))
+      | .proj _ _ b => pure (e.updateProj! (← go b off))
       | _ => pure e
     modify (·.insert (e, off) r)
     return r

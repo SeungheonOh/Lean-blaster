@@ -71,6 +71,43 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
   | .ok _ => return none
   | .error ex => return some m!"kernel rejected the reconstructed proof: {ex.toMessageData (← getOptions)}"
 
+/-- Add the proof `proof` of `goal` as an auxiliary theorem checked by the kernel synchronously (`Elab.async` false: a
+    rejected declaration is an exception, after which the state is restored), and return its constant: e.g., the large
+    proofs of the replays of SMT proofs are then neither traversed by the next phases of the reconstruction (e.g.,
+    `shareDeepProofs`, `dischargeHoles`) nor checked again with the proof of the goal. -/
+def addAuxProof (goal proof : Expr) : TermElabM (Except String Expr) := do
+  let goal ← instantiateMVars goal
+  let proof ← instantiateMVars proof
+  if proof.hasMVar then return .error "proof term contains metavariables"
+  if goal.hasMVar || goal.hasFVar || proof.hasFVar then
+    -- open goals (e.g., over the variables of the context): checked by the elaborator, closed by `mkAuxTheorem`
+    if let some msg ← kernelCheck goal proof then return .error (← msg.toString)
+    return .ok (← withOptions (Elab.async.set · false) (mkAuxTheorem goal proof (cache := false)))
+  let s ← saveState
+  try
+    let name ← mkAuxDeclName (kind := `_smt_proof)
+    let lvls := (collectLevelParams {} goal).params.toList
+    withOptions (Elab.async.set · false) <| addDecl (.thmDecl { name, levelParams := lvls, type := goal, value := proof })
+    -- NOTE: a declaration rejected by the kernel is added as an axiom (see `addDecl`) before the exception
+    let some (.thmInfo _) := (← getEnv).find? name | throwError "{name} is not a theorem"
+    return .ok (mkConst name (lvls.map mkLevelParam))
+  catch ex =>
+    s.restore
+    return .error s!"kernel rejected the reconstructed proof: {← ex.toMessageData.toString}"
+
+/-- Run `x`, recording its start and its duration in the file given by `BLASTER_SMTPROOF_TRACE` (if set), e.g., to
+    locate the phases of a reconstruction that take long. -/
+def withReconTrace (phase : String) (x : TermElabM α) : TermElabM α := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" | x
+  let log (msg : String) : IO Unit := do
+    let h ← IO.FS.Handle.mk f .append
+    h.putStrLn s!"recon: {msg}"
+  log s!"{phase}"
+  let t0 ← IO.monoMsNow
+  let r ← x
+  log s!"{phase}: {(← IO.monoMsNow) - t0} ms"
+  return r
+
 /-- Record the outcome of the replay of an SMT proof (`kind`: `residual` or `obligation`) in the file given by
     `BLASTER_SMTPROOF_LOG` (JSON lines). -/
 def logSmtProof (kind : String) (res : Except String SmtProof.SmtProofResult) : TermElabM Unit := do
@@ -95,14 +132,15 @@ def bySmtProofReplay (task : ReconTask) (kind : String) (goal : Expr) : TermElab
   -- NOTE: the auxiliary declarations of the replay (e.g., the definitional equations of recursive functions) are
   -- checked by the kernel synchronously (`Elab.async` false), such that an ill-typed one fails the replay (instead of
   -- an error reported after the reconstruction)
-  let res ← tryCatchRuntimeEx (withOptions (Elab.async.set · false) <|
+  let res ← tryCatchRuntimeEx (withOptions (Elab.async.set · false) <| withReconTrace s!"{kind} replay" <|
       SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
     (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
   let res ← match res with
     | .ok r =>
-        match ← kernelCheck goal r.proof with
-        | none => pure (.ok r)
-        | some msg => pure (.error s!"kernel: {← msg.toString}")
+        -- NOTE: the (large) proof as an auxiliary theorem (see `addAuxProof`)
+        match ← withReconTrace s!"{kind} kernel check" (addAuxProof goal r.proof) with
+        | .ok c => pure (.ok { r with proof := c })
+        | .error msg => pure (.error s!"kernel: {msg}")
     | err => pure err
   logSmtProof kind res
   match res with
@@ -136,8 +174,8 @@ def finishProof
     return { o with elapsedMs := (← IO.monoMsNow) - startTime }
   -- NOTE: deeply nested subproofs are shared through `let` declarations such that the depth of the
   -- proof term checked by the kernel (and traversed when discharging proof obligations) is bounded.
-  let proof ← shareDeepProofs proof
-  let (proof, stats) ← dischargeHoles proof holes equivs fallback
+  let proof ← withReconTrace "sharing" (shareDeepProofs proof)
+  let (proof, stats) ← withReconTrace s!"obligations ({holes.size} holes)" (dischargeHoles proof holes equivs fallback)
   let out := { out with stats }
   if !stats.failures.isEmpty || hasHoles proof then
     let shown := stats.failures.extract 0 3
@@ -145,9 +183,9 @@ def finishProof
     return ← finish { out with failure := m!"{stats.failures.size} unresolved proof obligation(s) out of {stats.total}:{msgs}" }
   -- NOTE: `sorryAx` may occur in auxiliary declarations created by tactics (e.g., after an
   -- elaboration error), which the kernel accepts.
-  if proof.hasSorry || (← dependsOnSorry proof) then
+  if proof.hasSorry || (← withReconTrace "sorry check" (dependsOnSorry proof)) then
     return ← finish { out with failure := m!"the reconstructed proof depends on sorryAx" }
-  match ← kernelCheck goal proof with
+  match ← withReconTrace "kernel check" (kernelCheck goal proof) with
   | some msg => finish { out with failure := msg }
   | none => finish { out with proof? := some proof }
 

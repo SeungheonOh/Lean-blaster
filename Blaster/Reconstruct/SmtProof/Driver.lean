@@ -1219,13 +1219,21 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
               let ms := (st.stats.msByRule.toArray.qsort (·.2 > ·.2)).extract 0 6
               let methods := st.stats.byRule.toList.map fun (r, m) => (r, m.toList)
               throwError "{ex.toMessageData}; first failures: {fs}; time per rule: {ms}; methods: {methods}"
-        let pt ← inferType p
+        let pt ← traceTimed "root type" (inferType p)
         if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
         -- NOTE: the proofs of the steps are instantiated once (see `replay`)
-        return (← mkLambdaFVars #[hneg] (← instantiateMVars p), st.stats)
+        let p ← traceTimed "instantiation" (instantiateMVars p)
+        if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
+          let (n, d) := dagStats p
+          traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
+        -- NOTE: the negated goal only occurs in the proofs of the asserted formulas (see `abstractFVar`)
+        let pf ← traceTimed "abstraction of the negated goal" do
+          if p.hasMVar then mkLambdaFVars #[hneg] p
+          else return .lam `hneg (← inferType hneg) (abstractFVar p hneg.fvarId!) .default
+        return (pf, st.stats)
       let (pf, stats) := pf
       let proofBody := mkApp2 (mkConst ``Classical.byContradiction) body pf
-      let proof ← instantiateMVars (← mkLambdaFVars xs proofBody)
+      let proof ← traceTimed "abstraction of the variables" (do instantiateMVars (← mkLambdaFVars xs proofBody))
       -- NOTE: e.g., type parameters that nothing determines (the other interpretation is then tried)
       if proof.hasMVar then throwError "smt proof: proof term contains metavariables"
       -- debugging: free variables escaping their scopes (environment variable `BLASTER_SMTPROOF_CHECKFINAL`)
