@@ -1314,13 +1314,91 @@ structure QuantifierEnv where
   quantifiers: SortedVars
   premises : Array SmtTerm
   topLevel : Bool
+  /-- Polarity of the quantifier being translated (see `sortQuantifierMembership`). -/
+  polarity : Polarity
 deriving Inhabited
 
 abbrev QuantifierEnvT := StateRefT QuantifierEnv TranslateEnvT
 
 
-def initialQuantifierEnv (topLevel : Bool) : QuantifierEnv :=
-  { quantifiers := #[], premises := #[], topLevel }
+def initialQuantifierEnv (topLevel : Bool) (polarity := Polarity.mixed) : QuantifierEnv :=
+  { quantifiers := #[], premises := #[], topLevel, polarity }
+
+/-- Given `scope` the expressions in the scope of a sort quantifier `α` and `bound` the variables
+    bound by the quantifier from `α` onwards (i.e., including `α`), return `true` only when all the free
+    variables in `scope` (and transitively in their types), not in `bound`, are one of the following:
+      - a sort variable, which is instantiated with either the universal sort `@@Type` or a global
+        membership predicate (see `sortQuantifierMembership`); or
+      - a top level variable (see `isTopLevelFVar`) or a free variable that is not bound by a
+        pattern matching (i.e., declared at the top level when translated); or
+      - a proof or a class constraint (for which only their types are considered); or
+      - a variable in `univFVars` only when `allowUniv` is set to `true`.
+-/
+def isClosedSortScope (scope : Array Expr) (bound : Array Expr) (allowUniv : Bool) : TranslateEnvT Bool := do
+  let bound := bound.foldl (fun acc v => acc.insert v.fvarId!) (Std.HashSet.emptyWithCapacity : Std.HashSet FVarId)
+  let mut todo := (scope.foldl (fun acc e => collectFVars acc e) {}).fvarIds
+  let mut visited := (Std.HashSet.emptyWithCapacity : Std.HashSet FVarId)
+  while h : todo.size > 0 do
+    let v := todo[todo.size - 1]
+    todo := todo.pop
+    if bound.contains v || visited.contains v then continue
+    visited := visited.insert v
+    let t ← inferTypeEnv (mkFVar v)
+    todo := todo ++ (collectFVars {} t).fvarIds
+    if t.isType then continue
+    if (← isPropEnv t) || (← isClassConstraintExpr t) then continue
+    let env := (← get).smtEnv
+    match env.quantifiedFVars.get? v with
+    | some true => continue
+    | some false => if allowUniv && env.univFVars.contains v then continue else return false
+    | none => if (← isPatternMatchFVar v) then return false
+  return true
+
+/-- Add `v` to the set of non top level fvars bound by a quantifier that is universal w.r.t. the goal. -/
+def addUnivFVar (v : Expr) : TranslateEnvT Unit :=
+  modify (fun env => { env with smtEnv.univFVars := env.smtEnv.univFVars.insert v.fvarId! })
+
+/-- Given a sort variable `α` bound by a non top level quantifier, with
+     - `pol` the polarity of the quantifier;
+     - `isForall` set to `true` for `∀ α, e` and to `false` for `∃ α, e`;
+     - `scope` the expressions in the scope of `α` and `bound` the variables bound from `α` onwards
+        (see `isClosedSortScope`),
+    return `true` when a membership predicate has to be declared for `α` (see `declareSortMembership`).
+    Otherwise `α` is instantiated with the universal sort `@@Type`.
+
+    Let `G` be the goal to be proved. Sort variables are translated as follows:
+      - Existential quantifier w.r.t. `G` (i.e., `∀ α` in negative position or `∃ α` in positive position):
+          `α` is instantiated with `@@Type`, which is sound as `e[α/@@Type]` implies `∃ α, e`
+          (resp. `∀ α, e` implies `e[α/@@Type]`) whatever the enclosing quantifiers.
+      - Universal quantifier w.r.t. `G` (i.e., `∀ α` in positive position or `∃ α` in negative position):
+          `α` gets a global (i.e., declared at the top level) membership predicate when `α` does not depend on any
+          variable bound by an existential quantifier w.r.t. `G` (i.e., `isClosedSortScope scope bound true`).
+          This is sound as `∀ α` can then be moved to the top level of the goal (i.e., `α` is skolemized
+          in the negated goal), e.g., `p ∨ ∀ (x : Nat) (α : Type), e` is equivalent to `∀ (α : Type), p ∨ ∀ (x : Nat), e`.
+          Instantiating `α` with `@@Type` is unsound in this case as `@@Type` can never be empty.
+      - Mixed polarity (e.g., `(∀ α, e) ↔ p`):
+          `α` gets a global membership predicate `@is@α` when the quantified expression only depends on
+          top level and sort variables (i.e., `isClosedSortScope scope bound false`).
+          This is sound for any context `C`. Indeed, given `Q := ∀ α, e`, if `C[e[α/@is@α]]` is valid then:
+            - when `Q` holds, `e[α/@is@α]` holds and `C[Q]` is equivalent to `C[e[α/@is@α]]`;
+            - when `Q` does not hold, there exists a type `τ` such that `¬ e[α/τ]`. As `@is@α` can denote any
+              type, `C[e[α/τ]]` is valid and equivalent to `C[Q]`.
+          The same reasoning applies to `∃ α, e` and to several occurrences of `Q` in `C`.
+    In any other case, `α` is instantiated with `@@Type` and flag `unsupportedSortQuantifier` is set
+    such that an `unsat` result is reported as `Undetermined`.
+
+    NOTE: The translation of an expression containing sort quantifiers depends on its polarity and is therefore
+    not memoized (see `withTranslateEnvCache`).
+-/
+def sortQuantifierMembership
+  (pol : Polarity) (isForall : Bool) (scope : Array Expr) (bound : Array Expr) : TranslateEnvT Bool := do
+  modify (fun env => { env with smtEnv.sortQuantifierSeen := true })
+  let isUniv := (isForall && pol == .positive) || (!isForall && pol == .negative)
+  let isExists := (isForall && pol == .negative) || (!isForall && pol == .positive)
+  if isExists then return false
+  if ← isClosedSortScope scope bound isUniv then return true
+  modify (fun env => { env with smtEnv.unsupportedSortQuantifier := true })
+  return false
 
 /-- Translate a quantifier `(n : t)` by performing the following actions:
      - Add `n` to the quantified fvars cache.
@@ -1342,7 +1420,8 @@ def initialQuantifierEnv (topLevel : Bool) : QuantifierEnv :=
     TODO: UPDATE SPEC
 -/
 def translateQuantifier
-  (n : Expr) (t : Expr) (termTranslator : Expr → TranslateEnvT SmtTerm) : QuantifierEnvT Unit := do
+  (n : Expr) (t : Expr) (termTranslator : Expr → TranslateEnvT SmtTerm)
+  (sortMembership := false) : QuantifierEnvT Unit := do
  let Expr.fvar v := n | throwEnvError "translateQuantifier: FVarExpr expected but got {reprStr n}"
  -- update quantified fvars cache
  updateQuantifiedFVarsCache v (← get).topLevel
@@ -1352,11 +1431,13 @@ def translateQuantifier
    let s ← defineSortAndCache v
    -- NOTE: Sort variables universally quantified at the top level of the goal can be instantiated
    -- with any type (including empty ones) and therefore have their own membership predicate.
-   -- Other sort quantifiers (e.g., `∀ α` in a hypothesis) are instantiated with the universal sort `@@Type`.
-   if (← get).topLevel then declareSortMembership v s
+   -- Other sort quantifiers have a membership predicate only when `sortMembership` is set to `true`
+   -- (see `sortQuantifierMembership`). Otherwise, they are instantiated with the universal sort `@@Type`.
+   if (← get).topLevel || sortMembership then declareSortMembership v s
  else
    -- No more required to resolve type at this stage.
-   let smtType ← translateTypeAux termTranslator t
+   -- NOTE: binder types are not in a polarity position
+   let smtType ← withPolarity .mixed (translateTypeAux termTranslator t)
    let smtSym ← fvarIdToSmtSymbol v
    updatePredicateQualifiers t smtSym -- update predicate qualifiers list
    if !(← get).topLevel
@@ -1365,7 +1446,7 @@ def translateQuantifier
 
  where
    updatePredicateQualifiers (t : Expr) (smtSym : SmtSymbol) : QuantifierEnvT Unit := do
-     let pTerm ← createPredQualifierApp smtSym t
+     let pTerm ← withPolarity .mixed (createPredQualifierApp smtSym t)
      modify (fun env => { env with premises := env.premises.push pTerm})
 
    updateQuantifiers (smtSym : SmtSymbol) (smtType: SortExpr) : QuantifierEnvT Unit := do
@@ -1377,34 +1458,46 @@ def translateForAll
   (e : Expr) (termTranslator : Expr → TranslateEnvT SmtTerm) : QuantifierEnvT SmtTerm := do
  Optimize.forallTelescope e fun fvars b => do
    let topLevel := (← get).topLevel
-   let mut topLevelPremises := #[]
+   let pol := (← get).polarity
+   -- premises are translated once all sort variables with a membership predicate are known
+   let deferPremises ← pure topLevel <||> fvars.anyM (fun v => return (← inferTypeEnv v).isType)
+   let mut deferredPremises := #[]
    let mut sortVars := #[]
    for h : i in [:fvars.size] do
      let v := fvars[i]
      let decl ← getFVarLocalDecl v
      if (← isPropEnv decl.type) then
-       -- top level premises are translated once all top level sort variables are known
-       if topLevel then topLevelPremises := topLevelPremises.push decl.type
-       else updatePremises (← termTranslator decl.type)
+       if deferPremises then deferredPremises := deferredPremises.push decl.type
+       else updatePremises (← withPolarity pol.flip (termTranslator decl.type))
      -- need to filter out class constraints
      else if !(← isClassConstraintExpr decl.type) then
-       translateQuantifier v decl.type termTranslator
-       if decl.type.isType then sortVars := sortVars.push v
-   for h : i in [:topLevelPremises.size] do
-     let p := topLevelPremises[i]
-     let mut pTerm ← termTranslator p
+       if decl.type.isType then
+         let membership ←
+           if topLevel then pure true
+           else
+             let scope ← (fvars.extract (i+1) fvars.size).mapM (fun v => inferTypeEnv v)
+             sortQuantifierMembership pol (isForall := true) (scope.push b) (fvars.extract i fvars.size)
+         translateQuantifier v decl.type termTranslator membership
+         if membership then sortVars := sortVars.push v
+       else
+         translateQuantifier v decl.type termTranslator
+         if !topLevel && pol == .positive then addUnivFVar v
+   for h : i in [:deferredPremises.size] do
+     let p := deferredPremises[i]
+     let mut pTerm ← withPolarity pol.flip (termTranslator p)
      for pInst in (← instantiateSortHyp p sortVars) do
-       pTerm := andSmt pTerm (← termTranslator pInst)
+       pTerm := andSmt pTerm (← withPolarity pol.flip (termTranslator pInst))
      updatePremises pTerm
-   let fbody ← termTranslator b
+   let fbody ← withPolarity pol (termTranslator b)
    genForAllTerm fbody
 
  where
-   /-- Given `p := ∀ (β₁ : t₁) ... (βₙ : tₙ), e` a top level premise with `β₁ ... βₙ` sort variables
-       and `sortVars` the sort variables universally quantified at the top level, return the
-       instances `e[β₁/α₁] ... [βₙ/αₙ]` for all `αᵢ ∈ sortVars` such that `Type(αᵢ) = tᵢ` (at most `maxInsts`).
+   /-- Given `p := ∀ (β₁ : t₁) ... (βₙ : tₙ), e` a premise with `β₁ ... βₙ` sort variables
+       and `sortVars` the sort variables with a membership predicate universally quantified by the
+       same `∀` (e.g., at the top level), return the instances `e[β₁/α₁] ... [βₙ/αₙ]` for all `αᵢ ∈ sortVars`
+       such that `Type(αᵢ) = tᵢ` (at most `maxInsts`).
        Sort quantifiers in premises are otherwise instantiated with the universal sort `@@Type`
-       (see `translateQuantifier`), which does not satisfy the membership predicate of top level
+       (see `sortQuantifierMembership`), which does not satisfy the membership predicate of
        sort variables. Instantiating premises is sound as they are hypotheses.
    -/
    instantiateSortHyp (p : Expr) (sortVars : Array Expr) (maxInsts := 8) : TranslateEnvT (Array Expr) := do

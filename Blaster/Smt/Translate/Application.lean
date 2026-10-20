@@ -891,13 +891,24 @@ def translateApp
        | _ => return none
 
     genExistsTerm (lambdaE : Expr) : QuantifierEnvT SmtTerm := do
+      -- polarity of the `∃` (see `subTermPolarity` in `translateExpr`)
+      let pol ← getPolarity
       Optimize.lambdaTelescope lambdaE fun fvars b => do
         for h : i in [:fvars.size] do
           let fv := fvars[i]
           let decl ← getFVarLocalDecl fv
-          translateQuantifier fv decl.type termTranslator
-        let ebody ← termTranslator b
+          if decl.type.isType then
+            -- sort variable (see `sortQuantifierMembership`)
+            let scope ← (fvars.extract (i+1) fvars.size).mapM (fun v => inferTypeEnv v)
+            let membership ← sortQuantifierMembership pol (isForall := false) (scope.push b) (fvars.extract i fvars.size)
+            translateQuantifier fv decl.type termTranslator membership
+          else
+            translateQuantifier fv decl.type termTranslator
+            if pol == .negative then addUnivFVar fv
+        let ebody ← withPolarity pol (termTranslator b)
         let env ← get
+        -- no predicate qualifier premise for sort variables
+        if env.quantifiers.isEmpty then return ebody
         if env.premises.size != 1 then
           throwEnvError "genExistsTerm: only one predicate qualifier premise expected but got {env.premises}"
         -- set patterns to none for now

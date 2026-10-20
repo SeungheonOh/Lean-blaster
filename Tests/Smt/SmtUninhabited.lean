@@ -70,4 +70,56 @@ class ToNat (α : Type) where
 #blaster [ (∀ (β : Type) (xs : List β) (f : List β → Nat), f xs > 10) →
            ∀ (α : Type) (xs : List α) (f : List α → Nat), f xs > 5 ]
 
+/-! Test cases to ensure that sort quantifiers that are not in the top level ∀ prefix of the goal
+    are soundly translated w.r.t. their polarity. -/
+
+-- Counterexample: `p := False`, `α := Empty`
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (p : Prop), p ∨ ∀ (α : Type), (∀ (_x : α), False) → False ]
+
+-- Counterexample: `p := False`, `n := 0`, `α := Empty` (sort quantifier under a universal quantifier)
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (p : Prop), p ∨ ∀ (n : Nat) (α : Type), (∀ (_x : α), n > 5) → n > 5 ]
+
+-- Counterexample: `p := False`, `α := Empty` (sort quantifier with mixed polarity)
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (p : Prop), (p ↔ ∀ (α : Type), (∀ (_x : α), False) → False) → p ]
+
+-- Counterexample: `p := False`, `α := Empty`
+-- Test case: same sort quantifier in negative and positive position (translation not memoized)
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (p : Prop), ((∀ (α : Type), (∀ (_x : α), False) → False) → p) →
+                  p ∨ ∀ (α : Type), (∀ (_x : α), False) → False ]
+
+-- Counterexample: `p := False`, `α := Empty` (∃ over sort in negative position)
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (p : Prop), p ∨ ¬ ∃ (α : Type), ∀ (_x : α), False ]
+
+-- Counterexample: `p := False`, `α := Empty` (∃ over sort in negative position)
+#blaster (gen-cex: 0) (solve-result: 1)
+  [ ∀ (p : Prop), p ∨ ((∃ (α : Type), ∀ (_x : α), False) → False) ]
+
+-- Not a theorem (for `b := true` take `α := Empty` and for `b := false` take `α := Unit`).
+-- Sort quantifier depending on an existential variable: `unsat` is reported as `Undetermined`.
+#blaster (solve-result: 2)
+  [ ∃ (b : Bool), ∀ (α : Type), (b = true ↔ ∃ (_x : α), True) ]
+
+-- Not a theorem (counterexample: `f := λ n => decide (n > 5)`).
+-- Sort quantifier with mixed polarity depending on a quantified variable:
+-- `unsat` is reported as `Undetermined`.
+#blaster (solve-result: 2)
+  [ ∀ (f : Nat → Bool), (∀ (n : Nat), f n = true ↔ ∀ (α : Type), (∀ (_x : α), n > 5) → n > 5) → f 0 = true ]
+
+-- Theorem (`n := 6`) but sort quantifier depending on an existential variable.
+#blaster (solve-result: 2)
+  [ ∃ (n : Nat), ∀ (α : Type), (∀ (_x : α), n > 5) → n > 5 ]
+
+#blaster [ ∀ (p : Prop), p ∨ ∀ (α : Type) (a : α), (∀ (_x : α), False) → False ]
+
+#blaster [ ∀ (p : Prop), p ∨ ∀ (α : Type) (x y : α) (xs : List α), x :: xs = y :: xs → x = y ]
+
+#blaster [ ∃ (α : Type), ∃ (_x : α), True ]
+
+#blaster [ ∀ (p : Prop), p ∨ ((∃ (α : Type) (x y : α), x ≠ y) → ∃ (β : Type) (u v : β), u ≠ v) ]
+
 end Test.SmtUninhabited

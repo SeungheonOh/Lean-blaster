@@ -120,15 +120,30 @@ def updateTranslateCache (a : Expr) (b : SmtTerm) : TranslateEnvT Unit := do
       - execute `b ← fun ()`
       - update cache with `a := b`
       - return b
+    The cache is not updated when a sort quantifier has been translated by `f ()`,
+    as the translation of a sort quantifier depends on its polarity (see `sortQuantifierMembership`).
 -/
 def withTranslateEnvCache (a : Expr) (f : Unit → TranslateEnvT SmtTerm) : TranslateEnvT SmtTerm := do
   let env ← get
   match env.smtEnv.translateCache.get? a with
   | some b => return b
   | none => do
+     let seen := env.smtEnv.sortQuantifierSeen
+     modify (fun env => { env with smtEnv.sortQuantifierSeen := false })
      let b ← f ()
-     updateTranslateCache a b
+     let seenInA := (← get).smtEnv.sortQuantifierSeen
+     unless seenInA do updateTranslateCache a b
+     modify (fun env => { env with smtEnv.sortQuantifierSeen := seen || seenInA })
      return b
+
+/-- Return the polarity of the next expression to be translated. -/
+def getPolarity : TranslateEnvT Polarity := return (← get).smtEnv.polarity
+
+/-- Execute `k` with polarity set to `p` and restore the current polarity afterwards. -/
+def withPolarity (p : Polarity) (k : TranslateEnvT α) : TranslateEnvT α := do
+  let saved := (← get).smtEnv.polarity
+  modify (fun env => { env with smtEnv.polarity := p })
+  try k finally modify (fun env => { env with smtEnv.polarity := saved })
 
 /-- Check if cancel token has been triggered and kill corresponding running
     Solver instance (if necessary).
@@ -529,7 +544,10 @@ partial def getSatResult (p : IO.Process.Child ⟨.piped, .piped, .piped⟩) : T
      if ← IO.hasFinished res then
        match ← IO.ofExcept res.get with
        | "sat\n"     => return (.Falsified (← getModel))
-       | "unsat\n"   => return .Valid
+       | "unsat\n"   =>
+           -- a sort quantifier could not be soundly translated (see `sortQuantifierMembership`)
+           if (← get).smtEnv.unsupportedSortQuantifier then return .Undetermined
+           return .Valid
        | "unknown\n" => return .Undetermined -- unknown is also return when timeout is set to stdin
        | err => throwEnvError s!"checkSat: Unexpected check-sat result: {err}"
      else
