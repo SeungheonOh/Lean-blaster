@@ -79,12 +79,16 @@ inductive Kind where
 inductive Sign where
   | pos | neg | zero
 
+/-- A literal `0 ≤ e`, `0 < e` or `e = 0` (see `Kind`). -/
 structure Lit where
   kind : Kind
   e : Expr
   /-- proof of the literal -/
   pf : Expr
   deriving Inhabited
+
+/-- The term `e` of the literal `ty` (`0 ≤ e`, `0 < e` or `e = 0`). -/
+def litTerm (kind : Kind) (ty : Expr) : Expr := if kind == .zero then ty.appFn!.appArg! else ty.appArg!
 
 structure State where
   lits : Array Lit := #[]
@@ -121,13 +125,21 @@ partial def isNumeral (e : Expr) : Bool :=
   (e.isAppOfArity ``Neg.neg 3 && isNumeral e.appArg!) ||
   ((e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Nat.cast 3) && isNumeral e.appArg!)
 
+/-- Whether `e` is the type `Int`. -/
 def isInt (e : Expr) : Bool := e.isConstOf ``Int
+
+/-- Whether `e` is the numeral `0`. -/
+def isZero (e : Expr) : MetaM Bool := return (← getIntValue? e) == some 0
+
+/-- Divisions and modulos (`x / y`, `x % y`). -/
+def isDivOrMod (e : Expr) : Bool := e.isAppOfArity ``HDiv.hDiv 6 || e.isAppOfArity ``HMod.hMod 6
 
 /-- Nonlinear terms: products of non-numerals, divisions and modulos by non-numerals (over `Int`). -/
 def isNonlinear (e : Expr) : Bool :=
   (e.isAppOfArity ``HMul.hMul 6 && isInt (e.getArg! 0) && !isNumeral (e.getArg! 4) && !isNumeral (e.getArg! 5)) ||
-  ((e.isAppOfArity ``HDiv.hDiv 6 || e.isAppOfArity ``HMod.hMod 6) && isInt (e.getArg! 0) && !isNumeral (e.getArg! 5))
+  (isDivOrMod e && isInt (e.getArg! 0) && !isNumeral (e.getArg! 5))
 
+/-- Whether `e` contains a nonlinear term (see `isNonlinear`). -/
 def hasNonlinear (e : Expr) : Bool := (e.find? fun s => isNonlinear s && !s.hasLooseBVars).isSome
 
 /-- Subterms of `e` (without loose bound variables) satisfying `p`, outermost first. -/
@@ -310,7 +322,7 @@ def closeCase (ctx : Ctx) (atoms : Array Expr) (hs : Array Expr) : TacticM Expr 
   -- NOTE: the atoms interpreted by `omega` are kept (e.g., casts, divisions by numerals)
   let atoms := atoms.filter fun a => !(a.isAppOfArity ``Nat.cast 3 || a.isAppOfArity ``Int.toNat 1 ||
     a.isAppOfArity ``Int.natAbs 1 || a.isAppOfArity ``Min.min 4 || a.isAppOfArity ``Max.max 4 ||
-    ((a.isAppOfArity ``HDiv.hDiv 6 || a.isAppOfArity ``HMod.hMod 6) && isNumeral (a.getArg! 5)))
+    (isDivOrMod a && isNumeral (a.getArg! 5)))
   let idx : Std.HashMap Expr Nat := atoms.zipIdx.foldl (fun m (a, i) => m.insert a i) {}
   let decls := atoms.mapIdx fun i _ => (Name.mkSimple s!"a{i}", fun (_ : Array Expr) => pure (mkConst ``Int))
   let (fvs, g) ← withLocalDeclsD decls fun vs => do
@@ -323,8 +335,9 @@ def closeCase (ctx : Ctx) (atoms : Array Expr) (hs : Array Expr) : TacticM Expr 
   let atoms := fvs ++ atoms
   let mvar ← withLCtx {} {} (mkFreshExprMVar g)
   let t0 ← IO.monoMsNow
+  let maxHeartbeats := ctx.cfg.heartbeats * 1000
   let gs ← tryCatchRuntimeEx
-      (withCurrHeartbeats <| withTheReader Core.Context (fun c => { c with maxHeartbeats := ctx.cfg.heartbeats * 1000 }) <|
+      (withCurrHeartbeats <| withTheReader Core.Context (fun c => { c with maxHeartbeats }) <|
         Tactic.run mvar.mvarId! (evalTactic (← `(tactic| (intros; omega)))))
       fun ex => do
         trace[blaster.nlarith] "omega failed on {hs.size} facts ({(← IO.monoMsNow) - t0} ms)"
@@ -369,21 +382,19 @@ partial def nonnegProof? (e : Expr) : MetaM (Option Expr) := do
 /-- Literal of the comparison `a ≤ b` (`nonneg`), `a < b` (`pos`) or `a = b` (`zero`) proved by `h`, recording
     the signs of the terms compared with `0`. -/
 def addLit (st : State) (kind : Kind) (a b h : Expr) : MetaM State := do
-  let zero (e : Expr) : MetaM Bool := return (← getIntValue? e) == some 0
   -- the literal, and the sign of a term: `0 < y`, `y < 0` or `y = 0`
   let (pf, sign?) ← match kind with
-    | .nonneg => if ← zero a then pure (h, none) else pure (← mkAppM ``Int.sub_nonneg_of_le #[h], none)
+    | .nonneg => if ← isZero a then pure (h, none) else pure (← mkAppM ``Int.sub_nonneg_of_le #[h], none)
     | .pos =>
-        if ← zero a then pure (h, some (b, Sign.pos, h))
-        else if ← zero b then pure (← mkAppM ``Int.sub_pos_of_lt #[h], some (a, .neg, h))
+        if ← isZero a then pure (h, some (b, Sign.pos, h))
+        else if ← isZero b then pure (← mkAppM ``Int.sub_pos_of_lt #[h], some (a, .neg, h))
         else pure (← mkAppM ``Int.sub_pos_of_lt #[h], none)
     | .zero =>
-        if ← zero b then pure (h, some (a, .zero, h))
-        else if ← zero a then do let h' ← mkEqSymm h; pure (h', some (b, .zero, h'))
+        if ← isZero b then pure (h, some (a, .zero, h))
+        else if ← isZero a then do let h' ← mkEqSymm h; pure (h', some (b, .zero, h'))
         else pure (← mkAppM ``Int.sub_eq_zero_of_eq #[h], none)
   let ty ← instantiateMVars (← inferType pf)
-  let e := if kind == .zero then ty.appFn!.appArg! else ty.appArg!
-  let mut st := { st with lits := st.lits.push { kind, e, pf } }
+  let mut st := { st with lits := st.lits.push { kind, e := litTerm kind ty, pf } }
   if let some (y, sign, hs) := sign? then
     if !st.signs.contains y then st := { st with signs := st.signs.insert y (sign, hs) }
   return st
@@ -408,8 +419,7 @@ def rewriteLit (t v heq : Expr) (l : Lit) : MetaM Lit := do
   if !abst.hasLooseBVars then return l
   let motive := mkLambda `t .default (mkConst ``Int) abst
   let pf := mkApp6 (mkConst ``Eq.ndrec [levelZero, levelOne]) (mkConst ``Int) t motive l.pf v heq
-  let ty' := abst.instantiate1 v
-  return { l with e := if l.kind == .zero then ty'.appFn!.appArg! else ty'.appArg!, pf }
+  return { l with e := litTerm l.kind (abst.instantiate1 v), pf }
 
 /-- `False` from the literals of a case: the literals are normalized and the case is closed by `omega` (nonlinear
     monomials are atoms), first by linear reasoning (e.g., Farkas lemmas over nonlinear monomials, when `linear`),
@@ -471,7 +481,8 @@ partial def closeLits (ctx : Ctx) (lits : Array Lit) (splits : Nat)
     if let some ha ← nonnegProof? a then return ← zeroOrPos (mkApp2 (mkConst ``eq_zero_or_pos_of_nonneg) a ha)
     orElim (← mkAppM ``Int.lt_trichotomy #[a, zero]) (fun h => do next (← addLit { lits } .pos a zero h).lits)
       zeroOrPos
-  let nonlinear : TacticM Expr := attempt withProducts (if splits > 0 then withSigns else throwError "blaster_nlarith: failed")
+  let nonlinear : TacticM Expr :=
+    attempt withProducts (if splits > 0 then withSigns else throwError "blaster_nlarith: failed")
   if linear then attempt (closeCase ctx atoms (← dedup nlits)) nonlinear else nonlinear
 
 mutual
@@ -521,13 +532,14 @@ partial def refute (ctx : Ctx) (todo : List Expr) (st : State) : TacticM Expr :=
             if α.isProp then push ``not_iff_of_not_eq
             else if isInt α then
               -- `t ≠ 0` for a nonnegative term `t`: `0 < t`
-              let zero (e : Expr) : MetaM Bool := return (← getIntValue? e) == some 0
               let a := p.appFn!.appArg!
               let b := p.appArg!
-              if ← zero b then
-                if let some ha ← nonnegProof? a then return ← next (mkApp3 (mkConst ``pos_of_ne_zero_of_nonneg) a ha h :: rest)
-              if ← zero a then
-                if let some hb ← nonnegProof? b then return ← next (mkApp3 (mkConst ``pos_of_zero_ne_of_nonneg) b hb h :: rest)
+              if ← isZero b then
+                if let some ha ← nonnegProof? a then
+                  return ← next (mkApp3 (mkConst ``pos_of_ne_zero_of_nonneg) a ha h :: rest)
+              if ← isZero a then
+                if let some hb ← nonnegProof? b then
+                  return ← next (mkApp3 (mkConst ``pos_of_zero_ne_of_nonneg) b hb h :: rest)
               push ``Int.lt_or_gt_of_ne
             else other
         | LE.le α _ _ _ => if isInt α then push ``lt_of_not_le else other
@@ -541,7 +553,7 @@ partial def refute (ctx : Ctx) (todo : List Expr) (st : State) : TacticM Expr :=
 /-- Case without pending facts: split the next `if-then-else` term or divisor sign, add the facts on the divisions,
     modulos and nonnegative terms, then close the case (see `closeLits`). -/
 partial def closeOrSplit (ctx : Ctx) (st : State) : TacticM Expr := do
-  let isDivMod (s : Expr) := (s.isAppOfArity ``HDiv.hDiv 6 || s.isAppOfArity ``HMod.hMod 6) && isNonlinear s
+  let isDivMod (s : Expr) := isDivOrMod s && isNonlinear s
   let terms := st.lits.foldl (fun acc l => acc ++ subterms l.e fun s =>
     (s.isAppOfArity ``ite 5 && isInt (s.getArg! 0)) || isDivMod s ||
     (s.isAppOfArity ``Nat.cast 3 && isInt (s.getArg! 0))) #[]
@@ -598,8 +610,8 @@ where
   isZeroEq? (c : Expr) : MetaM (Option (Expr × Bool)) := do
     let some (α, a, b) := c.eq? | return none
     if !isInt α then return none
-    if (← getIntValue? a) == some 0 then return some (b, true)
-    if (← getIntValue? b) == some 0 then return some (a, false)
+    if ← isZero a then return some (b, true)
+    if ← isZero b then return some (a, false)
     return none
   /-- key of the facts of the division of `x` by `y` -/
   divKey (s : Expr) : Expr := mkApp2 (mkConst ``HDiv.hDiv) (s.getArg! 4) (s.getArg! 5)
