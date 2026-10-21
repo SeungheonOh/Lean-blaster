@@ -12,7 +12,9 @@ namespace Blaster.Smt
 /-- Translate an optimized Lean4 `Expr` to an SMT term, and invoke the solver. --/
 partial def translateExpr (e : Expr) (topLevel := true) : TranslateEnvT SmtTerm := do
   let rec visit (e : Expr) (topLevel := false) : TranslateEnvT SmtTerm := do
-    withTranslateEnvCache e fun _ => do
+    -- polarity of `e` (see `sortQuantifierMembership`)
+    let pol ← getPolarity
+    withTranslateEnvCache e fun _ => withPolarity (subTermPolarity e pol) do
     trace[Translate.expr] "translating {reprStr e}"
     logReprExpr "Translate:" e
     if let some n := isIntValue? e then return intLitSmt n
@@ -23,7 +25,7 @@ partial def translateExpr (e : Expr) (topLevel := true) : TranslateEnvT SmtTerm 
      | Expr.fvar .. => translateFreeVar e visit
      | Expr.const .. => translateConst e visit
      | Expr.forallE .. =>
-         let qtyEnv := initialQuantifierEnv topLevel
+         let qtyEnv := initialQuantifierEnv topLevel pol
          let (t, _) ← translateForAll e visit |>.run qtyEnv
          trace[Translate.forAll] "translate forall {reprStr e} ==> {t}"
          return t
@@ -41,7 +43,26 @@ partial def translateExpr (e : Expr) (topLevel := true) : TranslateEnvT SmtTerm 
      | Expr.bvar .. => throwEnvError "translateExpr: unexpected bound variable {reprStr e}"
      | Expr.letE .. => throwEnvError "translateExpr: unexpected let expression {reprStr e}"
      | Expr.sort _ => throwEnvError "translateExpr: unexpected sort type {reprStr e}" -- sort type are handled elsewhere
-  visit e topLevel
+  -- the goal is in positive position. Other expressions (e.g., state machine predicates)
+  -- may be asserted in any position.
+  withPolarity (if topLevel then .positive else .mixed) (visit e topLevel)
+
+ where
+   /-- Given `e` an expression in polarity `pol`, return the polarity of the sub-terms of `e`, i.e.,
+        - `pol` when `e := p₁ ∧ p₂` or `e := p₁ ∨ p₂` or `e := ∃ x, p` or `e` is an mdata expression
+        - `pol.flip` when `e := ¬ p`
+        - `pol` when `e := ∀ x, p`, which is refined by `translateForAll` for its premises and body
+        - `mixed` otherwise.
+   -/
+   subTermPolarity (e : Expr) (pol : Polarity) : Polarity :=
+     match e.getAppFn, e.getAppNumArgs with
+     | Expr.const ``And _, 2
+     | Expr.const ``Or _, 2
+     | Expr.const ``Exists _, 2 => pol
+     | Expr.const ``Not _, 1 => pol.flip
+     | Expr.forallE .., _
+     | Expr.mdata .., 0 => pol
+     | _, _ => .mixed
 
 /-- Same as `Translate.main` but also returns the information required to reconstruct a proof
     when the result is `Valid` and proof reconstruction is activated.

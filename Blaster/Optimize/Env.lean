@@ -350,6 +350,23 @@ instance : Inhabited TranslateOptions where
 
 abbrev TopLevelVars := Array (List (SmtSymbol × Lean.Name))
 
+/-- Polarity of a sub-term w.r.t. the goal being proved (see `sortQuantifierMembership`).
+     - `positive`: the sub-term only occurs under `∧`, `∨`, `∀` bodies, `∃` bodies and an even number
+        of negations/implication premises;
+     - `negative`: same as `positive` but with an odd number of negations/implication premises;
+     - `mixed`: any other context (e.g., `↔`, `=`, `ite` condition, function argument, lambda body).
+-/
+inductive Polarity where
+  | positive
+  | negative
+  | mixed
+deriving Inhabited, BEq, Repr
+
+def Polarity.flip : Polarity → Polarity
+  | .positive => .negative
+  | .negative => .positive
+  | .mixed => .mixed
+
 /-- Type defining the environment used when translating to Smt-Lib. -/
 structure SmtEnv where
   /-- Cache memoizing the translation to Smt-Lib term. -/
@@ -451,6 +468,39 @@ structure SmtEnv where
   /-- Translation options (see note on TranslateOptions) -/
   options: TranslateOptions
 
+  /-- Polarity of the next expression to be translated (see `sortQuantifierMembership`).
+      Set by the parent expression and reset to `mixed` for each sub-term by default.
+  -/
+  polarity : Polarity
+
+  /-- Non top level fvars bound by a quantifier that is universal w.r.t. the goal,
+      i.e., a `∀` in positive position or an `∃` in negative position, and that is not in the scope
+      of a quantifier that is existential w.r.t. the goal (see `sortQuantifierMembership`).
+  -/
+  univFVars : Std.HashSet FVarId
+
+  /-- Flag set to `true` when translating the scope of a quantifier that is existential w.r.t. the goal
+      (i.e., a `∀` in negative position or an `∃` in positive position) or the body of a predicate qualifier
+      (see `withQualifierBody`). Variables bound in such a scope are not added to `univFVars`.
+  -/
+  underExistential : Bool
+
+  /-- Flag set to `true` when the translation of an expression depends on its polarity, e.g., when a sort quantifier
+      or a negative only predicate qualifier (see `negativeOnlyQualifiers`) has been translated.
+      Such expressions are not memoized in `translateCache` (see `withTranslateEnvCache`).
+  -/
+  polarityDependent : Bool
+
+  /-- Predicate qualifiers (i.e., `IndTypeDeclaration.instName`) that are only implied by the type
+      membership they characterize, i.e., that can only be used in negative position (see `withQualifierBody`).
+  -/
+  negativeOnlyQualifiers : Std.HashSet SmtSymbol
+
+  /-- Flag set to `true` when a sort quantifier could not be soundly translated
+      (see `sortQuantifierMembership` and `checkQualifierPolarity`). An `unsat` result is then reported as `Undetermined`.
+  -/
+  unsupportedSortQuantifier : Bool
+
 instance : Inhabited SmtEnv where
   default :=
    { translateCache := Std.HashMap.emptyWithCapacity,
@@ -466,7 +516,13 @@ instance : Inhabited SmtEnv where
      topLevelVars := Array.mkEmpty 3,
      symbolStrCache := Std.HashMap.emptyWithCapacity,
      options := default
-     funCtorCache := Std.HashMap.emptyWithCapacity
+     funCtorCache := Std.HashMap.emptyWithCapacity,
+     polarity := .mixed,
+     univFVars := Std.HashSet.emptyWithCapacity,
+     underExistential := false,
+     polarityDependent := false,
+     negativeOnlyQualifiers := Std.HashSet.emptyWithCapacity,
+     unsupportedSortQuantifier := false
    }
 
 /-- Type defining the environment used when optimizing a lean theorem and translating to Smt-lib. -/

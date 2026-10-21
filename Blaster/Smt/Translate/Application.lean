@@ -743,14 +743,15 @@ def generateUndeclaredFun
     if fvars.size > 0 then
       let xIds := Array.map (λ v => smtSimpleVarId v) xsyms
       let f_applyTerm := mkSimpleSmtAppN s xIds
-      let forallBody ← createPredQualifierAppAux f_applyTerm retType
+      -- the co-domain qualifier of an asserted constraint is in negative position
+      let forallBody ← createPredQualifierAppAux f_applyTerm retType .negative
       let forallBody ← guardWithDomainQualifiers xIds argTypes forallBody
       let qidSuffix ← if declare then pure "cstr" else pure s!"cstr{← mkFreshId}"
       let qidName := mkQid $ appendSymbol s qidSuffix
       let pattern := some #[mkPattern #[f_applyTerm], qidName]
       assertTerm (mkForallTerm none co_quantifiers forallBody pattern)
     else
-      assertTerm (← createPredQualifierAppAux (smtSimpleVarId s) retType)
+      assertTerm (← createPredQualifierAppAux (smtSimpleVarId s) retType .negative)
 
 /-- Given `e := Expr.const n l`,
      - When `n := false`
@@ -879,7 +880,8 @@ def translateConst
              let smtType ← translateTypeAux termTranslator t'
              -- declare free variable at top level
              declareConst smtSym smtType
-             let pTerm ← createPredQualifierApp smtSym t'
+             -- asserted predicate qualifier is in negative position
+             let pTerm ← createPredQualifierApp smtSym t' .negative
              assertTerm pTerm
              return (smtSimpleVarId smtSym)
 
@@ -988,13 +990,27 @@ def translateApp
        | _ => return none
 
     genExistsTerm (lambdaE : Expr) : QuantifierEnvT SmtTerm := do
+      -- polarity of the `∃` (see `subTermPolarity` in `translateExpr`)
+      let pol ← getPolarity
       Optimize.lambdaTelescope lambdaE fun fvars b => do
+       -- quantifier not universal w.r.t. the goal (see `univFVars`)
+       let existential ← pure (pol != .negative) <&&> fvars.anyM (fun v => return !(← inferTypeEnv v).isType)
+       withUnderExistential existential do
         for h : i in [:fvars.size] do
           let fv := fvars[i]
           let decl ← getFVarLocalDecl fv
-          translateQuantifier fv decl.type termTranslator
-        let ebody ← termTranslator b
+          if decl.type.isType then
+            -- sort variable (see `sortQuantifierMembership`)
+            let scope ← (fvars.extract (i+1) fvars.size).mapM (fun v => inferTypeEnv v)
+            let membership ← sortQuantifierMembership pol (isForall := false) (scope.push b) (fvars.extract i fvars.size)
+            translateQuantifier fv decl.type termTranslator membership
+          else
+            translateQuantifier fv decl.type termTranslator (qualifierPol := pol)
+            if pol == .negative then addUnivFVar fv
+        let ebody ← withPolarity pol (termTranslator b)
         let env ← get
+        -- no predicate qualifier premise for sort variables
+        if env.quantifiers.isEmpty then return ebody
         if env.premises.size != 1 then
           throwEnvError "genExistsTerm: only one predicate qualifier premise expected but got {env.premises}"
         -- set patterns to none for now
@@ -1226,6 +1242,8 @@ def translateLambda
        `fun n => if n = 0 then 1 else n`).
        NOTE: parameters whose type has sort variables that are not top level are not guarded (their
        predicates would refer to locally quantified sort variables).
+       The guard occurs in positive position w.r.t. the goal (it restricts an assumed definition), as the
+       domain qualifiers of co-domain constraints (see `guardWithDomainQualifiers`).
    -/
    paramGuard? (x : SmtSymbol) (t : Expr) : TranslateEnvT (Option SmtTerm) := do
      if isTypeUniverse t || (← isClassConstraintExpr t) then return none
@@ -1234,7 +1252,7 @@ def translateLambda
      for h : i in [:genArgs.size] do
        let v := genArgs[i]
        if isTypeUniverse (← inferTypeEnv v) && !(v.isFVar && (← isTopLevelFVar v.fvarId!)) then return none
-     try return some (← createPredQualifierApp x t)
+     try return some (← createPredQualifierApp x t .positive)
      catch _ => return none
 
    /-- `true` only when `t` is a sort `Sort u` with `u ≠ 0`. -/
