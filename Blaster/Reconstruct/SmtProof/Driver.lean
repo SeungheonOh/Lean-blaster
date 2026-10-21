@@ -322,9 +322,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         let pt ← traceTimed "root type" (inferType p)
         if !pt.isConstOf ``False then throwError "smt proof: root does not prove False: {pt}"
         -- NOTE: the proofs of the steps are instantiated once (see `replay`), the ones of the global steps as closed
-        -- lambda terms over the variables of the base context (see `liftGlobalProofs`)
-        let fvs := (← getLCtx).foldl (init := #[]) fun acc d => if d.isImplementationDetail then acc else acc.push d.toExpr
-        let p ← traceTimed "instantiation" (liftGlobalProofs p st.cache fvs)
+        -- lambda terms over the variables of the goal and the negated goal (see `liftGlobalProofs`), the only free
+        -- variables of their proofs as `e` is closed (not the variables of the context of the elaboration)
+        let p ← traceTimed "instantiation" (liftGlobalProofs p st.cache (xs.push hneg))
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
           let (n, d) := dagStats p
           traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
