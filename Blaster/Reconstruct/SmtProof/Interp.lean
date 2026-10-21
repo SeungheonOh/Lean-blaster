@@ -320,6 +320,12 @@ partial def sortToType (s : SExpr) : InterpM Expr := do
 
 /-! ## Terms -/
 
+/-- Interpretation of SMT-LIB's `str.from_code`: the string of the character of code `n` when `n` is a code of the SMT
+    string alphabet (`[0, 196607]`), the empty string otherwise.
+    NOTE: Lean characters exclude the surrogate code points (mapped to `'\0'` by `Char.ofNat`): the steps relying on
+    the injectivity of `str.from_code` on them do not replay. -/
+def strFromCode (n : Int) : String := if 0 ≤ n ∧ n ≤ 196607 then String.singleton (Char.ofNat n.toNat) else ""
+
 /-- Decode the escape sequences `\u{h...}` and `\uhhhh` of SMT-LIB string literals. -/
 partial def decodeSmtString (s : String) : String := Id.run do
   let cs := s.toList.toArray
@@ -733,6 +739,7 @@ partial def interpApp (f : String) (args : Array STerm) : InterpM Expr := do
   | ">", _ => chain (fun a b => pure (mkIntLt b a)) (← args.mapM interpInt)
   | "str.++", _ | "seq.++", _ => foldBin (fun a b => mkApp2 (mkConst ``String.append) a b) (← args.mapM interp)
   | "str.len", 1 | "seq.len", 1 => return mkIntOfNat (mkApp (mkConst ``String.length) (← interp args[0]!))
+  | "str.from_code", 1 => return mkApp (mkConst ``strFromCode) (← interp args[0]!)
   -- lexicographic order (`str.<=` as the negation of the converse, the order being total)
   | "str.<", 2 => return mkStrLt (← interp args[0]!) (← interp args[1]!)
   | "str.<=", 2 => return mkNot (mkStrLt (← interp args[1]!) (← interp args[0]!))
