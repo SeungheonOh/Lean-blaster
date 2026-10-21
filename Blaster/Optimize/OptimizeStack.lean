@@ -15,9 +15,9 @@ instance : Repr (Option MVarIdDecls) where
 inductive OptimizeStack where
  | InitOptimizeExpr (e : Expr) (mvarDecls : Option MVarIdDecls := none)
  | InitOptimizeReturn (e : Expr) (isGlobal : Bool) (mvarDecls : Option MVarIdDecls)
- | RecFunDefWaitForStorage (args : Array Expr) (instApp : Expr)
+ | RecFunDefWaitForStorage (args : Array Expr) (recFn : Expr) (instApp : Expr)
                            (subsInts : Expr) (params : ImplicitParameters) (startCtxId : CtxId)
- | RecFunDefStorage (args : Array Expr) (instApp : Expr)
+ | RecFunDefStorage (args : Array Expr) (recFn : Expr) (instApp : Expr)
                     (subsInts : Expr) (params : ImplicitParameters) (optBody : Expr)
                     (startCtxId : CtxId)
  | ForallWaitForType (n : Name) (bi : BinderInfo) (body : Expr)
@@ -112,10 +112,10 @@ def stackContinuity (stack : List OptimizeStack) (optExpr : Expr) (skipCache := 
          | [] => return Sum.inr optExpr
          | _ => stackContinuity xs optExpr
 
-  | .RecFunDefWaitForStorage args instApp subsInst params startCtxId :: xs =>
+  | .RecFunDefWaitForStorage args recFn instApp subsInst params startCtxId :: xs =>
        -- optExpr corresponds to optimized rec fun body
        -- continuity with normOpaqueAndRecFun
-       return Sum.inl (.RecFunDefStorage args instApp subsInst params optExpr startCtxId :: xs)
+       return Sum.inl (.RecFunDefStorage args recFn instApp subsInst params optExpr startCtxId :: xs)
 
   | .ForallWaitForType n bi body :: xs =>
        -- optExpr corresponds to optimized forall binder type

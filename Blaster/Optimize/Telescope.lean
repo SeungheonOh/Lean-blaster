@@ -440,18 +440,25 @@ def getImplicitParameters (f : Expr) (args : Array Expr) : TranslateEnvT Implici
       - When instanceArgs.isEmpty
           - return `f`
       - Otherwise:
-          - When instanceArgs.size == params.size (i.e., only implicit arguments provided)
+          - When instanceArgs.size == params.size (i.e., only implicit arguments provided) and
+            each implicit argument is either generic or a type
              - return `mkLambdaFVars genFVars f`
           - Otherwise:
              - return `mkLambdaFVars genFVars (specializeLambda (← etaExpand f) params)`
+    NOTE: When only implicit arguments are provided (e.g., a partial application passed to a higher-order
+    function), they can only be dropped when they are types (the instances of a parametric function share the
+    same Smt function). Any other implicit argument (e.g., an instance of a class, `@f Int inst₁` vs `@f Int inst₂`)
+    must be kept, as distinct instances must not share the same key: the key is then the one of the corresponding
+    full application.
 -/
 def getInstApp (f : Expr) (params : ImplicitParameters) : TranslateEnvT Expr := do
  let instanceArgs := Array.filter (λ p => p.isInstance) params
  if instanceArgs.isEmpty then return f
  else
   let genFVars ← retrieveGenericFVars params
-  if instanceArgs.size == params.size
-  then mkLambdaFVarsExpr genFVars f -- only implicit arguments provided
+  if instanceArgs.size == params.size &&
+     (← instanceArgs.allM (λ p => return p.isGeneric || (← inferTypeEnv p.effectiveArg).isSort))
+  then mkLambdaFVarsExpr genFVars f -- only implicit arguments provided, all of them generic or types
   else mkLambdaFVarsExpr genFVars (← specializeLambda (← etaExpand f) params)
 
 

@@ -603,13 +603,18 @@ where
       - The polymorphic instance cache is updated with `f := body[mkAnnotation `_solver.recursivecall _'/_recFun α₁ ... αₖ x₁ ... xₙ]`
         (if required) for all cases. This is essential to avoid performing structural equivalence check again on an
         already handled recursive function.
+      - A tagged call `recFn y₁ ... yₘ` is only replaced by `_recFun` when it is a call to the instance being
+        stored, i.e., when `yᵢ = params[i].effectiveArg` for each non-generic implicit argument. A call to another
+        instance (e.g., `@recFn (!b) n` in the definition of `@recFn b n`) is kept as a regular call, as dropping
+        its implicit arguments would identify distinct instances.
     Assumes that:
 
+      - `recFn` is the function name expression for which the recursive calls have been tagged (see `generalizeRecCall`)
       - `f` is either a function name expression or a fully/partially instantiated polymorphic function (see `getInstApp`)
       - an entry exists for each opaque recursive function in `recFunMap` before optimization is performed
         (see function `cacheOpaqueRecFun`).
 -/
-partial def storeRecFunDef (f : Expr) (params : ImplicitParameters) (body : Expr) : TranslateEnvT Expr := do
+partial def storeRecFunDef (recFn : Expr) (f : Expr) (params : ImplicitParameters) (body : Expr) : TranslateEnvT Expr := do
   let body' ← replaceShared body (replacePred (← internalRecFunExpr))
   -- update polymorphic instance cache
   updateRecFunInst f body'
@@ -623,11 +628,15 @@ where
   replacePred (recFun : Expr) (e : Expr) : TranslateEnvT (Option Expr) := do
    match toTaggedRecursiveCall? e with
    | some b =>
-        let mut margs := b.getAppArgs
+        let (g, args) := getAppFnWithArgs b
+        let mut margs := args
         -- replace any occurrence in args first
         for i in [:margs.size] do
            margs ← margs.modifyM i (λ a => replaceShared a (replacePred recFun))
-        if params.isEmpty then
+        if !(isInstanceRecCall g args) then
+          -- call to another instance: kept as a regular call
+          mkAppNExpr g margs
+        else if params.isEmpty then
           -- case when function does not have any implicit parameters and is passed as argument (HOF)
           mkAppNExpr recFun margs
         else
@@ -640,6 +649,19 @@ where
              else effectiveArgs := effectiveArgs.push margs[i] -- case when f is partially applied
           mkAppNExpr recFun effectiveArgs
    | _ => return none
+
+  /-- Return `false` only when `g y₁ ... yₘ` is a call to another instance of the function being stored, i.e.,
+      `g = recFn` and `yᵢ ≠ params[i].effectiveArg` for some non-generic implicit argument.
+  -/
+  isInstanceRecCall (g : Expr) (args : Array Expr) : Bool := Id.run do
+    -- NOTE: a tagged call whose function was replaced by an equivalent one is a call to the instance
+    if !(exprEq g recFn || g == recFn) then return true
+    for h1 : i in [:args.size] do
+      if h2 : i < params.size then
+        let p := params[i]
+        if p.isInstance && !p.isGeneric && !(exprEq args[i] p.effectiveArg || args[i] == p.effectiveArg) then
+          return false
+    return true
 
 /-- Given `instApp` corresponding either to a function name expression or
     to a fully/partially instantiated polymorphic function (see function `getInstApp`),
