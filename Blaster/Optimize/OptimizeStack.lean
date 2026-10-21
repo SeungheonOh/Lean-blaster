@@ -17,6 +17,7 @@ inductive OptimizeStack where
  | InitOptimizeReturn (e : Expr) (isGlobal : Bool) (mvarDecls : Option MVarIdDecls)
  | RecFunDefWaitForStorage (args : Array Expr) (instApp : Expr)
                            (subsInts : Expr) (params : ImplicitParameters) (startCtxId : CtxId)
+                           (outerCtx : SavedCtx)
  | RecFunDefStorage (args : Array Expr) (instApp : Expr)
                     (subsInts : Expr) (params : ImplicitParameters) (optBody : Expr)
                     (startCtxId : CtxId)
@@ -112,8 +113,10 @@ def stackContinuity (stack : List OptimizeStack) (optExpr : Expr) (skipCache := 
          | [] => return Sum.inr optExpr
          | _ => stackContinuity xs optExpr
 
-  | .RecFunDefWaitForStorage args instApp subsInst params startCtxId :: xs =>
+  | .RecFunDefWaitForStorage args instApp subsInst params startCtxId outerCtx :: xs =>
        -- optExpr corresponds to optimized rec fun body
+       -- restore the context in which the rec fun application is optimized (see normRecFun)
+       restoreCtx outerCtx
        -- continuity with normOpaqueAndRecFun
        return Sum.inl (.RecFunDefStorage args instApp subsInst params optExpr startCtxId :: xs)
 

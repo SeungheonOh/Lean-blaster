@@ -274,6 +274,16 @@ structure CtxScope where
   current : CtxId
 deriving Inhabited, Repr
 
+/-- The optimization context (i.e., current context id and active context ids) saved
+    when optimizing a recursive function body in the root context (see `enterRootCtx`).
+-/
+structure SavedCtx where
+  curCtx : CtxId
+  active : HashSet CtxId
+
+instance : Repr SavedCtx where
+  reprPrec s _ := s!"<SavedCtx {s.curCtx}>"
+
 structure CtxReuseScope where
   /-- Context scope to be considered when restart is triggered for an ite/match expression -/
   scope : CtxScope
@@ -958,6 +968,22 @@ def endCtx (s : CtxScope) : TranslateEnvT Unit :=
   modifyOptEnv fun ⟨o1, rewrite, o3, o4, o5, o6, o7, o8, o9, o10, ⟨s1, s2, s3, s4, _, s6, active, s7, s8⟩, o12, o13, o14⟩ =>
                    ⟨o1, rewrite.erase s.current, o3, o4, o5, o6, o7, o8, o9, o10,
                    ⟨s1, s2, s3, s4, s.parent, s6, active.erase s.current, s7, s8⟩, o12, o13, o14⟩
+
+/-- Make the root context current, i.e., no hypothesis, equality or match pattern in scope,
+    and return the current context to be restored with `restoreCtx`.
+    This is used when optimizing a recursive function body, as the optimized body is
+    stored in `recFunInstCache` and `recFunMap`, which are not scoped to any context.
+-/
+@[always_inline, inline]
+def enterRootCtx : TranslateEnvT SavedCtx := do
+ modifyGet fun env =>
+   (⟨env.optEnv.options.curCtx, env.optEnv.options.active⟩,
+    {env with optEnv.options.curCtx := 0, optEnv.options.active := HashSet.emptyWithCapacity })
+
+/-- Restore a context saved with `enterRootCtx`. -/
+@[always_inline, inline]
+def restoreCtx (s : SavedCtx) : TranslateEnvT Unit :=
+  modify fun env => { env with optEnv.options.curCtx := s.curCtx, optEnv.options.active := s.active }
 
 
 

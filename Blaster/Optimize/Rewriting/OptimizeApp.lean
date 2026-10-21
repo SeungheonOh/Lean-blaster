@@ -144,6 +144,7 @@ def finalizeRecApp
              - return `optimizeRecApp fₙ params`
         - when no entry for `fᵢₙₛ` exists in the instance cache:
            - fbody' ← optimizer (← generalizeRecCall f params (λ p₁ ... pₙ → body))`
+             in the root context (i.e., without hypotheses in scope), see `enterRootCtx`.
            - call `storeRecFunDef` to update instance cache and check if recursive definition already exists in map, i.e.:
                fᵢ ← storeRecFunDef fᵢₙₛ fbody'
            - return `optimizeRecApp fᵢ params`
@@ -182,7 +183,12 @@ def normRecFun (uf : Expr) (uargs : Array Expr) (appExpr : Expr) (xs : List Opti
      -- optimize recursive fun definition and store
      -- NOTE: keeping track of next ctxId to generate for clean-up
      let nextCtxId := (← get).optEnv.options.nextCtxId
-     return Sum.inl (.InitOptimizeExpr fdef :: .RecFunDefWaitForStorage uargs instApp subsInst params nextCtxId :: xs)
+     -- NOTE: The rec fun definition is optimized in the root context, i.e., without the
+     -- hypotheses, equalities and match patterns in scope at the call site, as the
+     -- optimized definition is cached in `recFunInstCache` and `recFunMap` for all contexts.
+     -- The current context is restored once the definition is optimized.
+     let outerCtx ← enterRootCtx
+     return Sum.inl (.InitOptimizeExpr fdef :: .RecFunDefWaitForStorage uargs instApp subsInst params nextCtxId outerCtx :: xs)
  else stackContinuity xs appExpr -- proceed with continuity
 
  where
