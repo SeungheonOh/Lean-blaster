@@ -58,6 +58,16 @@ def Img {T : Sort u} {D : Sort v} (w : T → D) (d : D) : Prop := ∃ x, d = w x
 
 theorem img_self {T : Sort u} {D : Sort v} (w : T → D) (x : T) : Img w (w x) := ⟨x, rfl⟩
 
+/-- The value of the universe of a value `x : D` of the type `T` by the world `w` (the preimage of `x`), e.g., the
+    conversion `@coerce` from the sort of `T` to the sort `@Instance` when `T` is used as a value (see
+    `Blaster.Smt.translateIndTypeExpr?`). -/
+noncomputable def coerceWorld {T : Sort u} {D : Sort v} (w : T → D) (x : D) : Univ.{u} :=
+  open Classical in if h : Img w x then inj T (Classical.choose h) else none
+
+theorem img_coerceWorld {T : Sort u} {D : Sort v} {w : T → D} {x : D} (h : Img w x) :
+    Img (inj T) (coerceWorld w x) := by
+  unfold coerceWorld; rw [dif_pos h]; exact img_self _ _
+
 /-! Images of the worlds of the functors (definitions of the membership predicates of their sorts, e.g., `@isList`). -/
 
 theorem img_list_nil {α : Type u} {β : Type v} (w : α → β) : Img (List.map w) [] := ⟨[], rfl⟩

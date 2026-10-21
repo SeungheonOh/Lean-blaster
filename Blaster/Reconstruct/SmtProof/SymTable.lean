@@ -135,6 +135,24 @@ def guardedLambda (tbl : SymTable) (n : String) (s : SExpr) (ys xs : Array (Stri
     t := .quant .lambda #[xs[i]!] t
   return (if ys.isEmpty then t else .quant .lambda ys t, tbl)
 
+/-- The axiom of a type `T` used as a value (see `Blaster.Smt.translateIndTypeExpr?`):
+    `(forall ((@x S)) (=> (@isT @x) (@isInstance (@coerce_m @x) @abstractType_n)))`: the conversion `@coerce_m`, the
+    sort `S` of `T` and the constant `@abstractType_n` standing for `T`. -/
+def abstractTypeAxiom? (e : SExpr) : Option (String × SExpr × String) := Id.run do
+  let some #[SExpr.atom "forall", SExpr.list #[SExpr.list #[SExpr.atom x, s]], b] := e.list? | return none
+  -- NOTE: possibly with patterns, `(! b :pattern ...)`
+  let b := match b.list? with
+    | some xs => if xs[0]? == some (SExpr.atom "!") then xs[1]?.getD b else b
+    | none => b
+  -- the premises: the membership predicate of `T`, and `0 ≤ @x` for `Nat` (see `guardNatQuantifiers`)
+  let mut b := b
+  for _ in [0:3] do
+    let some #[SExpr.atom "=>", _, c] := b.list? | break
+    b := c
+  let some #[SExpr.atom _, SExpr.list #[SExpr.atom c, SExpr.atom x'], SExpr.atom a] := b.list? | return none
+  if x' != x || !(unquote c).startsWith "@coerce" || !(unquote a).startsWith "@abstractType" then return none
+  return some (c, s, a)
+
 /-- Interpretation of Blaster's polymorphic encoding (see `Poly`), given the sort variables of the goal with their
     SMT symbols: the membership predicates of the types with sort variables are the images of their worlds (e.g.,
     `@isFun α β f` is `Img (liftFun (inj α) (inj β) _) f`), the constants of the goal the images of their values
@@ -170,6 +188,27 @@ def polySymTable (tbl : SymTable) (cmds : Array SExpr) (env : TranslateEnv) (con
       let d ← (sortToType s).run { table := tbl }
       if let some (w, _) ← Poly.mkWorld (← inferType x) d then
         tbl := { tbl with syms := tbl.syms.insert n (.expr (Poly.applyWorld w x)) }
+    catch _ => pure ()
+  -- types used as values (see `abstractTypeAxiom?`): the constant `@abstractType_n` is the type `T`, and the
+  -- conversion `@coerce_m` maps the values of the sort of `T` to their preimages in `T` in the universe
+  -- (`Poly.coerceWorld`), such that the axiom holds
+  let mut absTypes : Std.HashMap String Expr := {}
+  for (k, n) in env.smtEnv.abstractTypeCache.toList do
+    absTypes := absTypes.insert (toString n) k.expr
+    tbl := { tbl with syms := tbl.syms.insert (toString n) (.expr k.expr) }
+  for c in cmds do
+    let some #[SExpr.atom "assert", a] := c.list? | continue
+    let some (coerce, s, abst) := abstractTypeAxiom? a | continue
+    -- NOTE: a conversion shared by several types (of the same sort) is interpreted for the first one
+    if tbl.syms.contains coerce then continue
+    let some t := absTypes.get? abst | continue
+    try
+      let d ← (sortToType s).run { table := tbl }
+      -- NOTE: the world of `T` (the identity when `T` is interpreted as itself, e.g., `List Nat`)
+      let w? ← if ← withReducible (isDefEq t d) then pure (some (mkApp (mkConst ``id [← getLevel t]) t))
+        else pure ((← Poly.mkWorld.go t d).map (·.1))
+      if let some w := w? then
+        tbl := { tbl with syms := tbl.syms.insert coerce (.expr (← mkAppM ``Poly.coerceWorld #[w])) }
     catch _ => pure ()
   -- lambda terms, guarded by the membership predicates of their parameters (the first definition, as in
   -- `buildSymTable`)

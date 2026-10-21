@@ -69,7 +69,7 @@ def prenex (e : Expr) : MetaM (Option (Expr × (Expr → MetaM Expr))) := do
         mkLambdaFVars bs' (mkAppN p ((data ++ hyps).map get))
     return some (e', back)
 
-/-- Quantifications over sorts `∀ (α : Sort u), b` (`u ≠ 0`) in `e` (traversal with sharing), possibly with loose
+/-- Quantifications over sorts `∀ (α : Sort u), b` and `∃ (α : Sort u), b` (`u ≠ 0`) in `e` (traversal with sharing), possibly with loose
     bound variables (e.g., `∀ (α : Type), (∀ (_x : α), n > 5) → n > 5` under `∃ n`). -/
 partial def sortQuantifiers (e : Expr) : Array Expr := Id.run do
   let mut acc := #[]
@@ -81,6 +81,9 @@ partial def sortQuantifiers (e : Expr) : Array Expr := Id.run do
     if seen.contains s then continue
     seen := seen.insert s
     if let .forallE _ (.sort u) _ _ := s then
+      if !u.isZero then acc := acc.push s
+    -- `∃ (α : Sort u), b` (the lambda term over the sort)
+    if let .app (.app (.const ``Exists _) (.sort u)) _ := s then
       if !u.isZero then acc := acc.push s
     match s with
     | .app f a => stack := stack.push f |>.push a
