@@ -310,11 +310,13 @@ definitional axioms of recursive functions into recursive definitions, is disabl
 The backend `z3rec` rewrites the query into `define-funs-rec` at the SMT-LIB level, which yields a proof in
 seconds, and replays Z3's `recfun` lemmas with kernel-checked definitional equations (`RecFun.lean`): all the 20
 `Governance` theorems (residual proofs of about 4K steps replayed in 4.5 minutes, 7 to 9 minutes per theorem in
-total) and the first `MintingPolicy` theorem (7 minutes) are kernel checked. The proofs of the steps that don't
-depend on a scope are lifted to closed lambda terms over the variables of the goal (`liftGlobalProofs`): they are
-shared by the nested `lemma` scopes at various binder depths, and abstracting the negated goal and the variables
-copied them once per depth (the second `MintingPolicy` theorem, a residual proof of 31.7K steps and 10.7M distinct
-subterms at binder depth 216, exceeded 36 GB). `SellNFT` remains open.
+total) and both `MintingPolicy` theorems (6 minutes each, at most 7 GB) are kernel checked. The proofs of the steps
+that don't depend on a scope are held by unassigned metavariables during the replay and lifted at the end to closed
+lambda terms over the variables of the goal and the negated goal (`liftGlobalProofs`): they are shared by the nested
+`lemma` scopes at various binder depths, and abstracting the negated goal and the variables in the inlined proof
+copied them once per depth. The second `MintingPolicy` theorem (a residual proof of 31.7K steps) gave a proof of
+10.7M distinct subterms at binder depth 216 whose abstraction exceeded 36 GB; it is now lifted in 0.5 s into a proof
+of 2.5M distinct subterms. `SellNFT` remains open.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
