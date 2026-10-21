@@ -205,9 +205,14 @@ def runBackendCached (backend : Backend) (cmds : Array SExpr) (seeds := 1) (dela
   let (q, runs) ← backendRuns.get
   let runs := if q == query then runs else {}
   if let some r := runs.get? backend.name then return r
-  let r ← if seeds ≤ 1 then runBackend backend cmds else
-    let seed := querySeed cmds
-    runPortfolio backend ((List.range seeds).toArray.map fun k => if k == 0 then cmds else withSeed cmds (seed + k)) delayMs
+  -- debugging: the proof output read from the file `BLASTER_SMTPROOF_PROOFFILE` instead of a run of the solver (e.g.,
+  -- to replay the same proof again), and the proof output written to the file `BLASTER_SMTPROOF_PROOFDUMP`
+  let r ← if let some f ← IO.getEnv "BLASTER_SMTPROOF_PROOFFILE" then pure (.ok (← IO.FS.readFile f))
+    else if seeds ≤ 1 then runBackend backend cmds else
+      let seed := querySeed cmds
+      runPortfolio backend ((List.range seeds).toArray.map fun k => if k == 0 then cmds else withSeed cmds (seed + k)) delayMs
+  if let some f ← IO.getEnv "BLASTER_SMTPROOF_PROOFDUMP" then
+    if let .ok out := r then IO.FS.writeFile f out
   backendRuns.set (query, runs.insert backend.name r)
   return r
 

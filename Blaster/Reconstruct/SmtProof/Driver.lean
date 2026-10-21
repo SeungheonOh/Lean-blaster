@@ -306,7 +306,13 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- CardanoLedgerApiBlaster's Governance); seconds (environment variable `BLASTER_SMTPROOF_DEADLINE`)
         let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 1800)
         let global := (scopedSteps sproof).map (!·)
-        let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
+        -- the instances of the constructor applications that their arguments don't determine (see `SortInfer`)
+        let t0 ← IO.monoMsNow
+        let (sortHints, conflicts) := SortInfer.inferHints cmds sproof
+        if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
+          traceTimed s!"sort inference: {sortHints.size} hints, {conflicts} unification failures, {(← IO.monoMsNow) - t0} ms"
+            (pure ())
+        let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache, sortHints }, cfg, deadline, global,
                                  openHyps := openHypotheses sproof,
                                  baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
         let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
