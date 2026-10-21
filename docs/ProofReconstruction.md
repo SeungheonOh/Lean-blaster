@@ -216,7 +216,12 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    Lean functions, constructor fields); `Bool` formulas as propositions; datatype constructors, selectors and
    testers as Lean constructors and case analyses; Blaster's function values (`@@ArrowT`, `@apply`) as Lean
    functions; Blaster's type predicates (`@isNat`, ...) as `True` (Lean values always satisfy them);
-   skolem constants as `Classical.epsilon` terms.
+   skolem constants as `Classical.epsilon` terms. Z3 prints the nullary constructors of parametric datatypes
+   without their sort (`List.nil` for all the instances of `@List`), and the occurrences of a term are one object
+   only when Z3 binds it by a `let`: the instances of the constructor applications that their arguments don't
+   determine are inferred on the whole proof (`SortInfer.lean`: one sort per term object, from the signatures of
+   the query and the constraints of all the steps), such that each occurrence is interpreted in the same instance
+   in all the steps where it occurs; the parts that remain undetermined are defaulted identically in each step.
 4. **Replay** (`Replay.lean`). Each step yields a Lean proof of the interpretation of its conclusion:
    explicit proof terms for resolution (a unit propagation procedure building the proof), modus ponens,
    equality reasoning, quantifier instantiation, skolemization, hypotheses and lemmas; and small tactic
@@ -287,7 +292,7 @@ On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=o
 SMT residuals), the replay of Z3 proofs proves **99.1%** of the goals closed by the SMT solver (338/341, nightly
 Z3; 88.9%, 248/279, before the closed-statement tactics, the universe interpretation of polymorphic goals, the
 nonlinear lemmas and the bridge of normalized `match` patterns). Counting each replay attempt of the `Tests/Smt`
-and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 310 of 320 goals are replayed (283 of
+and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 312 of 321 goals are replayed (283 of
 297 before the interpretation of empty types, of types used as values and of sort quantifiers under binders); the
 remaining ones involve polymorphic structure fields with instance arguments (`Issue15`, `InstanceArgs`), inductive
 propositions with data fields and constructor testers on propositions (`SmtUninhabited`), a nonlinear lemma over
@@ -318,8 +323,21 @@ copied them once per depth. The second `MintingPolicy` theorem (a residual proof
 10.7M distinct subterms at binder depth 216 whose abstraction exceeded 36 GB; it is now lifted in 0.5 s into a proof
 of 2.5M distinct subterms. The second `SellNFT` theorem (a residual proof replayed in 5 minutes, a final proof of
 9.2M distinct subterms at binder depth 964) is kernel checked in 53 minutes in total (17.5 GB; the kernel checks of
-reconstructed proofs have no heartbeat limit, see `kernelOptions`); the replay of the first one fails on steps about
-selectors applied to other constructors.
+reconstructed proofs have no heartbeat limit, see `kernelOptions`). The replay of the first one failed on a `trans*`
+step about `(List.cons.0 List.nil)`, the head of the empty list of pairs of `Data` (a default value of the selector):
+Z3 printed its occurrences in these steps as distinct objects (`let` bindings only share some of the occurrences of a
+term), each conclusion was interpreted by itself, and the steps that don't determine its instance defaulted it, e.g.,
+to a pair of `Data` in a step and to a pair of `Unit` (with another default value) in the next one, such that the
+paths of `trans*` between the interpretations didn't connect. The default values of the selectors are fixed per
+instance (`Inhabited.default`, or a constructor application); the instances were not. With the instances inferred on
+the whole proof (`SortInfer.lean`: 195 hints on the 152,698 steps of its residual proof, in 0.15 s), the residual proof
+is replayed in 5 minutes into a proof of 10.1M distinct subterms at binder depth 1425. Its kernel check does not fit
+in the memory of the measurement machine, whose user processes are throttled at 20 GB (`memory.high` of
+`user.slice`): it peaked at 16.9 GB of memory and 16.5 GB of swap, then made no progress while swapping (the check of
+the second theorem, at binder depth 964, peaked at 17.5 GB). The binder depth is the nesting of the `lemma` scopes,
+whose proofs are inlined under the binders of their hypotheses; lifting them to closed terms, as the proofs of the
+global steps are (`liftGlobalProofs`), would spare the kernel the copies of the subterms that refer to these binders
+when it instantiates them (not measured).
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional

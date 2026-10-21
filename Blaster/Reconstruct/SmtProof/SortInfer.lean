@@ -263,7 +263,7 @@ where
       for (a, s) in sig.args.zip ss do unify s (← ofSExpr sigs.aliases subst a)
     ofSExpr sigs.aliases subst sig.result
 
-/-- Sort as an S-expression, with `none` for its variables. -/
+/-- Inferred sort, with `unknown` for its undetermined parts. -/
 inductive Hint where
   | unknown
   | con (name : String) (args : Array Hint)
