@@ -287,9 +287,11 @@ On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=o
 SMT residuals), the replay of Z3 proofs proves **99.1%** of the goals closed by the SMT solver (338/341, nightly
 Z3; 88.9%, 248/279, before the closed-statement tactics, the universe interpretation of polymorphic goals, the
 nonlinear lemmas and the bridge of normalized `match` patterns). Counting each replay attempt of the `Tests/Smt`
-and `Tests/FixedIssues` files, 283 of 297 goals are replayed; the remaining ones involve polymorphic user
-datatypes (no world for them), types quantified as values, empty types, a nonlinear lemma over products of
-conditionals (`Tests/Smt/SmtMatch.lean`) and a proof-production timeout. With the default mode (`last`), the
+and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 310 of 320 goals are replayed (283 of
+297 before the interpretation of empty types, of types used as values and of sort quantifiers under binders); the
+remaining ones involve polymorphic structure fields with instance arguments (`Issue15`, `InstanceArgs`), inductive
+propositions with data fields and constructor testers on propositions (`SmtUninhabited`), a nonlinear lemma over
+products of conditionals (`Tests/Smt/SmtMatch.lean`), a bit-vector lemma and a proof-production timeout. With the default mode (`last`), the
 replay complements the tactic strategies: 99.8% of all the reconstruction attempts succeed (3917/3924),
 including all the 383 goals closed by the SMT solver and the 411 goals closed by the optimizer; the 7 failures
 are `#testOptimize` certificates of `match` normalizations.
@@ -304,8 +306,15 @@ the `Auction` residuals 44 to 197 steps in at most 0.2 s each; the optimizer's e
 `match` alternatives (case of case, functions pushed into `match`es) completes the proofs (about 26 s of
 reconstruction for `HelloWorld`). `MintingPolicy`, `SellNFT` and 19 of the 20 `Governance` theorems are proved
 by Z3 without proofs but time out with proof production: Z3's `recfun-finder` simplifier, which turns the
-definitional axioms of recursive functions into recursive definitions, is disabled under `produce-proofs`;
-rewriting the query into `define-funs-rec` at the SMT-LIB level yields a proof in seconds (work in progress).
+definitional axioms of recursive functions into recursive definitions, is disabled under `produce-proofs`.
+The backend `z3rec` rewrites the query into `define-funs-rec` at the SMT-LIB level, which yields a proof in
+seconds, and replays Z3's `recfun` lemmas with kernel-checked definitional equations (`RecFun.lean`): all the 20
+`Governance` theorems (residual proofs of about 4K steps replayed in 4.5 minutes, 7 to 9 minutes per theorem in
+total) and the first `MintingPolicy` theorem (7 minutes) are kernel checked. The proofs of the steps that don't
+depend on a scope are lifted to closed lambda terms over the variables of the goal (`liftGlobalProofs`): they are
+shared by the nested `lemma` scopes at various binder depths, and abstracting the negated goal and the variables
+copied them once per depth (the second `MintingPolicy` theorem, a residual proof of 31.7K steps and 10.7M distinct
+subterms at binder depth 216, exceeded 36 GB). `SellNFT` remains open.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
@@ -359,6 +368,15 @@ Reconstruction checks every individual rewrite, so it surfaces problems in the t
   instance arguments are canonical or instance-implicit binders of the goal (`Tests/FixedIssues/InstanceArgs.lean`;
   two instance-implicit binders of the same class are still not distinguished). Found by the replay of SMT proofs
   on polymorphic datatypes, which could not prove the goal.
+- **Sort quantifiers outside the goal prefix and proposition domains (soundness bugs of `staging`, fixed on
+  `sho/prop-domain-fun-guard`).** On `staging`, sort quantifiers that are not in the leading `∀` prefix of the goal
+  were instantiated with the non-empty sort `@@Type` (e.g., `∀ p, p ∨ ∀ (α : Type), (∀ (_x : α), False) → False`
+  was `Valid`), and the co-domain constraints of functions with a proposition domain (`P → β`, which is inhabited
+  when `P` does not hold, even for an empty `β`) were not guarded (e.g., `∀ (_f : Bad → Empty), False` for
+  `structure Bad : Prop where inv : 1 > 2`). `beta-lambda-cache-optimization` (c7e80b2) reports 18 of the false
+  statements of the regression tests (`Tests/Smt/SmtUninhabited.lean`) as `Valid`; the translation of this branch
+  none of them (it reports four theorems of these tests with a spurious counterexample, as `beta` does, which are
+  kept commented out).
 - **Ill-typed optimizer output.** The proof run avoids the following issues; the verdict run is unchanged.
   - The else branch of `Blaster.dite'` received the *normalized* type of `¬ c` (e.g. `false = c`
     instead of `¬ (true = c)`), so `dite'` applications were ill-typed. When tracking proofs, the
