@@ -1058,20 +1058,31 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
   | "monotonicity" | "cong" => replayCongr step concl
   | "commutativity" => replayComm concl
   | "sk" =>
-      -- `(¬ ∀ x, φ) → ¬ φ[ε]` or `(∃ x, φ) → φ[ε]` (see the interpretation of skolem constants)
+      -- `(¬ ∀ x, φ) → ¬ φ[ε]` or `(∃ x, φ) → φ[ε]` (see the interpretation of skolem constants), one bound
+      -- variable at a time: `¬ ∀ x₁ x₂, φ` gives `¬ ∀ x₂, φ[x₁ := ε₁]`, then `¬ φ[x₁ := ε₁, x₂ := ε₂]`
       let some (a, b) := (if concl.isArrow then some (concl.bindingDomain!, concl.bindingBody!) else none)
         | throwError "sk: implication expected"
       let r ← withLocalDeclD `h a fun h => do
-        let ex ← if let some q := a.not? then
-            -- `¬ ∀ x, φ x` gives `∃ x, ¬ φ x`
-            let .forallE n t body bi := q | throwError "sk: negated forall expected"
-            let p := mkLambda n bi t body
-            let iff := mkApp2 (Lean.mkConst ``Classical.not_forall [← getLevel t]) t p
-            mkAppM ``Iff.mp #[iff, h]
-          else pure h
-        let spec ← mkAppM ``Classical.epsilon_spec #[ex]
-        if !(← propEq (← inferType spec) b) then throwError "sk: skolem mismatch"
-        mkLambdaFVars #[h] spec
+        let mut pf := h
+        let mut ty := a
+        for _ in [0:64] do
+          let ex ← if let some q := ty.not? then
+              -- `¬ ∀ x, φ x` gives `∃ x, ¬ φ x`
+              let .forallE n t body bi := q | throwError "sk: negated forall expected"
+              let p := mkLambda n bi t body
+              let iff := mkApp2 (Lean.mkConst ``Classical.not_forall [← getLevel t]) t p
+              mkAppM ``Iff.mp #[iff, pf]
+            else pure pf
+          pf ← mkAppM ``Classical.epsilon_spec #[ex]
+          ty ← instantiateMVars (← inferType pf)
+          if ← propEq ty b then return ← mkLambdaFVars #[h] pf
+          -- another bound variable
+          let more := match ty.not? with
+            | some (.forallE ..) => true
+            | some _ => false
+            | none => ty.isAppOfArity ``Exists 2
+          if !more then break
+        throwError "sk: skolem mismatch"
       record step.rule "exact"
       return r
   | _ => replayByTactic step concl

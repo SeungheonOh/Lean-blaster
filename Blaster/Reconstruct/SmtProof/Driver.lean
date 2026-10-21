@@ -69,7 +69,8 @@ def prenex (e : Expr) : MetaM (Option (Expr × (Expr → MetaM Expr))) := do
         mkLambdaFVars bs' (mkAppN p ((data ++ hyps).map get))
     return some (e', back)
 
-/-- Closed quantifications over sorts `∀ (α : Sort u), b` (`u ≠ 0`) in `e` (traversal with sharing). -/
+/-- Quantifications over sorts `∀ (α : Sort u), b` (`u ≠ 0`) in `e` (traversal with sharing), possibly with loose
+    bound variables (e.g., `∀ (α : Type), (∀ (_x : α), n > 5) → n > 5` under `∃ n`). -/
 partial def sortQuantifiers (e : Expr) : Array Expr := Id.run do
   let mut acc := #[]
   let mut stack := #[e]
@@ -80,7 +81,7 @@ partial def sortQuantifiers (e : Expr) : Array Expr := Id.run do
     if seen.contains s then continue
     seen := seen.insert s
     if let .forallE _ (.sort u) _ _ := s then
-      if !u.isZero && !s.hasLooseBVars then acc := acc.push s
+      if !u.isZero then acc := acc.push s
     match s with
     | .app f a => stack := stack.push f |>.push a
     | .lam _ t b _ | .forallE _ t b _ => stack := stack.push t |>.push b
@@ -104,7 +105,9 @@ def sortVariables (xs : Array Expr) (body : Expr) : MetaM (Array Expr × Bool) :
       if body.containsFVar d.fvarId || (← xs.anyM fun x => do return (← inferType x).containsFVar d.fvarId) then
         sortVars := sortVars.push d.toExpr
   -- propositions quantifying over sorts (below the leading binders)
-  let quantifiedSorts ← (sortQuantifiers body).anyM fun s => isProp s
+  -- NOTE: a quantification with loose bound variables (e.g., under `∃`) is in a proposition of the goal: its sort
+  -- variable is a value of the sort `@Type` as for a closed one
+  let quantifiedSorts ← (sortQuantifiers body).anyM fun s => if s.hasLooseBVars then pure true else isProp s
   return (sortVars, quantifiedSorts)
 
 /-- Interpretations of the polymorphic encoding tried in order (`true`: `Poly`, `false`: `@Instance` as the sort

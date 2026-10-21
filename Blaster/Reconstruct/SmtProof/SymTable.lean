@@ -398,7 +398,10 @@ def polyBuildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.Ha
 /-- Interpretation of the skolem constants introduced by `sk` steps (Z3): for
     `(~ (not (forall ((x S)) φ)) (not φ[x := c]))` (resp. `(~ (exists ((x S)) φ) φ[x := c])`),
     the constant `c` (named `x!n`) is interpreted as `Classical.epsilon (fun x => ¬ φ)`
-    (resp. `Classical.epsilon (fun x => φ)`). Only steps with a single bound variable are handled. -/
+    (resp. `Classical.epsilon (fun x => φ)`). With several bound variables `x₁ ... xₙ`, the constant `cᵢ` of `xᵢ` is
+    interpreted as `Classical.epsilon (fun xᵢ => ¬ ∀ xᵢ₊₁ ... xₙ, φ[x₁ := c₁, ..., xᵢ₋₁ := cᵢ₋₁])` (resp. with `∃`), as
+    replayed by `sk` (one quantifier at a time). Skolem functions (applied to the variables of the context) are only
+    handled for a single bound variable. -/
 partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
   let mut tbl := tbl
   -- names introduced by `intro-def` (Z3's Tseitin names): `(= t k)` defines `k` as `t`; similarly for the
@@ -407,7 +410,7 @@ partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
     if !(step.rule == "intro-def" || (step.rule == "th-lemma" && step.premises.isEmpty)) then continue
     match step.concl.stripAnnot with
     | .app "=" #[t, .sym k] | .app "=" #[.sym k, t] =>
-        if !tbl.syms.contains k && (findSkolem k t (· == k)).isNone then
+        if !tbl.syms.contains k && (findSkolem (· == k) t fun _ => true).isNone then
           tbl := { tbl with syms := tbl.syms.insert k (.macro #[] t) }
     | _ => pure ()
   for step in proof.steps do
@@ -417,45 +420,62 @@ partial def addSkolems (proof : Proof) (tbl : SymTable) : MetaM SymTable := do
       | .app "not" #[.quant .forall vs φ] => (vs, φ, true)
       | .quant .exists vs φ => (vs, φ, false)
       | _ => (#[], .sym "true", false)
-    let #[(x, sort)] := vars | continue
-    -- skolem function applied to the variables of the context: `(x!n y₁ ... yₖ)`
-    if let some (c, ys) := findSkolemApp (x ++ "!") b (fun c => !tbl.syms.contains c) then
-      tbl := { tbl with syms := tbl.syms.insert c (.skolem ys x sort body neg) }
-      continue
-    -- the skolem constant: a symbol of `b` named `x!n`, not occurring in `a` and not yet interpreted
-    let some c := findSkolem (x ++ "!") b fun c => !tbl.syms.contains c && (findSkolem c a fun _ => true).isNone
+    if vars.isEmpty then continue
+    if let #[(x, sort)] := vars then
+      -- skolem function applied to the variables of the context: `(x!n y₁ ... yₖ)`
+      if let some (c, ys) := findSkolemApp (isSkolemOf x) b (fun c => !tbl.syms.contains c) then
+        tbl := { tbl with syms := tbl.syms.insert c (.skolem ys x sort body neg) }
+        continue
+    -- the skolem constants: for each variable `x`, a symbol of `b` named `x!n`, not occurring in `a` and not yet
+    -- interpreted
+    let some cs := vars.mapM fun (x, _) =>
+        findSkolem (isSkolemOf x) b fun c => !tbl.syms.contains c && (findSkolem (· == c) a fun _ => true).isNone
       | continue
     try
-      let e ← (do
-        let ty ← sortToType sort
-        let u ← getLevel ty
-        let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) ty)
-        withLocalDeclD (Name.mkSimple x) ty fun fx => do
-          let φ ← withReader (fun c => { c with locals := c.locals.insert x fx }) (interp body)
-          let p ← mkLambdaFVars #[fx] (if neg then mkNot φ else φ)
-          return mkApp3 (mkConst ``Classical.epsilon [u]) ty inst p : InterpM Expr).run { table := tbl }
-      tbl := { tbl with syms := tbl.syms.insert c (.expr e) }
+      let es ← (do
+        let mut es : Array Expr := #[]
+        let mut locals : Std.HashMap String Expr := {}
+        for h : i in [:vars.size] do
+          let (x, sort) := vars[i]
+          let ty ← sortToType sort
+          let u ← getLevel ty
+          let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) ty)
+          -- the variables after `x` remain quantified
+          let rest := vars.extract (i+1) vars.size
+          let bodyᵢ := if rest.isEmpty then body else .quant (if neg then .forall else .exists) rest body
+          let e ← withLocalDeclD (Name.mkSimple x) ty fun fx => do
+            let φ ← withScopeCache (locals.insert x fx) (interp bodyᵢ)
+            let p ← mkLambdaFVars #[fx] (if neg then mkNot φ else φ)
+            return mkApp3 (mkConst ``Classical.epsilon [u]) ty inst p
+          es := es.push e
+          locals := locals.insert x e
+        return es : InterpM (Array Expr)).run { table := tbl }
+      for (c, e) in cs.zip es do
+        tbl := { tbl with syms := tbl.syms.insert c (.expr e) }
     catch _ => pure ()
   return tbl
 where
-  findSkolemApp (pre : String) (t : STerm) (ok : String → Bool) : Option (String × Array String) :=
+  /-- Whether `c` is the name of a skolem constant of the variable `x`, i.e., `x!n` (with quoted symbols: `|x!n|`
+      for `|x|`). -/
+  isSkolemOf (x c : String) : Bool := (unquote c).startsWith (unquote x ++ "!")
+  findSkolemApp (name : String → Bool) (t : STerm) (ok : String → Bool) : Option (String × Array String) :=
     match t with
     | .app f args =>
         let syms := args.filterMap fun a => match a with | .sym s => some s | _ => none
-        if f.startsWith pre && !args.isEmpty && syms.size == args.size && ok f then some (f, syms)
-        else args.findSome? (findSkolemApp pre · ok)
-    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolemApp pre · ok)
-    | .quant _ _ b => findSkolemApp pre b ok
-    | .annot t _ => findSkolemApp pre t ok
+        if name f && !args.isEmpty && syms.size == args.size && ok f then some (f, syms)
+        else args.findSome? (findSkolemApp name · ok)
+    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolemApp name · ok)
+    | .quant _ _ b => findSkolemApp name b ok
+    | .annot t _ => findSkolemApp name t ok
     | _ => none
-  findSkolem (pre : String) (t : STerm) (ok : String → Bool) : Option String :=
+  findSkolem (name : String → Bool) (t : STerm) (ok : String → Bool) : Option String :=
     match t with
-    | .sym s => if s.startsWith pre && ok s then some s else none
+    | .sym s => if name s && ok s then some s else none
     | .app f args =>
-        if f.startsWith pre && args.isEmpty && ok f then some f else args.findSome? (findSkolem pre · ok)
-    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolem pre · ok)
-    | .quant _ _ b => findSkolem pre b ok
-    | .annot t _ => findSkolem pre t ok
+        if name f && args.isEmpty && ok f then some f else args.findSome? (findSkolem name · ok)
+    | .iapp _ _ args | .qual _ _ args => args.findSome? (findSkolem name · ok)
+    | .quant _ _ b => findSkolem name b ok
+    | .annot t _ => findSkolem name t ok
     | _ => none
 
 end Blaster.Reconstruct.SmtProof
