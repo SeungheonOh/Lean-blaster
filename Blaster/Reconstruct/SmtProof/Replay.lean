@@ -3,6 +3,7 @@ import Blaster.Reconstruct.SmtProof.IR
 import Blaster.Reconstruct.SmtProof.Interp
 import Blaster.Reconstruct.SmtProof.Prop
 import Blaster.Reconstruct.SmtProof.Local
+import Blaster.Optimize.Expr
 
 /-!
 # Replay of SMT proofs
@@ -779,6 +780,61 @@ where
     subterms containing `x` are traversed (`Expr.abstract` traverses the subterms with free variables, e.g., in a proof
     of the backend, the large terms over the variables of the goal, once per binder depth, i.e., per nested `lemma`). -/
 @[implemented_by abstractFVarImpl] opaque abstractFVar (e : Expr) (x : FVarId) : Expr
+
+/-- Cache of `abstractFVarsShared`: the abstracted subterms, at their binder depths. -/
+abbrev AbstractCache := Std.HashMap (Blaster.Optimize.PtrExpr × Nat) Expr
+
+/-- `e` with the free variables of `idx` (`n` of them, the one of index `n - 1` bound innermost) replaced by loose bound
+    variables, as the body of `fun xs => e`. The cache is shared by successive calls (e.g., the interpreted terms of the
+    goal shared by the proofs of the steps are abstracted once per binder depth); only the subterms with free variables
+    are traversed. -/
+partial def abstractFVarsShared (idx : Std.HashMap FVarId Nat) (n : Nat) (e : Expr) : StateM AbstractCache Expr :=
+  go e 0
+where
+  go (e : Expr) (off : Nat) : StateM AbstractCache Expr := do
+    if !e.hasFVar then return e
+    if let some r := (← get).get? (⟨e⟩, off) then return r
+    -- NOTE: `pure` (not `return`) in the alternatives, which would exit `go` before the cache is updated
+    let r ← match e with
+      | .fvar y => pure (match idx.get? y with | some i => .bvar (off + n - 1 - i) | none => e)
+      | .app f a => pure (e.updateApp! (← go f off) (← go a off))
+      | .lam _ t b _ => pure (e.updateLambdaE! (← go t off) (← go b (off + 1)))
+      | .forallE _ t b _ => pure (e.updateForallE! (← go t off) (← go b (off + 1)))
+      | .letE _ t v b _ => pure (e.updateLetE! (← go t off) (← go v off) (← go b (off + 1)))
+      | .mdata _ b => pure (e.updateMData! (← go b off))
+      | .proj _ _ b => pure (e.updateProj! (← go b off))
+      | _ => pure e
+    modify (·.insert (⟨e⟩, off) r)
+    return r
+
+/-- The proof `p` of the root (in which the proofs of the global steps are assigned metavariables, see `replay`), with
+    the proof `G` of each global step (with free variables) lifted to the closed lambda term `Λ := fun fvs => G`, used as
+    `Λ fvs` (`fvs`: the variables of the base local context, e.g., the variables of the goal and the negated goal).
+    The proofs of the global steps are shared by the proofs of the scopes (nested `lemma` steps) at various binder
+    depths, such that abstracting a variable in the instantiated proof (e.g., the negated goal) copies each subterm
+    containing it once per binder depth (e.g., 10M subterms at binder depth 216 for a CEK evaluation of a validator):
+    the closed lambda terms are neither traversed nor copied by the abstractions, and are checked once by the kernel.
+    The global steps are lifted in the order of their indices (premises first). -/
+def liftGlobalProofs (p : Expr) (cache : Std.HashMap Nat Expr) (fvs : Array Expr) : MetaM Expr := do
+  -- NOTE: let-variables would become lambda-bound (their values are needed by the proofs)
+  if fvs.isEmpty || (← fvs.anyM fun x => return (← x.fvarId!.getDecl).isLet) then return ← instantiateMVars p
+  let idx := fvs.foldl (init := ({} : Std.HashMap FVarId Nat)) fun m x => m.insert x.fvarId! m.size
+  -- the binders `fun fvs =>` (shared by the lambda terms)
+  let template ← mkLambdaFVars fvs (mkConst ``True)
+  let rec withBody (t : Expr) (k : Nat) (body : Expr) : Expr :=
+    match k, t with
+    | k + 1, .lam n d b bi => .lam n d (withBody b k body) bi
+    | _, _ => body
+  let mut absCache : AbstractCache := {}
+  for k in (cache.toArray.map (·.1)).qsort (· < ·) do
+    let some (.mvar m) := cache.get? k | continue
+    let some v ← getExprMVarAssignment? m | continue
+    let v ← instantiateMVars v
+    if v.hasMVar || !v.hasFVar then continue
+    let (body, c) := (abstractFVarsShared idx fvs.size v).run absCache
+    absCache := c
+    m.assign (mkAppN (withBody template fvs.size body) fvs)
+  instantiateMVars p
 
 /-- The steps being replayed (innermost last), written to the file given by `BLASTER_SMTPROOF_CURRENT` (if set)
     when a step starts, e.g., to locate a step that takes long (the modification time of the file). -/
