@@ -425,7 +425,7 @@ def createAppNAux (pInfo : FunEnvInfo) (s : Sum SmtQualifiedIdent SmtTerm)
             pure (exprEq inst a || (← withReducibleAndInstances (isDefEq inst a)))
           catch _ => pure false
         if !canonical then
-          throwEnvError "createAppNAux: non-canonical instance argument of a function value {reprStr a}"
+          throwEnvError m!"createAppNAux: non-canonical instance argument of a function value {a}"
     let instType ← inferFunType pInfo.type args
     withInstantiatedImplicitArgs pInfo.type fun polyType' => do
       let instArgTypes := retrieveArrowTypes instType

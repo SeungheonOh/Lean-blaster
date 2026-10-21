@@ -32,4 +32,45 @@ structure FunRel where
 #blaster [∀ (r : FunRel) (x y : Nat), x = y → r.f x = r.f y]
 #blaster [∀ (α : Type) [LT α] (r : FunRel) (x : α), r.f x = r.f x]
 
+/-! Relations of the SMT theories only for the canonical instances of `LT`/`LE`. -/
+
+def revLT : LT Nat := ⟨fun a b => b < a⟩
+def revLE : LE Nat := ⟨fun a b => b ≤ a⟩
+def trueLT : LT Int := ⟨fun _ _ => True⟩
+
+theorem revLT_counterexample : ¬ ¬ (@LT.lt Nat revLT 1 0) := fun h => h (show 0 < 1 from Nat.zero_lt_one)
+
+#blaster (gen-cex: 0) (solve-result: 1) [¬ (@LT.lt Nat revLT 1 0)]
+
+theorem revLT_forall_counterexample : ¬ (∀ x : Nat, ¬ (@LT.lt Nat revLT 0 x) → 0 = x) :=
+  fun h => absurd (h 1 (fun (hx : 1 < 0) => absurd hx (by decide))) (by decide)
+
+#blaster (gen-cex: 0) (solve-result: 1) [∀ x : Nat, ¬ (@LT.lt Nat revLT 0 x) → 0 = x]
+
+theorem revLE_counterexample : ¬ (@LE.le Nat revLE 0 1) := fun (h : 1 ≤ 0) => absurd h (by decide)
+
+#blaster (gen-cex: 0) (solve-result: 1) [@LE.le Nat revLE 0 1]
+
+theorem trueLT_counterexample : ¬ (∀ x y : Int, (@LT.lt Int trueLT x y) → x < y) :=
+  fun h => absurd (h 0 0 trivial) (by decide)
+
+#blaster (gen-cex: 0) (solve-result: 1) [∀ x y : Int, (@LT.lt Int trueLT x y) → x < y]
+
+-- Valid expected: the canonical instances
+#blaster [∀ x y : Nat, x < y → ¬ (y < x)]
+#blaster [∀ x y : Int, x ≤ y → y ≤ x → x = y]
+
+/-! Instance arguments of function values: a function of type `[Inhabited Nat] → Nat → Nat` applied to two different
+    instances. The application is only translated with canonical (or local) instances: an error is reported otherwise,
+    instead of the unsound `Valid` result. -/
+
+theorem inhabited_args_counterexample : ¬ (∀ (f : [Inhabited Nat] → Nat → Nat), @f ⟨0⟩ 3 = @f ⟨1⟩ 3) :=
+  fun h => absurd (h (fun [i : Inhabited Nat] _ => i.default)) (by decide)
+
+/--
+error: createAppNAux: non-canonical instance argument of a function value { default := 0 }
+-/
+#guard_msgs (error, drop info) in
+#blaster [∀ (f : [Inhabited Nat] → Nat → Nat), @f ⟨0⟩ 3 = @f ⟨1⟩ 3]
+
 end Tests.InstanceArgs
