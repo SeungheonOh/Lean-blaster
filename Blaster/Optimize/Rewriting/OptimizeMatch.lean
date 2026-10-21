@@ -131,11 +131,16 @@ partial def isPatternMatch (lhs : Expr) (rhs : Expr) : TranslateEnvT MatchResult
        -- Rhs is expected to be the same fvar (captured by physical equality)
        return .NoMatch
 
-  | Expr.const _ _ =>
+  | Expr.const n1 l1 =>
        match rhs with
-       | Expr.const n2 _ =>
+       | Expr.const n2 l2 =>
             -- top-level `exprEq lhs rhs` already ruled out physical equality
-            if (← isCtorName n2) then return .NoMatch
+            if (← isCtorName n2) then
+              if n1 != n2 then return .NoMatch
+              -- NOTE: universe levels are not normalized (e.g., `max u v` and `max v u`),
+              -- i.e., physical equality cannot be used to decide disequality on them.
+              if List.isEqv l1 l2 Level.isEquiv then return .UnifyMatch
+              return .PotentialMatch
             else return .PotentialMatch -- case when rhs is an expression
        | _ =>
            if ← isCtorExpr rhs.getAppFn

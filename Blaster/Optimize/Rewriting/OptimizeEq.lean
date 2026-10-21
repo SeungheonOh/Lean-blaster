@@ -14,9 +14,14 @@ partial def structEq? (op1 : Expr) (op2: Expr) : TranslateEnvT (Option Bool) := 
  let rec visit (op1 : Expr) (op2 : Expr) : TranslateEnvT (Option Bool) := do
    match op1, op2 with
     | Expr.lit _, Expr.lit _ => return exprEq op1 op2
-    | Expr.const n1 _, Expr.const n2 _ =>
+    | Expr.const n1 l1, Expr.const n2 l2 =>
        if (← (isCtorName n1) <&&> (isCtorName n2))
-       then return exprEq op1 op2
+       then
+         if n1 != n2 then return false
+         -- NOTE: universe levels are not normalized (e.g., `max u v` and `max v u`),
+         -- i.e., physical equality cannot be used to decide disequality on them.
+         if List.isEqv l1 l2 Level.isEquiv then return true
+         return none
        else return none -- function case not structurally equivalent
     | Expr.app .., Expr.app .. =>
         Expr.withApp op1 fun f1 as1 =>
