@@ -5,3 +5,4 @@ import Tests.Reconstruct.MatchEdge
 import Tests.Reconstruct.SmtProof
 import Tests.Reconstruct.NlArith
 import Tests.Reconstruct.DeepProofs
+import Tests.Reconstruct.SortInfer

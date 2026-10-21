@@ -125,7 +125,9 @@ def stepConcl (i : Nat) : ReplayM Expr := do
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
   let t0 ← IO.monoMsNow
-  let e ← instantiateMVars (← liftInterp (withReader (fun c => { c with deferTypes := true }) (interpProp c)))
+  -- NOTE: the hints of the constructor applications whose instance the conclusion leaves undetermined (see
+  -- `SortInfer`) are applied before the defaults
+  let e ← instantiateMVars (← liftInterp (withSortHints (withReader (fun c => { c with deferTypes := true }) (interpProp c))))
   -- NOTE: undetermined type parameters are most likely the sort variable of a polymorphic goal (e.g., `List.nil`
   -- in a goal on `List α`), and otherwise irrelevant (e.g., `Option.none` under a tester)
   let e ← defaultTypes (← fillDefaults e) (← defaultTypeParam)
@@ -1114,11 +1116,15 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       -- `(or (not (forall xs. P)) P[ts])`
       let some (nq, inst) := orArgs? concl | throwError "quant-inst: disjunction expected"
       let some q := nq.not? | throwError "quant-inst: negated quantifier expected"
-      let ts ← liftInterp (step.args.mapM interpInt?) >>= (·.mapM fun t => liftM (fillDefaults t))
+      let pending ← IO.mkRef #[]
+      let ts ← liftInterp (withReader (fun c => { c with pendingHints := some pending }) (step.args.mapM interpInt?)) >>=
+        (·.mapM fun t => liftM (fillDefaults t))
       let dflt ← defaultTypeParam
       let r ← withLocalDeclD `h q fun h => do
         let hi ← instantiateWithCoercion h ts
         if !(← propEq (← inferType hi) inst (deep := true)) then throwError "quant-inst: instance mismatch"
+        -- the hints of the instantiation terms whose instance is still undetermined (see `SortInfer`)
+        liftInterp (applySortHints (← pending.get))
         let hi ← assignDefaultTypes hi dflt
         mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inr) nq inst hi)
       let rn ← withLocalDeclD `h nq fun h => mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inl) nq inst h)
