@@ -150,12 +150,16 @@ partial def casesUninhabited (g : MVarId) (h : FVarId) (depth : Nat := 3) : Meta
         if ← casesUninhabited sg.mvarId x (depth - 1) then return true
     return false
 
-/-- Close the goal with a local function `f : A₁ → ... → Aₙ → T` (or a local variable `f : T`) into an uninhabited
-    inductive type `T` (see `isUninhabitedType`, e.g., `Empty`), whose arguments are proved by `trivial`, `decide` or a
-    constructor of their types (e.g., `f : True → Empty`): case analysis on `f a₁ ... aₙ`. Such functions are the values
-    of the sorts `@@ArrowT .. Empty` (e.g., the axioms on `@isFun f` hold vacuously). -/
+/-- Close the goal by case analysis on a term of an uninhabited inductive type (see `isUninhabitedType`, e.g., `Empty`):
+     - the application `f a₁ ... aₙ` of a local function `f : A₁ → ... → Aₙ → T` (or a local variable `f : T`), whose
+       arguments are proved by `trivial`, `decide` or a constructor of their types (e.g., `f : True → Empty`): such
+       functions are the values of the sorts `@@ArrowT .. Empty` (e.g., the axioms on `@isFun f` hold vacuously);
+     - a term of the goal (e.g., `g 0` for a constant `g : Nat → P E`). -/
 @[tactic blasterEmptyElim] def evalBlasterEmptyElim : Tactic := fun _ => withMainContext do
   let g ← getMainGoal
+  let casesOn (e : Expr) : MetaM Unit := do
+    let (h, g') ← (← g.assert `h (← inferType e) e).intro1
+    unless ← casesUninhabited g' h do throwError "case analysis"
   for d in ← getLCtx do
     -- NOTE: data only (e.g., not the negated goal `¬ p`, a function into `False`)
     if d.isImplementationDetail || (← isProp d.type) then continue
@@ -170,24 +174,20 @@ partial def casesUninhabited (g : MVarId) (h : FVarId) (depth : Nat := 3) : Meta
         unless gs.isEmpty do throwError "argument not proved"
       let e ← instantiateMVars (mkAppN d.toExpr args)
       if e.hasExprMVar then throwError "argument not inferred"
-      let (h, g') ← (← g.assert `h (← inferType e) e).intro1
-      unless ← casesUninhabited g' h do throwError "case analysis"
+      casesOn e
     if r.isSome then
       replaceMainGoal []
       return
-  -- terms of the goal of an uninhabited type (e.g., `g 0` for a constant `g : Nat → P E`)
   let candidates := (collectApps (← instantiateMVars (← g.getType))).filter fun e =>
     !e.hasLooseBVars && !e.hasMVar && (e.getAppFn.isConst || e.getAppFn.isFVar)
   for e in candidates.extract 0 64 do
     let r ← observing? do
-      let t ← inferType e
-      unless ← isUninhabitedType t do throwError "inhabited type"
-      let (h, g') ← (← g.assert `h t e).intro1
-      unless ← casesUninhabited g' h do throwError "case analysis"
+      unless ← isUninhabitedType (← inferType e) do throwError "inhabited type"
+      casesOn e
     if r.isSome then
       replaceMainGoal []
       return
-  throwError "blaster_empty_elim: no function into an empty type"
+  throwError "blaster_empty_elim: no term of an uninhabited type"
 
 syntax (name := blasterCasesNat) "blaster_cases_nat" : tactic
 
