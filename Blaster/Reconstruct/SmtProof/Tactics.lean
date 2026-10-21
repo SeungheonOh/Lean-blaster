@@ -106,20 +106,62 @@ syntax (name := blasterStringOrder) "blaster_string_order" : tactic
 
 syntax (name := blasterEmptyElim) "blaster_empty_elim" : tactic
 
-/-- Close the goal with a local function `f : A₁ → ... → Aₙ → T` into an inductive type `T` without constructors
-    (e.g., `Empty`), whose arguments are proved by `trivial`, `decide` or a constructor of their types (e.g.,
-    `f : True → Empty`): case analysis on `f a₁ ... aₙ`. Such functions are the values of the sorts
-    `@@ArrowT .. Empty` (e.g., the axioms on `@isFun f` hold vacuously). -/
+/-- The applications in `e` (without duplicates, traversal with sharing). -/
+partial def collectApps (e : Expr) : Array Expr := Id.run do
+  let mut acc := #[]
+  let mut seen : Std.HashSet Expr := {}
+  let mut stack := #[e]
+  while !stack.isEmpty do
+    let s := stack.back!
+    stack := stack.pop
+    if seen.contains s then continue
+    seen := seen.insert s
+    match s with
+    | .app f a => acc := acc.push s; stack := stack.push f |>.push a
+    | .lam _ t b _ | .forallE _ t b _ => stack := stack.push t |>.push b
+    | .letE _ t v b _ => stack := stack.push t |>.push v |>.push b
+    | .mdata _ b | .proj _ _ b => stack := stack.push b
+    | _ => pure ()
+  return acc
+
+/-- Whether the inductive type `t` (without indices) has no value: none of its constructors (e.g., `Empty`), or a field
+    of an uninhabited type in each of its constructors (e.g., `P E` for `inductive P (α) | node (a : α)` and an empty
+    type `E`), up to `depth` nested types. -/
+partial def isUninhabitedType (t : Expr) (depth : Nat := 3) : MetaM Bool := do
+  let t ← whnfD t
+  let .const n _ := t.getAppFn | return false
+  let .inductInfo info ← getConstInfo n | return false
+  if info.numIndices != 0 || t.getAppNumArgs != info.numParams then return false
+  if info.ctors.isEmpty then return true
+  if depth == 0 then return false
+  info.ctors.allM fun c => do
+    let cty ← instantiateForall ((← getConstInfo c).instantiateTypeLevelParams t.getAppFn.constLevels!) t.getAppArgs
+    forallTelescopeReducing cty fun fs _ => fs.anyM fun f => do isUninhabitedType (← inferType f) (depth - 1)
+
+/-- Close `g` by case analysis on `h`, of an uninhabited type (see `isUninhabitedType`): recursively on a field of an
+    uninhabited type of each constructor. -/
+partial def casesUninhabited (g : MVarId) (h : FVarId) (depth : Nat := 3) : MetaM Bool := do
+  let subgoals ← g.cases h
+  subgoals.allM fun sg => sg.mvarId.withContext do
+    if depth == 0 then return false
+    for f in sg.fields do
+      let .fvar x := f | continue
+      if ← isUninhabitedType (← inferType f) then
+        if ← casesUninhabited sg.mvarId x (depth - 1) then return true
+    return false
+
+/-- Close the goal with a local function `f : A₁ → ... → Aₙ → T` (or a local variable `f : T`) into an uninhabited
+    inductive type `T` (see `isUninhabitedType`, e.g., `Empty`), whose arguments are proved by `trivial`, `decide` or a
+    constructor of their types (e.g., `f : True → Empty`): case analysis on `f a₁ ... aₙ`. Such functions are the values
+    of the sorts `@@ArrowT .. Empty` (e.g., the axioms on `@isFun f` hold vacuously). -/
 @[tactic blasterEmptyElim] def evalBlasterEmptyElim : Tactic := fun _ => withMainContext do
   let g ← getMainGoal
   for d in ← getLCtx do
-    if d.isImplementationDetail then continue
+    -- NOTE: data only (e.g., not the negated goal `¬ p`, a function into `False`)
+    if d.isImplementationDetail || (← isProp d.type) then continue
     let r ← observing? do
       let (args, _, body) ← forallMetaTelescopeReducing d.type
-      if args.isEmpty then throwError "not a function"
-      let .const n _ := (← whnfD body).getAppFn | throwError "not an inductive type"
-      let .inductInfo info ← getConstInfo n | throwError "not an inductive type"
-      unless info.ctors.isEmpty do throwError "inhabited co-domain"
+      unless ← isUninhabitedType body do throwError "inhabited type"
       for a in args do
         let ag := a.mvarId!
         if ← ag.isAssigned then continue
@@ -129,7 +171,19 @@ syntax (name := blasterEmptyElim) "blaster_empty_elim" : tactic
       let e ← instantiateMVars (mkAppN d.toExpr args)
       if e.hasExprMVar then throwError "argument not inferred"
       let (h, g') ← (← g.assert `h (← inferType e) e).intro1
-      unless (← g'.cases h).isEmpty do throwError "case analysis"
+      unless ← casesUninhabited g' h do throwError "case analysis"
+    if r.isSome then
+      replaceMainGoal []
+      return
+  -- terms of the goal of an uninhabited type (e.g., `g 0` for a constant `g : Nat → P E`)
+  let candidates := (collectApps (← instantiateMVars (← g.getType))).filter fun e =>
+    !e.hasLooseBVars && !e.hasMVar && (e.getAppFn.isConst || e.getAppFn.isFVar)
+  for e in candidates.extract 0 64 do
+    let r ← observing? do
+      let t ← inferType e
+      unless ← isUninhabitedType t do throwError "inhabited type"
+      let (h, g') ← (← g.assert `h t e).intro1
+      unless ← casesUninhabited g' h do throwError "case analysis"
     if r.isSome then
       replaceMainGoal []
       return
