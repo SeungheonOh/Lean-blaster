@@ -98,6 +98,8 @@ structure ReplayState where
   /-- proofs of the global steps, in the order of their replay (premises first), represented in the proofs by the
       metavariables (unassigned, such that no instantiation inlines them, see `liftGlobalProofs`) -/
   globalProofs : Array (MVarId × Expr) := #[]
+  /-- the steps of the proofs of `globalProofs` -/
+  globalSteps : Array Nat := #[]
 
 abbrev ReplayM := ReaderT ReplayCtx (StateRefT ReplayState TermElabM)
 
@@ -832,8 +834,11 @@ where
     NOTE: the proofs use placeholders `P fvs` for the proofs of the global steps they use (such that they are not
     inlined), are abstracted by a single (native) abstraction sharing its cache (e.g., the interpreted terms of the goal
     shared by the proofs of the steps), and the placeholders are then replaced in the order of the steps (premises
-    first). Nothing is lifted when a proof has metavariables. -/
-def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array Expr) : MetaM Expr := do
+    first). Nothing is lifted when a proof has metavariables.
+    With `aux?`, each closed lambda term is replaced by the term that `aux? i (∀ fvs, φᵢ) Λ` returns (e.g., the
+    constant of an auxiliary theorem proved by `Λ`, see `proveBySmtProof`), in the order of the substitutions. -/
+def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array Expr)
+    (aux? : Option (Nat → Expr → Expr → MetaM Expr) := none) : MetaM Expr := do
   -- the proofs inlined (no lifting)
   let inline : MetaM Expr := do
     for (m, v) in globals do m.assign v
@@ -892,7 +897,12 @@ def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array 
         order := order.push i
   let mut finals : Std.HashMap FVarId Expr := {}
   for i in order do
-    finals := finals.insert ps[i]! (subst finals (withBody template fvs.size bodies[i]!))
+    let v := subst finals (withBody template fvs.size bodies[i]!)
+    -- the closed term replaced by the term `aux?` builds from its type and itself (e.g., an auxiliary theorem)
+    let v ← match aux? with
+      | some aux => aux i (← mkForallFVars fvs (← instantiateMVars (← globals[i]!.1.getType))) v
+      | none => pure v
+    finals := finals.insert ps[i]! v
   return subst finals root
 
 /-- The steps being replayed (innermost last), written to the file given by `BLASTER_SMTPROOF_CURRENT` (if set)
@@ -949,7 +959,7 @@ partial def replay (i : Nat) : ReplayM Expr := do
     -- scopes), but held by `globalProofs` (see `liftGlobalProofs`)
     let p ← if p.isFVar || p.isMVar then pure p else do
       let m ← withLCtx ctx.baseLCtx ctx.baseInsts <| mkFreshExprMVar (← stepConcl i) (kind := .syntheticOpaque)
-      modify fun s => { s with globalProofs := s.globalProofs.push (m.mvarId!, p) }
+      modify fun s => { s with globalProofs := s.globalProofs.push (m.mvarId!, p), globalSteps := s.globalSteps.push i }
       pure m
     modify fun s => { s with cache := s.cache.insert i p }
     return p
