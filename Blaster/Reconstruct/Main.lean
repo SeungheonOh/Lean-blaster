@@ -50,6 +50,11 @@ private def mkTopHole (lhs rhs : Expr) : MetaM Expr := do
   let sorryExpr := mkApp2 (Lean.mkConst ``sorryAx [levelZero]) eqType (toExpr true)
   return mkMData (KVMap.empty.insert holeKey (.ofNat 0)) sorryExpr
 
+/-- The options of the kernel checks of reconstructed proofs: no heartbeat limit, as a reconstructed proof (whose
+    construction is bounded by the deadline of the replay) may take more than the default limit to check (e.g., the
+    9M distinct subterms of the proof of a CEK evaluation of CardanoLedgerApiBlaster's `SellNFT` validator). -/
+def kernelOptions (o : Options) : Options := maxHeartbeats.set o 0
+
 /-- Check `proof` against `goal` with the Lean kernel. Fall back to the elaborator's type checker
     when `goal` contains metavariables or free variables.
 -/
@@ -68,7 +73,7 @@ def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) :=
   let decl := Declaration.thmDecl { name, levelParams := lvls, type := goal, value := proof }
   -- NOTE: `addDecl` may perform kernel checking asynchronously, i.e., errors are reported
   -- as messages instead of exceptions. We here call the kernel synchronously.
-  match Lean.Kernel.Environment.addDecl (← getEnv).toKernelEnv (← getOptions) decl with
+  match Lean.Kernel.Environment.addDecl (← getEnv).toKernelEnv (kernelOptions (← getOptions)) decl with
   | .ok _ => return none
   | .error ex => return some m!"kernel rejected the reconstructed proof: {ex.toMessageData (← getOptions)}"
 
@@ -127,7 +132,7 @@ def checkedProof (checked : IO.Ref (Array (Name × Expr))) (goal proof : Expr) :
   try
     -- NOTE: the declaration is checked synchronously, i.e., kernel errors are reported as exceptions
     let lvls := (collectLevelParams {} goal).params.toList
-    let n ← withOptions (fun o => Elab.async.set o false) <| mkAuxLemma lvls goal proof (cache := false)
+    let n ← withOptions (fun o => kernelOptions (Elab.async.set o false)) <| mkAuxLemma lvls goal proof (cache := false)
     checked.modify (·.push (n, proof))
     return .ok (Lean.mkConst n (lvls.map mkLevelParam))
   catch ex =>
