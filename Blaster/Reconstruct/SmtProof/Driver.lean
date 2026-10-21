@@ -334,6 +334,12 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
           let (n, d) := dagStats p
           traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
+          -- the cost of the instantiations of the binders by the kernel (environment variable
+          -- `BLASTER_SMTPROOF_ISTATS`, the traversal being costly on large proofs)
+          if (← IO.getEnv "BLASTER_SMTPROOF_ISTATS").isSome then
+            let pf := mkLambda `hneg .default (← inferType hneg) (p.abstract #[hneg])
+            let (m, total, hist) := instantiationStats (← mkLambdaFVars xs pf)
+            traceTimed s!"instantiations: {m} subterms with loose bound variables, {total} copies, histogram {hist}" (pure ())
         -- NOTE: the negated goal only occurs in the proofs of the asserted formulas (see `abstractFVar`)
         let pf ← traceTimed "abstraction of the negated goal" do
           if p.hasMVar then mkLambdaFVars #[hneg] p

@@ -749,6 +749,42 @@ where
     large proof). -/
 @[implemented_by dagStatsImpl] opaque dagStats (e : Expr) : Nat × Nat
 
+/-- Number of bits set in `n`. -/
+partial def popCount (n : Nat) (acc : Nat := 0) : Nat :=
+  if n == 0 then acc else
+    let w : UInt64 := n.toUInt64
+    let w : UInt64 := w - ((w >>> 1) &&& (0x5555555555555555 : UInt64))
+    let w : UInt64 := (w &&& (0x3333333333333333 : UInt64)) + ((w >>> 2) &&& (0x3333333333333333 : UInt64))
+    let w : UInt64 := (w + (w >>> 4)) &&& (0x0f0f0f0f0f0f0f0f : UInt64)
+    let w : UInt64 := (w * (0x0101010101010101 : UInt64)) >>> 56
+    popCount (n >>> 64) (acc + w.toNat)
+
+/-- Implementation of `instantiationStats`. -/
+unsafe def instantiationStatsImpl (e : Expr) : Nat × Nat × Array Nat :=
+  let (_, (m, total, hist)) := (go e).run ({}, 0, Array.replicate 12 0)
+  (hist.foldl (· + ·) 0, total, hist)
+where
+  -- NOTE: the closed subterms are traversed too (e.g., the closed lambda terms of `liftGlobalProofs`)
+  go (e : Expr) : StateM (Std.HashMap USize Nat × Nat × Array Nat) Nat := do
+    if let some s := (← get).1.get? (ptrAddrUnsafe e) then return s
+    let s ← match e with
+      | .bvar i => pure (1 <<< i)
+      | .app f a => pure ((← go f) ||| (← go a))
+      | .lam _ t b _ | .forallE _ t b _ => pure ((← go t) ||| ((← go b) >>> 1))
+      | .letE _ t v b _ => pure ((← go t) ||| (← go v) ||| ((← go b) >>> 1))
+      | .mdata _ b | .proj _ _ b => go b
+      | _ => pure 0
+    let k := popCount s
+    modify fun (m, total, hist) =>
+      (m.insert (ptrAddrUnsafe e) s, total + k, if k == 0 then hist else hist.modify (min (Nat.log2 k) 11) (· + 1))
+    return s
+
+/-- Cost of the instantiations of the binders of `e` by the kernel (e.g., in `infer_lambda`), which rebuild the subterms
+    referring to the instantiated binder: the number of distinct subterms with loose bound variables, the sum over them
+    of the number of distinct binders they refer to (the number of copies of the subterms built by the instantiations),
+    and the histogram of these numbers (bucket `k`: from `2^k` to `2^(k+1) - 1` binders). -/
+@[implemented_by instantiationStatsImpl] opaque instantiationStats (e : Expr) : Nat × Nat × Array Nat
+
 /-- Implementation of `abstractFVar`: the caches are keyed by the addresses of the subterms (the structural equality of
     large terms is costly). -/
 unsafe def abstractFVarImpl (e : Expr) (x : FVarId) : Expr :=
