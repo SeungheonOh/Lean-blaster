@@ -826,7 +826,10 @@ def removeOutParam : Expr → Expr
  | e => e
 
 
-/-- Returns all axioms only defined in current module. -/
+/-- Returns all axioms only defined in current module.
+    NOTE: `unsafe` axioms are not considered as the kernel rejects
+    any safe declaration depending on them.
+-/
 def findLocalAxioms : MetaM (List Expr) := do
  let env ← getEnv
  (Environment.constants env).toList.filterMapM
@@ -836,6 +839,7 @@ def findLocalAxioms : MetaM (List Expr) := do
         match c.2 with
         | .axiomInfo info =>
             if wasOriginallyTheorem env c.1 then return none
+            if info.isUnsafe then return none
             if ← isProp (info.type) then
               return some info.type
             else return none
