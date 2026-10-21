@@ -815,7 +815,18 @@ def liftGlobalProofs (p : Expr) (cache : Std.HashMap Nat Expr) (fvs : Array Expr
     match k, t with
     | k + 1, .lam n d b bi => .lam n d (withBody b k body) bi
     | _, _ => body
-  let bodies := ((mkAppN (mkConst ``True) ws).abstract fvs).getAppArgs
+  -- NOTE: a balanced tree of the proofs (a single application of all of them would be traversed recursively)
+  let rec bundle (es : Array Expr) (lo hi : Nat) : Expr :=
+    if hi ≤ lo + 1 then es.getD lo (mkConst ``True)
+    else mkApp2 (mkConst ``And) (bundle es lo ((lo + hi) / 2)) (bundle es ((lo + hi) / 2) hi)
+  termination_by hi - lo
+  decreasing_by all_goals omega
+  let rec unbundle (e : Expr) (lo hi : Nat) (acc : Array Expr) : Array Expr :=
+    if hi ≤ lo + 1 then (if lo < hi then acc.push e else acc)
+    else unbundle e.appArg! ((lo + hi) / 2) hi (unbundle e.appFn!.appArg! lo ((lo + hi) / 2) acc)
+  termination_by hi - lo
+  decreasing_by all_goals omega
+  let bodies := unbundle ((bundle ws 0 ws.size).abstract fvs) 0 ws.size #[]
   let subst (finals : Std.HashMap FVarId Expr) (e : Expr) : Expr :=
     e.replace fun s => if !s.hasFVar then some s else match s with
       | .fvar x => finals.get? x
