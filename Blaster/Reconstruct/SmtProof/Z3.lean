@@ -67,12 +67,13 @@ partial def convert (t : STerm) : ConvM Nat := do
   modify fun s => { s with cache := s.cache.insert addr i }
   return i
 
-/-- The proof term `p` of the first `(proof p)` occurring in `e`. -/
-partial def findProof? (e : SExpr) : Option SExpr :=
-  match e with
-  | .list #[.atom "proof", x] => some x
-  | .list xs => xs.findSome? findProof?
-  | _ => none
+/-- The proof term `p` of the first `(proof p)` occurring in `e` (at most at depth `depth`, e.g., in a list wrapping
+    the proof: the proof terms may be deeply nested). -/
+def findProof? (e : SExpr) (depth := 4) : Option SExpr :=
+  match e, depth with
+  | .list #[.atom "proof", x], _ => some x
+  | .list xs, depth + 1 => xs.findSome? (findProof? · depth)
+  | _, _ => none
 
 /-- Sorted variables `((x S) ...)`. -/
 def sortedVars (e : SExpr) : Except String (Array (String × SExpr)) := do

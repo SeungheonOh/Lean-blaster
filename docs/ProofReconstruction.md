@@ -285,11 +285,27 @@ tests the replay alone (`(smt-proof: 3)`).
 
 ### Results
 
-On this branch, with `BLASTER_SMT_PROOF=only` (no tactic strategy for SMT residuals) on the 42 files of
-`Tests/Smt` and `Tests/FixedIssues` with SMT residuals (except `SmtNatMod`, `CharBitVec` and `Issue18`), after the
-sync with 53dc075 of `feat/smt-proof-replay` (Z3 5.3.1): **199 of the 220 replays succeed** (90.5%), and all 5 of
-the new soundness tests (`LambdaDefGuard`, `InstanceArgs`). The source branch replays 212 of 223 on its versions
-of the same files. Per file (target / source):
+On this branch, after the sync with 85e883f of `feat/smt-proof-replay`, with `BLASTER_SMT_PROOF=only` (no tactic
+strategy for SMT residuals) and Z3 5.3.1, counting each replay of the 52 files of `Tests/Smt` and
+`Tests/FixedIssues` with SMT residuals (`covreplay`, optimizer obligations excluded): **245 of the 272 replays
+succeed** (90.1%; 240 before the sync, on the same files). The gains come from the interpretation of the inductive
+types without constructors declared as uninterpreted sorts (`(declare-sort Empty 0)`), `blaster_empty_elim`, the
+skolem constants of several bound variables and `str.from_code` (`Tests/Smt/SmtUninhabited.lean` 8 → 12 of 21,
+`Tests/FixedIssues/CharBitVec.lean` 17 → 18 of 21), and all the 3 new goals of `Tests/Reconstruct/SmtProof.lean`
+are replayed (19 of its 25 replays). The remaining failures are those described below (universes of `Issue26`,
+sort quantifiers in hypotheses, class methods at several sort variables, `Issue25`), the propositions with data
+fields and the constructor testers on propositions of `SmtUninhabited`, its existential sort quantifier
+`∃ (α : Type), ∃ (_x : α), True` (translated on this branch as a quantifier over `@@Type`, whose interpretation the
+bridge does not relate to the goal), the `Char` literals and a bit-vector lemma of `CharBitVec`, and the nonlinear
+lemma of `SmtMatch.lean` (the replay deadline being 30 minutes by default now, it exceeds the measurement's timeout
+per file instead of the deadline). The types used as values (`@abstractType`, `@coerce`) of the source's
+translation have no counterpart in this branch's translation.
+
+At the sync with 53dc075, on the 42 files of `Tests/Smt` and `Tests/FixedIssues` with SMT residuals (except
+`SmtNatMod`, `CharBitVec` and `Issue18`; the regression tests of `SmtUninhabited` were extended since):
+**199 of the 220 replays succeeded** (90.5%), and all 5 of the new soundness tests (`LambdaDefGuard`,
+`InstanceArgs`). The source branch replayed 212 of 223 on its versions of the same files. Per file (target /
+source):
 
 | file | this branch | `feat/smt-proof-replay` |
 |------|-------------|-------------------------|
@@ -324,13 +340,17 @@ Z3 5.3.1. With Z3 4.13.3, 5 of them are replayed, and the other two are proved b
 of `x / (y + 1) ≤ x` needs a non-linear `div` lemma, and the proof of the `Option α` goal a datatype lemma over a
 selector of `Option α`, whose interpretation needs an inhabitant of `α`.
 
-On the `beta-lambda-cache-optimization` port (`feat/smt-proof-replay` at 53dc075, nightly Z3), the replay proves
-99.1% of the goals closed by the SMT solver on the whole test suite (338/341), and scales to the validators of
+On the `beta-lambda-cache-optimization` port (`feat/smt-proof-replay`, nightly Z3), the replay proves 99.1% of the
+goals closed by the SMT solver on the whole test suite (338/341, at 53dc075; 310 of the 320 replays of `covreplay`
+at 85e883f), and scales to the validators of
 [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
 evaluation of UPLC programs by the CEK machine (Z3 proofs of ≈900 steps over formulas of tens of thousands of
-nodes): `HelloWorld`, `UnlockPIN`, `ParamFeed` and `Auction` are fully reconstructed with the replay only, and the
-`z3rec` backend yields the proofs of `MintingPolicy` (a residual of 22K steps replayed and kernel checked in about
-2.5 min). With the default mode (`last`), the replay complements the tactic strategies.
+nodes): `HelloWorld`, `UnlockPIN`, `ParamFeed` and `Auction` are fully reconstructed with the replay only, and with
+the `z3rec` backend all the 20 `Governance` theorems and both `MintingPolicy` theorems are kernel checked (residual
+proofs of 4K to 31.7K steps; the proofs of the steps that don't depend on a scope are held by unassigned
+metavariables during the replay and lifted at the end to closed lambda terms over the variables of the goal and the
+negated goal, `liftGlobalProofs`, instead of being abstracted once per binder depth of the nested `lemma` scopes).
+`SellNFT` remains open. With the default mode (`last`), the replay complements the tactic strategies.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional

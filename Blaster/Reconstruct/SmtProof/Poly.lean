@@ -58,6 +58,16 @@ def Img {T : Sort u} {D : Sort v} (w : T → D) (d : D) : Prop := ∃ x, d = w x
 
 theorem img_self {T : Sort u} {D : Sort v} (w : T → D) (x : T) : Img w (w x) := ⟨x, rfl⟩
 
+/-- The value of the universe of a value `x : D` of the type `T` by the world `w` (the preimage of `x`), e.g., the
+    conversion `@coerce` from the sort of `T` to the sort `@Instance` when `T` is used as a value (see
+    `Blaster.Smt.translateIndTypeExpr?`). -/
+noncomputable def coerceWorld {T : Sort u} {D : Sort v} (w : T → D) (x : D) : Univ.{u} :=
+  open Classical in if h : Img w x then inj T (Classical.choose h) else none
+
+theorem img_coerceWorld {T : Sort u} {D : Sort v} {w : T → D} {x : D} (h : Img w x) :
+    Img (inj T) (coerceWorld w x) := by
+  unfold coerceWorld; rw [dif_pos h]; exact img_self _ _
+
 /-! Images of the worlds of the functors (definitions of the membership predicates of their sorts, e.g., `@isList`). -/
 
 theorem img_list_nil {α : Type u} {β : Type v} (w : α → β) : Img (List.map w) [] := ⟨[], rfl⟩
@@ -266,15 +276,6 @@ theorem img_id {T : Sort u} {D : Sort v} {w : T → D} (hw : Function.Injective 
     Img (liftFun w w (fun x => x)) (fun x => x) :=
   ⟨fun x => x, (lam_world hw (fun _ => rfl) (fun _ _ => rfl)).symm⟩
 
-/-- Membership of the lambda terms guarded by the membership predicates of their parameters (see
-    `guardedLambda`). -/
-theorem img_lam_ite {A : Sort a} {B : Sort b} {D : Sort d} {C : Sort c}
-    {wa : A → D} (hw : Function.Injective wa) {wb : B → C} {dflt : D → C} {F : D → C}
-    (h : ∀ y, Img wa y → Img wb (F y)) :
-    Img (liftFun wa wb dflt) (fun y => @ite C (Img wa y) (Classical.propDecidable _) (F y) (dflt y)) :=
-  ⟨fun x => Classical.choose (h (wa x) ⟨x, rfl⟩),
-    (lam_world_ite hw fun x => (Classical.choose_spec (h (wa x) ⟨x, rfl⟩)).symm).symm⟩
-
 /-- One level of case analysis on the variables `fvs` of `g`. -/
 partial def casesVars (g : MVarId) (fvs : List FVarId) : MetaM (List MVarId) := do
   match fvs with
@@ -323,12 +324,6 @@ partial def mkDefault (t : Expr) : MetaM Expr := do
     let inst ← synthInstance (mkApp (mkConst ``Nonempty [u]) t)
     return mkApp2 (mkConst ``Classical.ofNonempty [u]) t inst
 
-/-- The universe level `u` of `Univ.{u}`. -/
-def univLevel? (t : Expr) : Option Level :=
-  match t with
-  | .const ``Univ [u] => some u
-  | _ => none
-
 /-- Whether `t` is (or contains) the universe of the interpretation. -/
 def hasUniv (t : Expr) : Bool := (t.find? fun s => s.isConstOf ``Univ).isSome
 
@@ -348,6 +343,10 @@ auxiliary declarations, per instance closed over its free variables, with the le
 NOTE: there is no world for the types with indices, with proof fields whose propositions differ in the two instances
 (e.g., properties of function fields, whose proofs would have to be transported), with dependent fields mapped by a
 world, or with recursive fields of function types. -/
+
+/-- The worlds of the types of the fields of the constructors (`field t d` for the type `t` interpreted as `d`, see
+    `mkWorld`), with the proofs of their injectivity (`none` when there is none). -/
+abbrev FieldWorld := Expr → Expr → MetaM (Option (Expr × Expr))
 
 /-- Map of a field of a constructor (see `mkIndWorld`). -/
 inductive FieldMap where
@@ -387,9 +386,28 @@ structure Block where
   /-- recursor of each motive (`T.rec` for the types of the block, `T.rec_i` for their nested occurrences) -/
   recs : Array Name
 
+/-- The recursor of the `k`-th motive of the block at the level `lvl`, applied to the motives `ms`, the minor premises
+    `mns` and `x`. -/
+def Block.recApp (b : Block) (k : Nat) (lvl : Level) (ms mns : Array Expr) (x : Expr) : Expr :=
+  mkAppN (mkConst b.recs[k]! (lvl :: b.us)) (b.as ++ ms ++ mns |>.push x)
+
 /-- The map of the `k`-th motive of the block applied to `x`. -/
-def Block.map (b : Block) (k : Nat) (x : Expr) : Expr :=
-  mkAppN (mkConst b.recs[k]! (b.lvl :: b.us)) (b.as ++ b.motives ++ b.minorVals |>.push x)
+def Block.map (b : Block) (k : Nat) (x : Expr) : Expr := b.recApp k b.lvl b.motives b.minorVals x
+
+/-- Proofs of the minor premises of the recursors of the block for the motives `props` (into `Prop`), by `prove` from
+    the type of each minor premise and its map. -/
+def Block.minorProofs (b : Block) (props : Array Expr) (prove : Expr → MinorMap → MetaM Expr) :
+    MetaM (Array Expr) := do
+  let recName := mkRecName b.info.all.head!
+  let mut ty ← instantiateForall ((← getConstInfo recName).instantiateTypeLevelParams (levelZero :: b.us))
+    (b.as ++ props)
+  let mut proofs := #[]
+  for mi in b.minors do
+    let .forallE _ mt body _ := ty | throwError "mkIndWorld: minor premise expected"
+    let p ← prove (← Core.betaReduce mt) mi
+    proofs := proofs.push p
+    ty := body.instantiate1 p
+  return proofs
 
 /-- Lemmas of the world `W` of an inductive type (see `mkIndWorld`), closed over the arguments of `W` (its free
     variables): its injectivity and, per constructor `C` (`C'` in the target instance), the equation
@@ -459,8 +477,7 @@ def mkImgIntro (w a x h : Expr) : MetaM Expr := do
     with their recursors, where the fields that are not recursive are mapped by `field` (the worlds of their types,
     `none` when there is none). The lemmas of the worlds (see `IndWorldLemmas`) are proved once the worlds of the
     block are known (e.g., `List.map W` for the nested occurrences). -/
-partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Expr × Expr))) :
-    MetaM (Option (Expr × Expr)) := do
+partial def mkIndWorld (t d : Expr) (field : FieldWorld) : MetaM (Option (Expr × Expr)) := do
   let .const I us := t.getAppFn | return none
   let .const I' vs := d.getAppFn | return none
   if I != I' then return none
@@ -473,7 +490,8 @@ partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Ex
   let closed (e : Expr) : MetaM (Option Expr) := do
     let e ← mkLambdaFVars fvs e
     return if e.hasFVar || e.hasMVar then none else some e
-  let some key ← closed (mkApp2 (mkConst `_blaster_world) t d) | return none
+  let cacheKey (t d : Expr) : MetaM (Option Expr) := closed (mkApp2 (mkConst `_blaster_world) t d)
+  let some key ← cacheKey t d | return none
   let env ← getEnv
   if (← noIndWorld.get).contains key then return none
   for (w, h) in (← indWorldCache.get).getD key #[] do
@@ -483,8 +501,7 @@ partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Ex
   let some (blk, worlds) := r | noIndWorld.modify (·.insert key); return none
   -- the worlds of the types of the block, then their lemmas
   for (n, w, h) in info.all.toArray.zip worlds do
-    let some k ← closed (mkApp2 (mkConst `_blaster_world) (mkAppN (mkConst n us) blk.as) (mkAppN (mkConst n vs) blk.bs))
-      | continue
+    let some k ← cacheKey (mkAppN (mkConst n us) blk.as) (mkAppN (mkConst n vs) blk.bs) | continue
     if let (some cw, some ch) := (← closed w, ← closed h) then
       indWorldCache.modify fun m => m.insert k ((m.getD k #[]).push (cw, ch))
   let auxEqns ← try auxEquations field blk catch _ => pure #[]
@@ -504,8 +521,8 @@ partial def mkIndWorld (t d : Expr) (field : Expr → Expr → MetaM (Option (Ex
 where
   /-- The block of `info` (`I as` to `I bs`, where `lvl` is the level of the sort of the target types), with the
       worlds of its types and the proofs of their injectivity. -/
-  build (field : Expr → Expr → MetaM (Option (Expr × Expr))) (info : InductiveVal) (us vs : List Level)
-      (as bs : Array Expr) (lvl : Level) : MetaM (Block × Array (Expr × Expr)) := do
+  build (field : FieldWorld) (info : InductiveVal) (us vs : List Level) (as bs : Array Expr) (lvl : Level) :
+      MetaM (Block × Array (Expr × Expr)) := do
     let env ← getEnv
     let recName := mkRecName info.all.head!
     let some (.recInfo rinfo) := env.find? recName | throwError "mkIndWorld: no recursor"
@@ -536,7 +553,8 @@ where
         return (vals, infos)
     let minorVals ← minorVals.mapM fun v => Core.betaReduce (v.beta motives)
     let recs := (List.range ds.size).toArray.map fun k =>
-      if h : k < info.all.length then mkRecName info.all[k] else Name.str info.all.head! s!"rec_{k + 1 - info.all.length}"
+      if h : k < info.all.length then mkRecName info.all[k]
+      else Name.str info.all.head! s!"rec_{k + 1 - info.all.length}"
     for k in [:ds.size] do
       if !env.contains recs[k]! then throwError "mkIndWorld: recursor {recs[k]!}"
     let blk : Block := { info, us, vs, as, bs, lvl, ds, dt, motives, minorVals, minors, recs }
@@ -544,28 +562,19 @@ where
     let props ← (List.range ds.size).toArray.mapM fun k =>
       withLocalDeclD `x ds[k]! fun x => withLocalDeclD `y ds[k]! fun y => do
         mkLambdaFVars #[x] (← mkForallFVars #[y] (← mkArrow (← mkEq (blk.map k x) (blk.map k y)) (← mkEq x y)))
-    let mut ty ← recType recName (levelZero :: us) (as ++ props)
-    let mut proofs := #[]
-    for mi in minors do
-      let .forallE _ mt b _ := ty | throwError "mkIndWorld: minor premise expected"
-      let p ← proveMinor (← Core.betaReduce mt) mi
-      proofs := proofs.push p
-      ty := b.instantiate1 p
+    let proofs ← blk.minorProofs props proveMinor
     let mut res := #[]
-    for h : i in [:info.all.length] do
-      let n := info.all[i]
+    for i in [:info.all.length] do
       let value ← withLocalDeclD `x ds[i]! fun x => do mkLambdaFVars #[x] (blk.map i x)
       let w ← mkAuxDefinition (← mkAuxDeclName (kind := `_blaster_world)) (← mkArrow ds[i]! dt[i]!) value
         (compile := false)
       let stmt ← mkAppM ``Function.Injective #[w]
-      let pf ← withLocalDeclD `x ds[i]! fun x => do
-        mkLambdaFVars #[x] (mkAppN (mkConst (mkRecName n) (levelZero :: us)) (as ++ props ++ proofs |>.push x))
+      let pf ← withLocalDeclD `x ds[i]! fun x => do mkLambdaFVars #[x] (blk.recApp i levelZero props proofs x)
       res := res.push (w, ← mkAuxTheorem stmt (← mkExpectedTypeHint pf stmt))
     return (blk, res)
   /-- The minor premise of the map for the constructor of `concl` (`motive_k (C ps fs)`, where the `ms` are the
       motives, `xs` the binders of the minor premise and `dt` the target types of the motives). -/
-  minor (field : Expr → Expr → MetaM (Option (Expr × Expr))) (ms dt xs : Array Expr) (concl : Expr) :
-      MetaM (Expr × MinorMap) := do
+  minor (field : FieldWorld) (ms dt xs : Array Expr) (concl : Expr) : MetaM (Expr × MinorMap) := do
     let some k := ms.findIdx? (· == concl.getAppFn) | throwError "mkIndWorld: motive expected"
     let app := concl.appArg!
     let .const c _ := app.getAppFn | throwError "mkIndWorld: constructor expected"
@@ -641,7 +650,7 @@ where
       mkLambdaFVars xs (← instantiateMVars g)
   /-- Equations of the maps of the nested occurrences: `∀ l, map_j l = E_j l` where `E_j` is the world of the type of
       `l` (e.g., `List.map W` for `List (T α)`, see `mkWorld`), by the recursor of the block. -/
-  auxEquations (field : Expr → Expr → MetaM (Option (Expr × Expr))) (blk : Block) : MetaM (Array (Nat × Expr)) := do
+  auxEquations (field : FieldWorld) (blk : Block) : MetaM (Array (Nat × Expr)) := do
     let n := blk.info.all.length
     if blk.ds.size == n then return #[]
     let mut ws : Array (Option Expr) := #[]
@@ -653,13 +662,8 @@ where
         match ws[k]! with
         | some w => mkLambdaFVars #[x] (← mkEq (blk.map k x) (applyWorld w x))
         | none => mkLambdaFVars #[x] (mkConst ``True)
-    let recName := mkRecName blk.info.all.head!
-    let mut ty ← instantiateForall ((← getConstInfo recName).instantiateTypeLevelParams (levelZero :: blk.us))
-      (blk.as ++ props)
-    let mut proofs := #[]
-    for mi in blk.minors do
-      let .forallE _ mt b _ := ty | throwError "mkIndWorld: minor premise expected"
-      let p ← forallBoundedTelescope (← Core.betaReduce mt) mi.numBinders fun xs goal => do
+    let proofs ← blk.minorProofs props fun mt mi =>
+      forallBoundedTelescope mt mi.numBinders fun xs goal => do
         if goal.isConstOf ``True then return ← mkLambdaFVars xs (mkConst ``True.intro)
         let some (_, lhs, rhs) := goal.eq? | throwError "mkIndWorld: equation expected"
         -- the inductive hypotheses of the nested fields
@@ -670,25 +674,27 @@ where
             return none)
           | throwError "mkIndWorld: equation of a nested occurrence"
         mkLambdaFVars xs p
-      proofs := proofs.push p
-      ty := b.instantiate1 p
     let mut res := #[]
     for k in [n:blk.ds.size] do
       if ws[k]!.isNone then continue
       let stmt ← withLocalDeclD `x blk.ds[k]! fun x => do mkForallFVars #[x] (props[k]!.beta #[x])
-      let pf ← withLocalDeclD `x blk.ds[k]! fun x => do
-        mkLambdaFVars #[x] (mkAppN (mkConst blk.recs[k]! (levelZero :: blk.us)) (blk.as ++ props ++ proofs |>.push x))
+      let pf ← withLocalDeclD `x blk.ds[k]! fun x => do mkLambdaFVars #[x] (blk.recApp k levelZero props proofs x)
       res := res.push (k, ← mkAuxTheorem stmt pf)
     return res
   /-- The equation and the image of the constructor `c` of the `i`-th type of the block in its world `w` (see
       `IndWorldLemmas`). -/
-  ctorLemmas (field : Expr → Expr → MetaM (Option (Expr × Expr))) (blk : Block) (i : Nat) (w : Expr)
-      (auxEqns : Array (Nat × Expr)) (c : Name) : MetaM (Option (Expr × Expr)) := do
+  ctorLemmas (field : FieldWorld) (blk : Block) (i : Nat) (w : Expr) (auxEqns : Array (Nat × Expr)) (c : Name) :
+      MetaM (Option (Expr × Expr)) := do
     let tgt ← whnf blk.dt[i]!
     let src := mkAppN (mkConst c blk.us) blk.as
     let ctor' := mkAppN (mkConst c tgt.getAppFn.constLevels!) tgt.getAppArgs
-    -- equation: `∀ xs, W (C xs) = C' (Ŵ xs)`
-    let some (eqn, ws) ← forallTelescope (← inferType src) fun xs _ => do
+    let some (eqn, ws) ← ctorEquation field blk w auxEqns src ctor' | return none
+    return some (eqn, ← ctorImage w c src ctor' eqn ws)
+  /-- The equation `∀ xs, W (C xs) = C' (Ŵ xs)` of the constructor `src` (`ctor'` in the target instance) in the
+      world `w`, with the worlds `Ŵ` of its fields (`none` for the fields of the same type in both instances). -/
+  ctorEquation (field : FieldWorld) (blk : Block) (w : Expr) (auxEqns : Array (Nat × Expr)) (src ctor' : Expr) :
+      MetaM (Option (Expr × Array (Option Expr))) := do
+    forallTelescope (← inferType src) fun xs _ => do
       let mut cty ← inferType ctor'
       let mut args := #[]
       let mut ws := #[]
@@ -698,7 +704,7 @@ where
         let (v, wi) ← if ← isDefEq ft g then pure (x, none)
           else if ft.hasAnyFVar (xs.contains <| mkFVar ·) then return none
           else match ← field ft g with
-            | some (wx, hx) => pure (applyWorld wx x, some (wx, hx))
+            | some (wx, _) => pure (applyWorld wx x, some wx)
             | none => return none
         args := args.push v
         ws := ws.push wi
@@ -713,11 +719,13 @@ where
           return none)
         | return none
       return some (← mkAuxTheorem (← mkForallFVars xs (← mkEq lhs rhs)) (← mkLambdaFVars xs p), ws)
-      | return none
-    -- image: `∀ ys, Img W (C' ys) = (Img Ŵᵢ yᵢ ∧ …)`
-    let img ← forallTelescope (← inferType ctor') fun ys _ => do
+  /-- The image `∀ ys, Img W (C' ys) = (Img Ŵᵢ yᵢ ∧ …)` of the constructor `c` (`src` in the source instance,
+      `ctor'` in the target instance) in the world `w`, from its equation `eqn` and the worlds `ws` of its fields (see
+      `ctorEquation`). -/
+  ctorImage (w : Expr) (c : Name) (src ctor' eqn : Expr) (ws : Array (Option Expr)) : MetaM Expr := do
+    forallTelescope (← inferType ctor') fun ys _ => do
       if ys.size != ws.size then throwError "mkIndWorld: fields"
-      let imgs ← (ys.zip ws).filterMapM fun (y, wi) => wi.mapM fun (wx, _) => mkAppM ``Img #[wx, y]
+      let imgs ← (ys.zip ws).filterMapM fun (y, wi) => wi.mapM fun wx => mkAppM ``Img #[wx, y]
       let conj := if imgs.isEmpty then mkConst ``True else imgs.pop.foldr mkAnd imgs.back!
       let lhs ← mkAppM ``Img #[w, mkAppN ctor' ys]
       let mkConj (pfs : Array Expr) : MetaM Expr := do
@@ -747,7 +755,7 @@ where
               if eqs.size != nonProof.size then throwError "mkIndWorld: image"
               let mut pfs := #[]
               for (e, j) in eqs.zip nonProof do
-                if let some (wx, _) := ws[j]! then
+                if let some wx := ws[j]! then
                   pfs := pfs.push (← mkImgIntro wx ys[j]! sg'.fields[j]! (mkFVar e))
               if pfs.size != imgs.size then throwError "mkIndWorld: image"
               g.assign (← mkConj pfs)
@@ -764,7 +772,7 @@ where
             rest ← mkAppM ``And.right #[rest]
         let rec elim (j k : Nat) (xs : Array Expr) (es : Array (Nat × Expr)) : MetaM Expr := do
           if h : j < ys.size then
-            let some (wx, _) := ws[j]! | elim (j + 1) k (xs.push ys[j]) es
+            let some wx := ws[j]! | elim (j + 1) k (xs.push ys[j]) es
             let some (srcTy, _) := (← whnfD (← inferType hs[k]!)).app2? ``Exists | throwError "mkIndWorld: image"
             withLocalDeclD `x srcTy fun x => do
             withLocalDeclD `e (← mkEq ys[j] (applyWorld wx x)) fun e => do
@@ -781,7 +789,7 @@ where
         mkLambdaFVars #[h] (← elim 0 0 #[] #[])
       let pf ← mkAppM ``propext #[← mkAppM ``Iff.intro #[mp, mpr]]
       mkAuxTheorem (← mkForallFVars ys (← mkEq lhs conj)) (← mkLambdaFVars ys pf)
-    return some (eqn, img)
+
 /-- The world of the Lean values of type `t` interpreted with type `d`, with a proof of its injectivity: `none` when
     `t` and `d` are the same type (worlds `Nat → Int` and `Bool → Prop` only occur below the type constructors, as
     in `α → Nat`; they are handled by the bridge otherwise). The construction is syntactic, such that the worlds
@@ -790,6 +798,7 @@ partial def mkWorld (t d : Expr) : MetaM (Option (Expr × Expr)) := do
   if !hasUniv d then return none
   go t d
 where
+  /-- whether `t` is interpreted as itself -/
   same (t d : Expr) : MetaM Bool := do
     if t == d then return true
     withReducible (isDefEq t d)
@@ -801,7 +810,7 @@ where
     go t d
   go (t d : Expr) : MetaM (Option (Expr × Expr)) := do
     if ← same t d then return none
-    if let some u := univLevel? d then
+    if let .const ``Univ [u] := d then
       if ← isDefEq (← inferType t) (mkSort u) then
         return some (mkApp (mkConst ``inj [u]) t, mkApp (mkConst ``inj_injective [u]) t)
       return none
@@ -931,9 +940,11 @@ partial def worldInjective? (w : Expr) : MetaM (Option Expr) := do
         let some hb ← worldInjective? args[5]! | return none
         return some (← mkAppM ``liftFun_injective #[ha, hb, args[6]!])
   | .const ``List.map _ =>
-      if args.size == 3 then if let some h ← worldInjective? args[2]! then return some (← mkAppM ``listMap_injective #[h])
+      if args.size == 3 then
+        if let some h ← worldInjective? args[2]! then return some (← mkAppM ``listMap_injective #[h])
   | .const ``Option.map _ =>
-      if args.size == 3 then if let some h ← worldInjective? args[2]! then return some (← mkAppM ``optionMap_injective #[h])
+      if args.size == 3 then
+        if let some h ← worldInjective? args[2]! then return some (← mkAppM ``optionMap_injective #[h])
   | .const ``Prod.map _ =>
       if args.size == 6 then
         let some h₁ ← worldInjective? args[4]! | return none
@@ -954,14 +965,34 @@ def indWorldSimpTerms (e : Expr) : TermElabM (Array (TSyntax ``Lean.Parser.Tacti
         res := res.push (← `(Lean.Parser.Tactic.simpLemma| $(← Term.exprToSyntax t):term))
   return res
 
+/-- The theorems of the worlds of the inductive types occurring in the main goal (target and hypotheses), see
+    `indWorldSimpTerms`. -/
+def goalIndWorldSimpTerms : TacticM (Array (TSyntax ``Lean.Parser.Tactic.simpLemma)) := withMainContext do
+  let mut e ← instantiateMVars (← getMainTarget)
+  for d in ← getLCtx do
+    if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
+  indWorldSimpTerms e
+
+/-- Whether one of the tactics `attempts` (tried in order, the state being restored after each failure) closes all
+    the goals. -/
+def closeWithFirst (attempts : Array (TSyntax `tactic)) : TacticM Bool := do
+  for t in attempts do
+    let s ← saveState
+    try
+      evalTactic t
+      if (← getGoals).isEmpty then return true
+    catch _ => pure ()
+    s.restore
+  return false
+
 syntax (name := blasterPolyInj) "blaster_poly_inj" : tactic
 
 /-- Proofs of the injectivity of worlds (`Function.Injective w`, see `worldInjective?`). -/
 @[tactic blasterPolyInj] def evalBlasterPolyInj : Tactic := fun _ => do
   let g ← getMainGoal
   let t ← whnfR (← instantiateMVars (← g.getType))
-  let some w := if t.isAppOfArity ``Function.Injective 3 then some t.appArg! else none
-    | throwError "blaster_poly_inj: injectivity expected"
+  if !t.isAppOfArity ``Function.Injective 3 then throwError "blaster_poly_inj: injectivity expected"
+  let w := t.appArg!
   let some p ← worldInjective? (← instantiateMVars w) | throwError "blaster_poly_inj: unknown world {w}"
   g.assign p
   replaceMainGoal []
@@ -971,13 +1002,9 @@ syntax (name := blasterPolySimp) "blaster_poly_simp" : tactic
 /-- Simplification of the naturality statements (see `blaster_poly_nat`), with the lemmas of the worlds of the
     inductive types of the goal (see `IndWorldLemmas`). -/
 @[tactic blasterPolySimp] def evalBlasterPolySimp : Tactic := fun _ => withMainContext do
-  let mut e ← instantiateMVars (← getMainTarget)
-  for d in ← getLCtx do
-    if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
-  let extra ← indWorldSimpTerms e
+  let extra ← goalIndWorldSimpTerms
   evalTactic (← `(tactic| simp_all [liftFun_apply, inj_injective, liftFun_injective, listMap_injective,
     optionMap_injective, prodMap_injective, id_injective, natCast_injective, boolTrue_injective, $extra,*]))
-
 
 syntax (name := blasterPolyNat) "blaster_poly_nat" : tactic
 
@@ -996,16 +1023,10 @@ syntax (name := blasterPolyNat) "blaster_poly_nat" : tactic
   let attempts : Array (TSyntax `tactic) := #[
     ← `(tactic| (fun_induction $stx <;> blaster_poly_simp)),
     ← `(tactic| (fun_induction $stx <;> (try blaster_poly_simp) <;> blaster_poly_cases <;> blaster_poly_simp)),
-    ← `(tactic| (fun_induction $stx <;> (try simp_all [$fId:ident]) <;> (try blaster_poly_cases) <;> blaster_poly_simp)),
+    ← `(tactic| (fun_induction $stx <;> (try simp_all [$fId:ident]) <;> (try blaster_poly_cases) <;>
+          blaster_poly_simp)),
     ← `(tactic| blaster_poly_simp)]
-  for t in attempts do
-    let s ← saveState
-    try
-      evalTactic t
-      if (← getGoals).isEmpty then return
-    catch _ => pure ()
-    s.restore
-  throwError "blaster_poly_nat: failed"
+  if !(← closeWithFirst attempts) then throwError "blaster_poly_nat: failed"
 
 syntax (name := blasterPoly) "blaster_poly" : tactic
 
@@ -1014,11 +1035,7 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
 @[tactic blasterPoly] def evalBlasterPoly : Tactic := fun _ => do
   evalTactic (← `(tactic| intros))
   -- the lemmas of the worlds of the inductive types of the goal (see `IndWorldLemmas`)
-  let extra ← withMainContext do
-    let mut e ← instantiateMVars (← getMainTarget)
-    for d in ← getLCtx do
-      if !d.isImplementationDetail then e := mkApp e (← instantiateMVars d.type)
-    indWorldSimpTerms e
+  let extra ← goalIndWorldSimpTerms
   let attempts : Array (TSyntax `tactic) := #[
     ← `(tactic| exact img_self _ _),
     ← `(tactic| exact img_id (inj_injective _)),
@@ -1036,13 +1053,7 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
     ← `(tactic| ((apply ext_liftFun₂ <;> try assumption) <;> blaster_poly_inj)),
     ← `(tactic| ((apply img_liftFun₂ <;> try assumption) <;> blaster_poly_inj)),
     ← `(tactic| ((apply img_liftFun <;> try assumption) <;> blaster_poly_inj))]
-  for t in attempts do
-    let s ← saveState
-    try
-      evalTactic t
-      if (← getGoals).isEmpty then return
-    catch _ => pure ()
-    s.restore
+  if ← closeWithFirst attempts then return
   -- membership hypotheses on variables: the variables are substituted by their witnesses
   for _ in [0:16] do
     let h? ← withMainContext do
@@ -1057,6 +1068,7 @@ syntax (name := blasterPoly) "blaster_poly" : tactic
     -- NOTE: `rfl` patterns are not recognized in quotations (hygiene)
     evalTactic (← `(tactic| (obtain ⟨_, h⟩ := $hs; subst h)))
   evalTactic (← `(tactic| (simp only [liftFun_apply, inj_injective, listMap_injective, optionMap_injective,
-    id_injective, natCast_injective, boolTrue_injective, img_self, $extra,*] <;> first | done | omega | rfl | simp_all | grind)))
+    id_injective, natCast_injective, boolTrue_injective, img_self, $extra,*] <;>
+      first | done | omega | rfl | simp_all | grind)))
 
 end Blaster.Reconstruct.SmtProof.Poly

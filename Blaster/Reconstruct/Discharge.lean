@@ -4,6 +4,7 @@ import Blaster.Reconstruct.Proof
 import Blaster.Reconstruct.Lemmas
 import Blaster.Reconstruct.Match
 import Blaster.Reconstruct.Depth
+import Blaster.Reconstruct.Profile
 
 open Lean Meta Elab Term Tactic
 
@@ -79,15 +80,47 @@ def attempt [Monad m] [MonadBacktrack s m] [MonadExcept Exception m] [MonadRunti
       if r.isNone then failed else return r)
     (fun _ => failed)
 
-/-- Return `true` if `prf` depends on `sorryAx` through an auxiliary declaration of the current
-    module (e.g., a matcher created by `nomatch` after an elaboration error).
+/-- Implementation of `dependsOnSorry`.
+    NOTE: Each expression is traversed by the native `Expr.findExt?` (whose cache of visited shared subterms is
+    much more efficient than the one of `Expr.getUsedConstants`, i.e., on large proofs), the constants of the
+    current module being recorded on the fly.
 -/
-def dependsOnSorry (prf : Expr) : MetaM Bool := do
-  let env ← getEnv
-  for c in prf.getUsedConstants do
-    if (env.getModuleIdxFor? c).isSome then continue
-    if (← collectAxioms c).contains ``sorryAx then return true
+unsafe def dependsOnSorryImpl (env : Environment) (prf : Expr) (checked : Array (Name × Expr)) : BaseIO Bool := do
+  let found ← IO.mkRef (#[] : Array Name)
+  let step (s : Expr) : Expr.FindStep :=
+    match s with
+    | .const c _ =>
+        if c == ``sorryAx then .found
+        else if (env.getModuleIdxFor? c).isSome then .done
+        else unsafeBaseIO do found.modify (·.push c); return .done
+    | _ => .visit
+  let mut visited : NameHashSet := {}
+  let mut todo : Array Expr := #[prf]
+  while !todo.isEmpty do
+    let e := todo.back!
+    todo := todo.pop
+    if (e.findExt? step).isSome then return true
+    for c in ← found.swap #[] do
+      if visited.contains c then continue
+      visited := visited.insert c
+      let some info := env.find? c | continue
+      let value? := info.value? (allowOpaque := true)
+      if let some v := value? then
+        if checked.any fun (n, v') => n == c && ptrEq v v' then continue
+        todo := todo.push v
+      todo := todo.push info.type
   return false
+
+@[implemented_by dependsOnSorryImpl]
+private opaque dependsOnSorryAux (env : Environment) (prf : Expr) (checked : Array (Name × Expr)) : BaseIO Bool
+
+/-- Return `true` if `prf` depends on `sorryAx`, directly or through an auxiliary declaration of the current
+    module (e.g., a matcher created by `nomatch` after an elaboration error). The declarations of `checked`
+    (with their values) are known not to depend on `sorryAx` (see `Blaster.Reconstruct.checkedProof`).
+    NOTE: Imported declarations are not traversed.
+-/
+def dependsOnSorry (prf : Expr) (checked : Array (Name × Expr) := #[]) : MetaM Bool := do
+  dependsOnSorryAux (← getEnv) prf checked
 
 /-- Try to close goal `type` with tactic `tac`. The elaboration state is restored on failure. -/
 def proveWithTactic (type : Expr) (tac : TSyntax `tactic) (budget := dischargeHeartbeats) : TermElabM (Option Expr) := do
@@ -1006,44 +1039,63 @@ def abstractDiscrs (ds : Array Expr) (rhs : Expr) : MetaM Expr := do
     return r.abstract ys
 
 mutual
-/-- Try to discharge proof obligation `type` (expected to be an equality) and return
-    the proof together with the method used.
+/-- Try to discharge proof obligation `type` (expected to be an equality) and return the proof together with
+    the method used and, when the proof is given by a tactic of `dischargeTactics`, its index.
+    The tactic of index `first?` (e.g., the one that discharged the previous obligation with the same origin,
+    see `dischargeHoles`) is tried first.
 -/
-partial def dischargeOne (type : Expr) (depth := matchCasesDepth) : TermElabM (Option (Expr × String)) := do
+partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : Option Nat := none) :
+    TermElabM (Option (Expr × String × Option Nat)) := do
   let type ← instantiateMVars type
   -- ill-typed proof obligations (e.g., due to ill-typed optimized expressions) can't be discharged
   if !(← isTypeCorrectObligation type) then
     if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then
       try Meta.check type catch ex => logInfo m!"ill-typed proof obligation: {ex.toMessageData}"
+    if ← isProfiling then
+      let msg ← try Meta.check type; pure "budget" catch ex => pure (← ex.toMessageData.toString)
+      profileLog "obligation.illtyped" 0 fun _ => msg.take 2000
     return none
-  if let some prf ← proveByDefEq type then return some (prf, "rfl")
-  -- closed obligations (e.g., concrete computations) are decided by kernel evaluation
-  if !type.hasFVar && !type.hasMVar then
-    if let some prf ← proveWithTactic type (← `(tactic| decide +kernel)) then return some (prf, "decide")
-    -- closed computations involving well-founded recursion
-    if let some prf ← proveWithTactic type (← `(tactic| blaster_wf_eval)) (budget := 4 * dischargeHeartbeats) then
-      return some (prf, "decide")
   -- NOTE: case analysis on (or unfolding of) large `match` expressions requires the generation of
   -- costly auxiliary lemmas (e.g., splitters), which are not subject to the discharge budget.
   let large ← involvesLargeMatch type
-  for (name, tac) in (← dischargeTactics) do
-    if large && name ∈ ["split", "cases", "induction"] then continue
-    if let some prf ← proveWithTactic type tac then return some (prf, name)
+  let tacs ← dischargeTactics
+  let skip (name : String) : Bool := large && name ∈ ["split", "cases", "induction"]
+  let first := first?.filter fun i => i < tacs.size && !skip tacs[i]!.1
+  if let some i := first then
+    let (name, tac) := tacs[i]!
+    if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
+  if let some prf ← profileAttempt "rfl" (proveByDefEq type) then return some (prf, "rfl", none)
+  -- closed obligations (e.g., concrete computations) are decided by kernel evaluation
+  if !type.hasFVar && !type.hasMVar then
+    if let some prf ← profileAttempt "decide" (proveWithTactic type (← `(tactic| decide +kernel))) then
+      return some (prf, "decide", none)
+    -- closed computations involving well-founded recursion
+    if let some prf ← profileAttempt "wf_eval"
+        (proveWithTactic type (← `(tactic| blaster_wf_eval)) (budget := 4 * dischargeHeartbeats)) then
+      return some (prf, "decide", none)
+  for h : i in [0:tacs.size] do
+    let (name, tac) := tacs[i]
+    if skip name || first == some i then continue
+    if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
   -- deeper case analysis with a larger budget (e.g., equality of nested structures)
   if !large then
-    if let some prf ← proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats) then
-      return some (prf, "cases")
-  if let some prf ← proveByMatchCases type depth then return some (prf, "match cases")
+    if let some prf ← profileAttempt "deep cases"
+        (proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats)) then
+      return some (prf, "cases", none)
+  if let some prf ← profileAttempt "match cases" (proveByMatchCases type depth) then
+    return some (prf, "match cases", none)
   -- case analysis on `match` expressions with generalized discriminants (e.g., symbolic `Int.negSucc`
   -- normalized by the optimizer)
   if !large then
-    if let some prf ← proveWithTactic type (← matchGeneralizeTactic) (budget := 4 * dischargeHeartbeats) then
-      return some (prf, "match cases")
+    if let some prf ← profileAttempt "match generalize"
+        (proveWithTactic type (← matchGeneralizeTactic) (budget := 4 * dischargeHeartbeats)) then
+      return some (prf, "match cases", none)
   -- case analysis on the variables stuck `match` applications depend on (no splitter needed)
   if depth == matchCasesDepth then
     if (collectMatchApps (← getEnv) type).size > 0 then
-      if let some prf ← proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats) then
-        return some (prf, "match cases")
+      if let some prf ← profileAttempt "match stuck cases"
+          (proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats)) then
+        return some (prf, "match cases", none)
   return none
 
 /-- Try to discharge `m = rhs` (or `rhs = m`) with `m` a `match` application by a case split over the
@@ -1062,7 +1114,7 @@ partial def proveByMatchCases (type : Expr) (depth : Nat) : TermElabM (Option Ex
   if app.alts.size > matchCasesMaxAlts then return none
   let altPf (_ : Nat) (_ : Array Expr) (_ : Array Expr) (alt rhsᵢ : Expr) : TermElabM Expr := do
     let goal ← mkEq alt rhsᵢ
-    match ← dischargeOne goal (depth - 1) with
+    match ← dischargeOneAux goal (depth - 1) with
     | some (p, _) => return p
     | none => throwError "proveByMatchCases: alternative not discharged"
   let attemptWith (rhsFn : Array Expr → MetaM Expr) : TermElabM (Option Expr) := do
@@ -1083,6 +1135,12 @@ partial def proveByMatchCases (type : Expr) (depth : Nat) : TermElabM (Option Ex
       if let some p ← attemptWith (fun xs => pure (abst.instantiateRev xs)) then return some p
   attemptWith (fun _ => pure other)
 end
+
+/-- Try to discharge proof obligation `type` (expected to be an equality) and return
+    the proof together with the method used.
+-/
+def dischargeOne (type : Expr) (depth := matchCasesDepth) : TermElabM (Option (Expr × String)) := do
+  return (← dischargeOneAux type depth).map fun (p, m, _) => (p, m)
 
 /-- Return the type of a hole, i.e., `t` in `mdata {blaster.hole := _} (sorryAx t _)`. -/
 def holeType? (e : Expr) : Option Expr := do
@@ -1128,20 +1186,21 @@ def proveEquivalences (equivs : Array (Expr × Expr)) : TermElabM (Array (Expr �
     if let some fact := r then facts := facts.push fact
   return facts
 
-/-- Return `true` if `e` contains a proof obligation or a fallback region. The results are memoized in
-    `cache` for all the visited subterms (i.e., the terms rewritten by the optimizer, which do not contain
-    any proof obligation, are traversed once).
-    NOTE: The traversal is iterative and bound variables are not instantiated.
+namespace TransformScoped
+
+/-- Return the subterms of `e` (by pointer) containing a proof obligation, i.e., the ones mapped to `true`.
+    NOTE: The traversal is iterative, each shared subterm is visited once and bound variables are not
+    instantiated, i.e., the terms rewritten by the optimizer (which do not contain proof obligations) are
+    traversed once.
 -/
-def containsObligation (cache : IO.Ref (Std.HashMap ExprStructEq Bool)) (e : Expr) : IO Bool := do
-  if let some b := (← cache.get).get? e then return b
-  let mut m ← cache.swap {}
+unsafe def obligationNodes (e : Expr) : PtrMap Expr Bool := Id.run do
+  let mut m : PtrMap Expr Bool := mkPtrMap
   let mut todo : Array (Expr × Bool) := #[(e, false)]
   while !todo.isEmpty do
     let (x, expanded) := todo.back!
     todo := todo.pop
     if m.contains x then continue
-    if (isHole? x).isSome || isFallback x then
+    if (isHole? x).isSome then
       m := m.insert x true
       continue
     let cs : Array Expr := match x with
@@ -1155,80 +1214,139 @@ def containsObligation (cache : IO.Ref (Std.HashMap ExprStructEq Bool)) (e : Exp
       for c in cs do
         if !m.contains c then todo := todo.push (c, false)
       continue
-    m := m.insert x (cs.any fun c => m.getD c false)
-  cache.set m
-  return m.getD e false
+    m := m.insert x (cs.any fun c => (m.find? c).getD false)
+  return m
 
-/-- Traverse `e` and replace each subterm `s` such that `f s = some r` with `r`, where `f` is only applied
-    to the subterms containing proof obligations or fallback regions (see `containsObligation`).
+mutual
+/-- Visit `e`, whose loose bound variables stand for the free variables `subst` (see `Expr.instantiateRev`).
+    The results for the visited subterms are memoized in `openCache` (subterms with loose bound variables, i.e.,
+    valid at the current binder depth) and `closedCache` (closed subterms).
+-/
+unsafe def go (obl : PtrMap Expr Bool) (f : Expr → TermElabM (Option Expr)) (subst : Array Expr)
+    (openCache closedCache : IO.Ref (PtrMap Expr Expr)) (e : Expr) : TermElabM Expr := do
+  if !(obl.find? e).getD false then return e
+  let cache := if e.hasLooseBVars then openCache else closedCache
+  if let some r := (← cache.get).find? e then return r
+  let r ← visit obl f subst openCache closedCache e
+  cache.modify (·.insert e r)
+  return r
+
+unsafe def visit (obl : PtrMap Expr Bool) (f : Expr → TermElabM (Option Expr)) (subst : Array Expr)
+    (openCache closedCache : IO.Ref (PtrMap Expr Expr)) (e : Expr) : TermElabM Expr := do
+  if (isHole? e).isSome || isFallback e then
+    if let some r ← f (e.instantiateRev subst) then return r.abstract subst
+  let go' := go obl f subst openCache closedCache
+  match e with
+  | .app .. =>
+      -- NOTE: the arguments of an application are visited in a loop (instead of recursing over the spine)
+      let fn := e.getAppFn
+      let args := e.getAppArgs
+      let fn' ← go' fn
+      let args' ← args.mapM go'
+      if ptrEq fn fn' && (args.zip args').all (fun (a, a') => ptrEq a a') then return e
+      return mkAppN fn' args'
+  | .mdata _ b => return e.updateMData! (← go' b)
+  | .proj _ _ b => return e.updateProj! (← go' b)
+  | .lam n t b bi | .forallE n t b bi =>
+      let t' ← go' t
+      withLocalDecl n bi (t'.instantiateRev subst) fun x => do
+        let b' ← go obl f (subst.push x) (← IO.mkRef mkPtrMap) (← IO.mkRef mkPtrMap) b
+        return if e.isLambda then e.updateLambdaE! t' b' else e.updateForallE! t' b'
+  | .letE .. => visitLets obl f subst openCache closedCache e
+  | _ => return e
+
+/-- Visit a `let` telescope iteratively (e.g., the declarations introduced by `shareDeepProofs`).
+    NOTE: The declarations introduced by `shareDeepProofs` only bind subproofs, i.e., proof obligations and
+    their proofs never refer to them (see `withoutSharedProofs`): they stand for free variables that are not
+    declared, such that their types and values are not instantiated. Fallback regions don't refer to them
+    either (see `ShareDeep.scope`).
+    NOTE: The results for closed subterms are kept across the declarations introduced by `shareDeepProofs`,
+    i.e., the proof obligations are discharged in the same local context.
+-/
+unsafe def visitLets (obl : PtrMap Expr Bool) (f : Expr → TermElabM (Option Expr)) (subst : Array Expr)
+    (openCache closedCache : IO.Ref (PtrMap Expr Expr)) (e : Expr) : TermElabM Expr := do
+  let insts ← getLocalInstances
+  let mut lctx ← getLCtx
+  let mut subst := subst
+  let mut openCache := openCache
+  let mut closedCache := closedCache
+  let mut decls : Array (Name × Expr × Expr × Bool) := #[]
+  let mut cur := e
+  while true do
+    let .letE n t v b nondep := cur | break
+    let t' ← withLCtx lctx insts (go obl f subst openCache closedCache t)
+    let v' ← withLCtx lctx insts (go obl f subst openCache closedCache v)
+    let fvarId ← mkFreshFVarId
+    let shared := n == sharedProofName
+    if !shared then
+      lctx := lctx.mkLetDecl fvarId n (t'.instantiateRev subst) (v'.instantiateRev subst) nondep
+      closedCache ← IO.mkRef mkPtrMap
+    subst := subst.push (mkFVar fvarId)
+    openCache ← IO.mkRef mkPtrMap
+    decls := decls.push (n, t', v', nondep)
+    cur := b
+  let mut r ← withLCtx lctx insts (go obl f subst openCache closedCache cur)
+  for (n, t, v, nondep) in decls.reverse do
+    r := .letE n t v r nondep
+  return r
+end
+
+unsafe def transformScopedImpl (e : Expr) (f : Expr → TermElabM (Option Expr)) : TermElabM Expr := do
+  go (obligationNodes e) f #[] (← IO.mkRef mkPtrMap) (← IO.mkRef mkPtrMap) e
+
+end TransformScoped
+
+/-- Traverse `e` and replace each proof obligation or fallback region `s` containing proof obligations such that
+    `f s = some r` with `r` (in the local context of the binders of `e` enclosing `s`). Fallback regions for which
+    `f` returns `none` are traversed.
     NOTE: Unlike `Meta.transform`, results are only shared within the same binder scope. Proof obligations
     are closed terms, but their proofs may depend on the hypotheses of the local context (e.g., `simp [*]`).
     Hence, the same obligation occurring under different binders must be discharged in each context.
+    NOTE: The traversal is linear in the size of the subterms containing proof obligations (as a DAG): bound
+    variables are only instantiated in proof obligations and fallback regions (and in the types of the binders
+    enclosing them), and the results of `f` are abstracted accordingly.
 -/
-partial def transformScoped (e : Expr) (f : Expr → TermElabM (Option Expr)) : TermElabM Expr := do
-  go (← IO.mkRef {}) (← IO.mkRef {}) e
-where
-  go (obl : IO.Ref (Std.HashMap ExprStructEq Bool)) (cache : IO.Ref (Std.HashMap ExprStructEq Expr))
-      (e : Expr) : TermElabM Expr := do
-    if !(← containsObligation obl e) then return e
-    if let some r := (← cache.get).get? e then return r
-    let r ← match ← f e with
-      | some r => pure r
-      | none => visit obl cache e
-    cache.modify (·.insert e r)
-    return r
+@[implemented_by TransformScoped.transformScopedImpl]
+opaque transformScoped (e : Expr) (f : Expr → TermElabM (Option Expr)) : TermElabM Expr
 
-  visit (obl : IO.Ref (Std.HashMap ExprStructEq Bool)) (cache : IO.Ref (Std.HashMap ExprStructEq Expr))
-      (e : Expr) : TermElabM Expr := do
-    match e with
-    | .app .. =>
-        -- NOTE: the arguments of an application are visited in a loop (instead of recursing over
-        -- the spine of the application).
-        let fn := e.getAppFn
-        let args := e.getAppArgs
-        let fn' ← go obl cache fn
-        let args' ← args.mapM (go obl cache)
-        if Blaster.Optimize.exprEq fn fn' && (args.zip args').all (fun (a, a') => Blaster.Optimize.exprEq a a') then return e
-        return mkAppN fn' args'
-    | .mdata _ b => return e.updateMData! (← go obl cache b)
-    | .proj _ _ b => return e.updateProj! (← go obl cache b)
-    | .lam n t b bi =>
-        let t ← go obl cache t
-        withLocalDecl n bi t fun x => do mkLambdaFVars #[x] (← go obl (← IO.mkRef {}) (b.instantiate1 x))
-    | .forallE n t b bi =>
-        let t ← go obl cache t
-        withLocalDecl n bi t fun x => do mkForallFVars #[x] (← go obl (← IO.mkRef {}) (b.instantiate1 x))
-    | .letE .. => visitLets obl cache e
-    | _ => return e
+/-- Return the local context (and local instances) restricted to the declarations `type` depends on
+    (transitively) and to the hypotheses only depending on them (e.g., the equalities of the match context of
+    a proof obligation), or `none` when no declaration is removed.
+-/
+def relevantContext? (type : Expr) : MetaM (Option (LocalContext × LocalInstances)) := do
+  let lctx ← getLCtx
+  let mut keep : FVarIdSet := {}
+  let mut todo := (collectFVars {} (← instantiateMVars type)).fvarIds
+  while !todo.isEmpty do
+    let y := todo.back!
+    todo := todo.pop
+    if keep.contains y then continue
+    keep := keep.insert y
+    let some d := lctx.find? y | continue
+    todo := todo ++ (collectFVars {} d.type).fvarIds
+    if let some v := d.value? then todo := todo ++ (collectFVars {} v).fvarIds
+  let mut removed := false
+  for d in lctx do
+    if keep.contains d.fvarId then continue
+    if !d.isImplementationDetail && !d.type.hasAnyFVar (!keep.contains ·) && (← try isProp d.type catch _ => pure false) then
+      keep := keep.insert d.fvarId
+    else
+      removed := true
+  if !removed then return none
+  let lctx' := lctx.foldl (init := lctx) fun acc d => if keep.contains d.fvarId then acc else acc.erase d.fvarId
+  return some (lctx', (← getLocalInstances).filter (keep.contains ·.fvar.fvarId!))
 
-  /-- Visit a `let` telescope iteratively (e.g., the declarations introduced by `shareDeepProofs`), i.e.,
-      each value is instantiated and visited separately.
-      NOTE: The cache is shared across a telescope of declarations introduced by `shareDeepProofs`, as they
-      only bind subproofs (which are not visible when discharging proof obligations, see `withoutSharedProofs`).
-      NOTE: Nondependent declarations (e.g., `have` in tactic proofs) are kept as such, i.e., they must not
-      be generalized as lambda abstractions by `mkLetFVars`.
-  -/
-  visitLets (obl : IO.Ref (Std.HashMap ExprStructEq Bool)) (cache : IO.Ref (Std.HashMap ExprStructEq Expr))
-      (e : Expr) : TermElabM Expr := do
-    let insts ← getLocalInstances
-    let mut lctx ← getLCtx
-    let mut fvars : Array Expr := #[]
-    let mut cur := e
-    let mut bodyCache := cache
-    while true do
-      let .letE n t v b nondep := cur | break
-      let t ← withLCtx lctx insts (go obl bodyCache (t.instantiateRev fvars))
-      let v ← withLCtx lctx insts (go obl bodyCache (v.instantiateRev fvars))
-      let fvarId ← mkFreshFVarId
-      let shared := n == sharedProofName
-      lctx := lctx.mkLetDecl fvarId n t v nondep (if shared then .implDetail else .default)
-      fvars := fvars.push (mkFVar fvarId)
-      -- results are not shared with the scope of other declarations (e.g., `let` in tactic proofs)
-      if !shared then bodyCache ← IO.mkRef {}
-      cur := b
-    withLCtx lctx insts do
-      mkLetFVars fvars (← go obl bodyCache (cur.instantiateRev fvars)) (usedLetOnly := false)
-        (generalizeNondepLet := false)
+/-- Same as `dischargeOneAux` but the obligation is first discharged in its relevant local context (see
+    `relevantContext?`), i.e., without the hypotheses on other variables.
+    NOTE: The hypotheses of the goal (e.g., the evaluation of a validator) may be large, while proof
+    obligations usually only depend on a few variables. Tactics using all the hypotheses (e.g., `grind`,
+    `simp [*]`) are much faster without them. The obligation is discharged in the whole local context
+    otherwise.
+-/
+def dischargeInContext (type : Expr) (first? : Option Nat := none) : TermElabM (Option (Expr × String × Option Nat)) := do
+  let some (lctx, insts) ← relevantContext? type | dischargeOneAux type (first? := first?)
+  if let some r ← withLCtx lctx insts (dischargeOneAux type (first? := first?)) then return some r
+  dischargeOneAux type (first? := first?)
 
 /-- Discharge all the proof obligations in `p`.
     Return the updated proof term and the discharge statistics. Proof obligations that cannot be
@@ -1243,27 +1361,56 @@ partial def dischargeHoles
   (fallback : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) :
   TermElabM (Expr × DischargeStats) := do
   let stats ← IO.mkRef ({} : DischargeStats)
-  let facts ← IO.mkRef (← proveEquivalences equivs)
+  let facts ← IO.mkRef (← withProfile "dischargeHoles.equivalences" (proveEquivalences equivs))
   let labelOf (e : Expr) : String :=
     match isHole? e with
     | some idx => if h : idx < holes.size then holes[idx].label else "top"
     | none => "top"
+  -- NOTE: the optimizer may yield many proof obligations of the same origin (e.g., the same rewrite applied
+  -- in each step of a computation), possibly with the same type in different scopes. Hence, the proofs of
+  -- the obligations discharged so far are reused when they are well-scoped (i.e., their free variables are
+  -- in the local context), and the tactic that discharged the last obligation with the same label is tried
+  -- first.
+  let solved ← IO.mkRef ({} : Std.HashMap ExprStructEq (Expr × String))
+  let preferred ← IO.mkRef ({} : Std.HashMap String Nat)
   -- first pass
-  let p' ← transformScoped p fun e => do
+  let p' ← withProfile "dischargeHoles.first" (info := fun p' => s!"dag={dagSize p'}") <| transformScoped p fun e => do
     match holeType? e with
     | none => return none
     | some type =>
         let label := labelOf e
         stats.modify fun s => { s with total := s.total + 1 }
-        match ← withoutSharedProofs (dischargeOne type) with
-        | some (prf, method) =>
+        let type ← instantiateMVars type
+        if let some (prf, method) := (← solved.get).get? type then
+          let lctx ← getLCtx
+          if !prf.hasAnyFVar (!lctx.contains ·) then
             stats.modify (·.record method label)
+            return some prf
+        let start ← IO.monoMsNow
+        let r ← withoutSharedProofs (dischargeInContext type (first? := (← preferred.get).get? label))
+        let ms := (← IO.monoMsNow) - start
+        if ms ≥ 1000 then
+          profileLog "obligation" ms fun _ => s!"{label} {(r.map (·.2.1)).getD "failed"} hash={type.hash}"
+          if ← isProfiling then
+            let fvs := (collectFVars {} type).fvarIds.size
+            profileLog "obligation.type" 0 fun _ => s!"fvars={fvs} dag={dagSize type}"
+            if !(← preferred.get).contains label then
+              let (lctx, insts) := (← relevantContext? type).getD (← getLCtx, ← getLocalInstances)
+              let pp := toString (← withLCtx lctx insts (Meta.ppGoal (← mkFreshExprMVar type).mvarId!))
+              profileLog "obligation.goal" 0 fun _ => (pp.take 4000).replace "\n" "\n    "
+        match r with
+        | some (prf, method, i?) =>
+            stats.modify (·.record method label)
+            solved.modify (·.insert type (prf, method))
+            if let some i := i? then preferred.modify (·.insert label i)
             if label.startsWith "rule:recFunEquiv" then
               if let some f ← generalizeFact type prf then facts.modify (·.push f)
             return some prf
         | none => return some e
+  reportAttempts
   -- second pass (with proved equivalences as hypotheses), fallback regions and failure reporting
-  let (p', st) ← secondPass (← facts.get) labelOf p'
+  let (p', st) ← withProfile "dischargeHoles.second" (secondPass (← facts.get) labelOf p')
+  reportAttempts
   return (p', (← stats.get).merge st)
 
   where
@@ -1284,7 +1431,7 @@ partial def dischargeHoles
             if let some type ← observing? (do instantiateMVars (← inferType inner)) then
               let label := s!"fallback:{headSymbol (type.eq?.map (·.2.1) |>.getD type)}"
               stats.modify fun s => { s with total := s.total + 1 }
-              if let some (prf, method) ← dischargeOne type then
+              if let some (prf, method, _) ← dischargeInContext type then
                 stats.modify (·.record method label)
                 return some prf
               if let some prf ← dischargeWithFacts type facts then

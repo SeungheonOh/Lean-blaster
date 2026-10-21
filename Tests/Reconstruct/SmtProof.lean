@@ -21,6 +21,10 @@ namespace Tests.Reconstruct.SmtProof
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y z : Nat), 0 < x → x * y / (x * z) = y / z]
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x y : Nat), x % y ≤ x]
 
+-- divisions and modulos of `Int` (Blaster's SMT macros, see `Bridge.tdiv_macro`)
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10) [∀ (x y : Int), y > 0 → Int.fmod x y ≥ 0]
+#blaster (reconstruct: 2) (smt-proof: 3) (timeout: 10) [∀ (x y : Int), x ≥ 0 → y > 0 → Int.tmod x y = x % y]
+
 -- Bool encodings
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ (x : Int) (f : Int → Bool), (f x && x == 0) = true → x = 0]
 
@@ -49,6 +53,21 @@ def firstAmount (l : List (D × D)) : Bool :=
   | _ => false
 
 #blaster (reconstruct: 2) (smt-proof: 3) [∀ l, firstAmount l = true → l ≠ []]
+
+-- recursive functions on string literal patterns: definitional axioms and equations by case analyses (see
+-- `blaster_rec_eqn`)
+def lovelace (v : List (D × D)) : Int :=
+  match v with
+  | (D.B { data := "" }, D.Map [(D.B { data := "" }, D.I n)]) :: _ => n
+  | _ => 0
+
+def anyPaid (p : Int) (xs : List (List (D × D))) : Bool :=
+  match xs with
+  | [] => false
+  | x :: rest => decide (lovelace x ≥ p) || anyPaid p rest
+
+#blaster (reconstruct: 2) (smt-proof: 3)
+  [∀ p x (xs ys : List (List (D × D))), xs = x :: ys → anyPaid p xs = true → anyPaid p ys = false → lovelace x ≥ p]
 
 def nested (d : D) : Bool :=
   match d with

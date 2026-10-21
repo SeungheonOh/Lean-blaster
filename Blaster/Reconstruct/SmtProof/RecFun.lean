@@ -472,6 +472,9 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     let aux ← auxDefs.get
     g'.withContext do g'.replaceTargetDefEq (← deltaExpand (← instantiateMVars (← g'.getType)) aux.contains)
   replaceMainGoal [g]
+  -- NOTE: the Boolean equalities of lawful instances as decided equalities (the user instances are unfolded by
+  -- `blaster_unfold_user`, e.g., `x == y` into a recursive `eqData x y`, while Blaster translates them as equalities)
+  try evalTactic (← `(tactic| simp only [Bool.beq_eq_decide_eq])) catch _ => pure ()
   try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
   -- case analyses: the goals are reduced (`dsimp`) and split, the eliminators of the left-hand side (the Lean
   -- definition) first, those of the right-hand side (the SMT definition, whose testers may examine more constructors
@@ -480,6 +483,8 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
   let mut count := todo.length
   let mut unfolded : Std.HashSet MVarId := {}
   let mut remaining := []
+  -- debugging: the case analyses (environment variable `BLASTER_RECEQN_DEBUG`)
+  let trace := (← IO.getEnv "BLASTER_RECEQN_DEBUG").isSome
   while !todo.isEmpty do
     let g := todo.head!
     todo := todo.tail!
@@ -505,13 +510,33 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     let env ← getEnv
     let lhsCond := lhs.find? fun e => e.isAppOf ``ite || e.isAppOf ``dite || isMatcherCore env e.getAppFn.constName
     if let some x := (← g.withContext (blockingVars lhs))[0]? then
+      if trace then debugLog m!"blaster_rec_eqn: cases on {← g.withContext (ppExpr (mkFVar x))} (left-hand side)"
       subgoals? := some ((← g.cases x).toList.map (·.mvarId))
     else if lhsCond.isSome then
       subgoals? ← observing? (do evalTactic (← `(tactic| split)); getGoals)
+      -- NOTE: `split` fails when the discriminants of a `match` can't be generalized in the goal (e.g., `x :: xs`
+      -- matched against string literal patterns): the discriminants of the first `match` of the left-hand side are
+      -- generalized first
+      if subgoals?.isNone then
+        let isMatch (e : Expr) : Bool := match e.getAppFn with
+          | .const m _ => isMatcherCore env m && (getMatcherInfoCore? env m).any (·.arity == e.getAppNumArgs)
+          | _ => false
+        if let some m := lhs.find? isMatch then
+          if let some app ← g.withContext (matchMatcherApp? m) then
+            let ds := app.discrs.filter (!·.isFVar)
+            if !ds.isEmpty then
+              subgoals? ← observing? do
+                let (_, g') ← g.generalize (ds.map fun d => { expr := d, hName? := some `hd })
+                setGoals [g']
+                evalTactic (← `(tactic| split))
+                getGoals
+      if trace then debugLog m!"blaster_rec_eqn: split (left-hand side): {subgoals?.map (·.length)}"
     if subgoals?.isNone then
       let vars ← g.withContext (blockingVars all)
       let vars ← if !vars.isEmpty then pure vars else g.withContext structVars
-      if let some x := vars[0]? then subgoals? := some ((← g.cases x).toList.map (·.mvarId))
+      if let some x := vars[0]? then
+        if trace then debugLog m!"blaster_rec_eqn: cases on {← g.withContext (ppExpr (mkFVar x))}"
+        subgoals? := some ((← g.cases x).toList.map (·.mvarId))
     if let some gs := subgoals? then
       count := count + gs.length
       if count > maxEqnGoals then
@@ -526,12 +551,14 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     if (← getGoals).isEmpty then continue
     if !unfolded.contains g then
       -- user definitions exposed by the case analyses
+      try evalTactic (← `(tactic| simp only [Bool.beq_eq_decide_eq])) catch _ => pure ()
       try evalTactic (← `(tactic| blaster_unfold_user)) catch _ => pure ()
       for g' in ← getGoals do
         unfolded := unfolded.insert g'
         todo := g' :: todo
       continue
     -- case analyses on the conditions of the right-hand side
+    if trace then debugLog m!"blaster_rec_eqn: split (right-hand side)\n{← Meta.ppGoal g}"
     let some gs ← observing? (do evalTactic (← `(tactic| split)); getGoals) | remaining := remaining ++ [g]; continue
     count := count + gs.length
     if count > maxEqnGoals then throwError "blaster_rec_eqn: too many cases"
@@ -542,11 +569,34 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     throwError "blaster_rec_eqn: unsolved cases"
   setGoals []
 
+/-- Proof of the definitional axiom `∀ x⃗, f x⃗ = body` of a recursive function `f` asserted by Blaster's query (the
+    backends without `define-funs-rec`, e.g., `z3`), by `blaster_rec_eqn`. -/
+def proveDefAxiom? (c : Expr) : TermElabM (Option Expr) := do
+  if c.hasFVar || c.hasMVar then return none
+  let some head ← forallTelescope c fun _ b => do
+      let some (_, l, _) := b.eq? | return none
+      return lhsHead? l
+    | return none
+  if !(← isRecursiveDefinition head) then return none
+  let t0 ← IO.monoMsNow
+  let p ← withLCtx {} {} <| proveWithTactic c (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
+  debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for the axiom of {head} ({(← IO.monoMsNow) - t0} ms)"
+  return p
+
 /-! ## Lemmas -/
 
 /-- Short form of `e` for debugging messages (large terms are not printed). -/
 def brief (e : Expr) : String :=
   if Local.sizeLe e 2000 then toString e else "<large term>"
+
+/-- The error of the kernel on the closed theorem `type` with proof `value`, if any. -/
+def kernelError? (type value : Expr) : MetaM (Option MessageData) := do
+  if type.hasFVar || type.hasMVar || value.hasFVar || value.hasMVar then return some m!"open term"
+  let lvls := (collectLevelParams (collectLevelParams {} type) value).params.toList
+  let decl := Declaration.thmDecl { name := ← mkFreshUserName `_blaster_check, levelParams := lvls, type, value }
+  match Lean.Kernel.Environment.addDecl (← getEnv).toKernelEnv (← getOptions) decl with
+  | .ok _ => return none
+  | .error ex => return some (ex.toMessageData (← getOptions))
 
 /-- Definitional equation `∀ x⃗, f x⃗ = body` of a recursive function, proved on first use. The candidate
     statements are tried in order: the body of the function in the header of Z3's proof (on which Z3's lemmas
@@ -615,19 +665,11 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       let p ← if stmt.hasFVar then pure none else
         withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
       debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for {eq.head} ({(← IO.monoMsNow) - t0} ms)"
-      -- the reason of the failure (debugging)
-      if p.isNone && !stmt.hasFVar && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
-        withoutModifyingState <| withLCtx {} {} do
-          try
-            let m ← mkFreshExprMVar stmt
-            let t0 ← IO.monoMsNow
-            let h0 ← IO.getNumHeartbeats
-            let gs ← withoutErrToSorry <| Tactic.run m.mvarId! (evalTactic (← `(tactic| blaster_rec_eqn)))
-            let prf ← instantiateMVars m
-            debugLog m!"recfun: blaster_rec_eqn: {gs.length} goals left, {(← IO.monoMsNow) - t0} ms, {((← IO.getNumHeartbeats) - h0) / 1000} heartbeats, mvars {prf.hasMVar}, errors {(← Core.getMessageLog).hasErrors}"
-          catch ex => debugLog m!"recfun: blaster_rec_eqn: {ex.toMessageData}"
       if p.isSome then return p
-      ctx.proveDef stmt
+      debugLog m!"recfun: bridge tactics on the definitional equation of {eq.head}"
+      let r ← ctx.proveDef stmt
+      debugLog m!"recfun: bridge tactics {if r.isSome then "proved" else "failed"} for {eq.head}"
+      return r
     if let some p ← (try prove catch _ => pure none) then
       -- Z3's normal forms (as in Z3's lemmas)
       let stmt' ← z3Normalize stmt
@@ -640,10 +682,12 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       -- NOTE: an auxiliary theorem, such that the instances of the equation (see `instantiateEq`) do not copy its
       -- proof (the instantiation of a metavariable assigned to the proof would beta-reduce its applications)
       let p ← instantiateMVars p
-      let c ← try mkAuxTheorem stmt p catch _ => do
-        let m ← mkFreshExprMVar stmt
-        m.mvarId!.assign p
-        pure m
+      -- the proof is checked by the kernel first: an ill-typed equation fails cleanly (the theorem would only be
+      -- checked asynchronously, see `Elab.async`)
+      if let some msg ← kernelError? stmt p then
+        debugLog m!"recfun: definitional equation of {eq.head} rejected by the kernel: {msg}"
+        continue
+      let some c ← (try some <$> mkAuxTheorem stmt p catch _ => pure none) | continue
       r := some (stmt, c)
       break
     debugLog m!"recfun: definitional equation not proved: {brief stmt}"
@@ -803,14 +847,15 @@ def proveByLit (ctx : Ctx) (lits : Array Expr) (concl : Expr) (j : Nat) : TermEl
   let r ← withLocalDeclD `hn (mkNot concl) fun hn => do
     let mut facts : Std.HashMap Expr Expr := {}
     let mut hyps := #[]
+    let sfx := orSuffixes lits
     for i in [:lits.size] do
       if i == j then continue
       let l := lits[i]!
-      let nl ← withLam `h l fun h => return mkApp hn (← mkOrInj lits i h)
+      let nl ← withLam `h l fun h => return mkApp hn (mkOrInjWith lits sfx i h)
       facts ← addFact facts (mkNot l) nl
       hyps := hyps.push (mkNot l, nl)
     let some p ← proveLit ctx facts hyps lits[j]! | return none
-    return some (mkLambda `hn .default (mkNot concl) ((mkApp hn (← mkOrInj lits j p)).abstract #[hn]))
+    return some (mkLambda `hn .default (mkNot concl) ((mkApp hn (mkOrInjWith lits sfx j p)).abstract #[hn]))
   return r.map (mkApp2 (mkConst ``Classical.byContradiction) concl ·)
 
 /-- Proof of `goal` by case splits on `atoms` (in order), each case by unit propagation (see `PropEngine`), e.g.,

@@ -96,13 +96,23 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
       if xs.isEmpty then throw "empty application"
       match xs[0]! with
       | .atom "let" =>
-          let some binds := xs[1]? >>= SExpr.list? | throw s!"ill-formed let: {e}"
-          let mut env' := env
-          -- NOTE: SMT-LIB `let` is parallel, i.e., bound terms are evaluated in the outer environment
-          for b in binds do
-            let some #[.atom x, v] := b.list? | throw s!"ill-formed let binding: {b}"
-            env' := env'.insert x (← ofSExpr env v)
-          ofSExpr env' xs[2]!
+          -- NOTE: the chains of nested `let`s (e.g., tens of thousands in Z3's proofs) are expanded iteratively, with
+          -- the environment updated in place
+          let mut env := env
+          let mut e := e
+          repeat
+            let .list ys := e | break
+            if ys[0]? != some (.atom "let") then break
+            let some binds := ys[1]? >>= SExpr.list? | throw s!"ill-formed let: {e}"
+            let some body := ys[2]? | throw s!"ill-formed let: {e}"
+            -- NOTE: SMT-LIB `let` is parallel, i.e., bound terms are evaluated in the outer environment
+            let mut vals := #[]
+            for b in binds do
+              let some #[.atom x, v] := b.list? | throw s!"ill-formed let binding: {b}"
+              vals := vals.push (x, ← ofSExpr env v)
+            for (x, t) in vals do env := env.insert x t
+            e := body
+          ofSExpr env e
       | .atom "forall" | .atom "exists" | .atom "lambda" =>
           let k := match xs[0]! with
             | .atom "forall" => QuantKind.forall
