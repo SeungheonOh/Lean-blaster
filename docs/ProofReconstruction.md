@@ -316,7 +316,10 @@ lambda terms over the variables of the goal and the negated goal (`liftGlobalPro
 `lemma` scopes at various binder depths, and abstracting the negated goal and the variables in the inlined proof
 copied them once per depth. The second `MintingPolicy` theorem (a residual proof of 31.7K steps) gave a proof of
 10.7M distinct subterms at binder depth 216 whose abstraction exceeded 36 GB; it is now lifted in 0.5 s into a proof
-of 2.5M distinct subterms. `SellNFT` remains open.
+of 2.5M distinct subterms. The second `SellNFT` theorem (a residual proof replayed in 5 minutes, a final proof of
+9.2M distinct subterms at binder depth 964) is kernel checked in 53 minutes in total (17.5 GB; the kernel checks of
+reconstructed proofs have no heartbeat limit, see `kernelOptions`); the replay of the first one fails on steps about
+selectors applied to other constructors.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
