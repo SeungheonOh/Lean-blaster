@@ -124,8 +124,8 @@ class ToNat (α : Type) where
 
 #blaster [ ∀ (p : Prop), p ∨ ∀ (α : Type) (x y : α) (xs : List α), x :: xs = y :: xs → x = y ]
 
--- KNOWN (beta translation): spurious counterexample, also reported by beta-lambda-cache-optimization c7e80b2.
--- #blaster [ ∃ (α : Type), ∃ (_x : α), True ]
+-- Theorem: some type is inhabited (see `Blaster.Smt.defineTypeSort`; spurious counterexample before).
+#blaster [ ∃ (α : Type), ∃ (_x : α), True ]
 
 #blaster [ ∀ (p : Prop), p ∨ ((∃ (α : Type) (x y : α), x ≠ y) → ∃ (β : Type) (u v : β), u ≠ v) ]
 

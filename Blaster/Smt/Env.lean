@@ -320,6 +320,12 @@ def defineTypeSort (typeSym : SmtSymbol) (instSym : SmtSymbol) (decl: IndTypeDec
   declareSort typeSym 0
   declareSort instSym 0
   declareFun decl.instName #[.SymbolSort instSym, decl.instSort] boolSort
+  -- some type of the universe is inhabited (e.g., `PUnit`): `(exists ((@a typeSym) (@x instSym)) (@isInstance @x @a))`
+  -- NOTE: sound for any universe `Sort u` with `u ≠ 0` (the only ones with sorts `@Type` and `@Instance`)
+  let a := mkReservedSymbol "@a"
+  let x := mkReservedSymbol "@x"
+  assertTerm (mkExistsTerm none #[(a, .SymbolSort typeSym), (x, .SymbolSort instSym)]
+    (mkSimpleSmtAppN decl.instName #[smtSimpleVarId x, smtSimpleVarId a]) none)
 
 
 /-- Perform the following actions:

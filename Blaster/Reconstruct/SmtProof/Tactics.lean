@@ -264,6 +264,10 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
                             Int.toNat_natCast, Int.ediv_zero, Int.emod_zero] at * <;> (try split) <;> (try split) <;>
                             first | omega | (simp_all; done) | grind))),
     ("grind", ← `(tactic| (intros; grind))),
+    -- some type of a universe is inhabited (see `Blaster.Smt.defineTypeSort`)
+    ("inhabited universe", ← `(tactic| first
+        | exact ⟨PUnit, Poly.inj PUnit PUnit.unit, Poly.img_self (Poly.inj PUnit) PUnit.unit⟩
+        | exact ⟨_, default, trivial⟩)),
     -- axioms of the types used as values (see `Poly.coerceWorld`)
     ("coerce world", ← `(tactic| (intros; apply Poly.img_coerceWorld;
                                   first | assumption | exact ⟨_, (Int.toNat_of_nonneg ‹_›).symm⟩ | (simp_all [Poly.Img])))),
