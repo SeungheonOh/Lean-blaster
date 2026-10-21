@@ -104,6 +104,37 @@ syntax (name := blasterStringOrder) "blaster_string_order" : tactic
   evalTactic (← `(tactic| (intros; grind [String.lt_irrefl, String.lt_trans, String.lt_asymm, str_lt_total,
     str_not_lt_empty])))
 
+syntax (name := blasterEmptyElim) "blaster_empty_elim" : tactic
+
+/-- Close the goal with a local function `f : A₁ → ... → Aₙ → T` into an inductive type `T` without constructors
+    (e.g., `Empty`), whose arguments are proved by `trivial`, `decide` or a constructor of their types (e.g.,
+    `f : True → Empty`): case analysis on `f a₁ ... aₙ`. Such functions are the values of the sorts
+    `@@ArrowT .. Empty` (e.g., the axioms on `@isFun f` hold vacuously). -/
+@[tactic blasterEmptyElim] def evalBlasterEmptyElim : Tactic := fun _ => withMainContext do
+  let g ← getMainGoal
+  for d in ← getLCtx do
+    if d.isImplementationDetail then continue
+    let r ← observing? do
+      let (args, _, body) ← forallMetaTelescopeReducing d.type
+      if args.isEmpty then throwError "not a function"
+      let .const n _ := (← whnfD body).getAppFn | throwError "not an inductive type"
+      let .inductInfo info ← getConstInfo n | throwError "not an inductive type"
+      unless info.ctors.isEmpty do throwError "inhabited co-domain"
+      for a in args do
+        let ag := a.mvarId!
+        if ← ag.isAssigned then continue
+        let gs ← Tactic.run ag (evalTactic (← `(tactic| first | trivial | decide |
+          (constructor <;> first | trivial | decide | omega))))
+        unless gs.isEmpty do throwError "argument not proved"
+      let e ← instantiateMVars (mkAppN d.toExpr args)
+      if e.hasExprMVar then throwError "argument not inferred"
+      let (h, g') ← (← g.assert `h (← inferType e) e).intro1
+      unless (← g'.cases h).isEmpty do throwError "case analysis"
+    if r.isSome then
+      replaceMainGoal []
+      return
+  throwError "blaster_empty_elim: no function into an empty type"
+
 syntax (name := blasterCasesNat) "blaster_cases_nat" : tactic
 
 /-- Case analysis (`0` / `n + 1`) on the local variables of type `Nat`. -/
@@ -179,6 +210,8 @@ def bridgeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
                             Int.toNat_natCast, Int.ediv_zero, Int.emod_zero] at * <;> (try split) <;> (try split) <;>
                             first | omega | (simp_all; done) | grind))),
     ("grind", ← `(tactic| (intros; grind))),
+    -- axioms on the values of sorts of functions into empty types (e.g., `@@ArrowT2 @True Empty`)
+    ("empty elim", ← `(tactic| (intros; blaster_empty_elim))),
     -- definitional axioms of recursive functions (e.g., by well-founded recursion): one unfolding
     ("unfold lhs", ← `(tactic| (intros; blaster_unfold_lhs <;> first | rfl | grind | ((repeat' split) <;> omega)))),
     ("nat unfold lhs", ← `(tactic| (blaster_nat_intros <;> (try simp only [Int.toNat_natCast] at *) <;> blaster_unfold_lhs <;>

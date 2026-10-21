@@ -422,6 +422,13 @@ partial def mkSelector (ctor : Name) (idx : Nat) (x : Expr) (deferDefault := fal
   let some (.inductInfo iinfo) := (← getEnv).find? cinfo.induct | throwError "smt proof: unknown inductive {cinfo.induct}"
   let params ← (xt.getAppArgs.extract 0 iinfo.numParams).mapM unfoldTypeAliases
   let xt := mkAppN xt.getAppFn (params ++ xt.getAppArgs.extract iinfo.numParams xt.getAppNumArgs)
+  -- NOTE: an inductive proposition with data fields (e.g., `SomeBig.intro (n : Nat) (h : n > 5)`) has no selectors:
+  -- neither a projection nor a case analysis eliminates a proof into data (the propositions of its proof fields
+  -- depend on the data fields)
+  if ← isProp xt then
+    let hasData ← forallTelescopeReducing (← instantiateForall (cinfo.instantiateTypeLevelParams lvls) params) fun fs _ =>
+      fs.anyM fun f => return !(← isProof f)
+    if hasData then throwError "smt proof: selector of the inductive proposition {cinfo.induct} with data fields"
   -- structure: projection (a proof field is interpreted as its proposition)
   if iinfo.ctors.length == 1 && iinfo.numIndices == 0 && !iinfo.isRec then
     let p := mkProj cinfo.induct idx x

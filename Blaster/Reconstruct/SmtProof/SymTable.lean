@@ -230,6 +230,8 @@ def buildSymTable (cmds : Array SExpr) (env : TranslateEnv) (consts : Std.HashMa
           tbl := { tbl with sorts := tbl.sorts.insert n (mkConst ``Unit) }
         else if n.startsWith "@Instance" then
           if let some t := instanceType? then tbl := { tbl with sorts := tbl.sorts.insert n t }
+        else if let some t ← emptyInductive? n then
+          tbl := { tbl with sorts := tbl.sorts.insert n t }
     | some "define-sort", some n =>
         if let some (SExpr.list #[]) := xs[2]? then
           tbl := { tbl with aliases := tbl.aliases.insert n xs[3]! }
@@ -354,6 +356,15 @@ where
         let xs := vars.extract k vars.size
         return some (g, .quant .lambda ys (if xs.isEmpty then b else .quant .lambda xs b))
     | _ => return none
+  /-- The inductive type without constructors (e.g., `Empty`) declared as the uninterpreted sort `n`
+      (e.g., `(declare-sort Empty 0)`), which is interpreted by itself: its membership predicate is `false`,
+      and the terms of the sort in a proof are terms of the goal (e.g., the applications of a function of
+      type `True → Empty`). -/
+  emptyInductive? (n : String) : MetaM (Option Expr) := do
+    let some (.inductInfo info) := (← getEnv).find? (symbolToName n) | return none
+    unless info.ctors.isEmpty && info.numParams == 0 && info.numIndices == 0 && info.levelParams.isEmpty do
+      return none
+    return some (mkConst info.name)
   addDatatype (tbl : SymTable) (n : String) (decl : SExpr) : MetaM SymTable := do
     -- `(par (params) (ctors))` or `(ctors)`
     let ctors := match decl with
