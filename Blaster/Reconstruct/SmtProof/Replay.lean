@@ -95,6 +95,9 @@ structure ReplayState where
   /-- maximal sharing of the interpreted conclusions: structurally equal terms are pointer equal, such that the
       comparisons of the explicit constructions (e.g., `congrDescent` on large CEK terms) are constant time -/
   share : ShareCommon.State.{0} Lean.ShareCommon.objectFactory := default
+  /-- proofs of the global steps, in the order of their replay (premises first), represented in the proofs by the
+      metavariables (unassigned, such that no instantiation inlines them, see `liftGlobalProofs`) -/
+  globalProofs : Array (MVarId × Expr) := #[]
 
 abbrev ReplayM := ReaderT ReplayCtx (StateRefT ReplayState TermElabM)
 
@@ -781,7 +784,7 @@ where
     of the backend, the large terms over the variables of the goal, once per binder depth, i.e., per nested `lemma`). -/
 @[implemented_by abstractFVarImpl] opaque abstractFVar (e : Expr) (x : FVarId) : Expr
 
-/-- The proof `p` of the root (in which the proofs of the global steps are assigned metavariables, see `replay`), with
+/-- The proof `p` of the root (in which the proofs `globals` of the global steps are metavariables, see `replay`), with
     the proof `G` of each global step lifted to the closed lambda term `Λ := fun fvs => G`, used as `Λ fvs` (`fvs`: the
     variables of the base local context, e.g., the variables of the goal and the negated goal).
     The proofs of the global steps are shared by the proofs of the scopes (nested `lemma` steps) at various binder
@@ -792,23 +795,18 @@ where
     inlined), are abstracted by a single (native) abstraction sharing its cache (e.g., the interpreted terms of the goal
     shared by the proofs of the steps), and the placeholders are then replaced in the order of the steps (premises
     first). Nothing is lifted when a proof has metavariables. -/
-def liftGlobalProofs (p : Expr) (cache : Std.HashMap Nat Expr) (fvs : Array Expr) : MetaM Expr := do
+def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array Expr) : MetaM Expr := do
+  -- the proofs inlined (no lifting)
+  let inline : MetaM Expr := do
+    for (m, v) in globals do m.assign v
+    instantiateMVars p
   -- NOTE: let-variables would become lambda-bound (their values are needed by the proofs)
-  if fvs.isEmpty || (← fvs.anyM fun x => return (← x.fvarId!.getDecl).isLet) then return ← instantiateMVars p
-  let mut globals : Array (MVarId × Expr) := #[]
-  for k in (cache.toArray.map (·.1)).qsort (· < ·) do
-    let some (.mvar m) := cache.get? k | continue
-    let some v ← getExprMVarAssignment? m | continue
-    globals := globals.push (m, v)
-  if globals.isEmpty then return ← instantiateMVars p
+  if fvs.isEmpty || globals.isEmpty || (← fvs.anyM fun x => return (← x.fvarId!.getDecl).isLet) then return ← inline
   let ps ← globals.mapM fun _ => mkFreshFVarId
   for ((m, _), P) in globals.zip ps do m.assign (mkAppN (.fvar P) fvs)
   let ws ← globals.mapM fun (_, v) => instantiateMVars v
   let root ← instantiateMVars p
-  if root.hasMVar || ws.any (·.hasMVar) then
-    -- restore the proofs
-    for (m, v) in globals do m.assign v
-    return ← instantiateMVars p
+  if root.hasMVar || ws.any (·.hasMVar) then return ← inline
   -- the binders `fun fvs =>` (shared by the lambda terms)
   let template ← mkLambdaFVars fvs (mkConst ``True)
   let rec withBody (t : Expr) (k : Nat) (body : Expr) : Expr :=
@@ -908,11 +906,12 @@ partial def replay (i : Nat) : ReplayM Expr := do
       IO.eprintln s!"unknown fvar in step {i} ({ctx.proof.steps[i]!.rule}) depth {ctx.depth}: {bad.map (·.name)} in {← (MessageData.ofExpr (sub?.getD p')).toString}"
       throwError "smt proof: step {i} ({ctx.proof.steps[i]!.rule}) has a proof with an unknown free variable: {p'}"
   if isGlobal then
-    -- the proof is represented by an assigned metavariable, such that the proofs using it stay small
-    -- (they are instantiated once, at the end of the replay)
+    -- the proof is represented by a metavariable of the base context, such that the proofs using it stay small; it
+    -- is not assigned (the instantiations of the proofs using it would inline it, e.g., in the abstractions of the
+    -- scopes), but held by `globalProofs` (see `liftGlobalProofs`)
     let p ← if p.isFVar || p.isMVar then pure p else do
-      let m ← mkFreshExprMVar (← stepConcl i)
-      m.mvarId!.assign p
+      let m ← withLCtx ctx.baseLCtx ctx.baseInsts <| mkFreshExprMVar (← stepConcl i) (kind := .syntheticOpaque)
+      modify fun s => { s with globalProofs := s.globalProofs.push (m.mvarId!, p) }
       pure m
     modify fun s => { s with cache := s.cache.insert i p }
     return p

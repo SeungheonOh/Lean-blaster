@@ -324,7 +324,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- NOTE: the proofs of the steps are instantiated once (see `replay`), the ones of the global steps as closed
         -- lambda terms over the variables of the goal and the negated goal (see `liftGlobalProofs`), the only free
         -- variables of their proofs as `e` is closed (not the variables of the context of the elaboration)
-        let p ← traceTimed "instantiation" (liftGlobalProofs p st.cache (xs.push hneg))
+        let p ← traceTimed "instantiation" (liftGlobalProofs p st.globalProofs (xs.push hneg))
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
           let (n, d) := dagStats p
           traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
