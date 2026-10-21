@@ -1406,10 +1406,50 @@ def translateQuantifier
      then updateQuantifiers smtSym smtType -- add quantifier to list
      else declareConst smtSym smtType -- declare quantifier at top level
 
+/-- Given `e := ∀ (x₁ : t₁) ... (xₙ : tₙ), b` (or `e := fun (x₁ : t₁) ... (xₙ : tₙ) => b` for an
+    existential quantifier) and `xs` the fvars instantiating `x₁ ... xₙ` in `b`, perform the following:
+     - When ∃ i ∈ [1..n], isClassConstraintExpr tᵢ ∧ ¬ isProp tᵢ ∧
+                         (xᵢ occurs in `b` ∨ ∃ j ∈ [i+1..n], xᵢ occurs in tⱼ) ∧
+                         ∃ v free in `e` such that v is bound by an enclosing quantifier, lambda or match pattern
+         - set `hoistedInstBinder` to `true`
+     - Otherwise do nothing
+
+    Instance binders are not quantified at the Smt level: each class function applied to an instance
+    binder is declared as a global uninterpreted function (see `translateAxiomOrUndeclFun?`), i.e., the
+    instance binder is treated as a top-level constant. This is sound only when the instance binder
+    does not depend on an enclosing bound variable. For instance, `∃ x, ∀ [i : Inhabited Nat], default ≠ x`
+    is otherwise translated to `∃ x, @default ≠ x` for a global `@default`, which is not valid.
+    When `hoistedInstBinder` is set, an `unsat` result is reported as `Undetermined` (see `getSatResult`).
+-/
+def flagHoistedInstBinders (e : Expr) (xs : Array Expr) (b : Expr) : TranslateEnvT Unit := do
+  if (← get).smtEnv.options.hoistedInstBinder then return
+  for h : i in [:xs.size] do
+    let t := (← xs[i].fvarId!.getEnvDecl).type
+    if (← isClassConstraintExpr t) && !(← isPropEnv t) && (← isUsed xs[i] (i + 1)) then
+      if (← hasBoundFVars) then
+        modify (fun env => { env with smtEnv.options.hoistedInstBinder := true })
+      return
+
+  where
+    isUsed (x : Expr) (start : Nat) : TranslateEnvT Bool := do
+      if containsFVar b x then return true
+      for j in [start:xs.size] do
+        if containsFVar (← xs[j]!.fvarId!.getEnvDecl).type x then return true
+      return false
+
+    hasBoundFVars : TranslateEnvT Bool := do
+      for v in (collectFVars {} e).fvarIds do
+        if (← isPatternMatchFVar v) then return true
+        -- free variables not yet in cache are declared at top level (see `translateFreeVar`)
+        if (← get).smtEnv.quantifiedFVars.get? v == some false then return true
+      return false
+
 /-- TODO: UPDATE SPEC -/
 def translateForAll
   (e : Expr) (termTranslator : Expr → TranslateEnvT SmtTerm) : QuantifierEnvT SmtTerm := do
  Optimize.forallTelescope e fun fvars b => do
+   -- top level instance binders are translated as top level constants
+   unless (← get).topLevel do flagHoistedInstBinders e fvars b
    for h : i in [:fvars.size] do
      let v := fvars[i]
      let decl ← v.fvarId!.getEnvDecl

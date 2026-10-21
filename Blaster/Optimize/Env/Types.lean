@@ -660,6 +660,12 @@ structure TranslateOptions where
   -/
   inPatternMatching : HashSet FVarId
 
+  /-- Flag set to `true` when an instance binder that is not quantified at the Smt level
+      depends on a variable bound by an enclosing quantifier (see `flagHoistedInstBinders`).
+      An `unsat` result can then no longer be trusted and is reported as `Undetermined`.
+  -/
+  hoistedInstBinder : Bool := false
+
   /-- Map keeping track of axioms not of type Prop or opaque variables, encountered during translation.
       This set is used mainly to avoid multiple global declaration in the Smt instance.
   -/

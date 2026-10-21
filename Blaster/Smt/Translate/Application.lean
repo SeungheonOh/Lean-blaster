@@ -1070,6 +1070,8 @@ def translateApp
           let fv := fvars[i]
           let decl ← fv.fvarId!.getEnvDecl
           translateQuantifier fv decl.type termTranslator
+        -- class functions applied to an existential instance binder are also global declarations
+        flagHoistedInstBinders lambdaE fvars b
         let env ← get
         let mut ebody ← termTranslator b
         let nbPremises := env.premises.size

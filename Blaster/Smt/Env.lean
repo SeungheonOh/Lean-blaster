@@ -537,7 +537,13 @@ partial def getSatResult (p : IO.Process.Child ⟨.piped, .piped, .piped⟩) : T
      if ← IO.hasFinished res then
        match normalizeLine (← IO.ofExcept res.get) with
        | "sat\n"     => return (.Falsified (← getModel))
-       | "unsat\n"   => return .Valid
+       | "unsat\n"   =>
+           -- the Smt query may be stronger than the negated goal when an instance binder
+           -- has been hoisted (see `flagHoistedInstBinders`)
+           if (← get).smtEnv.options.hoistedInstBinder then
+             logWarningAt (← blankRef) "⚠️ unsat result not trusted: an instance binder depends on an enclosing bound variable"
+             return .Undetermined
+           else return .Valid
        | "unknown\n" => return .Undetermined -- unknown is also return when timeout is set to stdin
        | err => throwEnvError s!"checkSat: Unexpected check-sat result: {err}"
      else
