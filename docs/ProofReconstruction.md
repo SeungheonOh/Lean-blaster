@@ -331,13 +331,35 @@ to a pair of `Data` in a step and to a pair of `Unit` (with another default valu
 paths of `trans*` between the interpretations didn't connect. The default values of the selectors are fixed per
 instance (`Inhabited.default`, or a constructor application); the instances were not. With the instances inferred on
 the whole proof (`SortInfer.lean`: 195 hints on the 152,698 steps of its residual proof, in 0.15 s), the residual proof
-is replayed in 5 minutes into a proof of 10.1M distinct subterms at binder depth 1425. Its kernel check does not fit
-in the memory of the measurement machine, whose user processes are throttled at 20 GB (`memory.high` of
-`user.slice`): it peaked at 16.9 GB of memory and 16.5 GB of swap, then made no progress while swapping (the check of
-the second theorem, at binder depth 964, peaked at 17.5 GB). The binder depth is the nesting of the `lemma` scopes,
-whose proofs are inlined under the binders of their hypotheses; lifting them to closed terms, as the proofs of the
-global steps are (`liftGlobalProofs`), would spare the kernel the copies of the subterms that refer to these binders
-when it instantiates them (not measured).
+is replayed in 5 minutes into a proof of 10.1M distinct subterms at binder depth 1425. Checked as a single
+declaration, it did not fit in the memory of the measurement machine, whose user processes are throttled at 20 GB
+(`memory.high` of `user.slice`): from the 7.3 GB of the replay, the kernel check grew by about 4 GB per minute,
+peaked at 16.9 GB of memory and 16.5 GB of swap, then made no progress while swapping (the check of the second
+theorem, at binder depth 964, peaked at 17.5 GB). The binder depth is not the cause. The 7,207 `lemma` steps are all
+global steps (their subproofs discharge all their hypotheses), whose proofs are already lifted to closed terms, and
+the kernel does not rebuild a closed term when it instantiates the binders it occurs under. Counted on the proof
+(`BLASTER_SMTPROOF_ISTATS`), the kernel's instantiations of the binders, which rebuild the subterms referring to the
+instantiated binder, build 15.7M copies of the 9.3M subterms with loose bound variables (a subterm refers to at most
+63 binders). The memory goes to the kernel's caches, which are kept for the check of a whole declaration: the type
+inferred for each checked subterm, and the equivalences of the types that `is_def_eq` compares (the conclusions of
+the steps, interpreted over the terms of the CEK evaluation, are compared structurally where the kernel's
+instantiations made them pointer-distinct; samples of the kernel's stacks are in `equiv_manager` and `expr_eq_fn`).
+With 4096 global proofs or more (`BLASTER_SMTPROOF_SPLIT`, 0: always), each lifted global proof is checked by the
+kernel as an auxiliary theorem `∀ xs, ¬ goal → φ` over the variables of the goal and the negated goal, and used as
+its constant applied to them (`liftGlobalProofs` with `aux?`): the 19,369 global proofs of the residual of the first
+theorem are checked one at a time in 6.5 minutes (each in less than a second, about 20 ms on average), the memory
+staying at the 7.3 GB of the replay, and the final proof of the residual has 5 distinct subterms. The first
+`SellNFT` theorem is then kernel checked in 33 minutes in total (12.7 GB at most): the residual in 11 minutes (Z3,
+replay and auxiliary theorems), the optimizer's evidence (12.5M distinct subterms, 1,004 proof obligations, 3 of
+them proved by the replay of their own Z3 proofs of 2,674 to 3,608 global proofs, checked as single declarations in
+15 to 32 s) in 14 minutes, and the kernel check of the whole proof (19.7M distinct subterms, which refer to the
+auxiliary theorems) in 32 s. The obligations' proofs are then the peak; checked as auxiliary theorems too
+(`BLASTER_SMTPROOF_SPLIT=1`), the theorem is kernel checked in 35 minutes at 11.0 GB at most. The second `SellNFT`
+theorem (16,946 global proofs in its residual, checked as auxiliary theorems in 5.5 minutes) is now kernel checked
+in 31 minutes at 13.3 GB at most (53 minutes and 17.5 GB as a single declaration), and the second `MintingPolicy`
+theorem (6,928 global proofs) in 5 minutes at 3.7 GB. The proofs that are not closed (e.g., over the variables of
+the polymorphic encoding bound by an enclosing context) stay inlined; with all the proofs as auxiliary theorems
+(`BLASTER_SMTPROOF_SPLIT=0`), the replay of the SMT goals of the test suite is unchanged (312/321).
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
