@@ -820,9 +820,32 @@ def liftGlobalProofs (p : Expr) (cache : Std.HashMap Nat Expr) (fvs : Array Expr
     e.replace fun s => if !s.hasFVar then some s else match s with
       | .fvar x => finals.get? x
       | _ => none
+  -- the order of the substitutions: the placeholders of a proof before it (a proof may use the proof of a step of
+  -- greater index, e.g., in a `lemma` scope)
+  let index : Std.HashMap FVarId Nat := ps.zipIdx.foldl (fun m (x, i) => m.insert x i) {}
+  -- NOTE: the bodies have no other free variables (traversal of the subterms with free variables only)
+  let deps := bodies.map fun b => ((collectFVars {} b).fvarIds.filterMap index.get?)
+  let mut order : Array Nat := #[]
+  let mut state : Array Nat := Array.replicate bodies.size 0  -- 0: new, 1: visiting, 2: done
+  for r in [:bodies.size] do
+    if state[r]! != 0 then continue
+    let mut stack : Array (Nat × Nat) := #[(r, 0)]
+    state := state.set! r 1
+    while h : stack.size > 0 do
+      let (i, k) := stack[stack.size - 1]
+      if h' : k < deps[i]!.size then
+        stack := stack.set! (stack.size - 1) (i, k + 1)
+        let j := deps[i]![k]!
+        if state[j]! == 0 then
+          state := state.set! j 1
+          stack := stack.push (j, 0)
+      else
+        stack := stack.pop
+        state := state.set! i 2
+        order := order.push i
   let mut finals : Std.HashMap FVarId Expr := {}
-  for h : i in [:bodies.size] do
-    finals := finals.insert ps[i]! (subst finals (withBody template fvs.size bodies[i]))
+  for i in order do
+    finals := finals.insert ps[i]! (subst finals (withBody template fvs.size bodies[i]!))
   return subst finals root
 
 /-- The steps being replayed (innermost last), written to the file given by `BLASTER_SMTPROOF_CURRENT` (if set)
