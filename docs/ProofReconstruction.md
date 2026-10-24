@@ -344,8 +344,8 @@ instantiated binder, build 15.7M copies of the 9.3M subterms with loose bound va
 inferred for each checked subterm, and the equivalences of the types that `is_def_eq` compares (the conclusions of
 the steps, interpreted over the terms of the CEK evaluation, are compared structurally where the kernel's
 instantiations made them pointer-distinct; samples of the kernel's stacks are in `equiv_manager` and `expr_eq_fn`).
-With 4096 global proofs or more (`BLASTER_SMTPROOF_SPLIT`, 0: always), each lifted global proof is checked by the
-kernel as an auxiliary theorem `∀ xs, ¬ goal → φ` over the variables of the goal and the negated goal, and used as
+With 4096 global proofs or more (`BLASTER_SMTPROOF_SPLIT`, 0: always) in a proof of 5M distinct subterms or more
+(`BLASTER_SMTPROOF_SPLIT_DAG`), each lifted global proof is checked by the kernel as an auxiliary theorem `∀ xs, ¬ goal → φ` over the variables of the goal and the negated goal, and used as
 its constant applied to them (`liftGlobalProofs` with `aux?`): the 19,369 global proofs of the residual of the first
 theorem are checked one at a time in 6.5 minutes (each in less than a second, about 20 ms on average), the memory
 staying at the 7.3 GB of the replay, and the final proof of the residual has 5 distinct subterms. The first
@@ -356,10 +356,40 @@ them proved by the replay of their own Z3 proofs of 2,674 to 3,608 global proofs
 auxiliary theorems) in 32 s. The obligations' proofs are then the peak; checked as auxiliary theorems too
 (`BLASTER_SMTPROOF_SPLIT=1`), the theorem is kernel checked in 35 minutes at 11.0 GB at most. The second `SellNFT`
 theorem (16,946 global proofs in its residual, checked as auxiliary theorems in 5.5 minutes) is now kernel checked
-in 31 minutes at 13.3 GB at most (53 minutes and 17.5 GB as a single declaration), and the second `MintingPolicy`
-theorem (6,928 global proofs) in 5 minutes at 3.7 GB. The proofs that are not closed (e.g., over the variables of
+in 31 minutes at 13.3 GB at most (53 minutes and 17.5 GB as a single declaration). The smaller proofs are checked as a
+single declaration: the auxiliary theorems check the shared subterms of their statements again (the 2.5M distinct
+subterms of the residual of the second `MintingPolicy` theorem, 6,928 global proofs: 35 s as auxiliary theorems at
+3.7 GB, 25 s as a single declaration at 6.2 GB). The proofs that are not closed (e.g., over the variables of
 the polymorphic encoding bound by an enclosing context) stay inlined; with all the proofs as auxiliary theorems
 (`BLASTER_SMTPROOF_SPLIT=0`), the replay of the SMT goals of the test suite is unchanged (312/321).
+
+Performance on the CEK validators (one theorem per run, `BLASTER_SMT_PROOF=only`, backend `z3rec`, 4 threads): the
+`Governance` theorems are reconstructed and kernel checked in 38 to 53 s in total, Blaster's own check included (15 s
+of Z3; the fourteenth theorem took 392 s before the changes below), the `MintingPolicy` ones in 90 and 92 s (348 and
+382 s), `HelloWorld` in 10 s:
+ - the optimizer records evidence for the simplifications of `Blaster.dite'` with constant branches
+   (`recordDITESimp`), the connectives of `Blaster.decide'` (`recordDecideOp`) and the replacement of a matcher by an
+   equivalent one (`mkMatchEquivProof`): 467 of the 672 proof obligations of the fourteenth `Governance` theorem,
+   whose discharge took 40 s;
+ - the proof run (the optimization tracking proof terms) is performed while the backend solver checks the query (its
+   result is discarded unless the goal is valid); `MatcherApp.transform` is used without its type check of the new
+   motive (`transformMatcherApp`, the check traversed the alternatives of the nested `match` applications again at each
+   level), the match equations are cached and the congruences of `match` applications reused;
+ - the tactics on the local differences of large steps are bounded in time (1 s, `BLASTER_SMTPROOF_LOCAL_MS`; the
+   tactic running past the deadline is interrupted, see `withTimeLimit`), not attempted on generalizations refuted by
+   instances of their variables at small values (`Local.refuted`), and their lossless generalization is not attempted
+   after a timeout; comparisons whose operands differ at their heads are first tried as a whole, the branches of a
+   conditional whose condition is negated are swapped (`classical_ite_not`), and the results on the generalizations are
+   cached per replay; the other differences of large terms are bounded at 120 times the budget (runaway attempts);
+ - the occurrences of a term are abstracted syntactically before `kabstract` (`monotonicity`, `substProof?`), which
+   checks every subterm with the head of the term for definitional equality;
+ - the definitional equations of the recursive functions are proved in parallel (`RecFun.startEqTasks`, tasks without
+   the state of the replay, whose objects would be marked as multi-threaded);
+ - `shareDeepProofs` bounds the proof depth at 512 (128 before, which shared the evidence of depth 211 of a
+   `MintingPolicy` theorem in 12 s).
+The rest is mostly Z3's check of the query (15 s for `Governance`, 10 s for `MintingPolicy`), the kernel checks (3 s
+for the residual of `Governance`, 26 s for the 2.5M distinct subterms of `MintingPolicy`'s, mostly the instantiations
+of the binders of the lifted proofs) and, for `MintingPolicy`, the 25 s of its proof run (15 s beyond the solver's).
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
