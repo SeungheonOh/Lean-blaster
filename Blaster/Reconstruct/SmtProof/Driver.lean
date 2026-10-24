@@ -257,6 +257,10 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         (fun a b => do
           let largeStep := !(Local.sizeLe a 20000 && Local.sizeLe b 20000)
           Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite" largeStep) (← IO.mkRef 6) a b)
+      -- the definitional equations of the functions unfolded by the lemmas of the proof, proved in parallel
+      let unfolded := sproof.steps.foldl (init := {}) fun acc s =>
+        if s.rule == "th-lemma" && s.attrs[0]? == some (.atom "recfun") then RecFun.appliedSymbols s.concl acc else acc
+      RecFun.startEqTasks recCtx unfolded
       let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
       let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
         let cfg : ReplayConfig := {
@@ -334,15 +338,20 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- lambda terms over the variables of the goal and the negated goal (see `liftGlobalProofs`), the only free
         -- variables of their proofs as `e` is closed (not the variables of the context of the elaboration)
         -- NOTE: the proofs of many global steps (environment variable `BLASTER_SMTPROOF_SPLIT`, default 4096; 0: always)
-        -- are auxiliary theorems over the variables of the goal and the negated goal, checked by the kernel one at a
-        -- time: the kernel's caches (e.g., the types inferred for the subterms) are kept for the check of a whole
-        -- declaration, e.g., beyond 30 GB for the 10.1M distinct subterms of the proof of a CEK evaluation of a
-        -- validator (19,369 global proofs), checked as auxiliary theorems in 6.5 minutes without memory increase
+        -- of large proofs (`BLASTER_SMTPROOF_SPLIT_DAG`, default 5M distinct subterms) are auxiliary theorems over the
+        -- variables of the goal and the negated goal, checked by the kernel one at a time: the kernel's caches (e.g., the
+        -- types inferred for the subterms) are kept for the check of a whole declaration, e.g., beyond 30 GB for the
+        -- 10.1M distinct subterms of the proof of a CEK evaluation of a validator (19,369 global proofs), checked as
+        -- auxiliary theorems in 6.5 minutes without memory increase. The smaller proofs are checked as a whole: the
+        -- auxiliary theorems check the shared subterms of their statements again (e.g., 35 s instead of 25 s for the
+        -- 2.6M distinct subterms of the proof of another validator, at 6.5 GB)
         let trace ← IO.getEnv "BLASTER_SMTPROOF_TRACE"
         let splitMin := ((← IO.getEnv "BLASTER_SMTPROOF_SPLIT").bind String.toNat?).getD 4096
+        let splitDag := ((← IO.getEnv "BLASTER_SMTPROOF_SPLIT_DAG").bind String.toNat?).getD 5000000
+        let split := splitMin == 0 || (st.globalProofs.size ≥ splitMin && !dagSizeLe (balancedConj (st.globalProofs.map (·.2))) splitDag)
         let auxCount ← IO.mkRef 0
         let aux? : Option (Nat → Expr → Expr → MetaM Expr) :=
-          if st.globalProofs.size < splitMin then none else some fun i ty v => do
+          if !split then none else some fun i ty v => do
             -- NOTE: inlined when not closed, e.g., over variables of the polymorphic encoding (see `Poly`) bound by the
             -- enclosing context
             if ty.hasFVar || v.hasFVar || ty.hasMVar || v.hasMVar then return v

@@ -492,11 +492,12 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     try evalTactic (← `(tactic| dsimp only)) catch _ => pure ()
     let some g ← (do return (← getGoals).head?) | continue
     setGoals [g]
-    -- NOTE: `simp_all` closes the contradictory cases (e.g., the patterns excluded by the hypotheses of `split`)
+    -- NOTE: `simp_all` closes the contradictory cases (e.g., the patterns excluded by the hypotheses of `split`); `simp`
+    -- closes other goals (e.g., a third of the nodes of the equations of the CEK evaluation of a validator), `simp only []`
+    -- none (while costing a quarter of the time of these attempts)
     let hasHyps ← g.withContext do (← getLCtx).anyM fun d => do return !d.isImplementationDetail && (← isProp d.type)
-    try evalTactic (← if hasHyps then `(tactic| first | (simp only []; done) | (simp [smt_str_empty_lt]; done) |
-                                          (simp_all [smt_str_empty_lt]; done))
-                       else `(tactic| first | (simp only []; done) | (simp [smt_str_empty_lt]; done)))
+    try evalTactic (← if hasHyps then `(tactic| first | (simp [smt_str_empty_lt]; done) | (simp_all [smt_str_empty_lt]; done))
+                       else `(tactic| (simp [smt_str_empty_lt]; done)))
     catch _ => pure ()
     if (← getGoals).isEmpty then continue
     let (lhs, all) ← g.withContext do
@@ -605,8 +606,12 @@ structure DefEq where
   stmts : Array Expr
   /-- head constant of the left-hand side (see `lhsHead?`) -/
   head : Name
+  /-- the SMT symbols of the function (see `Pair`) -/
+  fns : Array String := #[]
   /-- the proved statement and its proof (`none` when not attempted yet) -/
   proof : IO.Ref (Option (Option (Expr × Expr)))
+  /-- the proof of the first statement by `blaster_rec_eqn` started beforehand (see `startEqTasks`) -/
+  task : IO.Ref (Option (Task (Except Exception (Option Expr))))
 
 structure Ctx where
   eqs : Array DefEq := #[]
@@ -652,18 +657,46 @@ def mkCtx (tbl : SymTable) (aux : NameSet) (pairs : Array Pair) (defs : Array Fu
       if let some (stmt, h) ← interpStmt φ then
         if head.isAnonymous then head := h
         if h == head then stmts := stmts.push stmt
-    if !stmts.isEmpty then eqs := eqs.push { stmts, head, proof := ← IO.mkRef none }
+    if !stmts.isEmpty then
+      eqs := eqs.push { stmts, head, fns := #[p.fn, p.defn], proof := ← IO.mkRef none, task := ← IO.mkRef none }
   return { eqs, aux, proveDef, proveImp, proveDiff }
+
+/-- The proof of a closed definitional equation `stmt` by `blaster_rec_eqn`. -/
+def proveEqn (stmt : Expr) : TermElabM (Option Expr) := do
+  if stmt.hasFVar then return none
+  withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
+
+/-- Start the proofs of the definitional equations of the functions `fns` (SMT symbols, e.g., the ones of the recursive
+    functions unfolded by the lemmas of the proof) in parallel (see `runAsync`), their case analyses taking seconds each
+    (e.g., 12 s in sequence for the 8 equations of the CEK evaluation of a validator). The proofs are used by
+    `DefEq.get` when they are closed and only use constants of its environment. -/
+def startEqTasks (ctx : Ctx) (fns : Std.HashSet String) : TermElabM Unit := do
+  for eq in ctx.eqs do
+    if !eq.fns.any fns.contains then continue
+    let some stmt := eq.stmts[0]? | continue
+    if stmt.hasFVar || stmt.hasMVar then continue
+    eq.task.set (some (← runAsync do
+      let some p ← proveEqn stmt | return none
+      return some (← instantiateMVars p)))
 
 /-- Proof of the definitional equation `eq` (attempted once; the proof is shared by the lemmas using it). -/
 def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
   if let some r ← eq.proof.get then return r
   let mut r := none
-  for stmt in eq.stmts do
+  let task? ← eq.task.get
+  for stmt in eq.stmts, i in [0:eq.stmts.size] do
     let prove : TermElabM (Option Expr) := do
       let t0 ← IO.monoMsNow
-      let p ← if stmt.hasFVar then pure none else
-        withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
+      -- the proof started beforehand (see `startEqTasks`), unless it uses declarations of its own environment (e.g.,
+      -- equations realized on its branch only, `skipRealize`)
+      let env ← getEnv
+      let usable (p : Expr) : Bool := !p.hasMVar && !p.hasFVar &&
+        (p.find? fun e => e.isConst && !env.contains e.constName! (skipRealize := true)).isNone
+      let p ← match task?, i with
+        | some t, 0 => match ← IO.wait t with
+          | .ok (some p) => if usable p then pure (some p) else proveEqn stmt
+          | _ => proveEqn stmt
+        | _, _ => proveEqn stmt
       debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for {eq.head} ({(← IO.monoMsNow) - t0} ms)"
       if p.isSome then return p
       debugLog m!"recfun: bridge tactics on the definitional equation of {eq.head}"

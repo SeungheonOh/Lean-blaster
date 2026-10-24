@@ -100,6 +100,19 @@ def withTimeLimit (ms : Nat) (x : TermElabM (Option α)) : TermElabM (Option α)
   controlAt CoreM fun runInBase =>
     catchInterrupt (withReader (fun ctx => { ctx with cancelTk? := some tk }) (runInBase x)) (runInBase interrupted)
 
+/-- `x` run in a task (on a dedicated thread) on a copy of the current state, whose final state is discarded (see
+    `Core.wrapAsync`): its messages, auxiliary declarations and metavariables are lost, i.e., its result is expected to
+    be closed (e.g., the proof of a closed statement, checked by the caller). -/
+def runAsync (x : TermElabM α) : TermElabM (Task (Except Exception α)) := do
+  let tctx ← read
+  let tst ← get
+  let mctx ← readThe Meta.Context
+  let mst ← getThe Meta.State
+  let act ← Core.wrapAsync (fun (_ : Unit) => do
+      let ((a, _), _) ← (x.run tctx tst).run mctx mst
+      return a) none
+  EIO.asTask (act ()) (prio := .dedicated)
+
 /-- Implementation of `dependsOnSorry`.
     NOTE: Each expression is traversed by the native `Expr.findExt?` (whose cache of visited shared subterms is
     much more efficient than the one of `Expr.getUsedConstants`, i.e., on large proofs), the constants of the

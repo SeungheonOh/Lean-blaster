@@ -76,4 +76,21 @@ unsafe def dagSizeImpl (e : Expr) : Nat := unsafeBaseIO do
 @[implemented_by dagSizeImpl]
 opaque dagSize (e : Expr) : Nat
 
+/-- Whether the DAG size of `e` (see `dagSize`) is at most `n`, visiting at most `n + 1` subterms. -/
+unsafe def dagSizeLeImpl (e : Expr) (n : Nat) : Bool := unsafeBaseIO do
+  let k ← IO.mkRef 0
+  let step (_ : Expr) : Expr.FindStep := unsafeBaseIO do
+    k.modify (· + 1)
+    return if (← k.get) > n then .found else .visit
+  return (e.findExt? step).isNone
+
+@[implemented_by dagSizeLeImpl]
+opaque dagSizeLe (e : Expr) (n : Nat) : Bool
+
+/-- The conjunction of `es` as a balanced tree (e.g., the terms of an array traversed as a whole, with a logarithmic
+    recursion depth). -/
+partial def balancedConj (es : Array Expr) (lo := 0) (hi := es.size) : Expr :=
+  if hi ≤ lo + 1 then es.getD lo (mkConst ``True)
+  else mkApp2 (mkConst ``And) (balancedConj es lo ((lo + hi) / 2)) (balancedConj es ((lo + hi) / 2) hi)
+
 end Blaster.Reconstruct

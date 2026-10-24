@@ -352,21 +352,38 @@ def decidableItes (e : Expr) : MetaM Expr :=
         return .done (mkAppN s.getAppFn #[s.getArg! 0, c, inst, s.getArg! 3, s.getArg! 4])
     return .continue)
 
+/-- The proposition `p` with its equalities of propositions as equivalences (decidable). -/
+def propEqAsIff (p : Expr) : Expr :=
+  match p.eq? with
+  | some (ty, a, b) => if ty.isProp then mkApp2 (mkConst ``Iff) a b else p
+  | none => p
+
+/-- Whether the closed decision `d` (`decide p`) evaluates to `false`. Inconclusive (e.g., stuck evaluation) is
+    `false`.
+    NOTE: runtime exceptions (e.g., the heartbeats of the evaluation exhausted) are inconclusive too. -/
+def decidesFalse (d : Expr) : MetaM Bool := do
+  let s ← saveState
+  tryCatchRuntimeEx (do
+      let r ← withTheReader Core.Context (fun c => { c with maxHeartbeats := 200 * 1000 }) <| withCurrHeartbeats <|
+        withDefault <| whnf d
+      return r.isConstOf ``Bool.false)
+    fun _ => do s.restore; return false
+
+/-- The decision `decide p` of the proposition `p` (with its conditionals decidable, see `decidableItes`), if `p` has a
+    decidable instance. -/
+def decision? (p : Expr) : MetaM (Option Expr) := do
+  let s ← saveState
+  tryCatchRuntimeEx (do
+      let p ← decidableItes (propEqAsIff p)
+      let inst ← synthInstance (mkApp (mkConst ``Decidable) p)
+      return some (mkApp2 (mkConst ``Decidable.decide) p inst))
+    fun _ => do s.restore; return none
+
 /-- Whether the closed proposition `p` evaluates to `false` (`decide` by evaluation; equalities of propositions as
     equivalences). Inconclusive (e.g., no decidable instance, stuck evaluation) is `false`. -/
 def evalsFalse (p : Expr) : MetaM Bool := do
-  let p ← match p.eq? with
-    | some (ty, a, b) => if ty.isProp then pure (mkApp2 (mkConst ``Iff) a b) else pure p
-    | none => pure p
-  -- NOTE: runtime exceptions (e.g., the heartbeats of the evaluation exhausted) are inconclusive too
-  let s ← saveState
-  tryCatchRuntimeEx (do
-      let p ← decidableItes p
-      let inst ← synthInstance (mkApp (mkConst ``Decidable) p)
-      let r ← withTheReader Core.Context (fun c => { c with maxHeartbeats := 200 * 1000 }) <| withCurrHeartbeats <|
-        withDefault <| whnf (mkApp2 (mkConst ``Decidable.decide) p inst)
-      return r.isConstOf ``Bool.false)
-    fun _ => do s.restore; return false
+  let some d ← decision? p | return false
+  decidesFalse d
 
 /-- Whether the statement `g := ∀ zs, body` (e.g., a local difference with its common subterms generalized) is false:
     an instance of `body` at small values of its variables (of types `Int`, `Nat`, `Bool` and `Prop`) evaluates to
@@ -390,6 +407,14 @@ def refuted (g : Expr) (maxInstances := 64) : MetaM Bool := do
     let mut combos : Array (Array Expr) := #[#[]]
     for d in domains do
       combos := (combos.flatMap fun c => d.map c.push).extract 0 maxInstances
+    -- NOTE: the decision of the body is built once (its instances are synthesized with the variables, e.g., `Int.decLt`),
+    -- then instantiated at the values (the synthesis at each instance took a tenth of the replay of a CEK evaluation);
+    -- per instance with variables of type `Prop` (e.g., the conditions of conditionals, decidable at `True` and `False`)
+    let props ← zs.anyM fun z => return (← inferType z).isProp
+    if let some d ← (if props then pure none else decision? body) then
+      for c in combos do
+        if ← decidesFalse (d.replaceFVars zs c) then return true
+      return false
     for c in combos do
       if ← evalsFalse (body.replaceFVars zs c) then return true
     return false
