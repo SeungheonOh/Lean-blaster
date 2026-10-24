@@ -29,8 +29,12 @@ not overflow the stack itself on deep proof terms.
 /-- User name of the `let` declarations introduced by `shareDeepProofs`. -/
 def sharedProofName : Name := `_blaster_pf
 
-/-- Maximum nesting depth of proof constructions (i.e., nested proofs) in a shared subproof. -/
-def maxProofDepth : Nat := 128
+/-- Maximum nesting depth of proof constructions (i.e., nested proofs) in a shared subproof.
+    NOTE: the traversal of `shareDeepProofs` enters the binders of the deep subterms, i.e., abstracts their bodies again
+    (e.g., 12 s on the evidence of a CEK evaluation, 1.5M distinct subterms of depth 211, with a bound of 128); the
+    kernel checks values of depth 1024 (e.g., the shared subproofs of an evaluation of depth 15,010, see
+    Tests/Reconstruct/DeepProofs.lean). -/
+def maxProofDepth : Nat := 512
 
 /-- Return `true` if `d` is a declaration introduced by `shareDeepProofs`. -/
 @[inline] def isSharedProofDecl (d : LocalDecl) : Bool :=

@@ -97,7 +97,17 @@ def unifyApps (l r : Expr) : MetaM Bool := do
   let (lf, rf) := (l.getAppFn, r.getAppFn)
   if lf.isConst && rf.isConst && lf.constName! == rf.constName! && l.getAppNumArgs == r.getAppNumArgs then
     let s ← saveState
-    if ← isDefEq lf rf <&&> (l.getAppArgs.zip r.getAppArgs).allM fun (a, b) => isDefEq a b then return true
+    -- NOTE: the arguments that are unassigned metavariables of `l` (e.g., the parameters, motive and alternatives of a
+    -- match equation) are assigned in order, i.e., without the unification of their types with the types of the large
+    -- alternatives (`isDefEq` infers them), the types of the arguments being the instances of the binder types of the
+    -- same constant; the other arguments (e.g., the patterns) are unified
+    let ok ← isDefEq lf rf <&&> (l.getAppArgs.zip r.getAppArgs).allM fun (a, b) => do
+      if let .mvar m := a then
+        if !(← m.isAssigned) && !(← m.isDelayedAssigned) && !b.hasLooseBVars then
+          m.assign b
+          return true
+      isDefEq a b
+    if ok then return true
     s.restore
   isDefEq l r
 
@@ -147,6 +157,171 @@ def lastFVarsRev (lctx : LocalContext) (n : Nat) : Array Expr := Id.run do
     if let some d := lctx.decls.get! i then r := r.push d.toExpr
   return r
 
+/-- `Match.forallAltVarsTelescope` lifted to a monad transformer (see `transformMatcherApp`). -/
+def forallAltTelescopeAux
+    {n} [Monad n] [MonadControlT MetaM n]
+    {α} (origAltType : Expr) (numParams numDiscrEqs : Nat)
+    (k : Array Expr → Array Expr → n α) : n α := do
+  map2MetaM (fun k =>
+    Match.forallAltVarsTelescope origAltType numParams numDiscrEqs
+      fun ys args _mask _bodyType => k ys args
+  ) k
+
+/-- `Lean.Meta.MatcherApp.transform` (Lean 4 core, `Lean/Meta/Match/MatcherApp/Transform.lean`, Apache 2.0) without the
+    type checking of the new motive applied to the discriminants (`isTypeCorrect`), whose type is only inferred.
+    NOTE: the check traverses the alternatives of the right-hand side of the motive of `mkMatchCasesProof`, i.e., the
+    alternatives of the nested `match` applications again at each level (a third of the proof run of a CEK evaluation);
+    `mkMatchCasesProof` checks that the sides of the equation of its motive have the same type, the alternatives being
+    well typed (the kernel checks the resulting proof).
+-/
+def transformMatcherApp
+    {n} [MonadLiftT MetaM n] [MonadControlT MetaM n] [Monad n] [MonadError n] [MonadEnv n] [MonadLog n]
+    [AddMessageContext n] [MonadOptions n]
+    (matcherApp : MatcherApp)
+    (useSplitter := false)
+    (addEqualities : Bool := false)
+    (onParams : Expr → n Expr := pure)
+    (onMotive : Array Expr → Expr → n Expr := fun _ e => pure e)
+    (onAlt : Nat → Expr → Array Expr → Expr → n Expr := fun _ _ _ e => pure e)
+    (onRemaining : Array Expr → n (Array Expr) := pure) :
+    n MatcherApp := do
+
+  -- We also handle CasesOn applications here, and need to treat them specially in a
+  -- few places.
+  -- TODO: Expand MatcherApp with the necessary fields to make this more uniform
+  -- (in particular, include discrEq and whether there is a splitter)
+  let isCasesOn := isCasesOnRecursor (← getEnv) matcherApp.matcherName
+
+  let numDiscrEqs ←
+    if isCasesOn then pure 0 else
+    match ← getMatcherInfo? matcherApp.matcherName with
+    | some info => pure info.getNumDiscrEqs
+    | none      => throwError "matcher {matcherApp.matcherName} has no MatchInfo found"
+
+  let params' ← matcherApp.params.mapM onParams
+  let discrs' ← matcherApp.discrs.mapM onParams
+
+  let (motive', uElim, addHEqualities) ← lambdaTelescope matcherApp.motive fun motiveArgs motiveBody => do
+    unless motiveArgs.size == matcherApp.discrs.size do
+      throwError "unexpected matcher application, motive must be lambda expression with #{matcherApp.discrs.size} arguments"
+    let mut motiveBody' ← onMotive motiveArgs motiveBody
+
+    -- Prepend `(x = e) →` or `(x ≍ e) → ` to the motive when an equality is requested
+    -- and not already present, and remember whether we added an Eq or a HEq
+    let mut addHEqualities : Array (Option Bool) := #[]
+    for arg in motiveArgs, discr in discrs', di in matcherApp.discrInfos do
+      if addEqualities && di.hName?.isNone then
+        if ← isProof arg then
+          addHEqualities := addHEqualities.push none
+        else
+          let heq ← mkEqHEq discr arg
+          motiveBody' ← liftMetaM <| mkArrow heq motiveBody'
+          addHEqualities := addHEqualities.push heq.isHEq
+      else
+        addHEqualities := addHEqualities.push none
+
+    return (← mkLambdaFVars motiveArgs motiveBody', ← getLevel motiveBody', addHEqualities)
+
+  let matcherLevels ← match matcherApp.uElimPos? with
+    | none     => pure matcherApp.matcherLevels
+    | some pos => pure <| matcherApp.matcherLevels.set! pos uElim
+
+  -- We pass `Eq.refl`s for all the equations we added as extra arguments
+  -- (and count them along the way)
+  let mut remaining' := #[]
+  let mut extraEqualities : Nat := 0
+  for discr in discrs'.reverse, b in addHEqualities.reverse do
+    match b with
+    | none => pure ()
+    | some is_heq =>
+        remaining' := remaining'.push (← (if is_heq then mkHEqRefl else mkEqRefl) discr)
+        extraEqualities := extraEqualities + 1
+
+  if useSplitter && !isCasesOn then
+    let aux1 := mkAppN (mkConst matcherApp.matcherName matcherLevels.toList) params'
+    let aux1 := mkApp aux1 motive'
+    let aux1 := mkAppN aux1 discrs'
+    discard <| liftMetaM (inferType aux1)
+    let origAltTypes ← inferArgumentTypesN matcherApp.alts.size aux1
+
+    -- We replace the matcher with the splitter
+    let matchEqns ← Match.getEquationsFor matcherApp.matcherName
+    let splitter := matchEqns.splitterName
+
+    let aux2 := mkAppN (mkConst splitter matcherLevels.toList) params'
+    let aux2 := mkApp aux2 motive'
+    let aux2 := mkAppN aux2 discrs'
+    discard <| liftMetaM (inferType aux2)
+    let altTypes ← inferArgumentTypesN matcherApp.alts.size aux2
+
+    let mut alts' := #[]
+    for altIdx in *...matcherApp.alts.size,
+        alt in matcherApp.alts,
+        numParams in matcherApp.altNumParams,
+        splitterNumParams in matchEqns.splitterAltNumParams,
+        origAltType in origAltTypes,
+        altType in altTypes do
+      let alt' ← forallAltTelescopeAux origAltType (numParams - numDiscrEqs) 0 fun ys args => do
+        let altType ← instantiateForall altType ys
+        -- The splitter inserts its extra parameters after the first ys.size parameters, before
+        -- the parameters for the numDiscrEqs
+        forallBoundedTelescope altType (splitterNumParams - ys.size) fun ys2 altType => do
+          forallBoundedTelescope altType numDiscrEqs fun ys3 altType => do
+            forallBoundedTelescope altType extraEqualities fun ys4 altType => do
+              let altParams := args ++ ys3
+              let alt ← try instantiateLambda alt altParams
+                        catch _ => throwError "unexpected matcher application, insufficient number of parameters in alternative"
+              let alt' ← onAlt altIdx altType altParams alt
+              mkLambdaFVars (ys ++ ys2 ++ ys3 ++ ys4) alt'
+      alts' := alts'.push alt'
+
+    remaining' := remaining' ++ (← onRemaining matcherApp.remaining)
+
+    return { matcherApp with
+      matcherName   := splitter
+      matcherLevels := matcherLevels
+      params        := params'
+      motive        := motive'
+      discrs        := discrs'
+      altNumParams  := matchEqns.splitterAltNumParams.map (· + extraEqualities)
+      alts          := alts'
+      remaining     := remaining'
+    }
+  else
+    let aux := mkAppN (mkConst matcherApp.matcherName matcherLevels.toList) params'
+    let aux := mkApp aux motive'
+    let aux := mkAppN aux discrs'
+    discard <| liftMetaM (inferType aux)
+    let altTypes ← inferArgumentTypesN matcherApp.alts.size aux
+
+    let mut alts' := #[]
+    for altIdx in *...matcherApp.alts.size,
+        alt in matcherApp.alts,
+        numParams in matcherApp.altNumParams,
+        altType in altTypes do
+      let alt' ← forallBoundedTelescope altType numParams fun xs altType => do
+        forallBoundedTelescope altType extraEqualities fun ys4 altType => do
+          -- we should try to preserve the variable names in the alternative
+          let names ← lambdaTelescope alt fun xs _ => xs.mapM (·.fvarId!.getUserName)
+          MatcherApp.withUserNames xs names do
+            let alt ← instantiateLambda alt xs
+            let alt' ← onAlt altIdx altType xs alt
+            mkLambdaFVars (xs ++ ys4) alt'
+      alts' := alts'.push alt'
+
+    remaining' := remaining' ++ (← onRemaining matcherApp.remaining)
+
+    return { matcherApp with
+      matcherLevels := matcherLevels
+      params        := params'
+      motive        := motive'
+      discrs        := discrs'
+      altNumParams  := matcherApp.altNumParams.map (· + extraEqualities)
+      alts          := alts'
+      remaining     := remaining'
+    }
+
+
 /-- Given a match application `m := matcher ps motive d₁ ... dₙ alt₁ ... altₖ` and `rhsFn` returning
     `rhs[x₁ ... xₙ]` for motive arguments `x₁ ... xₙ`, return a proof of `m = rhsFn #[d₁, ..., dₙ]`.
     The obligation for alternative `i` is provided by `altPf i args hs alt rhsᵢ` with:
@@ -173,8 +348,14 @@ def mkMatchCasesProof {n} [MonadLiftT MetaM n] [MonadControlT MetaM n] [Monad n]
   let nDiscrs := app.discrs.size
   let mkM (discrs : Array Expr) : Expr :=
     mkAppN (mkConst app.matcherName app.matcherLevels.toList) (app.params ++ #[app.motive] ++ discrs ++ app.alts)
-  let app' ← app.transform (useSplitter := true) (addEqualities := true)
-    (onMotive := fun xs _ => do liftMetaM (mkEq (mkM xs) (← rhsFn xs)))
+  let app' ← transformMatcherApp app (useSplitter := true) (addEqualities := true)
+    (onMotive := fun xs _ => do
+      let (lhs, rhs) := (mkM xs, ← rhsFn xs)
+      liftMetaM do
+        -- NOTE: the motive is not type checked as a whole (see `transformMatcherApp`)
+        unless ← isDefEq (← inferType lhs) (← inferType rhs) do
+          throwError "mkMatchCasesProof: the sides of the motive have different types"
+        mkEq lhs rhs)
     (onAlt := fun altIdx altType args alt => do
       let some (_, lhs, rhs) := altType.eq? | throwError "mkMatchCasesProof: equality expected"
       -- the equalities added by `transform` are the last `nDiscrs` local declarations (in reverse order)

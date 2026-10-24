@@ -72,9 +72,9 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
         -- NOTE: the proof run starts with an empty hash-consing cache, i.e., `e'` must be hash-consed
         -- such that structural equality checks (e.g., on literals) remain valid.
         (some <$> Reconstruct.withProfile "proofRun" (do
-            Reconstruct.clearMatchCongrCache
+            Reconstruct.clearMatchCongrCache; Reconstruct.clearHoleFreeProofs
             try (Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv
-            finally Reconstruct.clearMatchCongrCache))
+            finally Reconstruct.clearMatchCongrCache; Reconstruct.clearHoleFreeProofs))
         (fun _ => do s.restore; return none)
     -- `run?`: the result of the proof run when performed beforehand (see `Solve` below)
     let mkTask (bySmt : Bool) (run? : Option (Option ((Expr × Reconstruct.EqPf) × TranslateEnv)) := none) :

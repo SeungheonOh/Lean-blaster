@@ -60,6 +60,30 @@ def hasHoles (e : Expr) : Bool :=
 def mkFallback (p : Expr) : Expr :=
   if hasHoles p then mkMData (KVMap.empty.insert fallbackKey (.ofBool true)) p else p
 
+/-- The proofs without proof obligations found by `mkFallbackM` (by address, the proofs being kept alive), cleared at the
+    start and end of each proof run (see `clearHoleFreeProofs`). -/
+initialize holeFreeProofs : IO.Ref (Std.HashMap USize Expr) ← IO.mkRef {}
+
+def clearHoleFreeProofs : IO Unit := holeFreeProofs.set {}
+
+/-- Implementation of `hasHolesMemo`. -/
+unsafe def hasHolesMemoImpl (p : Expr) : BaseIO Bool := do
+  let free ← holeFreeProofs.get
+  let found := p.findExt? fun s =>
+    if free.contains (ptrAddrUnsafe s) then .done else if (isHole? s).isSome then .found else .visit
+  if found.isNone then holeFreeProofs.modify (·.insert (ptrAddrUnsafe p) p)
+  return found.isSome
+
+/-- Same as `hasHoles`, skipping the subproofs found without proof obligations before (see `holeFreeProofs`), e.g., the
+    congruences of the nested `match` applications, the congruence of each `match` containing the ones of the
+    alternatives (a quadratic traversal otherwise). -/
+@[implemented_by hasHolesMemoImpl]
+opaque hasHolesMemo (p : Expr) : BaseIO Bool
+
+/-- Same as `mkFallback` (see `hasHolesMemo`). -/
+def mkFallbackM (p : Expr) : BaseIO Expr := do
+  return if ← hasHolesMemo p then mkMData (KVMap.empty.insert fallbackKey (.ofBool true)) p else p
+
 /-- Return a short description of the head symbol of `e` (used to label proof obligations). -/
 def headSymbol (e : Expr) : String :=
   match e.consumeMData.getAppFn with
@@ -718,7 +742,7 @@ def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT Eq
             | _ => return none
           -- NOTE: the congruence is a fallback region, i.e., it is replaced with the coarse proof
           -- obligation `lhs = f args` when one of the obligations of the alternatives is not discharged.
-          return some (mkFallback (← mkMatchCongr lhs (args.extract firstAlt (firstAlt + app.alts.size)) altPfs))
+          return some (← mkFallbackM (← mkMatchCongr lhs (args.extract firstAlt (firstAlt + app.alts.size)) altPfs))
       | _ => return none
 
     /-- Return a proof of `∀ h : τ, b (_ : orig) = b' h` for a dite' branch rewritten to `b'`.
