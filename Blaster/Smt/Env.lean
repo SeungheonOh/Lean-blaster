@@ -546,9 +546,10 @@ def getModel : TranslateEnvT (List String) := do
 -/
 partial def getSatResult (p : IO.Process.Child ⟨.piped, .piped, .piped⟩) : TranslateEnvT Result := do
   let res ← IO.asTask p.stdout.getLine -- only one line expected for checkSat result
-  waitForResult res
+  getSatResultOf res
 
  where
+   getSatResultOf (res : Task (Except IO.Error String)) : TranslateEnvT Result := waitForResult res
    waitForResult (res : Task (Except IO.Error String)) : TranslateEnvT Result := do
      checkCancelTk?
      if ← IO.hasFinished res then
@@ -561,6 +562,9 @@ partial def getSatResult (p : IO.Process.Child ⟨.piped, .piped, .piped⟩) : T
        let sleepTimeMs := (20 : UInt32)
        IO.sleep sleepTimeMs
        waitForResult res
+
+/-- Whether the line `l` of the solver's output is the answer `unsat`. -/
+def isUnsatLine (l : String) : Bool := normalizeLine l == "unsat\n"
 
 /-- Check satisfiability of current Smt query and return the result.
     An error is triggered when an unexpected check-sat result is obtained.

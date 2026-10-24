@@ -49,11 +49,19 @@ partial def translateExpr (e : Expr) (topLevel := true) : TranslateEnvT SmtTerm 
      | Expr.sort _ => throwEnvError "translateExpr: unexpected sort type {reprStr e}" -- sort type are handled elsewhere
   visit e topLevel
 
+/-- `x` with its interrupt exceptions (not caught by `try`/`catch`) as `none`. -/
+private def catchInterrupt (x : MetaM α) : MetaM (Option α) :=
+  controlAt CoreM fun runInBase => fun ctx s => do
+    try (runInBase (some <$> x)) ctx s
+    catch ex => if ex.isInterrupt then (runInBase (pure none)) ctx s else throw ex
+
 /-- Same as `Translate.main` but also returns the information required to reconstruct a proof
-    when the result is `Valid` and proof reconstruction is activated.
+    when the result is `Valid` and proof reconstruction is activated, and the result of `speculate?` on it (e.g., the
+    reconstruction itself) when performed while the backend solver checks the query (see `Solve` below).
 -/
-def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
-  TranslateEnvT (Result × Expr × Option Reconstruct.ReconTask) := do
+def Translate.mainWithTaskSpec {α : Type} (e : Expr) (logUndetermined := true)
+    (speculate? : Option (Reconstruct.ReconTask → MetaM α) := none) :
+  TranslateEnvT (Result × Expr × Option Reconstruct.ReconTask × Option α) := do
     -- set start local context
     updateLocalContext (← mkLocalContext)
     let goal ← toPropExpr e
@@ -94,7 +102,7 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
     | res@(.Undetermined) =>
         if (← get).optEnv.options.solverOptions.onlyOptimize then
           if logUndetermined then logResult res
-          return (res, optExpr, none)
+          return (res, optExpr, none, none)
         else
           -- set backend solver
           setBlasterProcess
@@ -106,27 +114,41 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
           -- NOTE: with proof reconstruction, the proof run is performed while the backend solver checks the
           -- query (e.g., 10 s of the 15 s of the check of a CEK evaluation), the verdict being unaffected; its
           -- result is discarded unless the goal is valid
-          let (res, run?) ← match (← get).smtEnv.smtProc with
+          let (res, task?, spec?) ← match (← get).smtEnv.smtProc with
             | some p =>
-                if sOpts.reconstruct == 0 then pure (← profileTask "Solve" checkSat, none) else
+                if sOpts.reconstruct == 0 then pure (← profileTask "Solve" checkSat, none, none) else
                 submitCommand .checkSat
+                let answer ← IO.asTask p.stdout.getLine
                 let s ← Meta.saveState
-                let run ← proofRun
-                let res ← profileTask "Solve" (getSatResult p)
-                if res matches .Valid then pure (res, some run) else
+                let task? ← mkTask true (some (← proofRun))
+                -- NOTE: `speculate?` (e.g., the reconstruction) is started when the solver is still checking the query
+                -- after the proof run (e.g., 7 of the 15 s of the check of a CEK evaluation), interrupted when the solver
+                -- answers that the goal is not valid, and discarded unless the goal is valid
+                let mut spec? := none
+                if let (some speculate, some task) := (speculate?, task?) then
+                  if !(← IO.hasFinished answer) then
+                    let tk ← IO.CancelToken.new
+                    let _ ← IO.mapTask (t := answer) fun r => do
+                      match r with
+                      | .ok l => if !isUnsatLine l then tk.set
+                      | .error _ => tk.set
+                    spec? ← (catchInterrupt (withTheReader Core.Context (fun c => { c with cancelTk? := some tk })
+                      (speculate task)) : MetaM _)
+                let res ← profileTask "Solve" (getSatResult.getSatResultOf answer)
+                if res matches .Valid then pure (res, task?, spec?) else
                   s.restore
-                  pure (res, none)
-            | none => pure (← profileTask "Solve" checkSat, none)
+                  pure (res, none, none)
+            | none => pure (← profileTask "Solve" checkSat, none, none)
           if !isUndeterminedResult res || logUndetermined then logResult res
           discard $ exitSmt
           match res with
-          | .Valid => return (res, optExpr, ← mkTask true run?)
-          | _ => return (res, optExpr, none)
+          | .Valid => return (res, optExpr, task?, spec?)
+          | _ => return (res, optExpr, none, none)
     | res =>
        logResult res
        match res with
-       | .Valid => return (res, optExpr, ← mkTask false)
-       | _ => return (res, optExpr, none)
+       | .Valid => return (res, optExpr, ← mkTask false, none)
+       | _ => return (res, optExpr, none, none)
 
   where
     isTheoremExpr (e : Expr) : TranslateEnvT (Option Expr) := do
@@ -147,6 +169,12 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
       | [] => return e
       | a :: tl =>
          addAxioms (← mkForallExpr (← Term.mkFreshBinderName) BinderInfo.default (← hashcons a) e) tl
+
+/-- Same as `Translate.mainWithTaskSpec` without speculation. -/
+def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
+    TranslateEnvT (Result × Expr × Option Reconstruct.ReconTask) := do
+  let (res, optExpr, task?, _) ← Translate.mainWithTaskSpec (α := Unit) e logUndetermined none
+  return (res, optExpr, task?)
 
 def Translate.main (e : Expr) (logUndetermined := true) : TranslateEnvT (Result × Expr) := do
   let (res, optExpr, _) ← Translate.mainWithTask e logUndetermined

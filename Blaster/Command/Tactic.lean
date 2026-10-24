@@ -52,10 +52,16 @@ def blasterTacticImp : Tactic := fun stx =>
    let sOpts ← parseSolveOptions opts (← BlasterOptions.fromEnv)
    let goal ← revertHypotheses (← getMainGoal)
    let env := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-   let ((result, optExpr, task?), _) ←
+   -- the reconstruction, started while the backend solver checks the query when possible (see `mainWithTaskSpec`)
+   let tctx ← readThe Term.Context
+   let tst ← getThe Term.State
+   let speculate (task : Reconstruct.ReconTask) : MetaM Reconstruct.ReconOutcome := do
+     return (← (Reconstruct.reconstructSafe task task.recon).run tctx tst).1
+   let ((result, optExpr, task?, spec?), _) ←
      withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $ do
        IO.setNumHeartbeats 0
-       Translate.mainWithTask (← goal.getType >>= instantiateMVars) (logUndetermined := false) |>.run env
+       Translate.mainWithTaskSpec (← goal.getType >>= instantiateMVars) (logUndetermined := false)
+         (speculate? := if sOpts.reconstruct > 0 then some speculate else none) |>.run env
    match result with
    | .Valid =>
       let admit : TacticM Unit := do
@@ -67,8 +73,10 @@ def blasterTacticImp : Tactic := fun stx =>
           if sOpts.reconstruct > 0 then
             -- NOTE: reconstruction is not subject to the heartbeat limit of the enclosing declaration
             let heartbeats ← IO.getNumHeartbeats
-            let outcome ← withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $
-              Reconstruct.reconstructSafe task task.recon
+            let outcome ← match spec? with
+              | some outcome => pure outcome
+              | none => withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) $
+                  Reconstruct.reconstructSafe task task.recon
             IO.setNumHeartbeats heartbeats
             Reconstruct.dumpStats outcome "tactic"
             Reconstruct.reportOutcome sOpts outcome
