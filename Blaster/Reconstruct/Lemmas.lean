@@ -426,6 +426,59 @@ end Blaster.Reconstruct
 
 namespace Blaster.Reconstruct
 
+/-! ## `Blaster.dite'` with non-dependent branches (see `iteSimp?` and `recordDITESimp`) -/
+
+theorem dite'_same {α : Sort u} (c : Prop) (a : α) : Blaster.dite' c (fun _ => a) (fun _ => a) = a := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; by_cases h : c <;> simp [h]
+
+theorem dite'_true_false (c : Prop) : Blaster.dite' c (fun _ => True) (fun _ => False) = c := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; by_cases h : c <;> simp [h]
+
+theorem dite'_false_true (c : Prop) : Blaster.dite' c (fun _ => False) (fun _ => True) = ¬ c := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; by_cases h : c <;> simp [h]
+
+theorem dite'_true_left (c p : Prop) : Blaster.dite' c (fun _ => True) (fun _ => p) = (¬ c → p) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; by_cases h : c <;> simp [h]
+
+theorem dite'_false_left (c p : Prop) : Blaster.dite' c (fun _ => False) (fun _ => p) = (¬ c ∧ p) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; by_cases h : c <;> simp [h]
+
+theorem dite'_true_right (c p : Prop) : Blaster.dite' c (fun _ => p) (fun _ => True) = (c → p) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; by_cases h : c <;> simp [h]
+
+theorem dite'_false_right (c p : Prop) : Blaster.dite' c (fun _ => p) (fun _ => False) = (c ∧ p) := by
+  simp only [Blaster.Reconstruct.dite'_eq_dite]; by_cases h : c <;> simp [h]
+
+end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
+/-! ## Boolean connectives of `Blaster.decide'` (see `decideOpDecide?` and `recordDecideOp`) -/
+
+theorem decide'_and_decide' (p q : Prop) :
+    (Blaster.decide' p && Blaster.decide' q) = Blaster.decide' (p ∧ q) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]; by_cases hp : p <;> by_cases hq : q <;> simp [hp, hq]
+
+theorem decide'_and_bool (p : Prop) (b : Bool) : (Blaster.decide' p && b) = Blaster.decide' (p ∧ true = b) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]; by_cases hp : p <;> cases b <;> simp [hp]
+
+theorem bool_and_decide' (b : Bool) (p : Prop) : (b && Blaster.decide' p) = Blaster.decide' (p ∧ true = b) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]; by_cases hp : p <;> cases b <;> simp [hp]
+
+theorem decide'_or_decide' (p q : Prop) :
+    (Blaster.decide' p || Blaster.decide' q) = Blaster.decide' (p ∨ q) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]; by_cases hp : p <;> by_cases hq : q <;> simp [hp, hq]
+
+theorem decide'_or_bool (p : Prop) (b : Bool) : (Blaster.decide' p || b) = Blaster.decide' (p ∨ true = b) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]; by_cases hp : p <;> cases b <;> simp [hp]
+
+theorem bool_or_decide' (b : Bool) (p : Prop) : (b || Blaster.decide' p) = Blaster.decide' (p ∨ true = b) := by
+  simp only [Blaster.Reconstruct.decide'_eq_decide]; by_cases hp : p <;> cases b <;> simp [hp]
+
+end Blaster.Reconstruct
+
+namespace Blaster.Reconstruct
+
 /-! ## `Blaster.dite'` with a constant condition (see `optimizeDITEChoice`) -/
 
 theorem dite'_pos {α : Sort u} (c : Prop) (t : c → α) (e : ¬ c → α) (h : c) : Blaster.dite' c t e = t h := by

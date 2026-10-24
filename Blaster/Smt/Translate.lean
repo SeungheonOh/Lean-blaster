@@ -64,17 +64,25 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
     let (optExpr, _) ← profileTask "Optimization" $ Optimize.mainPf e' (track := false) (applyHashCons := false)
     trace[Translate.optExpr] "optimized expression: {← ppExpr optExpr}"
     let sOpts := (← get).optEnv.options.solverOptions
-    let mkTask (bySmt : Bool) : TranslateEnvT (Option Reconstruct.ReconTask) := do
-      if sOpts.reconstruct == 0 then return none
-      -- proof run: optimize again while tracking proof terms (see `Blaster.Reconstruct`)
+    -- proof run: optimize again while tracking proof terms (see `Blaster.Reconstruct`)
+    let proofRun : MetaM (Option ((Expr × Reconstruct.EqPf) × TranslateEnv)) := do
       let proofEnv := {(default : TranslateEnv) with optEnv.options.solverOptions := sOpts}
-      let r ← (do
-        let s ← Meta.saveState
-        tryCatchRuntimeEx
-          -- NOTE: the proof run starts with an empty hash-consing cache, i.e., `e'` must be hash-consed
-          -- such that structural equality checks (e.g., on literals) remain valid.
-          (some <$> Reconstruct.withProfile "proofRun" ((Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv))
-          (fun _ => do s.restore; return none) : MetaM _)
+      let s ← Meta.saveState
+      tryCatchRuntimeEx
+        -- NOTE: the proof run starts with an empty hash-consing cache, i.e., `e'` must be hash-consed
+        -- such that structural equality checks (e.g., on literals) remain valid.
+        (some <$> Reconstruct.withProfile "proofRun" (do
+            Reconstruct.clearMatchCongrCache
+            try (Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv
+            finally Reconstruct.clearMatchCongrCache))
+        (fun _ => do s.restore; return none)
+    -- `run?`: the result of the proof run when performed beforehand (see `Solve` below)
+    let mkTask (bySmt : Bool) (run? : Option (Option ((Expr × Reconstruct.EqPf) × TranslateEnv)) := none) :
+        TranslateEnvT (Option Reconstruct.ReconTask) := do
+      if sOpts.reconstruct == 0 then return none
+      let r ← match run? with
+        | some r => pure r
+        | none => proofRun
       match r with
       | some ((optExprP, optPf), envP) =>
           return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr := optExprP, optPf,
@@ -95,11 +103,24 @@ def Translate.mainWithTask (e : Expr) (logUndetermined := true) :
           profileTask "Submitting Smt Query" $ assertTerm (notSmt st)
           -- dump smt commands submitted to backend solver when `dumpSmtLib` option is set.
           logSmtQuery
-          let res ← profileTask "Solve" checkSat
+          -- NOTE: with proof reconstruction, the proof run is performed while the backend solver checks the
+          -- query (e.g., 10 s of the 15 s of the check of a CEK evaluation), the verdict being unaffected; its
+          -- result is discarded unless the goal is valid
+          let (res, run?) ← match (← get).smtEnv.smtProc with
+            | some p =>
+                if sOpts.reconstruct == 0 then pure (← profileTask "Solve" checkSat, none) else
+                submitCommand .checkSat
+                let s ← Meta.saveState
+                let run ← proofRun
+                let res ← profileTask "Solve" (getSatResult p)
+                if res matches .Valid then pure (res, some run) else
+                  s.restore
+                  pure (res, none)
+            | none => pure (← profileTask "Solve" checkSat, none)
           if !isUndeterminedResult res || logUndetermined then logResult res
           discard $ exitSmt
           match res with
-          | .Valid => return (res, optExpr, ← mkTask true)
+          | .Valid => return (res, optExpr, ← mkTask true run?)
           | _ => return (res, optExpr, none)
     | res =>
        logResult res

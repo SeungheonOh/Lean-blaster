@@ -21,6 +21,15 @@ under which the alternatives are optimized (see `Blaster.Optimize.optimizeMatchA
 /-- Matchers for which the generation of the match equations and splitter failed. -/
 initialize matchEqnsFailures : IO.Ref NameSet ← IO.mkRef {}
 
+/-- The congruences of `match` applications built so far (see `mkMatchCongr`), cleared by `clearMatchCongrCache`. -/
+initialize matchCongrCache : IO.Ref (Std.HashMap (Expr × Array Expr × Array (Option Expr)) Expr) ← IO.mkRef {}
+
+/-- Clear the congruences of `match` applications built so far (see `mkMatchCongr`). -/
+def clearMatchCongrCache : IO Unit := matchCongrCache.set {}
+
+/-- The match equations generated so far (see `getEquationsFor?`). -/
+initialize matchEqnsCache : IO.Ref (Std.HashMap Name Match.MatchEqns) ← IO.mkRef {}
+
 /-- Same as `Lean.Meta.Match.getEquationsFor` but return `none` when the match equations cannot be
     generated (e.g., heartbeats exhausted on matchers with many overlapping patterns).
     NOTE: The generation is performed via `realizeConst`, which reports failures as messages.
@@ -28,9 +37,18 @@ initialize matchEqnsFailures : IO.Ref NameSet ← IO.mkRef {}
 -/
 def getEquationsFor? (n : Name) : MetaM (Option Match.MatchEqns) := do
   if (← matchEqnsFailures.get).contains n then return none
+  -- NOTE: `Match.getEquationsFor` looks up the realized equations at each call (`realizeConst`), which is costly when
+  -- called for each alternative of the many `match` applications of an optimization (e.g., a fifth of the proof run of
+  -- a CEK evaluation); the equations are cached while their declarations are in the environment
+  if let some eqns := (← matchEqnsCache.get)[n]? then
+    -- NOTE: the splitter is realized (see `realizeConst`), i.e., possibly on another environment branch
+    if (← getEnv).contains eqns.splitterName (skipRealize := false) then return some eqns
   let tasks := (← getThe Core.State).snapshotTasks
   let msgs := (← getThe Core.State).messages
-  tryCatchRuntimeEx (some <$> Match.getEquationsFor n) fun _ => do
+  tryCatchRuntimeEx (do
+      let eqns ← Match.getEquationsFor n
+      matchEqnsCache.modify (·.insert n eqns)
+      return some eqns) fun _ => do
     modifyThe Core.State fun s => { s with snapshotTasks := tasks, messages := msgs }
     matchEqnsFailures.modify (·.insert n)
     return none
@@ -70,6 +88,19 @@ def absurdFromOverlap? : MetaM (Option Expr) := do
     | none => s.restore
   return none
 
+/-- `isDefEq l r` for applications of the same constant, unifying their arguments pairwise first.
+    NOTE: `isDefEq` on the applications of a matcher first reduces them (`whnfCore`), e.g., the matcher instantiated
+    at the patterns of an alternative (see `proveMatchAltEq`), while the unification of the arguments assigns the
+    metavariables of the match equation directly.
+-/
+def unifyApps (l r : Expr) : MetaM Bool := do
+  let (lf, rf) := (l.getAppFn, r.getAppFn)
+  if lf.isConst && rf.isConst && lf.constName! == rf.constName! && l.getAppNumArgs == r.getAppNumArgs then
+    let s ← saveState
+    if ← isDefEq lf rf <&&> (l.getAppArgs.zip r.getAppArgs).allM fun (a, b) => isDefEq a b then return true
+    s.restore
+  isDefEq l r
+
 /-- Given `m := matcher ps motive pats alts` (i.e., a matcher instantiated at the patterns of alternative
     `altIdx`), return a proof of `m = altᵢ args` with `args` the arguments of the alternative.
     The overlap hypotheses required by the match equation are looked up in the local context.
@@ -82,7 +113,7 @@ def proveMatchAltEq (m : Expr) (alt : Expr) (altIdx : Nat) (isCasesOn : Bool) : 
       let c ← mkConstWithFreshMVarLevels eqns.eqnNames[altIdx]
       let (mvars, _, ty) ← forallMetaTelescopeReducing (← inferType c)
       if let some (_, lhs, rhs) := ty.eq? then
-        if ← isDefEq lhs m <&&> isDefEq rhs alt then
+        if ← unifyApps lhs m <&&> isDefEq rhs alt then
           let lctx ← getLCtx
           let mut ok := true
           for mv in mvars do
@@ -162,6 +193,12 @@ def mkMatchCasesProof {n} [MonadLiftT MetaM n] [MonadControlT MetaM n] [Monad n]
       - `some p` with `p : ∀ args (h₁ : d₁ = pᵢ₁) ... (hₙ : dₙ = pᵢₙ), altᵢ args = alt'ᵢ args`.
 -/
 def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) : MetaM Expr := do
+  -- NOTE: the optimizer may justify the same rewrite of a `match` application several times (e.g., about a third of
+  -- the congruences of a CEK evaluation), the congruences are reused when they are well-scoped
+  let key := (m, alts', altPfs)
+  if let some p := (← matchCongrCache.get)[key]? then
+    let lctx ← getLCtx
+    if !p.hasAnyFVar (!lctx.contains ·) then return p
   let some app ← matchMatcherApp? m (alsoCasesOn := true)
     | throwError "mkMatchCongr: match application expected"
   let isCasesOn := isCasesOnRecursor (← getEnv) app.matcherName
@@ -177,6 +214,28 @@ def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) 
       match altPfs[altIdx]! with
       | none => return pRhs
       | some p => mkEqTrans (mkAppN p (args ++ hs)) pRhs)
+  let p ← app.remaining.foldlM (init := p) fun acc a => mkCongrFun acc a
+  let p ← instantiateMVars p
+  if !p.hasMVar then matchCongrCache.modify (·.insert key p)
+  return p
+
+/-- Given the applications `m := matcher ps motive ds alts` and `m' := matcher' ps' motive ds alts` of two matchers with the
+    same patterns (e.g., the generated matchers of two functions matching on the same patterns, see
+    `Blaster.Optimize.structEqMatch`), return a proof of `m = m'`: a case split over the alternatives of `m`, the `i`-th
+    alternative of `m'` being reduced by the `i`-th match equation of `matcher'`.
+-/
+def mkMatchEquivProof (m m' : Expr) : MetaM Expr := do
+  let some app ← matchMatcherApp? m | throwError "mkMatchEquivProof: matcher application expected"
+  let some app' ← matchMatcherApp? m' | throwError "mkMatchEquivProof: matcher application expected"
+  if app.alts.size != app'.alts.size || app.discrs.size != app'.discrs.size || app.remaining != app'.remaining then
+    throwError "mkMatchEquivProof: matchers with different alternatives"
+  let mkM (discrs : Array Expr) : Expr :=
+    mkAppN (mkConst app.matcherName app.matcherLevels.toList) (app.params ++ #[app.motive] ++ discrs ++ app.alts)
+  let mkM' (discrs : Array Expr) : Expr :=
+    mkAppN (mkConst app'.matcherName app'.matcherLevels.toList) (app'.params ++ #[app'.motive] ++ discrs ++ app'.alts)
+  -- extra arguments (i.e., match returning a function) are handled via `congrFun`
+  let p ← mkMatchCasesProof (mkM app.discrs) (fun xs => pure (mkM' xs))
+    (fun altIdx _ _ alt rhs => do mkEqSymm (← proveMatchAltEq rhs alt altIdx false))
   app.remaining.foldlM (init := p) fun acc a => mkCongrFun acc a
 
 /-- Given `inner := matcher ps motive d₁ ... dₙ alt₁ ... altₖ`, a context `F := fun z => F[z]` and

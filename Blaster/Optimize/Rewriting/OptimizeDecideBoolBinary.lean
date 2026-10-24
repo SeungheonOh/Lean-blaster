@@ -28,6 +28,17 @@ def decideOpDecide?
   | _, _ => return none
 
 
+/-- When tracking proof terms, record the justification of the rewrite of `e := op1 ⊕ op2` into `r` by
+    `decideOpDecide?`, with `both`, `left` and `right` the lemmas for `decide' e1 ⊕ decide' e2`, `decide' e1 ⊕ b`
+    and `b ⊕ decide' e1` (e.g., `Blaster.Reconstruct.decide'_and_decide'`), and return `r`.
+-/
+def recordDecideOp (e r op1 op2 : Expr) (both left right : Name) : TranslateEnvT Expr := do
+  match decide'? op1, decide'? op2 with
+  | some e1, some e2 => Blaster.Reconstruct.withThm e r both #[e1, e2]
+  | some e1, _ => Blaster.Reconstruct.withThm e r left #[e1, op2]
+  | _, some e1 => Blaster.Reconstruct.withThm e r right #[op1, e1]
+  | _, _ => return r
+
 /-- Call `optimizeBoolAnd f args` and apply the following `decide` simplification/normalization
     rules on the resulting `and` expression (if any):
      - decide' e1 && decide' e2 ==> decide' (e1 ∧ e2)
@@ -42,7 +53,9 @@ def decideOpDecide?
 def optimizeDecideBoolAnd (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
  let e ← optimizeBoolAnd f args
  let some (op1, op2) := boolAnd? e | return e
- if let some r ← decideOpDecide? op1 op2 (mkApp2Expr (← mkPropAndOp)) then return r
+ if let some r ← decideOpDecide? op1 op2 (mkApp2Expr (← mkPropAndOp)) then
+   return ← recordDecideOp e r op1 op2
+     ``Blaster.Reconstruct.decide'_and_decide' ``Blaster.Reconstruct.decide'_and_bool ``Blaster.Reconstruct.bool_and_decide'
  return e
 
 /-- Call `optimizeBoolOr f args` and apply the following `decide` simplification/normalization
@@ -61,7 +74,9 @@ def optimizeDecideBoolAnd (f : Expr) (args : Array Expr) : TranslateEnvT Expr :=
 def optimizeDecideBoolOr (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
  let e ← optimizeBoolOr f args
  let some (op1, op2) := boolOr? e | return e
- if let some r ← decideOpDecide? op1 op2 (mkApp2Expr (← mkPropOrOp)) then return r
+ if let some r ← decideOpDecide? op1 op2 (mkApp2Expr (← mkPropOrOp)) then
+   return ← recordDecideOp e r op1 op2
+     ``Blaster.Reconstruct.decide'_or_decide' ``Blaster.Reconstruct.decide'_or_bool ``Blaster.Reconstruct.bool_or_decide'
  return e
 
 

@@ -969,7 +969,7 @@ partial def optimizeMatch
  let (f', args') ← structEqMatch f args mInfo
  let e ← mkAppNExpr f' args'
  updateCtorCacheAndFreeUnusedContext e f' args'
- return (← stackContinuity xs e)
+ return (← stackContinuity xs e (← structEqPf e))
 
  where
    /-- Return evidence for the elimination of a match whose alternatives all have the same rhs `e`, i.e., a
@@ -981,6 +981,16 @@ partial def optimizeMatch
      let some p ← tryInLocalContext (mkMatchCasesProof lhs (fun _ => pure e) fun _ _ _ alt rhs => do
          mkExpectedTypeHint (← Meta.mkEqRefl alt) (← mkEq alt rhs))
        | return .unknown
+     if !(← validStep lhs e (.proof p)) then return .unknown
+     return .proof p
+
+   /-- Return evidence for the replacement of the matcher of `f args` by the equivalent one of `e` (see `structEqMatch`
+       and `Blaster.Reconstruct.mkMatchEquivProof`). -/
+   structEqPf (e : Expr) : TranslateEnvT EqPf := do
+     if !(← isTracking) then return .unknown
+     let lhs ← mkAppNExpr f args
+     if lhs == e then return .defeq
+     let some p ← tryInLocalContext (Blaster.Reconstruct.mkMatchEquivProof lhs e) | return .unknown
      if !(← validStep lhs e (.proof p)) then return .unknown
      return .proof p
 

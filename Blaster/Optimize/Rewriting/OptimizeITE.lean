@@ -209,6 +209,44 @@ def iteSimp? (iteType : Expr) (c : Expr) (t : Expr) (e : Expr) (inDiteChoice := 
 
 
 
+/-- When tracking proof terms, record the justification of the rewrite of `Blaster.dite' c t e` (with `f` the
+    `Blaster.dite'` constant) into `r` by `iteSimp?` when both branches are non-dependent, i.e., the cases
+    `sif h : c then e1 else e1 ==> e1` and the ones with a branch `True` or `False` (see the lemmas
+    `Blaster.Reconstruct.dite'_same`, `dite'_true_false`, etc.). Nothing is recorded otherwise (e.g., a branch
+    implied by the hypotheses), i.e., the rewrite remains a proof obligation.
+-/
+def recordDITESimp (f iteType c t e r : Expr) : TranslateEnvT Unit := do
+  if !(← Blaster.Reconstruct.isTracking) then return
+  let (Expr.lam _ _ a _, Expr.lam _ _ b _) := (t, e) | return
+  if a.hasLooseBVars || b.hasLooseBVars then return
+  let notC := mkApp (mkConst ``Not) c
+  -- NOTE: by pattern matching (the compiler may evaluate `r.bindingDomain!` and the like out of the guards)
+  let isImp (d body : Expr) : Bool := match r with
+    | .forallE _ t b _ => t == d && b == body
+    | _ => false
+  let isAnd (x y : Expr) : Bool := match r with
+    | .app (.app (.const ``And _) x') y' => x' == x && y' == y
+    | _ => false
+  let thm? : Option (Name × Array Expr) :=
+    if a == b then (if r == a then some (``Blaster.Reconstruct.dite'_same, #[iteType, c, a]) else none)
+    else if a.isConstOf ``True && b.isConstOf ``False then
+      if r == c then some (``Blaster.Reconstruct.dite'_true_false, #[c]) else none
+    else if a.isConstOf ``False && b.isConstOf ``True then
+      if r == notC then some (``Blaster.Reconstruct.dite'_false_true, #[c]) else none
+    else if a.isConstOf ``True then
+      if isImp notC b then some (``Blaster.Reconstruct.dite'_true_left, #[c, b]) else none
+    else if a.isConstOf ``False then
+      if isAnd notC b then some (``Blaster.Reconstruct.dite'_false_left, #[c, b]) else none
+    else if b.isConstOf ``True then
+      if isImp c a then some (``Blaster.Reconstruct.dite'_true_right, #[c, a]) else none
+    else if b.isConstOf ``False then
+      if isAnd c a then some (``Blaster.Reconstruct.dite'_false_right, #[c, a]) else none
+    else none
+  let some (thm, args) := thm? | return
+  let us := if thm == ``Blaster.Reconstruct.dite'_same then f.constLevels! else []
+  discard <| Blaster.Reconstruct.withProofM (← mkApp4Expr f iteType c t e) r do
+    return mkAppN (mkConst thm us) args
+
 /-- Given `a`, 't` and `e` the condition, then and else expressions for
     a Blaster.dite' expression,
      - When `t := sif h2 : c1 then e1 else e2` ∧
@@ -396,6 +434,7 @@ def optimizeDITEChoice (f : Expr) (args : Array Expr) : TranslateEnvT (Option Ex
  if let some r ← diteReduce? (← optimizeAdvancedNot (← mkPropNotOp) #[c] (restart := false)) e t then return r
  if let some r ← iteSimp? iteType c t e (inDiteChoice := true) then
     resetRestart
+    recordDITESimp f iteType c t e r
     return r
  if let some r ← constDITEPropagation? args then return r
  if let some r ← diteToPropExpr? iteType c t e then return r
@@ -488,7 +527,9 @@ def optimizeDITE (f : Expr) (args : Array Expr) : TranslateEnvT Expr := do
  let c := args[1]!
  let t := args[2]!
  let e := args[3]!
- if let some r ← iteSimp? iteType c t e then return r
+ if let some r ← iteSimp? iteType c t e then
+    recordDITESimp f iteType c t e r
+    return r
  if let some r ← diteFactorize? c t e then return r
  let ite' ← mkApp4Expr f iteType c t e
  let isCtor ← updateCtorCache ite' t e
