@@ -428,10 +428,52 @@ def refuted (g : Expr) (maxInstances := 64) : MetaM Bool := do
 def runAsync (x : Elab.Term.TermElabM α) : Elab.Term.TermElabM (Task (Except Exception α)) := do
   let tctx ← read
   let mctx := { (← readThe Meta.Context) with lctx := {}, localInstances := #[] }
-  let act ← Core.wrapAsync (fun (_ : Unit) => do
-      let ((a, _), _) ← (x.run tctx {}).run mctx {}
-      return a) none
+  -- NOTE: the task gets the environment but not the caches, messages, info trees and traces of the Core state (taken by
+  -- `Core.wrapAsync`), which would be shared with the task, i.e., copied by their next updates (e.g., after each of the
+  -- parallel attempts of a portfolio, see `SmtProof.portfolioParMulti`)
+  let saved ← getThe Core.State
+  modifyThe Core.State fun s =>
+    { s with cache := {}, messages := {}, infoState := {}, traceState := {}, snapshotTasks := #[] }
+  let act ← try
+      Core.wrapAsync (fun (_ : Unit) => do
+        let ((a, _), _) ← (x.run tctx {}).run mctx {}
+        return a) none
+    finally
+      modifyThe Core.State fun s =>
+        { s with cache := saved.cache, messages := saved.messages, infoState := saved.infoState,
+                 traceState := saved.traceState, snapshotTasks := saved.snapshotTasks }
   EIO.asTask (act ()) (prio := .dedicated)
+
+/-- `e` with the constants of the environment that are not in `base` replaced by their values, e.g., the auxiliary lemmas
+    of the tactics in a task with its own environment (see `Local.runAsync`), such that the proof can be used in the
+    environment `base`. The reserved names (e.g., the splitters and equations of matchers, realized on demand and shared
+    between the environments, see `realizeReservedNames`) are kept. -/
+partial def inlineNewConstants (base : Environment) (e : Expr) : CoreM Expr := do
+  let env ← getEnv
+  let rec go (e : Expr) : StateT (Std.HashMap Name (List Name × Expr)) CoreM Expr := do
+    let cs := e.getUsedConstants.filter fun c => !base.contains c (skipRealize := true) && !isReservedName base c
+    if cs.isEmpty then return e
+    for c in cs do
+      if (← get).contains c then continue
+      let some info := env.find? c | throwError "inlineNewConstants: unknown constant {c}"
+      let some v := info.value? (allowOpaque := true) | throwError "inlineNewConstants: {c} has no value"
+      let v ← go v
+      modify (·.insert c (info.levelParams, v))
+    let m ← get
+    return e.replace fun s => match s with
+      | .const c us => (m.get? c).map fun (ps, v) => v.instantiateLevelParams ps us
+      | _ => none
+  (go e).run' {}
+
+/-- Realize the reserved names among the constants of `e` that are not in the environment (e.g., the splitters and
+    equations of matchers realized in the environment of a task, see `inlineNewConstants`); messages are discarded. -/
+def realizeReservedNames (e : Expr) : CoreM Unit := do
+  for c in e.getUsedConstants do
+    let env ← getEnv
+    if env.contains c (skipRealize := true) || !isReservedName env c then continue
+    let msgs := (← getThe Core.State).messages
+    try executeReservedNameAction c catch _ => pure ()
+    modifyThe Core.State fun s => { s with messages := msgs }
 
 /-- Option holding the deadline of the portfolio (monotonic time in ms plus one, `0`: none): no tactic is started after
     it (see `withPortfolioDeadline` and `SmtProof.portfolio`). An option of the context, i.e., local to the tasks of a

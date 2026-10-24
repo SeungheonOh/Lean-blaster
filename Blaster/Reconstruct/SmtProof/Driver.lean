@@ -42,6 +42,44 @@ structure SmtProofResult where
   steps : Nat
   stats : ReplayStats
 
+/-- The kernel checks of the auxiliary theorems of the last proof, run in parallel (see `proveBySmtProof`): the
+    error of each failed check. The proof is only accepted once they all succeeded (see `awaitKernelChecks`). -/
+initialize pendingKernelChecks : IO.Ref (Array (Task (Option String))) ← IO.mkRef #[]
+
+/-- The auxiliary theorems of the last proof whose checks are started by `startKernelChecks`, with their values: known
+    not to depend on `sorryAx` (see `dependsOnSorry`, such that their values are not traversed again). -/
+initialize sorryFreeAuxTheorems : IO.Ref (Array (Name × Expr)) ← IO.mkRef #[]
+
+/-- Start the kernel checks of `decls`, each against the kernel environment given with it (the environment before
+    it, such that a declaration may only use the declarations before it), on `threads` dedicated threads. -/
+def startKernelChecks (decls : Array (Kernel.Environment × Declaration)) (threads : Nat) (opts : Options) :
+    BaseIO Unit := do
+  let next ← IO.mkRef 0
+  let rec worker (fuel : Nat) : BaseIO (Option String) := do
+    match fuel with
+    | 0 => return none
+    | fuel + 1 =>
+      let i ← next.modifyGet fun i => (i, i + 1)
+      let some (kenv, decl) := decls[i]? | return none
+      match kenv.addDeclCore 0 decl none with
+      | .ok _ => worker fuel
+      | .error ex =>
+          let msg ← (do return some (← (ex.toMessageData opts).toString)).catchExceptions fun _ => pure (some "?")
+          return some s!"kernel check of {decl.getNames}: {msg.getD "?"}"
+  let mut tasks := #[]
+  for _ in [:max threads 1] do
+    tasks := tasks.push (← BaseIO.asTask (prio := .dedicated) (worker decls.size))
+  pendingKernelChecks.modify (· ++ tasks)
+
+/-- Wait for the kernel checks started by `startKernelChecks`: the first error, if any. -/
+def awaitKernelChecks : BaseIO (Option String) := do
+  let tasks ← pendingKernelChecks.modifyGet fun ts => (ts, #[])
+  let mut err := none
+  for t in tasks do
+    if let some msg ← IO.wait t then
+      if err.isNone then err := some msg
+  return err
+
 /-- Given `e := ∀ b₁ ... bₙ, C` (leading binders), return `∀ xs, hs → C` where `xs` are the data binders and
     `hs` the propositions among the `bᵢ` (only when no data binder depends on a proposition), together with
     a function turning a proof of the latter into a proof of `e`. Blaster declares the data variables of
@@ -123,6 +161,83 @@ def polyModes (sortVars : Array Expr) (quantifiedSorts : Bool) : Array Bool :=
   else if sortVars.size == 1 then #[false, true]
   else #[true, false]
 
+/-- The translation of the negation of the goal `body` over the data variables `xs` (with the sort variables `sortVars`):
+    the goal translated (`body` or its optimized form, see below), the environment of the translation and the SMT
+    commands. -/
+def translateNegGoal (xs : Array Expr) (body : Expr) (sortVars : Array Expr) (sOpts : BlasterOptions) :
+    TermElabM (Expr × TranslateEnv × Array SExpr) := do
+  -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
+  let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
+  let (goalTerm, tenv) ← (do
+      -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
+      -- recursive functions); `body` being already optimized, `body'` is expected to be `body` (up to
+      -- definitional equality, which the bridge requires).
+      let (body', _) ← Optimize.mainPf body (track := false)
+      -- NOTE: when the optimizer is not idempotent on `body`, `body` itself is translated, such that the
+      -- asserted formula is the translation of the negated goal (see the bridge)
+      let reopt := body' == body
+      setBlasterProcess
+      -- sort variables introduced as free variables: declared as Blaster does for top-level quantifiers
+      for α in sortVars do
+        updateQuantifiedFVarsCache α.fvarId! true
+        -- NOTE: the declarations of sorts are cached on (hash-consed) sort objects
+        let decl ← generateSortInstDecl (← hashcons (← inferType α))
+        declareConst (← typeParamNameToSmtSymbol α.fvarId!) decl.instSort
+      -- the data variables are declared first: their datatypes are then declared before the body refers to
+      -- their fields (e.g., the function fields of structures, applied in the body); with sort variables, they
+      -- are declared with their membership predicates also when they don't occur in the goal (e.g., `a : α`
+      -- witnessing that `α` is inhabited)
+      -- NOTE: variables that can't be translated by themselves (e.g., instances of classes) are left to the
+      -- translation of the body
+      for x in xs do
+        let t ← inferType x
+        if sortVars.contains x || (← isProp t) || (← isClass? t).isSome then continue
+        let saved ← get
+        try discard <| translateExpr x catch _ => set saved
+      -- NOTE: the unoptimized goal may not be translatable (e.g., terms that only the optimizer normalizes):
+      -- its optimized form is then translated, when definitionally equal to it
+      let saved ← get
+      let (st, goalTerm) ← if reopt then pure (← translateExpr body', body') else
+        try pure (← translateExpr body, body) catch ex => do
+          set saved
+          let defeq ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
+              withCurrHeartbeats <| withDefault <| isDefEq body body' catch _ => pure false
+          if !defeq then throw ex
+          pure (← translateExpr body', body')
+      assertTerm (notSmt st)
+      return goalTerm : TranslateEnvT Expr).run env
+  let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
+  return (goalTerm, tenv, cmds.map guardNatQuantifiers)
+
+/-- The backend `n` of the proof replay on the commands `cmds` (see `proveBySmtProof`), if it applies: the backend, its
+    query, the recursive functions of the query (`z3rec`), its number of random seeds and the delay between the starts
+    of its runs. -/
+def backendFor (n : String) (cmds : Array SExpr) (timeout : Nat) :
+    TermElabM (Option (Backend × Array SExpr × Array RecFun.Pair × Nat × Nat)) := do
+  let recQuery := if n == "z3rec" then (RecFun.rewriteQuery cmds).toOption else none
+  if n == "z3rec" && recQuery.isNone then return none
+  let backend ← match n with
+    | "z3" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout)
+    | "z3+" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout (simplifiers := true))
+    | "z3rec" => pure { z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout with name := "z3rec" }
+    | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
+    | b => throwError "unknown proof backend {b}"
+  let (query, pairs) := if n == "z3rec" then recQuery.getD (cmds, #[]) else (cmds, #[])
+  -- Z3: portfolio of random seeds (environment variable `BLASTER_SMTPROOF_SEEDS`, default 3), started every
+  -- `BLASTER_SMTPROOF_SEED_DELAY` ms (default: a quarter of the timeout, at most 10 s) while no proof is found
+  -- NOTE: e.g., Z3 finds a proof of a CEK evaluation of a validator in 30 to 170 s depending on the seed
+  let seedsEnv ← IO.getEnv "BLASTER_SMTPROOF_SEEDS"
+  let seeds := if n == "cvc5" then 1 else (seedsEnv.bind String.toNat?).getD 3
+  let delayMs := ((← IO.getEnv "BLASTER_SMTPROOF_SEED_DELAY").bind String.toNat?).getD (min 10000 (timeout * 250))
+  return some (backend, query, pairs, seeds, delayMs)
+
+/-- The backends of the proof replay, tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`),
+    and their timeout in seconds. -/
+def proofBackends (sOpts : BlasterOptions) : IO (List String × Nat) := do
+  let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3rec,z3+").splitOn ","
+  let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
+  return (names.map (·.trim), timeout)
+
 /-- Try to prove `e` (a closed proposition proved valid by the SMT solver) by replaying a proof of the
     SMT backend. The polymorphic encoding is interpreted by `Poly` when `poly?` is `some true`, with `@Instance` as
     the sort variable when `some false`, and with the interpretations of `modes` tried in order otherwise. -/
@@ -142,6 +257,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       let mut msgs := #[]
       for poly in modes do
         s.restore
+        pendingKernelChecks.set #[]
+        sorryFreeAuxTheorems.set #[]
         -- NOTE: the name generator (not restored by `restore`) is reset too, such that the translations (whose
         -- SMT symbols have fresh names) coincide and the proofs of the backends are reused (see `runBackendCached`)
         setNGen ngen
@@ -159,60 +276,20 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let (sortVars, quantifiedSorts) ← sortVariables xs body
     let poly := poly?.getD (polyModes sortVars quantifiedSorts)[0]!
     -- 1. translation
-    -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
-    let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
-    let (goalTerm, tenv) ← (do
-        -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
-        -- recursive functions); `body` being already optimized, `body'` is expected to be `body` (up to
-        -- definitional equality, which the bridge requires).
-        let (body', _) ← Optimize.mainPf body (track := false)
-        -- NOTE: when the optimizer is not idempotent on `body`, `body` itself is translated, such that the
-        -- asserted formula is the translation of the negated goal (see the bridge)
-        let reopt := body' == body
-        setBlasterProcess
-        -- sort variables introduced as free variables: declared as Blaster does for top-level quantifiers
-        for α in sortVars do
-          updateQuantifiedFVarsCache α.fvarId! true
-          -- NOTE: the declarations of sorts are cached on (hash-consed) sort objects
-          let decl ← generateSortInstDecl (← hashcons (← inferType α))
-          declareConst (← typeParamNameToSmtSymbol α.fvarId!) decl.instSort
-        -- the data variables are declared first: their datatypes are then declared before the body refers to
-        -- their fields (e.g., the function fields of structures, applied in the body); with sort variables, they
-        -- are declared with their membership predicates also when they don't occur in the goal (e.g., `a : α`
-        -- witnessing that `α` is inhabited)
-        -- NOTE: variables that can't be translated by themselves (e.g., instances of classes) are left to the
-        -- translation of the body
-        for x in xs do
-          let t ← inferType x
-          if sortVars.contains x || (← isProp t) || (← isClass? t).isSome then continue
-          let saved ← get
-          try discard <| translateExpr x catch _ => set saved
-        -- NOTE: the unoptimized goal may not be translatable (e.g., terms that only the optimizer normalizes):
-        -- its optimized form is then translated, when definitionally equal to it
-        let saved ← get
-        let (st, goalTerm) ← if reopt then pure (← translateExpr body', body') else
-          try pure (← translateExpr body, body) catch ex => do
-            set saved
-            let defeq ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
-                withCurrHeartbeats <| withDefault <| isDefEq body body' catch _ => pure false
-            if !defeq then throw ex
-            pure (← translateExpr body', body')
-        assertTerm (notSmt st)
-        return goalTerm : TranslateEnvT Expr).run env
-    let cmds ← tenv.smtEnv.smtCommands.mapM fun c => ofExcept (parseSExpr (toString c))
-    let cmds := cmds.map guardNatQuantifiers
+    let (goalTerm, tenv, cmds) ← translateNegGoal xs body sortVars sOpts
     -- 3.-4. interpretation and replay of the proof `sproof` of `backend`
-    let replayWith (backend : Backend) (sproof : Proof) (recPairs : Array RecFun.Pair) : TermElabM SmtProofResult := do
+    -- 3. interpretation
+    -- SMT constants of the free variables of the goal (the introduced variables, as well as the
+    -- variables of the local context, e.g., section variables)
+    let mut consts : Std.HashMap String Expr := {}
+    let lctx ← getLCtx
+    for (v, idx) in tenv.smtEnv.fvarsCache.toList do
+      if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
+    let baseTbl ← if poly then polyBuildSymTable cmds tenv consts sortVars else buildSymTable cmds tenv consts sortVars[0]?
+    let replayWith (backend : Backend) (sproof : Proof) (recPairs : Array RecFun.Pair)
+        (eqTasks : Array (Expr × Task (Except Exception (Option Expr)))) : TermElabM SmtProofResult := do
       clearLocalCache
-      -- 3. interpretation
-      -- SMT constants of the free variables of the goal (the introduced variables, as well as the
-      -- variables of the local context, e.g., section variables)
-      let mut consts : Std.HashMap String Expr := {}
-      let lctx ← getLCtx
-      for (v, idx) in tenv.smtEnv.fvarsCache.toList do
-        if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
-      let tbl ← if poly then polyBuildSymTable cmds tenv consts sortVars else buildSymTable cmds tenv consts sortVars[0]?
-      let tbl ← addSkolems sproof tbl
+      let tbl ← addSkolems sproof baseTbl
       -- auxiliary functions and case predicates of recursive functions (Z3)
       let (tbl, recAux) ← RecFun.addProofDefs sproof tbl
       -- 4. replay
@@ -246,7 +323,17 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
         -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
         let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
-        portfolio tacs stmt rule
+        portfolioPar tacs stmt rule
+      -- several goals attempted in parallel (see `proveClosedFirst`)
+      let proveSteps? : Option (Array (String × Expr) → TermElabM (Option (Nat × Expr × String))) :=
+        if (← IO.getEnv "BLASTER_SMTPROOF_PARPORTFOLIO") == some "0" then none else some fun gs => do
+          let jobs ← gs.mapM fun (rule, stmt) => do
+            let tacs ← match (← tacCache.get).get? rule with
+              | some t => pure t
+              | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
+            let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
+            return (stmt, tacs, rule)
+          portfolioParMulti jobs
       -- recursive functions (`z3rec`): definitional equations, proved with the bridge tactics in the empty local
       -- context when closed (see `proveClosed`), and differences of normal forms in their unfoldings
       let recCtx ← RecFun.mkCtx tbl recAux recPairs sproof.defs
@@ -257,6 +344,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         (fun a b => do
           let largeStep := !(Local.sizeLe a 20000 && Local.sizeLe b 20000)
           Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite" largeStep) (← IO.mkRef 6) a b)
+        eqTasks
       -- the definitional equations of the functions unfolded by the lemmas of the proof, proved in parallel
       let unfolded := sproof.steps.foldl (init := {}) fun acc s =>
         if s.rule == "th-lemma" && s.attrs[0]? == some (.atom "recfun") then RecFun.appliedSymbols s.concl acc else acc
@@ -298,7 +386,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
                 let h ← IO.FS.Handle.mk f .append
                 h.putStrLn s!"=== bridge failed:\n{← ppExpr c}\n--- negated goal:\n{← ppExpr (mkNot goalTerm)}\n"
             return r.map (·.1)
-          proveStep
+          proveStep, proveSteps?
           proveRecFun := fun c n => do
             -- NOTE: the lemmas have no premises (a failure is not retried)
             if let some r := (← recCache.get).get? c then return r
@@ -342,14 +430,24 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- variables of the goal and the negated goal, checked by the kernel one at a time: the kernel's caches (e.g., the
         -- types inferred for the subterms) are kept for the check of a whole declaration, e.g., beyond 30 GB for the
         -- 10.1M distinct subterms of the proof of a CEK evaluation of a validator (19,369 global proofs), checked as
-        -- auxiliary theorems in 6.5 minutes without memory increase. The smaller proofs are checked as a whole: the
-        -- auxiliary theorems check the shared subterms of their statements again (e.g., 35 s instead of 25 s for the
-        -- 2.6M distinct subterms of the proof of another validator, at 6.5 GB)
+        -- auxiliary theorems in 6.5 minutes without memory increase. The smaller proofs are checked as a whole unless
+        -- their auxiliary theorems are checked in parallel (see `startKernelChecks`): one at a time, the auxiliary
+        -- theorems check the shared subterms of their statements again (e.g., 35 s instead of 25 s for the 2.6M
+        -- distinct subterms of the proof of another validator, at 6.5 GB)
         let trace ← IO.getEnv "BLASTER_SMTPROOF_TRACE"
         let splitMin := ((← IO.getEnv "BLASTER_SMTPROOF_SPLIT").bind String.toNat?).getD 4096
         let splitDag := ((← IO.getEnv "BLASTER_SMTPROOF_SPLIT_DAG").bind String.toNat?).getD 5000000
-        let split := splitMin == 0 || (st.globalProofs.size ≥ splitMin && !dagSizeLe (balancedConj (st.globalProofs.map (·.2))) splitDag)
+        -- parallel kernel checks (environment variable `BLASTER_SMTPROOF_PARCHECK`: number of threads, default 8, 0: none)
+        -- of the auxiliary theorems of the proofs with at least `BLASTER_SMTPROOF_PARCHECK_MIN` (default 1024) global
+        -- proofs, e.g., 4 s instead of 26 s (as a whole) for the 6928 global proofs of the CEK evaluation of a minting
+        -- policy, and a third of the memory
+        let parThreads := ((← IO.getEnv "BLASTER_SMTPROOF_PARCHECK").bind String.toNat?).getD 8
+        let parMin := ((← IO.getEnv "BLASTER_SMTPROOF_PARCHECK_MIN").bind String.toNat?).getD 1024
+        let parallel := parThreads > 0 && st.globalProofs.size ≥ parMin
+        let split := parallel || splitMin == 0 ||
+          (st.globalProofs.size ≥ splitMin && !dagSizeLe (balancedConj (st.globalProofs.map (·.2))) splitDag)
         let auxCount ← IO.mkRef 0
+        let parDecls : IO.Ref (Array (Kernel.Environment × Declaration)) ← IO.mkRef #[]
         let aux? : Option (Nat → Expr → Expr → MetaM Expr) :=
           if !split then none else some fun i ty v => do
             -- NOTE: inlined when not closed, e.g., over variables of the polymorphic encoding (see `Poly`) bound by the
@@ -357,6 +455,18 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
             if ty.hasFVar || v.hasFVar || ty.hasMVar || v.hasMVar then return v
             let lvls := (collectLevelParams (collectLevelParams {} ty) v).params.toList
             let t0 ← IO.monoMsNow
+            if parallel then
+              -- NOTE: added without checking, and checked against the environment before it by `startKernelChecks`
+              -- (such that it only uses the auxiliary theorems before it)
+              -- NOTE: not traversed by `addDecl` either (`warn.sorry`), the whole proof being traversed by `dependsOnSorry`
+              let kenv := (← getEnv).toKernelEnv
+              let n ← mkAuxDeclName (kind := `_proof)
+              let decl := Declaration.thmDecl { name := n, levelParams := lvls, type := ty, value := v }
+              withOptions (fun o => warn.sorry.set (debug.skipKernelTC.set (maxHeartbeats.set o 0) true) false) <|
+                addDecl decl
+              parDecls.modify (·.push (kenv, decl))
+              auxCount.modify (· + 1)
+              return mkConst n (lvls.map mkLevelParam)
             let n ← withOptions (fun o => maxHeartbeats.set o 0) <| mkAuxLemma lvls ty v (cache := false)
             auxCount.modify (· + 1)
             -- the checks taking more than a second (environment variable `BLASTER_SMTPROOF_TRACE`)
@@ -371,6 +481,20 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         if trace.isSome then
           traceTimed s!"{st.globalProofs.size} global proofs (auxiliary theorems: {aux?.isSome}), negated goal of {(dagStats (← inferType hneg)).1} distinct subterms" (pure ())
         let p ← traceTimed "instantiation" (liftGlobalProofs p st.globalProofs (xs.push hneg) aux?)
+        if parallel then
+          let decls ← parDecls.get
+          -- NOTE: the values of the auxiliary theorems share subterms (e.g., the interpreted terms of the goal), traversed
+          -- once by a single traversal of all of them
+          let thms := decls.filterMap fun (_, d) => match d with
+            | .thmDecl t => some t
+            | _ => none
+          let entries := thms.map fun t => (t.name, t.value)
+          let all := balancedConj (thms.map fun t => mkApp2 (mkConst ``And) t.type t.value)
+          if ← traceTimed "sorry check of the auxiliary theorems" (dependsOnSorry all entries) then
+            throwError "smt proof: the proof depends on sorryAx"
+          sorryFreeAuxTheorems.modify (· ++ entries)
+          traceTimed s!"parallel kernel checks of {decls.size} auxiliary theorems on {parThreads} threads started"
+            (startKernelChecks decls parThreads (← getOptions))
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
           let (n, d) := dagStats p
           traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
@@ -400,33 +524,21 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     -- NOTE: `z3rec` finds proofs when Z3 gets lost in the instantiations of the axioms of recursive functions (e.g., on
     -- the CEK evaluation of validators), but may time out where `z3` succeeds; the next backends are tried when the
     -- replay of a proof fails
-    let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3rec,z3+").splitOn ","
-    let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
+    let (names, timeout) ← proofBackends sOpts
     let mut errors := #[]
-    let seedsEnv ← IO.getEnv "BLASTER_SMTPROOF_SEEDS"
     for n in names do
-      let recQuery := if n.trim == "z3rec" then (RecFun.rewriteQuery cmds).toOption else none
-      if n.trim == "z3rec" && recQuery.isNone then continue
-      let backend ← match n.trim with
-        | "z3" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout)
-        | "z3+" => pure (z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout (simplifiers := true))
-        | "z3rec" => pure { z3Backend ((← IO.getEnv "BLASTER_SMTPROOF_Z3").getD "z3") timeout with name := "z3rec" }
-        | "cvc5" => pure (cvc5Backend ((← IO.getEnv "BLASTER_SMTPROOF_CVC5").getD "cvc5") timeout)
-        | b => throwError "unknown proof backend {b}"
-      let (query, pairs) := if n.trim == "z3rec" then recQuery.getD (cmds, #[]) else (cmds, #[])
-      -- Z3: portfolio of random seeds (environment variable `BLASTER_SMTPROOF_SEEDS`, default 3), started every
-      -- `BLASTER_SMTPROOF_SEED_DELAY` ms (default: a quarter of the timeout, at most 10 s) while no proof is found
-      -- NOTE: e.g., Z3 finds a proof of a CEK evaluation of a validator in 30 to 170 s depending on the seed
-      let seeds := if n.trim == "cvc5" then 1 else (seedsEnv.bind String.toNat?).getD 3
-      let delayMs := ((← IO.getEnv "BLASTER_SMTPROOF_SEED_DELAY").bind String.toNat?).getD (min 10000 (timeout * 250))
-      match ← runBackendCached backend query seeds delayMs with
+      let some (backend, query, pairs, seeds, delayMs) ← backendFor n cmds timeout | continue
+      -- the proofs of the definitional equations of the recursive functions, started before the search of the backend
+      let eqTasks ← if pairs.isEmpty then pure #[] else
+        traceTimed "definitional equations started" (try RecFun.preStartEqTasks baseTbl pairs catch _ => pure #[])
+      match ← traceTimed s!"backend {backend.name}" (runBackendCached backend query seeds delayMs) with
       | .error msg => errors := errors.push msg
       | .ok out =>
           match backend.parseProof out with
           | .ok p =>
               -- NOTE: the next backends are tried when the replay fails (e.g., `z3rec` after `z3`)
               let s ← saveState
-              try return .ok (← replayWith backend p pairs)
+              try return .ok (← replayWith backend p pairs eqTasks)
               catch ex =>
                 s.restore
                 errors := errors.push s!"{backend.name}: {← ex.toMessageData.toString}"

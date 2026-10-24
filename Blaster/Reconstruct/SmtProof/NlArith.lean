@@ -555,11 +555,15 @@ partial def refute (ctx : Ctx) (todo : List Expr) (st : State) : TacticM Expr :=
             else other
         | LE.le α _ _ _ => if isInt α then push ``lt_of_not_le else other
         | LT.lt α _ _ _ => if isInt α then push ``le_of_not_lt else other
-        | _ => if p.isArrow && (← isProp p.bindingDomain!) then push ``and_not_of_not_imp else other
+        -- NOTE: by pattern matching (the nested action `← isProp p.bindingDomain!` would be evaluated before the guard)
+        | _ => match p with
+          | .forallE _ d b _ => if !b.hasLooseBVars && (← isProp d) then push ``and_not_of_not_imp else other
+          | _ => other
     | _ =>
-        if t.isArrow && (← isProp t.bindingDomain!) then
-          em t.bindingDomain! (fun x => mkApp h x :: rest) (· :: rest)
-        else other
+        match t with
+        | .forallE _ d b _ =>
+          if !b.hasLooseBVars && (← isProp d) then em d (fun x => mkApp h x :: rest) (· :: rest) else other
+        | _ => other
 
 /-- Case without pending facts: split the next `if-then-else` term or divisor sign, add the facts on the divisions,
     modulos and nonnegative terms, then close the case (see `closeLits`). -/

@@ -374,15 +374,18 @@ where
     return some (if arith then "arith" else "other")
   isCtorName (env : Environment) (n : Name) : Bool := (env.find? n).any (·.isCtor)
 
-def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
-  let rule := s!"{rule}/{← goalShape goal}"
+/-- The tactics `tacs` on goals of the shape of `rule` (see `goalShape`), the most efficient first, i.e., highest number of
+    successes per time unit (with a prior favoring the given order). -/
+def orderTactics (tacs : Array (String × TSyntax `tactic)) (rule : String) : BaseIO (Array (String × TSyntax `tactic)) := do
   let stats ← tacticStats.get
-  -- most efficient tactics first, i.e., highest number of successes per time unit (with a prior
-  -- favoring the given order)
   let score (n : String) (i : Nat) : Float :=
     let (succ, ms) := stats.getD (rule, n) (0, 0)
     (succ.toFloat + 1.0 / (i.toFloat + 1.0)) / (ms.toFloat + 50.0)
-  let tacs := (tacs.zipIdx.qsort fun ((n₁, _), i₁) ((n₂, _), i₂) => score n₁ i₁ > score n₂ i₂).map (·.1)
+  return (tacs.zipIdx.qsort fun ((n₁, _), i₁) ((n₂, _), i₂) => score n₁ i₁ > score n₂ i₂).map (·.1)
+
+def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
+  let rule := s!"{rule}/{← goalShape goal}"
+  let tacs ← orderTactics tacs rule
   for (name, tac) in tacs do
     let start ← IO.monoMsNow
     let deadline ← Local.portfolioDeadline
@@ -397,5 +400,85 @@ def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := 
     tacticStats.modify fun m => let (a, b) := m.getD (rule, name) (0, 0); m.insert (rule, name) (a + succ, b + ms)
     if let some p := r then return some (p, name)
   return none
+
+/-- `portfolio` on several closed goals `jobs` (with their tactics) at once, the attempts being run in parallel, each in a
+    task with fresh states (see `Local.runAsync`): the first proof found (with the index of its goal), the other attempts
+    being interrupted, e.g., the tactics on the local differences of the rewrites of CEK evaluations (a few hundred
+    milliseconds each, after the failures of the others), or the generalizations of a datatype lemma. The proofs are
+    usable in the current environment (see `Local.inlineNewConstants`). -/
+def portfolioParMulti (jobs : Array (Expr × Array (String × TSyntax `tactic) × String)) :
+    TermElabM (Option (Nat × Expr × String)) := do
+  let start ← IO.monoMsNow
+  let deadline ← Local.portfolioDeadline
+  if let some d := deadline then
+    if start ≥ d then return none
+  let keys ← jobs.mapM fun (g, _, rule) => return s!"{rule}/{← goalShape g}"
+  -- the attempts in the order of the jobs and of their tactics (see `orderTactics`), at most `width` at a time
+  -- (environment variable `BLASTER_SMTPROOF_PARPORTFOLIO`, default 6): the next one is started when one fails
+  let width := ((← IO.getEnv "BLASTER_SMTPROOF_PARPORTFOLIO").bind String.toNat?).getD 6
+  let mut queue : Array (Nat × Nat) := #[]
+  let mut ordered : Array (Array (String × TSyntax `tactic)) := #[]
+  for (_, tacs, _) in jobs, j in [0:jobs.size] do
+    let tacs ← orderTactics tacs keys[j]!
+    ordered := ordered.push tacs
+    queue := queue ++ (Array.range tacs.size).map (j, ·)
+  -- round robin over the jobs
+  queue := queue.qsort fun (j₁, i₁) (j₂, i₂) => i₁ < i₂ || (i₁ == i₂ && j₁ < j₂)
+  let base ← getEnv
+  let tk ← IO.CancelToken.new
+  let start (j i : Nat) : TermElabM (Task (Nat × Nat × Nat × Option Expr)) := do
+    let goal := jobs[j]!.1
+    let tac := ordered[j]![i]!.2
+    let t ← Local.runAsync <| withTheReader Core.Context (fun c => { c with cancelTk? := some tk }) do
+      let t0 ← IO.monoMsNow
+      let r ← match deadline with
+        | some d => withTimeLimit (d - min d t0) (proveWithTactic goal tac)
+        | none => proveWithTactic goal tac
+      let r ← r.mapM fun p => do Local.inlineNewConstants base (← instantiateMVars p)
+      return (j, i, (← IO.monoMsNow) - t0, r)
+    return t.map fun r => match r with
+      | .ok r => r
+      | .error _ => (j, i, 0, none)
+  let mut pending : Array (Task (Nat × Nat × Nat × Option Expr)) := #[]
+  let mut next := 0
+  while next < queue.size && pending.size < max width 1 do
+    let (j, i) := queue[next]!
+    pending := pending.push (← start j i)
+    next := next + 1
+  let mut result := none
+  try
+    while result.isNone && !pending.isEmpty do
+      let l := pending.toList
+      if h : l.length > 0 then discard <| IO.waitAny l h
+      let mut rest := #[]
+      for t in pending do
+        if !(← IO.hasFinished t) then rest := rest.push t; continue
+        let (j, i, ms, r?) := t.get
+        let name := ordered[j]![i]!.1
+        let key := keys[j]!
+        tacticStats.modify fun m =>
+          let (a, b) := m.getD (key, name) (0, 0); m.insert (key, name) (a + (if r?.isSome then 1 else 0), b + ms)
+        if result.isSome then continue
+        let some p := r? | continue
+        -- the realizations of the task (e.g., the splitters of matchers), shared between the environments
+        Local.realizeReservedNames p
+        let env ← getEnv
+        if p.getUsedConstants.all (env.contains · (skipRealize := true)) then result := some (j, p, name)
+      -- the next attempts
+      while result.isNone && next < queue.size && rest.size < max width 1 do
+        let (j, i) := queue[next]!
+        rest := rest.push (← start j i)
+        next := next + 1
+      pending := rest
+  finally
+    tk.set
+  return result
+
+/-- `portfolio` with the tactics attempted in parallel on closed goals (see `portfolioParMulti`); environment variable
+    `BLASTER_SMTPROOF_PARPORTFOLIO`: the number of attempts at a time, `0` for `portfolio`. -/
+def portfolioPar (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
+  if tacs.size ≤ 1 || goal.hasFVar || goal.hasMVar || (← IO.getEnv "BLASTER_SMTPROOF_PARPORTFOLIO") == some "0" then
+    return ← portfolio tacs goal rule
+  return (← portfolioParMulti #[(goal, tacs, rule)]).map fun (_, p, n) => (p, n)
 
 end Blaster.Reconstruct.SmtProof

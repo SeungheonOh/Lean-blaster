@@ -610,8 +610,8 @@ structure DefEq where
   fns : Array String := #[]
   /-- the proved statement and its proof (`none` when not attempted yet) -/
   proof : IO.Ref (Option (Option (Expr × Expr)))
-  /-- the proof of the first statement by `blaster_rec_eqn` started beforehand (see `startEqTasks`) -/
-  task : IO.Ref (Option (Task (Except Exception (Option Expr))))
+  /-- the proofs of statements by `blaster_rec_eqn` started beforehand (see `startEqTasks`) -/
+  tasks : IO.Ref (Array (Expr × Task (Except Exception (Option Expr))))
 
 structure Ctx where
   eqs : Array DefEq := #[]
@@ -626,24 +626,29 @@ structure Ctx where
   proveDiff : Expr → Expr → TermElabM (Option Expr) := fun _ _ => pure none
 
 
+/-- The interpretation of the definitional equation `φ` (`∀ x⃗, f x⃗ = body`) with the head of its left-hand side. -/
+def interpEqStmt (tbl : SymTable) (φ : STerm) : TermElabM (Option (Expr × Name)) := do
+  try
+    let stmt ← instantiateMVars (← (interpProp φ).run { table := tbl })
+    if stmt.hasMVar then return none
+    let some head ← forallTelescope stmt fun _ b => do
+        let some (_, l, _) := b.eq? | return none
+        return lhsHead? l
+      | return none
+    return some (stmt, head)
+  catch ex =>
+    debugLog m!"recfun: no definitional equation for {φ}: {ex.toMessageData}"
+    return none
+
 /-- Definitional equations of the recursive functions `pairs`: the interpretation of `∀ x⃗, f x⃗ = body` for the
-    body of `f` in the definitions `defs` of the proof output, and of the axiom of `f` in the query. -/
+    body of `f` in the definitions `defs` of the proof output, and of the axiom of `f` in the query; `tasks`: the proofs
+    of definitional equations started beforehand (see `preStartEqTasks`). -/
 def mkCtx (tbl : SymTable) (aux : NameSet) (pairs : Array Pair) (defs : Array FunDef)
-    (proveDef proveImp : Expr → TermElabM (Option Expr)) (proveDiff : Expr → Expr → TermElabM (Option Expr)) :
+    (proveDef proveImp : Expr → TermElabM (Option Expr)) (proveDiff : Expr → Expr → TermElabM (Option Expr))
+    (tasks : Array (Expr × Task (Except Exception (Option Expr))) := #[]) :
     TermElabM Ctx := do
   if !pairs.isEmpty then debugLog m!"recfun: {pairs.size} recursive functions, {defs.size} definitions in the proof"
-  let interpStmt (φ : STerm) : TermElabM (Option (Expr × Name)) := do
-    try
-      let stmt ← instantiateMVars (← (interpProp φ).run { table := tbl })
-      if stmt.hasMVar then return none
-      let some head ← forallTelescope stmt fun _ b => do
-          let some (_, l, _) := b.eq? | return none
-          return lhsHead? l
-        | return none
-      return some (stmt, head)
-    catch ex =>
-      debugLog m!"recfun: no definitional equation for {φ}: {ex.toMessageData}"
-      return none
+  let interpStmt := interpEqStmt tbl
   let mut eqs := #[]
   for p in pairs do
     let mut cands := #[]
@@ -658,13 +663,23 @@ def mkCtx (tbl : SymTable) (aux : NameSet) (pairs : Array Pair) (defs : Array Fu
         if head.isAnonymous then head := h
         if h == head then stmts := stmts.push stmt
     if !stmts.isEmpty then
-      eqs := eqs.push { stmts, head, fns := #[p.fn, p.defn], proof := ← IO.mkRef none, task := ← IO.mkRef none }
+      let started := tasks.filter fun (stmt, _) => stmts.contains stmt
+      debugLog m!"recfun: {stmts.size} statements of the equation of {head} (the same: {stmts.all (· == stmts[0]!)}), {started.size} started beforehand"
+      eqs := eqs.push { stmts, head, fns := #[p.fn, p.defn], proof := ← IO.mkRef none, tasks := ← IO.mkRef started }
   return { eqs, aux, proveDef, proveImp, proveDiff }
 
 /-- The proof of a closed definitional equation `stmt` by `blaster_rec_eqn`. -/
 def proveEqn (stmt : Expr) : TermElabM (Option Expr) := do
   if stmt.hasFVar then return none
   withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
+
+/-- The proof of the closed definitional equation `stmt` by `blaster_rec_eqn` in a task (see `Local.runAsync`), usable in
+    the current environment (see `Local.inlineNewConstants`). -/
+def proveEqnAsync (stmt : Expr) : TermElabM (Task (Except Exception (Option Expr))) := do
+  let base ← getEnv
+  Local.runAsync do
+    let some p ← proveEqn stmt | return none
+    return some (← Local.inlineNewConstants base (← instantiateMVars p))
 
 /-- Start the proofs of the definitional equations of the functions `fns` (SMT symbols, e.g., the ones of the recursive
     functions unfolded by the lemmas of the proof) in parallel (see `Local.runAsync`), their case analyses taking seconds each
@@ -675,16 +690,28 @@ def startEqTasks (ctx : Ctx) (fns : Std.HashSet String) : TermElabM Unit := do
     if !eq.fns.any fns.contains then continue
     let some stmt := eq.stmts[0]? | continue
     if stmt.hasFVar || stmt.hasMVar then continue
-    eq.task.set (some (← Local.runAsync do
-      let some p ← proveEqn stmt | return none
-      return some (← instantiateMVars p)))
+    if (← eq.tasks.get).any (·.1 == stmt) then continue
+    eq.tasks.modify (·.push (stmt, ← proveEqnAsync stmt))
+
+/-- Start the proofs of the definitional equations of the recursive functions `pairs` from their axioms in the query
+    (see `startEqTasks`), i.e., before the proof of the backend is available (e.g., during the 6 s of the search of Z3
+    for a proof of the CEK evaluation of a validator): the started proofs, given to `mkCtx`. -/
+def preStartEqTasks (tbl : SymTable) (pairs : Array Pair) :
+    TermElabM (Array (Expr × Task (Except Exception (Option Expr)))) := do
+  let mut r := #[]
+  for p in pairs do
+    let .ok φ := STerm.ofSExpr {} p.formula | continue
+    let some (stmt, _) ← interpEqStmt tbl φ | continue
+    if stmt.hasFVar || stmt.hasMVar || r.any (·.1 == stmt) then continue
+    r := r.push (stmt, ← proveEqnAsync stmt)
+  return r
 
 /-- Proof of the definitional equation `eq` (attempted once; the proof is shared by the lemmas using it). -/
 def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
   if let some r ← eq.proof.get then return r
   let mut r := none
-  let task? ← eq.task.get
-  for stmt in eq.stmts, i in [0:eq.stmts.size] do
+  let tasks ← eq.tasks.get
+  for stmt in eq.stmts do
     let prove : TermElabM (Option Expr) := do
       let t0 ← IO.monoMsNow
       -- the proof started beforehand (see `startEqTasks`), unless it uses declarations of its own environment (e.g.,
@@ -692,11 +719,19 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       let env ← getEnv
       let usable (p : Expr) : Bool := !p.hasMVar && !p.hasFVar &&
         (p.find? fun e => e.isConst && !env.contains e.constName! (skipRealize := true)).isNone
-      let p ← match task?, i with
-        | some t, 0 => match ← IO.wait t with
-          | .ok (some p) => if usable p then pure (some p) else proveEqn stmt
-          | _ => proveEqn stmt
-        | _, _ => proveEqn stmt
+      let p ← match tasks.find? (·.1 == stmt) with
+        | some (_, t) => match ← traceSlow s!"wait for the equation of {eq.head}" (IO.wait t) with
+          | .ok (some p) =>
+              traceSlow "realization of the reserved names of the equation" (Local.realizeReservedNames p)
+              let env ← getEnv
+              let usable (p : Expr) : Bool := !p.hasMVar && !p.hasFVar &&
+                (p.find? fun e => e.isConst && !env.contains e.constName! (skipRealize := true)).isNone
+              if usable p then pure (some p) else
+                let missing := (p.getUsedConstants.filter (!env.contains · (skipRealize := true))).toList.take 5
+                debugLog m!"recfun: the proof of the equation of {eq.head} started beforehand uses {missing}"
+                traceSlow "blaster_rec_eqn" (proveEqn stmt)
+          | _ => traceSlow "blaster_rec_eqn" (proveEqn stmt)
+        | none => traceSlow "blaster_rec_eqn" (proveEqn stmt)
       debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for {eq.head} ({(← IO.monoMsNow) - t0} ms)"
       if p.isSome then return p
       debugLog m!"recfun: bridge tactics on the definitional equation of {eq.head}"
@@ -705,7 +740,7 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       return r
     if let some p ← (try prove catch _ => pure none) then
       -- Z3's normal forms (as in Z3's lemmas)
-      let stmt' ← z3Normalize stmt
+      let stmt' ← traceSlow "z3 normal form of the equation" (z3Normalize stmt)
       let (stmt, p) ← if stmt' == stmt then pure (stmt, p) else do
         let imp ← withLCtx {} {} <| proveWithTactic (mkForall `h .default stmt stmt')
           (← `(tactic| (intro h; simp only [smt_int_lt, smt_str_empty_lt] at h ⊢; exact h)))
@@ -717,10 +752,11 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       let p ← instantiateMVars p
       -- the proof is checked by the kernel first: an ill-typed equation fails cleanly (the theorem would only be
       -- checked asynchronously, see `Elab.async`)
-      if let some msg ← kernelError? stmt p then
+      if let some msg ← traceSlow "kernel check of the equation" (kernelError? stmt p) then
         debugLog m!"recfun: definitional equation of {eq.head} rejected by the kernel: {msg}"
         continue
-      let some c ← (try some <$> mkAuxTheorem stmt p catch _ => pure none) | continue
+      let some c ← traceSlow "auxiliary theorem of the equation" (try some <$> mkAuxTheorem stmt p catch _ => pure none)
+        | continue
       r := some (stmt, c)
       break
     debugLog m!"recfun: definitional equation not proved: {brief stmt}"
@@ -816,7 +852,7 @@ where
     let some h := lhsHead? t | return none
     for eq in ctx.eqs do
       if eq.head != h then continue
-      let some (stmt, pf) ← eq.get ctx | continue
+      let some (stmt, pf) ← traceSlow s!"definitional equation of {eq.head}" (eq.get ctx) | continue
       if let some r ← instantiateEq stmt pf t then return some r
     return none
 
@@ -831,8 +867,8 @@ def proveUnder (ctx : Ctx) (hyps : Array (Expr × Expr)) (goal : Expr) : TermEla
 def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (hyps : Array (Expr × Expr)) (l : Expr) :
     TermElabM (Option Expr) := do
   if let some (_, a, b) := l.eq? then
-    let ca ← rewriteChain ctx facts a
-    let cb ← rewriteChain ctx facts b
+    let ca ← traceSlow "rewrite chain (left)" (rewriteChain ctx facts a)
+    let cb ← traceSlow "rewrite chain (right)" (rewriteChain ctx facts b)
     if ca.size == 1 && cb.size == 1 then return none
     for (x, px) in ca do
       for (y, py) in cb do
@@ -844,13 +880,13 @@ def proveLit (ctx : Ctx) (facts : Std.HashMap Expr Expr) (hyps : Array (Expr × 
     let (x, px) := ca.back!
     let (y, py) := cb.back!
     -- Z3's normal forms in the instances of the definitions
-    let (x, px) ← match ← z3NormalizeProp x (← IO.mkRef {}) with
+    let (x, px) ← match ← traceSlow "z3 normal form" (z3NormalizeProp x (← IO.mkRef {})) with
       | some (x', p) => pure (x', ← mkEqTrans px p)
       | none => pure (x, px)
     if x == y then return some (← mkEqTrans px (← mkEqSymm py))
-    if let some p ← ctx.proveDiff x y then
+    if let some p ← traceSlow "difference" (ctx.proveDiff x y) then
       return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
-    if let some p ← proveUnder ctx hyps (← mkEq x y) then
+    if let some p ← traceSlow "under guards" (proveUnder ctx hyps (← mkEq x y)) then
       return some (← mkEqTrans (← mkEqTrans px p) (← mkEqSymm py))
     if (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
       debugLog m!"recfun: no common rewrite ({ca.size}, {cb.size} rewrites) of\n{← dagString x 6000}\nand\n{← dagString y 6000}"
@@ -939,7 +975,7 @@ def proveLemma (ctx : Ctx) (concl : Expr) (n : Nat) : TermElabM (Option Expr) :=
   let lits := disjuncts concl n
   if lits.size ≥ 1 then
     for j in (List.range lits.size).reverse do
-      if let some p ← proveByLit ctx lits concl j then return some p
+      if let some p ← traceSlow s!"recfun literal {j}/{lits.size}" (proveByLit ctx lits concl j) then return some p
   -- disjunctions of case predicates (no equality between data)
   let isDataEq (l : Expr) : TermElabM Bool := do
     let some (ty, _, _) := l.eq? | return false
@@ -947,7 +983,7 @@ def proveLemma (ctx : Ctx) (concl : Expr) (n : Nat) : TermElabM (Option Expr) :=
   if lits.size ≥ 2 && !(← lits.anyM isDataEq) then
     let atoms := guardAtoms lits
     if atoms.size ≤ 16 then
-      return ← splitProve #[] concl atoms.toList (← IO.mkRef 512)
+      return ← traceSlow "recfun case splits" (splitProve #[] concl atoms.toList (← IO.mkRef 512))
   return none
 
 end Blaster.Reconstruct.SmtProof.RecFun

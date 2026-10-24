@@ -44,6 +44,8 @@ structure ReplayConfig where
   proveDirect : Expr → TermElabM (Option Expr)
   /-- tactic proving `p₁ → ... → pₙ → c` for a step of the given rule -/
   proveStep : String → Expr → TermElabM (Option (Expr × String))
+  /-- the first of the closed goals proved (with the rules of their tactics, see `proveStep`), e.g., attempted in parallel -/
+  proveSteps? : Option (Array (String × Expr) → TermElabM (Option (Nat × Expr × String))) := none
   /-- proof of a lemma of Z3's theory of recursive functions (`th-lemma recfun`), given the interpretation
       of its clause and its number of literals (see `RecFun.lean`) -/
   proveRecFun : Expr → Nat → TermElabM (Option Expr) := fun _ _ => pure none
@@ -164,6 +166,15 @@ def traceTimed (phase : String) (x : TermElabM α) : TermElabM α := do
   let t0 ← IO.monoMsNow
   let r ← x
   log s!"{phase}: {(← IO.monoMsNow) - t0} ms"
+  return r
+
+/-- `traceTimed` for the phases taking at least `minMs` milliseconds, of which only the end is written. -/
+def traceSlow (phase : String) (x : TermElabM α) (minMs := 200) : TermElabM α := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" | x
+  let t0 ← IO.monoMsNow
+  let r ← x
+  let ms := (← IO.monoMsNow) - t0
+  if ms ≥ minMs then (← IO.FS.Handle.mk f .append).putStrLn s!"    {phase}: {ms} ms"
   return r
 
 /-- Debugging output (environment variable `BLASTER_SMTPROOF_DEBUG`: file receiving the failures of the steps;
@@ -299,17 +310,24 @@ def mkOrInjWith (lits sfx : Array Expr) (i : Nat) (p : Expr) : Expr := Id.run do
 def mkOrInj (lits : Array Expr) (i : Nat) (p : Expr) : MetaM Expr :=
   return mkOrInjWith lits (orSuffixes lits) i p
 
-/-- Case analysis on a proof `d` of the disjunction of `lits`: `k i hᵢ` builds a proof of `goal`
-    from a proof `hᵢ` of the `i`-th literal. -/
-partial def orElim (lits : Array Expr) (d : Expr) (goal : Expr) (k : Nat → Expr → MetaM Expr) (start := 0) : MetaM Expr := do
+/-- Case analysis on a proof `d` of the disjunction of `lits`: `k i hᵢ` builds a proof of `goal` from a proof `hᵢ` of
+    the `i`-th literal, given as a loose bound variable (to be used as is, e.g., in applications): the cases are built
+    under their binders without abstraction, i.e., without traversing the literals again at each case (quadratic on the
+    large clauses of CEK evaluations, a third of their replays). -/
+def orElim (lits : Array Expr) (d : Expr) (goal : Expr) (k : Nat → Expr → MetaM Expr) : MetaM Expr := do
   -- empty clause: `d : False`
-  if start ≥ lits.size then return mkApp2 (Lean.mkConst ``False.elim [← getLevel goal]) goal d
-  if lits.size - start == 1 then return ← k start d
-  let a := lits[start]!
-  let b := (lits.extract (start+1) lits.size).pop.foldr mkOr lits.back!
-  let left ← withLam `h a fun h => k start h
-  let right ← withLam `h b fun h => orElim lits h goal k (start+1)
-  return mkApp6 (Lean.mkConst ``Or.elim) a b goal d left right
+  if lits.isEmpty then return mkApp2 (Lean.mkConst ``False.elim [← getLevel goal]) goal d
+  let sfx := orSuffixes lits
+  -- the case analysis of the suffix `i` on its proof `bvar 0`, from the last literal
+  let n := lits.size
+  let mut inner ← k (n - 1) (.bvar 0)
+  let mut i := n - 1
+  while i > 0 do
+    i := i - 1
+    let left := Expr.lam `h lits[i]! (← k i (.bvar 0)) .default
+    let right := Expr.lam `h sfx[i+1]! inner .default
+    inner := mkApp6 (Lean.mkConst ``Or.elim) lits[i]! sfx[i+1]! goal (.bvar 0) left right
+  return inner.instantiate1 d
 
 /-- Given a proof `d` of a clause with literals `lits`, refutations of some literals and the target
     clause `target`, build a proof of `target` (each literal is either refuted or occurs in `target`). -/
@@ -528,6 +546,16 @@ def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Opt
   -- NOTE: let-bound variables are abstracted as `let`s (not applied)
   let args ← fvs.filterM fun x => return !(← x.fvarId!.getDecl).isLet
   return some (mkAppN pf args, m)
+
+/-- The first of the goals `gs` (with the rules of their tactics) proved by `proveClosed`, with its index (attempted in
+    parallel with `cfg.proveSteps?` when the goals are closed). -/
+def proveClosedFirst (cfg : ReplayConfig) (gs : Array (String × Expr)) : TermElabM (Option (Nat × Expr × String)) := do
+  if let some proveSteps := cfg.proveSteps? then
+    if gs.size > 1 && gs.all fun (_, g) => !g.hasFVar && !g.hasMVar then
+      return ← withLCtx {} {} (proveSteps gs)
+  for (rule, g) in gs, i in [0:gs.size] do
+    if let some (p, m) ← proveClosed cfg rule g then return some (i, p, m)
+  return none
 
 /-- The results of the tactics on the closed generalizations of the local differences (see `localProof`), per rule:
     the same generalization over other subterms (e.g., in the steps of a CEK evaluation, a third of the
@@ -963,6 +991,18 @@ def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array 
 /-- The steps being replayed (innermost last), written to the file given by `BLASTER_SMTPROOF_CURRENT` (if set)
     when a step starts, e.g., to locate a step that takes long (the modification time of the file). -/
 initialize currentSteps : IO.Ref (Array String) ← IO.mkRef #[]
+
+/-- Debugging: the goals proved by tactics in at least 200 ms, with the method (environment variable
+    `BLASTER_SMTPROOF_SLOWGOALS`: file receiving them). -/
+def slowGoal (g : Expr) (what : String) (x : ReplayM (Option (Expr × String))) : ReplayM (Option (Expr × String)) := do
+  let some f ← IO.getEnv "BLASTER_SMTPROOF_SLOWGOALS" | x
+  let t0 ← IO.monoMsNow
+  let r ← x
+  let ms := (← IO.monoMsNow) - t0
+  if ms ≥ 200 then
+    let s ← if Local.sizeLe g 5000 then pure (toString (← ppExpr g)) else dagString g
+    (← IO.FS.Handle.mk f .append).putStrLn s!"=== {what} ({(r.map (·.2)).getD "failed"}): {ms} ms\n{s.take 8000}\n"
+  return r
 
 mutual
 
@@ -1611,18 +1651,20 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
   if step.rule == "th-lemma" then
     -- the parts of the statement: premises and literals of the conclusion
     let parts := ps.map (·.1) ++ disjuncts concl (clauseSize step.concl)
-    if parts.size ≥ 2 then
-      let restE := (parts.extract 1 parts.size).foldl (fun acc l => mkAnd acc l) (mkConst ``True)
-      if let some (g, vals) ← Local.generalizeCommon stmt restE parts[0]! then
-        if let some (pf, method) ← timed "datatype" (proveClosed cfg "datatype" g) then
-          record step.rule s!"{method} (common)"
-          return applyPremises (mkAppN pf vals)
-        if (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then debugLog m!"th-lemma (common) failed: {← dagString g}"
-    -- datatype lemmas relating different terms (e.g., `¬ is-nil a → ¬ is-cons b → a = b → False`)
-    if let some (g, vals) ← Local.generalizeDatatypeAtoms stmt then
-      if let some (pf, method) ← timed "datatype" (proveClosed cfg "datatype" g) then
-        record step.rule s!"{method} (datatype atoms)"
+    -- the generalization of the subterms common to the literals, and the one of the datatype atoms relating different
+    -- terms (e.g., `¬ is-nil a → ¬ is-cons b → a = b → False`), attempted together
+    let restE := (parts.extract 1 parts.size).foldl (fun acc l => mkAnd acc l) (mkConst ``True)
+    let common? ← if parts.size ≥ 2 then Local.generalizeCommon stmt restE parts[0]! else pure none
+    let atoms? ← Local.generalizeDatatypeAtoms stmt
+    let gens := (common?.toArray.map ("common", ·)) ++ (atoms?.toArray.map ("datatype atoms", ·))
+    if !gens.isEmpty then
+      let r ← timed "datatype" (proveClosedFirst cfg (gens.map fun (_, g, _) => ("datatype", g)))
+      if let some (k, pf, method) := r then
+        let (what, _, vals) := gens[k]!
+        record step.rule s!"{method} ({what})"
         return applyPremises (mkAppN pf vals)
+      if (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
+        if let some (g, _) := common? then debugLog m!"th-lemma (common) failed: {← dagString g}"
     -- arithmetic lemmas over large atoms: the atoms are generalized
     if stmt.approxDepth.toNat > 8 then
       if let some (g, vals) ← Local.generalizeAtoms stmt then

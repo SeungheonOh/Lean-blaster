@@ -85,10 +85,21 @@ def catchInterrupt (x h : CoreM α) : CoreM α := fun ctx s => do
   try x ctx s catch ex => if ex.isInterrupt then h ctx s else throw ex
 
 /-- `x` interrupted after `ms` milliseconds (checked by `checkSystem`, e.g., in `whnf`, `isDefEq` and `simp`):
-    `none` when interrupted, with the state restored. -/
+    `none` when interrupted, with the state restored. It is also interrupted when the cancellation token of the context
+    is set (e.g., the attempts of a parallel portfolio, see `SmtProof.portfolioPar`). -/
 def withTimeLimit (ms : Nat) (x : TermElabM (Option α)) : TermElabM (Option α) := do
   let tk ← IO.CancelToken.new
-  let _ ← IO.asTask (prio := .dedicated) do IO.sleep ms.toUInt32; tk.set
+  let outer? := (← readThe Core.Context).cancelTk?
+  let finished ← IO.mkRef false
+  let deadline := (← IO.monoMsNow) + ms
+  let _ ← IO.asTask (prio := .dedicated) do
+    repeat
+      let now ← IO.monoMsNow
+      if now ≥ deadline || (← finished.get) then break
+      if let some outer := outer? then
+        if ← outer.isSet then break
+      IO.sleep (min 10 (deadline - now)).toUInt32
+    tk.set
   let s ← saveState
   let info ← getInfoState
   let tasks := (← getThe Core.State).snapshotTasks
@@ -97,8 +108,10 @@ def withTimeLimit (ms : Nat) (x : TermElabM (Option α)) : TermElabM (Option α)
     setInfoState info
     modifyThe Core.State fun st => { st with snapshotTasks := tasks }
     return none
-  controlAt CoreM fun runInBase =>
-    catchInterrupt (withReader (fun ctx => { ctx with cancelTk? := some tk }) (runInBase x)) (runInBase interrupted)
+  try
+    controlAt CoreM fun runInBase =>
+      catchInterrupt (withReader (fun ctx => { ctx with cancelTk? := some tk }) (runInBase x)) (runInBase interrupted)
+  finally finished.set true
 
 /-- Implementation of `dependsOnSorry`.
     NOTE: Each expression is traversed by the native `Expr.findExt?` (whose cache of visited shared subterms is
@@ -106,6 +119,7 @@ def withTimeLimit (ms : Nat) (x : TermElabM (Option α)) : TermElabM (Option α)
     current module being recorded on the fly.
 -/
 unsafe def dependsOnSorryImpl (env : Environment) (prf : Expr) (checked : Array (Name × Expr)) : BaseIO Bool := do
+  let checkedValues : Std.HashMap Name Expr := checked.foldl (fun m (n, v) => m.insert n v) {}
   let found ← IO.mkRef (#[] : Array Name)
   let step (s : Expr) : Expr.FindStep :=
     match s with
@@ -126,7 +140,7 @@ unsafe def dependsOnSorryImpl (env : Environment) (prf : Expr) (checked : Array 
       let some info := env.find? c | continue
       let value? := info.value? (allowOpaque := true)
       if let some v := value? then
-        if checked.any fun (n, v') => n == c && ptrEq v v' then continue
+        if checkedValues.get? c |>.any (ptrEq v ·) then continue
         todo := todo.push v
       todo := todo.push info.type
   return false
