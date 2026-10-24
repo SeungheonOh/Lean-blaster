@@ -60,28 +60,36 @@ def hasHoles (e : Expr) : Bool :=
 def mkFallback (p : Expr) : Expr :=
   if hasHoles p then mkMData (KVMap.empty.insert fallbackKey (.ofBool true)) p else p
 
-/-- The proofs without proof obligations found by `mkFallbackM` (by address, the proofs being kept alive), cleared at the
-    start and end of each proof run (see `clearHoleFreeProofs`). -/
-initialize holeFreeProofs : IO.Ref (Std.HashMap USize Expr) ← IO.mkRef {}
+/-- Implementation of `hasHolesIn`. -/
+unsafe def hasHolesInImpl (free : Std.HashMap USize Expr) (p : Expr) : Bool :=
+  (p.findExt? fun s =>
+    if free.contains (ptrAddrUnsafe s) then .done else if (isHole? s).isSome then .found else .visit).isSome
 
-def clearHoleFreeProofs : IO Unit := holeFreeProofs.set {}
+/-- Same as `hasHoles`, skipping the subproofs of `free` (by address). -/
+@[implemented_by hasHolesInImpl]
+opaque hasHolesIn (free : Std.HashMap USize Expr) (p : Expr) : Bool
 
-/-- Implementation of `hasHolesMemo`. -/
-unsafe def hasHolesMemoImpl (p : Expr) : BaseIO Bool := do
-  let free ← holeFreeProofs.get
-  let found := p.findExt? fun s =>
-    if free.contains (ptrAddrUnsafe s) then .done else if (isHole? s).isSome then .found else .visit
-  if found.isNone then holeFreeProofs.modify (·.insert (ptrAddrUnsafe p) p)
-  return found.isSome
+/-- Implementation of `insertHoleFree`. -/
+unsafe def insertHoleFreeImpl (free : Std.HashMap USize Expr) (p : Expr) : Std.HashMap USize Expr :=
+  free.insert (ptrAddrUnsafe p) p
 
-/-- Same as `hasHoles`, skipping the subproofs found without proof obligations before (see `holeFreeProofs`), e.g., the
-    congruences of the nested `match` applications, the congruence of each `match` containing the ones of the
+/-- `free` with the proof `p` (by address). -/
+@[implemented_by insertHoleFreeImpl]
+opaque insertHoleFree (free : Std.HashMap USize Expr) (p : Expr) : Std.HashMap USize Expr
+
+/-- Same as `hasHoles`, skipping the subproofs found without proof obligations before (see `ReconEnv.holeFree`), e.g.,
+    the congruences of the nested `match` applications, the congruence of each `match` containing the ones of the
     alternatives (a quadratic traversal otherwise). -/
-@[implemented_by hasHolesMemoImpl]
-opaque hasHolesMemo (p : Expr) : BaseIO Bool
+def hasHolesMemo (p : Expr) : TranslateEnvT Bool := do
+  -- NOTE: the set is taken out of the state, such that it is updated in place
+  let free ← modifyGet fun env => (env.recon.holeFree, { env with recon.holeFree := {} })
+  let found := hasHolesIn free p
+  let free := if found then free else insertHoleFree free p
+  modify fun env => { env with recon.holeFree := free }
+  return found
 
 /-- Same as `mkFallback` (see `hasHolesMemo`). -/
-def mkFallbackM (p : Expr) : BaseIO Expr := do
+def mkFallbackM (p : Expr) : TranslateEnvT Expr := do
   return if ← hasHolesMemo p then mkMData (KVMap.empty.insert fallbackKey (.ofBool true)) p else p
 
 /-- Return a short description of the head symbol of `e` (used to label proof obligations). -/
@@ -702,9 +710,21 @@ def addArgEvidence
 def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT EqPf := do
   match pf with
   | .depArgs pre pargs =>
-      let some r ← tryInLocalContext (resolve pargs) | return .unknown
+      -- NOTE: without proof obligations in the evidence of the alternatives of a `match` application (which may use the
+      -- equalities of the match context), its congruence may be built without case split (see `mkMatchCongrByAlts?`)
+      let noHoles ← pargs.allM fun (_, _, p) => match p with
+        | .matchAlt q => return !(← hasHolesMemo q)
+        | _ => return true
+      let congrs := (← get).recon.matchCongrs
+      let some r ← tryInLocalContext (resolve pargs noHoles congrs) | return .unknown
       match r with
-      | some p => pre.trans (.proof p)
+      | some (p, isMatch, entry?) =>
+          if let some (key, q) := entry? then
+            modify fun env => { env with recon.matchCongrs := env.recon.matchCongrs.insert key q }
+          -- NOTE: the congruence of a `match` application is a fallback region, i.e., it is replaced with the coarse
+          -- proof obligation `lhs = f args` when one of the obligations of the alternatives is not discharged
+          let p ← if isMatch then mkFallbackM p else pure p
+          pre.trans (.proof p)
       | none => return .unknown
   | _ => return pf
 
@@ -713,7 +733,11 @@ def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT Eq
     argPf (pargs : Array (Nat × Expr × EqPf)) (i : Nat) : Expr × EqPf :=
       pargs.foldl (fun acc (j, a, p) => if i == j then (a, p) else acc) (args[i]!, .defeq)
 
-    resolve (pargs : Array (Nat × Expr × EqPf)) : MetaM (Option Expr) := do
+    /-- The proof, whether it is the congruence of a `match` application, and the new entry of the cache of the
+        congruences `congrs` (see `mkMatchCongr`). -/
+    resolve (pargs : Array (Nat × Expr × EqPf)) (noHoles : Bool)
+        (congrs : MatchCongrs) :
+        MetaM (Option (Expr × Bool × Option ((Expr × Array Expr × Array (Option Expr)) × Expr))) := do
       match f with
       | .const ``Blaster.dite' us =>
           -- extra arguments (i.e., function-valued dite') are expected to be unchanged
@@ -726,7 +750,7 @@ def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT Eq
           let some he ← branchPf pe args[3]! (mkNot c') | return none
           let p := mkAppN (mkConst ``Blaster.Reconstruct.dite'_congr us)
                      #[args[0]!, c, args[1]!, t, e, args[2]!, args[3]!, hc, ht, he]
-          some <$> (args.extract 4 args.size).foldlM (init := p) fun acc a => mkCongrFun acc a
+          return some (← (args.extract 4 args.size).foldlM (init := p) fun acc a => mkCongrFun acc a, false, none)
       | .const _ _ =>
           let lhs := mkAppN f (pargs.foldl (fun acc (i, a, _) => acc.set! i a) args)
           let some app ← matchMatcherApp? lhs (alsoCasesOn := true) | return none
@@ -740,9 +764,9 @@ def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT Eq
             | .defeq => altPfs := altPfs.push none
             | .matchAlt p => altPfs := altPfs.push (some p)
             | _ => return none
-          -- NOTE: the congruence is a fallback region, i.e., it is replaced with the coarse proof
-          -- obligation `lhs = f args` when one of the obligations of the alternatives is not discharged.
-          return some (← mkFallbackM (← mkMatchCongr lhs (args.extract firstAlt (firstAlt + app.alts.size)) altPfs))
+          let alts' := args.extract firstAlt (firstAlt + app.alts.size)
+          let (p, cacheable) ← mkMatchCongr lhs alts' altPfs noHoles congrs
+          return some (p, true, if cacheable then some ((lhs, alts', altPfs), p) else none)
       | _ => return none
 
     /-- Return a proof of `∀ h : τ, b (_ : orig) = b' h` for a dite' branch rewritten to `b'`.

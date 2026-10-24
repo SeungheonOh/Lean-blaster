@@ -18,14 +18,13 @@ under which the alternatives are optimized (see `Blaster.Optimize.optimizeMatchA
 `casesOn` applications are handled in the same way, except that the alternatives are reduced by iota.
 -/
 
+/-- The congruences of `match` applications built by `mkMatchCongr`, by the application, the new alternatives and their
+    evidence (structural equality). -/
+abbrev MatchCongrs := Std.HashMap (Expr × Array Expr × Array (Option Expr)) Expr
+
 /-- Matchers for which the generation of the match equations and splitter failed. -/
 initialize matchEqnsFailures : IO.Ref NameSet ← IO.mkRef {}
 
-/-- The congruences of `match` applications built so far (see `mkMatchCongr`), cleared by `clearMatchCongrCache`. -/
-initialize matchCongrCache : IO.Ref (Std.HashMap (Expr × Array Expr × Array (Option Expr)) Expr) ← IO.mkRef {}
-
-/-- Clear the congruences of `match` applications built so far (see `mkMatchCongr`). -/
-def clearMatchCongrCache : IO Unit := matchCongrCache.set {}
 
 /-- The match equations generated so far (see `getEquationsFor?`). -/
 initialize matchEqnsCache : IO.Ref (Std.HashMap Name Match.MatchEqns) ← IO.mkRef {}
@@ -368,24 +367,106 @@ def mkMatchCasesProof {n} [MonadLiftT MetaM n] [MonadControlT MetaM n] [Monad n]
       liftMetaM (mkEqTrans pLhs pAlt))
   return app'.toExpr
 
+/-- `p` without its `m` binders following its first `n` binders (i.e., `fun xs ys => b` as `fun xs => b`), when they don't
+    occur in its body. -/
+def dropUnusedBinders? (p : Expr) (n m : Nat) : Option Expr :=
+  match n, p with
+  | n + 1, .lam x d b bi => (dropUnusedBinders? b n m).map fun b' => .lam x d b' bi
+  | 0, _ => strip p m
+  | _, _ => none
+where
+  strip (e : Expr) : Nat → Option Expr
+    | 0 => if (List.range m).any e.hasLooseBVar then none else some (e.lowerLooseBVars m m)
+    | k + 1 => match e with
+      | .lam _ _ b _ => strip b k
+      | _ => none
+
+/-- Proof of `f = g` from `pf := fun x₁ ... xₖ => b` with `b : f x₁ ... xₖ = g x₁ ... xₖ`, where `ty := ∀ x₁ ... xₖ, R` is the
+    type of `f` and `g`: nested applications of `funext`, built under the binders of `pf` (no abstraction of its body). -/
+partial def mkFunExtN (f g pf ty : Expr) (k : Nat) : MetaM Expr := do
+  let lvls ← forallBoundedTelescope ty k fun xs r => do
+    if xs.size != k then throwError "mkFunExtN: {k} binders expected"
+    (Array.range k).mapM fun j => do
+      return (← getLevel (← inferType xs[j]!), ← getLevel (← mkForallFVars (xs.extract (j + 1) k) r))
+  let rec go (j : Nat) (pf ty : Expr) : MetaM Expr := do
+    if j == k then return pf
+    let .lam n d b bi := pf | throwError "mkFunExtN: lambda expected"
+    let .forallE n' a b' bi' := ty | throwError "mkFunExtN: forall expected"
+    let inner ← go (j + 1) b b'
+    -- the binders of the enclosing applications of `funext`
+    let vs := (Array.range j).reverse.map mkBVar
+    let (u, v) := lvls[j]!
+    return mkApp5 (mkConst ``funext [u, v]) a (.lam n' a b' bi') (mkAppN f vs) (mkAppN g vs) (.lam n d inner bi)
+  go 0 pf ty
+
+/-- `mkMatchCongr` by congruence on the alternatives (`congr`, `funext`), when the evidence of the alternatives doesn't use
+    the equalities between the discriminants and the patterns, nor has proof obligations (`noHoles`, which may use them):
+    no case split (i.e., no instance of the splitter and of the match equations of the alternatives). -/
+def mkMatchCongrByAlts? (app : MatcherApp) (alts' : Array Expr) (altPfs : Array (Option Expr)) : MetaM (Option Expr) := do
+  if app.alts.size != alts'.size || app.alts.size != altPfs.size || app.altNumParams.size != altPfs.size then
+    return none
+  let nDiscrs := app.discrs.size
+  -- the evidence of the alternatives without the equalities
+  let mut pfs := #[]
+  for p? in altPfs, n in app.altNumParams do
+    match p? with
+    | none => pfs := pfs.push none
+    | some p =>
+        if p.hasMVar then return none
+        let some p' := dropUnusedBinders? p n nDiscrs | return none
+        pfs := pfs.push (some p')
+  let f := mkAppN (mkConst app.matcherName app.matcherLevels.toList) (app.params ++ #[app.motive] ++ app.discrs)
+  let mut ty ← inferType f
+  let mut lhs := f
+  let mut rhs := f
+  -- `lhs = rhs` (`none`: the same alternatives so far)
+  let mut cur : Option Expr := none
+  for i in [:app.alts.size] do
+    ty ← whnfD ty
+    let .forallE _ a b _ := ty | return none
+    if b.hasLooseBVars then return none
+    let alt := app.alts[i]!
+    let alt' := alts'[i]!
+    let e? ← match pfs[i]! with
+      | some p => pure (some (← mkFunExtN alt alt' p a app.altNumParams[i]!))
+      | none => if alt == alt' then pure none else pure (some (← mkEqRefl alt))
+    let u ← getLevel a
+    let v ← getLevel b
+    cur := match cur, e? with
+      | none, none => none
+      | none, some e => some (mkApp6 (mkConst ``congrArg [u, v]) a b alt alt' lhs e)
+      | some c, none => some (mkApp6 (mkConst ``congrFun [u, v]) a (.lam `_ a b .default) lhs rhs c alt)
+      | some c, some e => some (mkAppN (mkConst ``congr [u, v]) #[a, b, lhs, rhs, alt, alt', c, e])
+    lhs := mkApp lhs alt
+    rhs := mkApp rhs alt'
+    ty := b
+  match cur with
+  | some p => return some p
+  | none => return some (← mkEqRefl lhs)
+
 /-- Given evidence for each alternative of a match application `m := matcher ps motive ds alts`,
     return a proof of `m = matcher ps motive ds alts'`. The evidence `altPfs[i]` for alternative `i` is:
       - `none` when `altᵢ` and `alt'ᵢ` are definitionally equal;
       - `some p` with `p : ∀ args (h₁ : d₁ = pᵢ₁) ... (hₙ : dₙ = pᵢₙ), altᵢ args = alt'ᵢ args`.
 -/
-def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) : MetaM Expr := do
+def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) (noHoles := false)
+    (cache : MatchCongrs := {}) : MetaM (Expr × Bool) := do
   -- NOTE: the optimizer may justify the same rewrite of a `match` application several times (e.g., about a third of
   -- the congruences of a CEK evaluation), the congruences are reused when they are well-scoped
-  let key := (m, alts', altPfs)
-  if let some p := (← matchCongrCache.get)[key]? then
+  -- (`cache`, the result telling whether the congruence may be added to it, i.e., whether it is new and has no metavariable)
+  if let some p := cache[(m, alts', altPfs)]? then
     let lctx ← getLCtx
-    if !p.hasAnyFVar (!lctx.contains ·) then return p
+    if !p.hasAnyFVar (!lctx.contains ·) then return (p, false)
   let some app ← matchMatcherApp? m (alsoCasesOn := true)
     | throwError "mkMatchCongr: match application expected"
+  -- extra arguments (i.e., match returning a function) are handled via `congrFun`
+  if noHoles then
+    if let some p ← (try mkMatchCongrByAlts? app alts' altPfs catch _ => pure none) then
+      let p ← app.remaining.foldlM (init := p) fun acc a => mkCongrFun acc a
+      return (p, true)
   let isCasesOn := isCasesOnRecursor (← getEnv) app.matcherName
   let mkM (discrs : Array Expr) (alts : Array Expr) : Expr :=
     mkAppN (mkConst app.matcherName app.matcherLevels.toList) (app.params ++ #[app.motive] ++ discrs ++ alts)
-  -- extra arguments (i.e., match returning a function) are handled via `congrFun`
   let p ← mkMatchCasesProof (mkM app.discrs app.alts) (fun xs => pure (mkM xs alts'))
     (fun altIdx args hs _alt rhs => do
       -- `rhs := matcher ps motive pats alts'`
@@ -397,8 +478,7 @@ def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) 
       | some p => mkEqTrans (mkAppN p (args ++ hs)) pRhs)
   let p ← app.remaining.foldlM (init := p) fun acc a => mkCongrFun acc a
   let p ← instantiateMVars p
-  if !p.hasMVar then matchCongrCache.modify (·.insert key p)
-  return p
+  return (p, !p.hasMVar)
 
 /-- Given the applications `m := matcher ps motive ds alts` and `m' := matcher' ps' motive ds alts` of two matchers with the
     same patterns (e.g., the generated matchers of two functions matching on the same patterns, see

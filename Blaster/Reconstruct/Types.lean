@@ -1,4 +1,5 @@
 import Lean
+import Blaster.Reconstruct.Match
 
 open Lean
 
@@ -128,6 +129,14 @@ structure ReconEnv where
       `e = optimize(e)` (see `stackContinuity`).
   -/
   resultPf : EqPf := .unknown
+
+  /-- The proofs found without proof obligations by `hasHolesMemo` (by address, the proofs being kept alive).
+      NOTE: in the state of the proof run rather than in a global reference, whose values are marked as shared between
+      threads (the proofs, i.e., atomic reference counting), and updated in place. -/
+  holeFree : Std.HashMap USize Expr := {}
+
+  /-- The congruences of `match` applications built so far (see `mkMatchCongr`). -/
+  matchCongrs : MatchCongrs := {}
 
 instance : Inhabited ReconEnv := ⟨{}⟩
 

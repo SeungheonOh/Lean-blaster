@@ -80,9 +80,7 @@ def Translate.mainWithTaskSpec {α : Type} (e : Expr) (logUndetermined := true)
         -- NOTE: the proof run starts with an empty hash-consing cache, i.e., `e'` must be hash-consed
         -- such that structural equality checks (e.g., on literals) remain valid.
         (some <$> Reconstruct.withProfile "proofRun" (do
-            Reconstruct.clearMatchCongrCache; Reconstruct.clearHoleFreeProofs
-            try (Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv
-            finally Reconstruct.clearMatchCongrCache; Reconstruct.clearHoleFreeProofs))
+            (Optimize.mainPf e' (track := true) (applyHashCons := true)).run proofEnv))
         (fun _ => do s.restore; return none)
     -- `run?`: the result of the proof run when performed beforehand (see `Solve` below)
     let mkTask (bySmt : Bool) (run? : Option (Option ((Expr × Reconstruct.EqPf) × TranslateEnv)) := none) :
@@ -94,7 +92,7 @@ def Translate.mainWithTaskSpec {α : Type} (e : Expr) (logUndetermined := true)
       match r with
       | some ((optExprP, optPf), envP) =>
           return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr := optExprP, optPf,
-                        bySmt, recon := envP.recon, smtProof := sOpts.smtProof,
+                        bySmt, recon := { envP.recon with holeFree := {}, matchCongrs := {} }, smtProof := sOpts.smtProof,
                         randomSeed := sOpts.randomSeed, timeout := sOpts.timeout }
       | none =>
           return some { goal, axioms := axioms.map Prod.fst, fullGoal := e', optExpr, optPf := .unknown, bySmt }
