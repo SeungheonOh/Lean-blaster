@@ -385,7 +385,13 @@ def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := 
   let tacs := (tacs.zipIdx.qsort fun ((n₁, _), i₁) ((n₂, _), i₂) => score n₁ i₁ > score n₂ i₂).map (·.1)
   for (name, tac) in tacs do
     let start ← IO.monoMsNow
-    let r ← proveWithTactic goal tac
+    let deadline ← Local.portfolioDeadline.get
+    if let some d := deadline then
+      if start ≥ d then return none
+    -- NOTE: a tactic running past the deadline is interrupted
+    let r ← match deadline with
+      | some d => withTimeLimit (d - start) (proveWithTactic goal tac)
+      | none => proveWithTactic goal tac
     let ms := (← IO.monoMsNow) - start
     let succ := if r.isSome then 1 else 0
     tacticStats.modify fun m => let (a, b) := m.getD (rule, name) (0, 0); m.insert (rule, name) (a + succ, b + ms)

@@ -203,6 +203,7 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let cmds := cmds.map guardNatQuantifiers
     -- 3.-4. interpretation and replay of the proof `sproof` of `backend`
     let replayWith (backend : Backend) (sproof : Proof) (recPairs : Array RecFun.Pair) : TermElabM SmtProofResult := do
+      clearLocalCache
       -- 3. interpretation
       -- SMT constants of the free variables of the goal (the introduced variables, as well as the
       -- variables of the local context, e.g., section variables)
@@ -253,7 +254,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           let run : TermElabM (Option Expr) := do return (← portfolio bridge stmt "bridge").map (·.1)
           if stmt.hasFVar then run else withLCtx {} {} run)
         (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
-        (fun a b => do Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite") (← IO.mkRef 6) a b)
+        (fun a b => do
+          let largeStep := !(Local.sizeLe a 20000 && Local.sizeLe b 20000)
+          Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite" largeStep) (← IO.mkRef 6) a b)
       let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
       let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
         let cfg : ReplayConfig := {

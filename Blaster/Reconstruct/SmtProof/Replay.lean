@@ -525,10 +525,56 @@ def proveClosed (cfg : ReplayConfig) (rule : String) (g : Expr) : TermElabM (Opt
   let args ← fvs.filterM fun x => return !(← x.fvarId!.getDecl).isLet
   return some (mkAppN pf args, m)
 
+/-- The results of the tactics on the closed generalizations of the local differences (see `localProof`), per rule:
+    the same generalization over other subterms (e.g., in the steps of a CEK evaluation, a third of the
+    generalizations) is proved (or not) once. Cleared at the start of each replay (see `clearLocalCache`). -/
+initialize localCache : IO.Ref (Std.HashMap (String × Expr) (Option (Expr × String))) ← IO.mkRef {}
+
+def clearLocalCache : IO Unit := localCache.set {}
+
+/-- `x`, the tactics on the closed generalization `g` of a local difference within the time budget `budget?` (if any),
+    with its result cached (see `localCache`).
+    NOTE: failures due to the time budget are not cached (e.g., an attempt of a prepass under load), nor proofs using
+    declarations of the current module (e.g., auxiliary lemmas of tactics, which a backtracking may remove from the
+    environment). -/
+def cachedLocal (rule : String) (g : Expr) (budget? : Option Nat) (x : TermElabM (Option (Expr × String))) :
+    TermElabM (Option (Expr × String)) := do
+  if g.hasFVar || g.hasMVar then return ← x
+  if let some r := (← localCache.get)[(rule, g)]? then return r
+  let start ← IO.monoMsNow
+  let r ← x
+  if r.isNone && budget?.any ((← IO.monoMsNow) - start ≥ ·) then return r
+  let env ← getEnv
+  let local? := r.any fun (p, _) => (p.find? fun e => match e with
+    | .const n _ => (env.getModuleIdxFor? n).isNone
+    | _ => false).isSome
+  if !local? then localCache.modify (·.insert (rule, g) r)
+  return r
+
 /-- Proof of a local difference `∀ hs, l = r` of a step (see `Local.diffEq`, `hs` are hypotheses of the
     context of the difference): definitional equality, then the propositional engine and tactics on the
     statement with the subterms common to `l` and `r` generalized. -/
-def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Option Expr) := do
+def localProof (cfg : ReplayConfig) (rule : String) (largeStep : Bool) (eq : Expr) : TermElabM (Option Expr) := do
+  -- NOTE: the tactics on the local differences of large terms are bounded in time (environment variable
+  -- `BLASTER_SMTPROOF_LOCAL_MS`, default 1000 ms, and half of it for the lossless generalization; a tactic running past
+  -- the deadline is interrupted), with `largeStep` (the differences of large steps): on the CEK terms of validators, the
+  -- differences proved take at most a few hundred ms (about 80 ms for the lossless ones), while the ones not proved
+  -- (e.g., Z3's normal forms of nested integer divisions, whose step is then proved otherwise) took up to 17 s each. The
+  -- other differences of large terms are only bounded against runaway attempts, at 120 times the budget (e.g., the
+  -- polynomial normal forms of the steps of nonlinear goals are proved after more than 10 s, while a difference of the
+  -- same tests did not terminate), and the ones of small terms are not bounded.
+  if Local.sizeLe eq 2000 then return ← localProofCore cfg rule eq none
+  let budget := ((← IO.getEnv "BLASTER_SMTPROOF_LOCAL_MS").bind String.toNat?).getD 1000
+  let budget := if largeStep then budget else 120 * budget
+  localProofCore cfg rule eq (some (budget, budget / 2))
+where
+  /-- the tactics on the local difference, with the time budgets of the two generalizations (if any) -/
+  bounded {α : Type} (b : Option Nat) (x : TermElabM α) : TermElabM α :=
+    match b with
+    | some ms => Local.withPortfolioDeadline ms x
+    | none => x
+  localProofCore (cfg : ReplayConfig) (rule : String) (eq : Expr) (budgets : Option (Nat × Nat)) :
+      TermElabM (Option Expr) := do
   -- NOTE: `l` and `r` don't depend on the hypotheses
   let some (l, r) ← forallTelescope eq fun _ body => pure (body.eq?.map fun (_, l, r) => (l, r)) | return none
   if l.hasLooseBVars || r.hasLooseBVars then return none
@@ -549,18 +595,27 @@ def localProof (cfg : ReplayConfig) (rule : String) (eq : Expr) : TermElabM (Opt
     | some p => some <$> mkLambdaFVars zs p
     | none => pure none
   if let some pp := pp? then return some (mkAppN pp vals)
-  let mut res ← proveClosed cfg rule g
+  -- NOTE: no tactic on a generalization refuted by its small instances (e.g., the common subterms of the two sides
+  -- generalized as the same variable, while their relations make the difference hold)
+  let mut res : Option (Expr × String) := none
+  if !(← Local.refuted g) then
+    res ← cachedLocal rule g (budgets.map (·.1)) (bounded (budgets.map (·.1)) (proveClosed cfg rule g))
   let t2 ← IO.monoMsNow
   -- the generalization without loss of the relations between the generalized subterms (see `Local.commonSubterms`)
   let mut vals := vals
   let mut lossless := ""
-  if res.isNone then
+  -- NOTE: not when the tactics ran out of time on the generalization (on CEK evaluations, the lossless generalization of
+  -- such a difference was never proved, e.g., normal forms of nested divisions, while it cost half the budget again)
+  let timedOut := budgets.any fun (b, _) => t2 - t1 ≥ b
+  if res.isNone && !timedOut then
     if let some (g', vals') ← Local.generalizeCommon eq l r (lossless := true) then
-      if g' != g then
+      if g' != g && !(← Local.refuted g') then
         let t3 ← IO.monoMsNow
-        res ← proveClosed cfg rule g'
+        res ← cachedLocal rule g' (budgets.map (·.2)) (bounded (budgets.map (·.2)) (proveClosed cfg rule g'))
         vals := vals'
         lossless := s!", lossless: generalization {t3 - t2} ms, tactics {(← IO.monoMsNow) - t3} ms"
+        if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome && res.isNone then
+          lossless := lossless ++ s!" (lossless statement: {(toString (← ppExpr g')).take 1500})"
   if res.isNone && (← IO.getEnv "BLASTER_SMTPROOF_DEBUG").isSome then
     debugLog m!"local difference not proved:\n{← dagString eq 8000}"
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
@@ -1310,20 +1365,28 @@ partial def replayCongr (step : Step) (concl : Expr) : ReplayM Expr := do
   if let some pf ← congrDescent eqs l r 64 then
     record step.rule "exact"
     return pf
-  let mut cur := l
-  let mut pf ← mkEqRefl l
-  for (t, p) in ps do
-    let some (_, a, b) := t.eq? | throwError "monotonicity: equality premise expected"
-    let abst ← kabstract cur a
-    if !abst.hasLooseBVars then continue
-    let motive := mkLambda `x .default (← inferType a) abst
-    let next := abst.instantiate1 b
-    let u ← getLevel ty
-    let v ← getLevel (← inferType a)
-    let c := mkApp6 (Lean.mkConst ``congrArg [v, u]) (← inferType a) ty a b motive p
-    pf := mkApp6 (Lean.mkConst ``Eq.trans [u]) ty l cur next pf c
-    cur := next
-  if !(← propEq cur r) then throwError "monotonicity: congruence mismatch"
+  -- the occurrences of the premises abstracted (e.g., below binders), syntactically first (see
+  -- `Local.abstractOccurrences`), then up to reducible definitional equality
+  let byAbstraction (abstr : Expr → Expr → MetaM Expr) : ReplayM (Option Expr) := do
+    let mut cur := l
+    let mut pf ← mkEqRefl l
+    for (t, p) in ps do
+      let some (_, a, b) := t.eq? | throwError "monotonicity: equality premise expected"
+      let abst ← abstr cur a
+      if !abst.hasLooseBVars then continue
+      let motive := mkLambda `x .default (← inferType a) abst
+      let next := abst.instantiate1 b
+      let u ← getLevel ty
+      let v ← getLevel (← inferType a)
+      let c := mkApp6 (Lean.mkConst ``congrArg [v, u]) (← inferType a) ty a b motive p
+      pf := mkApp6 (Lean.mkConst ``Eq.trans [u]) ty l cur next pf c
+      cur := next
+    if !(← propEq cur r) then return none
+    return some pf
+  let some pf ← (do
+      if let some pf ← byAbstraction Local.abstractOccurrences then pure (some pf)
+      else byAbstraction kabstract)
+    | throwError "monotonicity: congruence mismatch"
   record step.rule "exact"
   return pf
 
@@ -1488,7 +1551,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
         -- NOTE: a budget of tactic attempts on the differences, larger for the large statements (e.g., the many
         -- simplifications of a CEK evaluation under the conditions of its conditionals)
         let budget := if large then 24 else 6
-        if let some p ← timed "local" (Local.diffEq (localProof cfg step.rule) (← IO.mkRef budget) a b) then
+        if let some p ← timed "local" (Local.diffEq (localProof cfg step.rule large) (← IO.mkRef budget) a b) then
           record step.rule "local"
           return ← mkExpectedTypeHint p concl
   -- theory lemmas over large terms: the subterms common to the literals are generalized (e.g., datatype

@@ -31,6 +31,12 @@ theorem classical_ite_congr_ctx {α : Sort u} {c c' : Prop} {x x' y y' : α} (hc
   · rw [if_pos h, if_pos h]; exact hx h
   · rw [if_neg h, if_neg h]; exact hy h
 
+theorem classical_ite_not {α : Sort u} (c : Prop) (x y : α) :
+    @ite α (¬c) (Classical.propDecidable (¬c)) x y = @ite α c (Classical.propDecidable c) y x := by
+  by_cases h : c
+  · rw [if_neg (fun h' => h' h), if_pos h]
+  · rw [if_pos h, if_neg h]
+
 theorem ite_eq_or {α : Sort u} {c : Prop} {a b k : α} {e : Prop} (ha : c → a = k) (hb : ¬c → (b = k) = e) :
     (@ite α c (Classical.propDecidable c) a b = k) = (c ∨ e) := by
   by_cases h : c
@@ -248,6 +254,15 @@ def isNumLit (e : Expr) : Bool :=
   (e.isAppOfArity ``Neg.neg 3 && (e.getArg! 2).isAppOfArity ``OfNat.ofNat 3) ||
   ((e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1) && e.appArg!.isRawNatLit)
 
+/-- `e` with the occurrences of `t` (structurally equal, i.e., pointer equal on the shared terms of the replay; `t` without
+    loose bound variables) replaced by the loose bound variable 0, as `kabstract` without definitional unfolding:
+    `kabstract` checks each subterm with the head of `t` for definitional equality (e.g., two minutes for a rewrite
+    step over the CEK terms of a validator). -/
+def abstractOccurrences (e t : Expr) : MetaM Expr := do
+  if t.hasLooseBVars then return ← kabstract e t
+  withLocalDeclD `z (← inferType t) fun z =>
+    return (e.replace fun s => if s == t then some z else none).abstract #[z]
+
 /-- Proof of `a = a'` under the hypothesis `h : k = t` (resp. `t = k`) where `k` is a literal, when `a` with `t`
     replaced by `k` is definitionally equal to `a'` (e.g., `3 + -2 * x` and `9` under `-3 = x`, Z3's
     simplification of the branches of conditionals under their conditions). -/
@@ -256,7 +271,7 @@ def substProof? (h a a' : Expr) : MetaM (Option Expr) := do
   let (t, k, toK) ← if isNumLit l && !isNumLit r then pure (r, l, ← mkEqSymm h)
     else if isNumLit r && !isNumLit l then pure (l, r, h)
     else return none
-  let abst ← kabstract a t
+  let abst ← abstractOccurrences a t
   if !abst.hasLooseBVars then return none
   let ok ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
       withCurrHeartbeats <| withDefault <| isDefEq (abst.instantiate1 k) a'
@@ -327,6 +342,68 @@ partial def arithAtoms (e : Expr) : MetaM (Array Expr) := do
   go e
   found.get
 
+/-- `e` with the classical instances of its conditionals (`ite`) replaced by decidable ones when they can be
+    synthesized: the value of a conditional does not depend on its instance, and evaluation needs decidable ones. -/
+def decidableItes (e : Expr) : MetaM Expr :=
+  Meta.transform e (post := fun s => do
+    if s.isAppOfArity ``ite 5 && (s.getArg! 2).isAppOfArity ``Classical.propDecidable 1 then
+      let c := s.getArg! 1
+      if let some inst ← (try some <$> synthInstance (mkApp (mkConst ``Decidable) c) catch _ => pure none) then
+        return .done (mkAppN s.getAppFn #[s.getArg! 0, c, inst, s.getArg! 3, s.getArg! 4])
+    return .continue)
+
+/-- Whether the closed proposition `p` evaluates to `false` (`decide` by evaluation; equalities of propositions as
+    equivalences). Inconclusive (e.g., no decidable instance, stuck evaluation) is `false`. -/
+def evalsFalse (p : Expr) : MetaM Bool := do
+  let p ← match p.eq? with
+    | some (ty, a, b) => if ty.isProp then pure (mkApp2 (mkConst ``Iff) a b) else pure p
+    | none => pure p
+  -- NOTE: runtime exceptions (e.g., the heartbeats of the evaluation exhausted) are inconclusive too
+  let s ← saveState
+  tryCatchRuntimeEx (do
+      let p ← decidableItes p
+      let inst ← synthInstance (mkApp (mkConst ``Decidable) p)
+      let r ← withTheReader Core.Context (fun c => { c with maxHeartbeats := 200 * 1000 }) <| withCurrHeartbeats <|
+        withDefault <| whnf (mkApp2 (mkConst ``Decidable.decide) p inst)
+      return r.isConstOf ``Bool.false)
+    fun _ => do s.restore; return false
+
+/-- Whether the statement `g := ∀ zs, body` (e.g., a local difference with its common subterms generalized) is false:
+    an instance of `body` at small values of its variables (of types `Int`, `Nat`, `Bool` and `Prop`) evaluates to
+    `false`. A test (no proof): e.g., `∀ z, (¬0 ≤ z) = (0 ≤ z)`, whose proof attempts by tactics took seconds. -/
+def refuted (g : Expr) (maxInstances := 64) : MetaM Bool := do
+  if !sizeLe g 3000 || g.hasMVar then return false
+  forallTelescope g fun zs body => do
+    if zs.size > 4 || body.hasLooseBVars then return false
+    let mut domains : Array (Array Expr) := #[]
+    for z in zs do
+      let t ← whnfR (← inferType z)
+      let vals :=
+        if t.isConstOf ``Int then #[0, 1, -1, 2, -2, 3].map (fun (i : Int) => toExpr i)
+        else if t.isConstOf ``Nat then #[0, 1, 2, 3].map (fun (n : Nat) => toExpr n)
+        else if t.isConstOf ``Bool then #[toExpr false, toExpr true]
+        else if t.isProp then #[mkConst ``False, mkConst ``True]
+        else #[]
+      if vals.isEmpty then return false
+      domains := domains.push vals
+    -- the instances (at most `maxInstances`, the first values of each domain first)
+    let mut combos : Array (Array Expr) := #[#[]]
+    for d in domains do
+      combos := (combos.flatMap fun c => d.map c.push).extract 0 maxInstances
+    for c in combos do
+      if ← evalsFalse (body.replaceFVars zs c) then return true
+    return false
+
+/-- Deadline (monotonic time in ms) of the portfolio: no tactic is started after it (see `withPortfolioDeadline` and `SmtProof.portfolio`). -/
+initialize portfolioDeadline : IO.Ref (Option Nat) ← IO.mkRef none
+
+/-- Run `x` with the portfolio deadline in `ms` milliseconds (or the current one if earlier). -/
+def withPortfolioDeadline (ms : Nat) (x : Elab.Term.TermElabM α) : Elab.Term.TermElabM α := do
+  let saved ← portfolioDeadline.get
+  let d := (← IO.monoMsNow) + ms
+  portfolioDeadline.set (some (match saved with | some s => min s d | none => d))
+  try x finally portfolioDeadline.set saved
+
 mutual
 /-- Proof of `l = r` by congruence on the common structure of `l` and `r`, proving the remaining
     differences with `prove` (given the equality to prove, returns a proof). At most `budget` calls of
@@ -378,6 +455,12 @@ partial def diffEq (prove : Expr → TermElabM (Option Expr)) (budget : IO.Ref N
           if r?.isSome then return r?
       | _, _ => pure ()
     return ← whole
+  -- arithmetic comparisons whose operands differ at their heads (e.g., Z3's normal form `x + y ≤ k` of `ite c a b ≤ k`,
+  -- or of nested divisions): the comparisons as a whole first, the differences of their operands being often false or
+  -- out of reach of the tactics (on CEK evaluations, failing after their time budget while the comparisons are proved)
+  if isArithComparison l then
+    if (l.getAppArgs.zip r.getAppArgs).any fun (a, b) => a != b && a.getAppFn != b.getAppFn then
+      if let some p ← whole then return some p
   -- conditionals (the instance depends on the condition): the branches under the condition (resp. its negation)
   if let some p ← iteCongrCtx? prove budget l r hyps then return some p
   if l.isAppOfArity ``Decidable.decide 2 then
@@ -421,6 +504,17 @@ partial def iteCongrCtx? (prove : Expr → TermElabM (Option Expr)) (budget : IO
   if !(la[2]!.isAppOfArity ``Classical.propDecidable 1 && ra[2]!.isAppOfArity ``Classical.propDecidable 1) then return none
   if la[0]! != ra[0]! then return none
   let (c, c') := (la[1]!, ra[1]!)
+  -- negated conditions (e.g., Z3's normal form `ite c y x` of `ite (¬c) x y`): the branches swapped, the difference of
+  -- the conditions being false (e.g., `(¬0 ≤ x) = (0 ≤ x)`)
+  let u ← getLevel la[0]!
+  let swapped (c x y : Expr) : Expr :=
+    mkAppN (mkConst ``ite [u]) #[la[0]!, c, mkApp (mkConst ``Classical.propDecidable) c, y, x]
+  if c.isAppOfArity ``Not 1 && c.appArg! == c' then
+    let some p ← iteCongrCtx? prove budget (swapped c' la[3]! la[4]!) r hyps | return none
+    return some (← mkEqTrans (mkAppN (mkConst ``classical_ite_not [u]) #[la[0]!, c', la[3]!, la[4]!]) p)
+  if c'.isAppOfArity ``Not 1 && c'.appArg! == c then
+    let some p ← iteCongrCtx? prove budget l (swapped c ra[3]! ra[4]!) hyps | return none
+    return some (← mkEqTrans p (← mkEqSymm (mkAppN (mkConst ``classical_ite_not [u]) #[la[0]!, c, ra[3]!, ra[4]!])))
   let some pc ← (if c == c' then some <$> mkEqRefl c else diffEq prove budget c c' hyps) | return none
   let branch (cond x x' : Expr) (subst : Bool) : TermElabM (Option Expr) :=
     withLocalDeclD `h cond fun h => do
@@ -435,7 +529,6 @@ partial def iteCongrCtx? (prove : Expr → TermElabM (Option Expr)) (budget : IO
       | none => pure none
   let some px ← branch c la[3]! ra[3]! true | return none
   let some py ← branch (mkNot c) la[4]! ra[4]! false | return none
-  let u ← getLevel la[0]!
   return some (mkAppN (mkConst ``classical_ite_congr_ctx [u]) #[la[0]!, c, c', la[3]!, ra[3]!, la[4]!, ra[4]!, pc, px, py])
 
 /-- `(ite c a b = k) = (c ∨ e)` (resp. `(¬c ∧ e)`) from `c → a = k` (resp. `c → a ≠ k`) and `¬c → (b = k) = e`,

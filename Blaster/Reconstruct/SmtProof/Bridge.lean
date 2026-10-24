@@ -62,8 +62,43 @@ structure State where
   natLemmas : Std.HashMap Expr (Option Expr) := {}
   /-- pairs of terms that could not be related (for diagnostics) -/
   failures : Array (Expr × Expr) := #[]
+  /-- the hypotheses of the branches met so far (see `containsFact`) -/
+  factIds : Std.HashSet FVarId := {}
+  /-- whether a subterm contains a hypothesis of a branch (see `containsFact`) -/
+  factMemo : Std.HashMap Expr Bool := {}
 
 abbrev BridgeM := ReaderT Cfg (StateRefT State Term.TermElabM)
+
+/-- Whether `p` contains one of the hypotheses `facts` of the current branch. Memoized across the walk (linear in
+    total): a proof built in a branch only contains the hypotheses of that branch and of the enclosing ones (those of
+    the other branches are abstracted), such that the hypotheses of all the branches met so far can be checked.
+    NOTE: `Expr.hasAnyFVar` on the proof of each node re-traverses the proofs of the subterms (e.g., 40 s for the
+    asserted formula of a CEK evaluation, under nested conditionals). -/
+def containsFact (facts : Array Expr) (p : Expr) : BridgeM Bool := do
+  if !p.hasFVar then return false
+  modify fun s => { s with factIds := facts.foldl (fun acc h => acc.insert h.fvarId!) s.factIds }
+  let ids := (← get).factIds
+  let mut memo := (← get).factMemo
+  let mut stack : Array (Expr × Bool) := #[(p, false)]
+  while !stack.isEmpty do
+    let (e, expanded) := stack.back!
+    stack := stack.pop
+    if memo.contains e then continue
+    let children : Array Expr := match e with
+      | .app f a => #[f, a]
+      | .lam _ t b _ | .forallE _ t b _ => #[t, b]
+      | .letE _ t v b _ => #[t, v, b]
+      | .mdata _ b | .proj _ _ b => #[b]
+      | _ => #[]
+    let children := children.filter (·.hasFVar)
+    if !expanded then
+      if let .fvar x := e then memo := memo.insert e (ids.contains x); continue
+      stack := stack.push (e, true)
+      for c in children do if !memo.contains c then stack := stack.push (c, false)
+    else
+      memo := memo.insert e (children.any (memo.getD · false))
+  modify fun s => { s with factMemo := memo }
+  return memo.getD p false
 
 /-- Naturality lemmas of the polymorphic functions (see `walkPolyApp`), per statement, across the calls of the bridge
     (reused while the environment contains them). -/
@@ -361,9 +396,9 @@ partial def walk (a b : Expr) : BridgeM (Option Expr) := do
   if r.isNone then modify fun s => { s with failures := s.failures.push (a, b) }
   -- NOTE: proofs using the hypotheses of a branch are not cached (they are only valid in the branch)
   let facts := (← read).facts
-  let local? := match r with
-    | some p => !facts.isEmpty && p.hasAnyFVar (fun f => facts.any (·.fvarId! == f))
-    | none => !facts.isEmpty
+  let local? ← match r with
+    | some p => if facts.isEmpty then pure false else containsFact facts p
+    | none => pure !facts.isEmpty
   if !local? then modify fun s => { s with cache := s.cache.insert (a, b) r }
   return r
 
