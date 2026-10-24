@@ -419,15 +419,37 @@ def refuted (g : Expr) (maxInstances := 64) : MetaM Bool := do
       if ← evalsFalse (body.replaceFVars zs c) then return true
     return false
 
-/-- Deadline (monotonic time in ms) of the portfolio: no tactic is started after it (see `withPortfolioDeadline` and `SmtProof.portfolio`). -/
-initialize portfolioDeadline : IO.Ref (Option Nat) ← IO.mkRef none
+/-- `x` run in a task (on a dedicated thread) in the empty local context with fresh elaboration and metavariable states
+    (see `Core.wrapAsync`), whose final state is discarded: its messages, auxiliary declarations and metavariables are
+    lost, i.e., its result is expected to be closed (e.g., the proof of a closed statement, checked by the caller).
+    NOTE: the states are fresh such that the objects of the current ones (e.g., the large terms of a replay) are not
+    shared with the task, i.e., marked as multi-threaded (their reference counts would be updated atomically, e.g.,
+    five times slower replays when sharing the state of a replay with tasks). -/
+def runAsync (x : Elab.Term.TermElabM α) : Elab.Term.TermElabM (Task (Except Exception α)) := do
+  let tctx ← read
+  let mctx := { (← readThe Meta.Context) with lctx := {}, localInstances := #[] }
+  let act ← Core.wrapAsync (fun (_ : Unit) => do
+      let ((a, _), _) ← (x.run tctx {}).run mctx {}
+      return a) none
+  EIO.asTask (act ()) (prio := .dedicated)
+
+/-- Option holding the deadline of the portfolio (monotonic time in ms plus one, `0`: none): no tactic is started after
+    it (see `withPortfolioDeadline` and `SmtProof.portfolio`). An option of the context, i.e., local to the tasks of a
+    parallel replay (see `SmtProof.prepass`). -/
+def portfolioDeadlineKey : Name := `blaster.smtproof.portfolioDeadline
+
+/-- The deadline of the portfolio (see `portfolioDeadlineKey`). -/
+def portfolioDeadline : CoreM (Option Nat) := do
+  let d := (← getOptions).getNat portfolioDeadlineKey 0
+  return if d == 0 then none else some (d - 1)
 
 /-- Run `x` with the portfolio deadline in `ms` milliseconds (or the current one if earlier). -/
 def withPortfolioDeadline (ms : Nat) (x : Elab.Term.TermElabM α) : Elab.Term.TermElabM α := do
-  let saved ← portfolioDeadline.get
   let d := (← IO.monoMsNow) + ms
-  portfolioDeadline.set (some (match saved with | some s => min s d | none => d))
-  try x finally portfolioDeadline.set saved
+  let d := match ← portfolioDeadline with
+    | some s => min s d
+    | none => d
+  withOptions (fun o => o.setNat portfolioDeadlineKey (d + 1)) x
 
 mutual
 /-- Proof of `l = r` by congruence on the common structure of `l` and `r`, proving the remaining

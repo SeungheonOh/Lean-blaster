@@ -667,7 +667,7 @@ def proveEqn (stmt : Expr) : TermElabM (Option Expr) := do
   withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
 
 /-- Start the proofs of the definitional equations of the functions `fns` (SMT symbols, e.g., the ones of the recursive
-    functions unfolded by the lemmas of the proof) in parallel (see `runAsync`), their case analyses taking seconds each
+    functions unfolded by the lemmas of the proof) in parallel (see `Local.runAsync`), their case analyses taking seconds each
     (e.g., 12 s in sequence for the 8 equations of the CEK evaluation of a validator). The proofs are used by
     `DefEq.get` when they are closed and only use constants of its environment. -/
 def startEqTasks (ctx : Ctx) (fns : Std.HashSet String) : TermElabM Unit := do
@@ -675,7 +675,7 @@ def startEqTasks (ctx : Ctx) (fns : Std.HashSet String) : TermElabM Unit := do
     if !eq.fns.any fns.contains then continue
     let some stmt := eq.stmts[0]? | continue
     if stmt.hasFVar || stmt.hasMVar then continue
-    eq.task.set (some (← runAsync do
+    eq.task.set (some (← Local.runAsync do
       let some p ← proveEqn stmt | return none
       return some (← instantiateMVars p)))
 
