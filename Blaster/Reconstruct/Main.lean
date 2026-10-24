@@ -153,18 +153,15 @@ def bySmtProofReplay (checked : IO.Ref (Array (Name × Expr))) (task : ReconTask
   let res ← match res with
     | .ok r =>
         profileLog s!"smtProof.{kind}" 0 fun _ => s!"dag={dagSize r.proof} steps={r.steps}"
-        checked.modify (· ++ (← SmtProof.sorryFreeAuxTheorems.swap #[]))
+        checked.modify (· ++ r.sorryFree)
         match ← withProfile s!"smtProof.{kind}.kernelCheck" (checkedProof checked goal r.proof) with
         | .ok p =>
             -- the parallel kernel checks of the auxiliary theorems of the proof (see `SmtProof.startKernelChecks`)
-            match ← withProfile s!"smtProof.{kind}.parallelKernelChecks" SmtProof.awaitKernelChecks with
+            match ← withProfile s!"smtProof.{kind}.parallelKernelChecks" (SmtProof.awaitKernelChecks r.kernelChecks) with
             | none => pure (.ok { r with proof := p })
             | some msg => pure (.error s!"kernel: {msg}")
         | .error msg => pure (.error s!"kernel: {← msg.toString}")
     | err => pure err
-  -- NOTE: the checks of a failed replay are not awaited
-  SmtProof.pendingKernelChecks.set #[]
-  SmtProof.sorryFreeAuxTheorems.set #[]
   logSmtProof kind res
   match res with
   | .ok r => return some (r.proof, s!"{r.backend} proof replay")

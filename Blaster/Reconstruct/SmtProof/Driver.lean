@@ -41,27 +41,34 @@ structure SmtProofResult where
   backend : String
   steps : Nat
   stats : ReplayStats
-
-/-- The kernel checks of the auxiliary theorems of the last proof, run in parallel (see `proveBySmtProof`): the
-    error of each failed check. The proof is only accepted once they all succeeded (see `awaitKernelChecks`). -/
-initialize pendingKernelChecks : IO.Ref (Array (Task (Option String))) ← IO.mkRef #[]
-
-/-- The auxiliary theorems of the last proof whose checks are started by `startKernelChecks`, with their values: known
-    not to depend on `sorryAx` (see `dependsOnSorry`, such that their values are not traversed again). -/
-initialize sorryFreeAuxTheorems : IO.Ref (Array (Name × Expr)) ← IO.mkRef #[]
+  /-- the kernel checks of the auxiliary theorems of the proof run in parallel (see `startKernelChecks`): the proof is
+      only accepted once they all succeeded (see `awaitKernelChecks`) -/
+  kernelChecks : Array (Task (Option String)) := #[]
+  /-- the auxiliary theorems of the proof whose checks are started by `startKernelChecks`, with their values: known not
+      to depend on `sorryAx` (see `dependsOnSorry`, such that their values are not traversed again) -/
+  sorryFree : Array (Name × Expr) := #[]
 
 /-- Start the kernel checks of `decls`, each against the kernel environment given with it (the environment before
     it, such that a declaration may only use the declarations before it), on `threads` dedicated threads. -/
 def startKernelChecks (decls : Array (Kernel.Environment × Declaration)) (threads : Nat) (opts : Options) :
-    BaseIO Unit := do
+    BaseIO (Array (Task (Option String))) := do
   let next ← IO.mkRef 0
+  -- the checks taking at least 200 ms (environment variable `BLASTER_SMTPROOF_TRACE`)
+  let trace ← IO.getEnv "BLASTER_SMTPROOF_TRACE"
   let rec worker (fuel : Nat) : BaseIO (Option String) := do
     match fuel with
     | 0 => return none
     | fuel + 1 =>
       let i ← next.modifyGet fun i => (i, i + 1)
       let some (kenv, decl) := decls[i]? | return none
-      match kenv.addDeclCore 0 decl none with
+      let t0 ← IO.monoMsNow
+      let r := kenv.addDeclCore 0 decl none
+      if let some f := trace then
+        let ms := (← IO.monoMsNow) - t0
+        if ms ≥ 200 then
+          (do (← IO.FS.Handle.mk f .append).putStrLn s!"  kernel check of auxiliary theorem {i}/{decls.size}: {ms} ms").catchExceptions
+            fun _ => pure ()
+      match r with
       | .ok _ => worker fuel
       | .error ex =>
           let msg ← (do return some (← (ex.toMessageData opts).toString)).catchExceptions fun _ => pure (some "?")
@@ -69,11 +76,10 @@ def startKernelChecks (decls : Array (Kernel.Environment × Declaration)) (threa
   let mut tasks := #[]
   for _ in [:max threads 1] do
     tasks := tasks.push (← BaseIO.asTask (prio := .dedicated) (worker decls.size))
-  pendingKernelChecks.modify (· ++ tasks)
+  return tasks
 
-/-- Wait for the kernel checks started by `startKernelChecks`: the first error, if any. -/
-def awaitKernelChecks : BaseIO (Option String) := do
-  let tasks ← pendingKernelChecks.modifyGet fun ts => (ts, #[])
+/-- Wait for the kernel checks `tasks` (see `startKernelChecks`): the first error, if any. -/
+def awaitKernelChecks (tasks : Array (Task (Option String))) : BaseIO (Option String) := do
   let mut err := none
   for t in tasks do
     if let some msg ← IO.wait t then
@@ -257,8 +263,6 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       let mut msgs := #[]
       for poly in modes do
         s.restore
-        pendingKernelChecks.set #[]
-        sorryFreeAuxTheorems.set #[]
         -- NOTE: the name generator (not restored by `restore`) is reset too, such that the translations (whose
         -- SMT symbols have fresh names) coincide and the proofs of the backends are reused (see `runBackendCached`)
         setNGen ngen
@@ -289,6 +293,9 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let replayWith (backend : Backend) (sproof : Proof) (recPairs : Array RecFun.Pair)
         (eqTasks : Array (Expr × Task (Except Exception (Option Expr)))) : TermElabM SmtProofResult := do
       clearLocalCache
+      -- the parallel kernel checks of the auxiliary theorems of the proof (see `startKernelChecks`)
+      let kernelChecks ← IO.mkRef (#[] : Array (Task (Option String)))
+      let sorryFree ← IO.mkRef (#[] : Array (Name × Expr))
       let tbl ← addSkolems sproof baseTbl
       -- auxiliary functions and case predicates of recursive functions (Z3)
       let (tbl, recAux) ← RecFun.addProofDefs sproof tbl
@@ -353,17 +360,18 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
         let cfg : ReplayConfig := {
           proveDirect := fun c => do
-            if ← withReducible (isDefEq c (mkNot body)) then return some (← mkExpectedTypeHint hneg c)
+            if ← traceSlow "asserted: reducible defeq" (withReducible (isDefEq c (mkNot body))) then
+              return some (← mkExpectedTypeHint hneg c)
             -- e.g., projections vs. case analyses, casts of literals (with a budget)
             let defeq (a b : Expr) : TermElabM Bool := do
               try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
                     withCurrHeartbeats <| withDefault <| isDefEq a b
               catch _ => return false
             if c.isAppOfArity ``Not 1 then
-              if ← defeq c (mkNot body) then return some (← mkExpectedTypeHint hneg c)
+              if ← traceSlow "asserted: defeq" (defeq c (mkNot body)) then return some (← mkExpectedTypeHint hneg c)
             -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
             -- NOTE: the translated goal is definitionally equal to the goal (see the translation above)
-            let (r, fails) ← Bridge.prove bcfg (mkNot goalTerm) c
+            let (r, fails) ← traceSlow "asserted: bridge" (Bridge.prove bcfg (mkNot goalTerm) c)
             if let some p := r then
               return some (← mkEqMP p (← mkExpectedTypeHint hneg (mkNot goalTerm)))
             if let some f ← IO.getEnv "BLASTER_SMTPROOF_BRIDGE_DUMP" then
@@ -492,9 +500,10 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           let all := balancedConj (thms.map fun t => mkApp2 (mkConst ``And) t.type t.value)
           if ← traceTimed "sorry check of the auxiliary theorems" (dependsOnSorry all entries) then
             throwError "smt proof: the proof depends on sorryAx"
-          sorryFreeAuxTheorems.modify (· ++ entries)
-          traceTimed s!"parallel kernel checks of {decls.size} auxiliary theorems on {parThreads} threads started"
+          sorryFree.modify (· ++ entries)
+          let tasks ← traceTimed s!"parallel kernel checks of {decls.size} auxiliary theorems on {parThreads} threads started"
             (startKernelChecks decls parThreads (← getOptions))
+          kernelChecks.modify (· ++ tasks)
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
           let (n, d) := dagStats p
           traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
@@ -516,7 +525,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       if proof.hasMVar then throwError "smt proof: proof term contains metavariables"
       -- debugging: free variables escaping their scopes (environment variable `BLASTER_SMTPROOF_CHECKFINAL`)
       if (← IO.getEnv "BLASTER_SMTPROOF_CHECKFINAL").isSome then reportEscapedFVars proof
-      return { proof, backend := backend.name, steps := sproof.steps.size, stats }
+      return { proof, backend := backend.name, steps := sproof.steps.size, stats,
+               kernelChecks := ← kernelChecks.get, sorryFree := ← sorryFree.get }
     -- 2. backend
     -- backends tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`)
     -- (`z3+`: Z3 with the simplifiers of the query; `z3rec`: Z3 on the query with its recursive functions defined by
