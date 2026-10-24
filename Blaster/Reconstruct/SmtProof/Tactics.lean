@@ -477,8 +477,14 @@ def portfolioParMulti (jobs : Array (Expr × Array (String × TSyntax `tactic) �
 /-- `portfolio` with the tactics attempted in parallel on closed goals (see `portfolioParMulti`); environment variable
     `BLASTER_SMTPROOF_PARPORTFOLIO`: the number of attempts at a time, `0` for `portfolio`. -/
 def portfolioPar (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
-  if tacs.size ≤ 1 || goal.hasFVar || goal.hasMVar || (← IO.getEnv "BLASTER_SMTPROOF_PARPORTFOLIO") == some "0" then
-    return ← portfolio tacs goal rule
-  return (← portfolioParMulti #[(goal, tacs, rule)]).map fun (_, p, n) => (p, n)
+  let t0 ← IO.monoMsNow
+  try
+    if tacs.size ≤ 1 || goal.hasFVar || goal.hasMVar || (← IO.getEnv "BLASTER_SMTPROOF_PARPORTFOLIO") == some "0" then
+      return ← portfolio tacs goal rule
+    return (← portfolioParMulti #[(goal, tacs, rule)]).map fun (_, p, n) => (p, n)
+  finally
+    if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
+      let ms := (← IO.monoMsNow) - t0
+      Local.portfolioTime.modify fun (t, n) => (t + ms, n + 1)
 
 end Blaster.Reconstruct.SmtProof

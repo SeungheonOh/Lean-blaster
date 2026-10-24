@@ -755,7 +755,14 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       if let some msg ← traceSlow "kernel check of the equation" (kernelError? stmt p) then
         debugLog m!"recfun: definitional equation of {eq.head} rejected by the kernel: {msg}"
         continue
-      let some c ← traceSlow "auxiliary theorem of the equation" (try some <$> mkAuxTheorem stmt p catch _ => pure none)
+      -- NOTE: added without checking it again, nor computing its closure (it is closed, see `kernelError?`), nor
+      -- traversing it for `sorryAx` (the whole proof is, see `dependsOnSorry`)
+      let lvls := (collectLevelParams (collectLevelParams {} stmt) p).params.toList
+      let some c ← traceSlow "auxiliary theorem of the equation" (try
+            let n ← withOptions (fun o => warn.sorry.set (debug.skipKernelTC.set o true) false) <|
+              mkAuxLemma lvls stmt p (cache := false)
+            pure (some (Lean.mkConst n (lvls.map mkLevelParam)))
+          catch _ => pure none)
         | continue
       r := some (stmt, c)
       break

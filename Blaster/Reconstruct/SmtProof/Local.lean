@@ -475,6 +475,10 @@ def realizeReservedNames (e : Expr) : CoreM Unit := do
     try executeReservedNameAction c catch _ => pure ()
     modifyThe Core.State fun s => { s with messages := msgs }
 
+/-- The time spent in the tactic portfolios (see `SmtProof.portfolioPar`) and their number of goals, e.g., per step of the
+    replay (environment variable `BLASTER_SMTPROOF_TRACE`). -/
+initialize portfolioTime : IO.Ref (Nat × Nat) ← IO.mkRef (0, 0)
+
 /-- Option holding the deadline of the portfolio (monotonic time in ms plus one, `0`: none): no tactic is started after
     it (see `withPortfolioDeadline` and `SmtProof.portfolio`). An option of the context, i.e., local to the tasks of a
     parallel replay (see `SmtProof.prepass`). -/

@@ -44,59 +44,67 @@ def addFact (t p : Expr) : M Unit := do
 
 def get? (t : Expr) : M (Option Expr) := return (← get).facts.get? t
 
+/-- `fun h : t => b h` built under the binder: `b` places its argument as is (a loose bound variable), the other
+    subterms of its result having no loose bound variables (e.g., terms over the local hypotheses of the engine), such
+    that the proofs of the facts are not traversed again by an abstraction at each derivation (quadratic in the length of
+    the derivations, e.g., on the clauses of CEK evaluations). -/
+@[inline] def lam1 (n : Name) (t : Expr) (b : Expr → Expr) : Expr := .lam n t (b (.bvar 0)) .default
+
 /-- Proof of `¬ t` if known (as `¬ t`, or `t := ¬ a` with `a` known). -/
 def getNeg? (t : Expr) : M (Option Expr) := do
   if let some p ← get? (mkNot t) then return some p
   if let some a := t.not? then
     if let some pa ← get? a then
-      return some (← withLocalDeclD `h t fun h => mkLambdaFVars #[h] (mkApp h pa))
+      return some (lam1 `h t fun h => mkApp h pa)
   return none
 
 /-- `propext (Iff.intro ab ba) : a = b`. -/
-def mkPropext (a b ab ba : Expr) : MetaM Expr :=
-  return mkApp3 (mkConst ``propext) a b (mkApp4 (mkConst ``Iff.intro) a b ab ba)
+def mkPropextPure (a b ab ba : Expr) : Expr :=
+  mkApp3 (mkConst ``propext) a b (mkApp4 (mkConst ``Iff.intro) a b ab ba)
 
-def byContra (t : Expr) (k : Expr → MetaM Expr) : MetaM Expr := do
-  -- `Classical.byContradiction (fun h : ¬ t => k h)`
-  let r ← withLocalDeclD `h (mkNot t) fun h => do mkLambdaFVars #[h] (← k h)
-  return mkApp2 (mkConst ``Classical.byContradiction) t r
+/-- `propext (Iff.intro ab ba) : a = b`. -/
+def mkPropext (a b ab ba : Expr) : MetaM Expr :=
+  return mkPropextPure a b ab ba
+
+/-- `Classical.byContradiction (fun h : ¬ t => k h)` (see `lam1`). -/
+def byContra (t : Expr) (k : Expr → Expr) : Expr :=
+  mkApp2 (mkConst ``Classical.byContradiction) t (lam1 `h (mkNot t) k)
 
 /-- Derive the consequences of fact `t` (with proof `p`) and of the facts it unlocks. -/
 def process (t p : Expr) : M Unit := do
   -- ¬¬a
   if let some na := t.not? then
     if let some a := na.not? then
-      addFact a (← byContra a fun h => return mkApp p h)
+      addFact a (byContra a fun h => mkApp p h)
     -- ¬(a ∧ b)
     if let some (a, b) := na.and? then
       if let some pa ← get? a then
-        addFact (mkNot b) (← withLocalDeclD `h b fun h => do mkLambdaFVars #[h] (mkApp p (← mkAppM ``And.intro #[pa, h])))
+        addFact (mkNot b) (lam1 `h b fun h => mkApp p (mkApp4 (mkConst ``And.intro) a b pa h))
       if let some pb ← get? b then
-        addFact (mkNot a) (← withLocalDeclD `h a fun h => do mkLambdaFVars #[h] (mkApp p (← mkAppM ``And.intro #[h, pb])))
+        addFact (mkNot a) (lam1 `h a fun h => mkApp p (mkApp4 (mkConst ``And.intro) a b h pb))
     -- ¬(a ∨ b)
     if let some (a, b) := na.app2? ``Or then
-      addFact (mkNot a) (← withLocalDeclD `h a fun h => do mkLambdaFVars #[h] (mkApp p (mkApp3 (mkConst ``Or.inl) a b h)))
-      addFact (mkNot b) (← withLocalDeclD `h b fun h => do mkLambdaFVars #[h] (mkApp p (mkApp3 (mkConst ``Or.inr) a b h)))
+      addFact (mkNot a) (lam1 `h a fun h => mkApp p (mkApp3 (mkConst ``Or.inl) a b h))
+      addFact (mkNot b) (lam1 `h b fun h => mkApp p (mkApp3 (mkConst ``Or.inr) a b h))
     -- ¬(a → b)
     if na.isArrow then
       let a := na.bindingDomain!
       let b := na.bindingBody!
       if (← isProp' a) && !b.hasLooseBVars then
-        addFact a (← byContra a fun hna => do
-          return mkApp p (← withLocalDeclD `ha a fun ha => do
-            mkLambdaFVars #[ha] (mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp hna ha))))
-        addFact (mkNot b) (← withLocalDeclD `hb b fun hb => do
-          mkLambdaFVars #[hb] (mkApp p (← withLocalDeclD `ha a fun ha => mkLambdaFVars #[ha] hb)))
+        addFact a (byContra a fun hna =>
+          mkApp p (lam1 `ha a fun ha => mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp (hna.liftLooseBVars 0 1) ha)))
+        addFact (mkNot b) (lam1 `hb b fun hb => mkApp p (lam1 `ha a fun _ => hb.liftLooseBVars 0 1))
     -- ¬(ite c a b) (propositions) with `c` (resp. `¬ c`) known: ¬a (resp. ¬b)
     if na.isAppOfArity ``ite 5 && (na.getArg! 0).isProp then
       let args := na.getAppArgs
       let (c, a, b) := (args[1]!, args[3]!, args[4]!)
       if let some pc ← get? c then
         let eq ← mkAppOptM ``if_pos #[c, args[2]!, pc, none, a, b]
-        addFact (mkNot a) (← withLocalDeclD `ha a fun ha => do mkLambdaFVars #[ha] (mkApp p (← mkEqMPR eq ha)))
+        -- `eq : ite c a b = a`
+        addFact (mkNot a) (lam1 `ha a fun ha => mkApp p (mkApp4 (mkConst ``Eq.mpr [levelZero]) na a eq ha))
       if let some nc ← getNeg? c then
         let eq ← mkAppOptM ``if_neg #[c, args[2]!, nc, none, a, b]
-        addFact (mkNot b) (← withLocalDeclD `hb b fun hb => do mkLambdaFVars #[hb] (mkApp p (← mkEqMPR eq hb)))
+        addFact (mkNot b) (lam1 `hb b fun hb => mkApp p (mkApp4 (mkConst ``Eq.mpr [levelZero]) na b eq hb))
     -- ¬(ite c a b = t) with `c` (resp. `¬ c`) known and `t` syntactically `a` (resp. `b`)
     if let some (_, x, y) := na.eq? then
       for (it, other, flip) in [(x, y, false), (y, x, true)] do
@@ -117,17 +125,15 @@ def process (t p : Expr) : M Unit := do
       if ty.isProp then
         if let some pa ← get? a then
           -- b → (a = b)
-          let nb ← withLocalDeclD `hb b fun hb => do
-            let ab ← withLocalDeclD `x a fun x => mkLambdaFVars #[x] hb
-            let ba ← withLocalDeclD `x b fun x => mkLambdaFVars #[x] pa
-            mkLambdaFVars #[hb] (mkApp p (← mkPropext a b ab ba))
+          let nb := lam1 `hb b fun hb =>
+            mkApp p (mkPropextPure a b (lam1 `x a fun _ => hb.liftLooseBVars 0 1) (lam1 `x b fun _ => pa))
           addFact (mkNot b) nb
         if let some pna ← getNeg? a then
           -- ¬ b → (a = b)
-          let pb ← byContra b fun hnb => do
-            let ab ← withLocalDeclD `x a fun x => mkLambdaFVars #[x] (mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp pna x))
-            let ba ← withLocalDeclD `x b fun x => mkLambdaFVars #[x] (mkApp2 (mkConst ``False.elim [levelZero]) a (mkApp hnb x))
-            return mkApp p (← mkPropext a b ab ba)
+          let pb := byContra b fun hnb =>
+            let ab := lam1 `x a fun x => mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp pna x)
+            let ba := lam1 `x b fun x => mkApp2 (mkConst ``False.elim [levelZero]) a (mkApp (hnb.liftLooseBVars 0 1) x)
+            mkApp p (mkPropextPure a b ab ba)
           addFact b pb
     return
   -- a ∧ b
@@ -147,7 +153,7 @@ def process (t p : Expr) : M Unit := do
     if (← isProp' a) && !b.hasLooseBVars then
       if let some pa ← get? a then addFact b (mkApp p pa)
       if let some nb ← getNeg? b then
-        addFact (mkNot a) (← withLocalDeclD `h a fun h => do mkLambdaFVars #[h] (mkApp nb (mkApp p h)))
+        addFact (mkNot a) (lam1 `h a fun h => mkApp nb (mkApp p h))
     return
   -- ite c a b (propositions)
   if t.isAppOfArity ``ite 5 then
@@ -164,9 +170,10 @@ def process (t p : Expr) : M Unit := do
       if let some pa ← get? a then addFact b (← mkEqMP p pa)
       if let some pb ← get? b then addFact a (← mkEqMPR p pb)
       if let some na ← getNeg? a then
-        addFact (mkNot b) (← withLocalDeclD `h b fun h => do mkLambdaFVars #[h] (mkApp na (← mkEqMPR p h)))
+        -- `p : a = b`
+        addFact (mkNot b) (lam1 `h b fun h => mkApp na (mkApp4 (mkConst ``Eq.mpr [levelZero]) a b p h))
       if let some nb ← getNeg? b then
-        addFact (mkNot a) (← withLocalDeclD `h a fun h => do mkLambdaFVars #[h] (mkApp nb (← mkEqMP p h)))
+        addFact (mkNot a) (lam1 `h a fun h => mkApp nb (mkApp4 (mkConst ``Eq.mp [levelZero]) a b p h))
 
 /-- Saturate the facts until a conflict is found (at most `fuel` rounds).
     NOTE: a round decomposes one level of the nested connectives (e.g., the literals of wide clauses `l₁ ∨ ... ∨ lₙ`
