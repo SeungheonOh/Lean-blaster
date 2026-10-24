@@ -5,6 +5,7 @@ import Blaster.Reconstruct.Lemmas
 import Blaster.Reconstruct.Match
 import Blaster.Reconstruct.Depth
 import Blaster.Reconstruct.Profile
+import Blaster.Reconstruct.SmtProof.Local
 
 open Lean Meta Elab Term Tactic
 
@@ -1390,6 +1391,65 @@ def dischargeInContext (type : Expr) (first? : Option Nat := none)
   -- NOTE: the costly strategies (and `early`) failed in the relevant context: the full context only for the tactics
   dischargeOneAux type (first? := first?) (cheap := true)
 
+/-- The closed form `∀ xs, type` of the proof obligation `type` over the variables `xs` of its relevant context (see
+    `relevantContext?`), to which its proof is applied (`none` when it would not be closed, or with `let` variables). -/
+def closedObligation? (type : Expr) : MetaM (Option (Expr × Array Expr)) := do
+  let type ← instantiateMVars type
+  if type.hasMVar then return none
+  let (lctx, insts) := (← relevantContext? type).getD (← getLCtx, ← getLocalInstances)
+  withLCtx lctx insts do
+    let mut xs := #[]
+    for d in lctx do
+      if d.isImplementationDetail then continue
+      if d.isLet then return none
+      xs := xs.push d.toExpr
+    let g ← mkForallFVars xs type
+    if g.hasFVar || g.hasMVar then return none
+    return some (g, xs)
+
+/-- The kind of the label of a proof obligation (e.g., `rule:matchReduction` for the reductions of the `match`
+    applications of all the matchers). -/
+def labelKind (label : String) : String := ":".intercalate ((label.splitOn ":").take 2)
+
+/-- The index of the tactic tried first on a proof obligation with label `label` (see `dischargeOneAux`): the one that
+    discharged the last obligation with the same label, or of the same kind (`preferred`), induction for the equivalences
+    of recursive functions (the case analyses tried before it fail after their budget, e.g., 1.6 s on a CEK evaluation). -/
+def firstTactic? (preferred : Std.HashMap String Nat) (label : String) : TermElabM (Option Nat) := do
+  match preferred.get? label, preferred.get? (labelKind label) with
+  | some i, _ => return some i
+  | none, some i => return some i
+  | none, none =>
+    if label.startsWith "rule:recFunEquiv:" then return (← dischargeTactics).findIdx? (·.1 == "induction")
+    else return none
+
+/-- The speculative discharge of the closed proof obligations `goals` (see `closedObligation?`, with their labels) by the
+    strategies of `dischargeOneAux` without its costly case analyses, in tasks (see `SmtProof.Local.runAsync`), `width`
+    at a time in the order of `goals`, the tactics that discharged them being preferred for the next ones (see
+    `firstTactic?`): their closed proofs, usable in the current environment (see `SmtProof.Local.inlineNewConstants`),
+    with their method and tactic. -/
+def startDischarges (goals : Array (Expr × String)) (width : Nat) :
+    TermElabM (Array (Task (Option (Expr × String × Option Nat)))) := do
+  let base ← getEnv
+  let promises ← goals.mapM fun _ => (IO.Promise.new : BaseIO (IO.Promise (Option (Expr × String × Option Nat))))
+  let next ← IO.mkRef 0
+  let preferred ← IO.mkRef ({} : Std.HashMap String Nat)
+  for _ in [:min width goals.size] do
+    discard <| SmtProof.Local.runAsync do
+      repeat
+        let i ← next.modifyGet fun i => (i, i + 1)
+        let (some (g, label), some p) := (goals[i]?, promises[i]?) | break
+        let r ← tryCatchRuntimeEx (do
+            let first? ← firstTactic? (← preferred.get) label
+            forallTelescope g fun xs body => do
+              let some (prf, m, i?) ← dischargeOneAux body (first? := first?) (cheap := true) | return none
+              if let some j := i? then preferred.modify (·.insert label j |>.insert (labelKind label) j)
+              let prf ← instantiateMVars (← mkLambdaFVars xs prf)
+              if prf.hasMVar || prf.hasFVar then return none
+              return some (← SmtProof.Local.inlineNewConstants base prf, m, i?))
+          fun _ => pure none
+        p.resolve r
+  return promises.map (·.resultD none)
+
 /-- Discharge all the proof obligations in `p`.
     Return the updated proof term and the discharge statistics. Proof obligations that cannot be
     discharged are left unchanged in the returned proof term.
@@ -1421,6 +1481,33 @@ partial def dischargeHoles
     let r ← fallback type
     if r.isNone then fallbackFailed.modify (·.insert type)
     return r
+  -- the obligations discharged speculatively, in parallel (see `startDischarges`; environment variable
+  -- `BLASTER_RECON_PARDISCHARGE`: the number of tasks, default 6, 0: none), e.g., the obligations of the CEK evaluation of
+  -- a validator proved by `grind` in about 0.4 s each
+  let width := ((← IO.getEnv "BLASTER_RECON_PARDISCHARGE").bind String.toNat?).getD 6
+  let spec : Std.HashMap ExprStructEq (Task (Option (Expr × String × Option Nat))) ←
+    if width == 0 || holes.size < 2 then pure {} else
+    withProfile "dischargeHoles.speculation" do
+      let goals ← IO.mkRef (#[] : Array (Expr × String))
+      let seen ← IO.mkRef ({} : Std.HashSet ExprStructEq)
+      discard <| transformScoped p fun e => do
+        let some type := holeType? e | return none
+        let type ← instantiateMVars type
+        -- NOTE: the obligations discharged by definitional unfolding (most of them, e.g., the projections of
+        -- constructor applications) are discharged here (see `solved`), the other ones speculatively
+        if (← solved.get).contains type then return none
+        if let some prf ← proveByDefEq type then
+          solved.modify (·.insert type (prf, "rfl"))
+          return none
+        if let some (g, _) ← closedObligation? type then
+          if !(← seen.get).contains g then
+            seen.modify (·.insert g)
+            goals.modify (·.push (g, labelOf e))
+        return none
+      let goals ← goals.get
+      let tasks ← startDischarges goals width
+      return (goals.zip tasks).foldl (init := ({} : Std.HashMap ExprStructEq (Task (Option (Expr × String × Option Nat)))))
+        fun m ((g, _), t) => m.insert g t
   -- first pass
   let p' ← withProfile "dischargeHoles.first" (info := fun p' => s!"dag={dagSize p'}") <| transformScoped p fun e => do
     match holeType? e with
@@ -1434,14 +1521,28 @@ partial def dischargeHoles
           if !prf.hasAnyFVar (!lctx.contains ·) then
             stats.modify (·.record method label)
             return some prf
+        -- the speculative discharge (see `startDischarges`)
+        if !spec.isEmpty then
+          if let some (g, xs) ← closedObligation? type then
+            if let some t := spec.get? g then
+              if let some (pf, method, i?) ← IO.wait t then
+                -- the realizations of the task (e.g., the splitters of matchers), shared between the environments
+                SmtProof.Local.realizeReservedNames pf
+                let env ← getEnv
+                if pf.getUsedConstants.all (env.contains · (skipRealize := true)) then
+                  let prf := pf.beta xs
+                  stats.modify (·.record method label)
+                  solved.modify (·.insert type (prf, method))
+                  if let some i := i? then preferred.modify (·.insert label i |>.insert (labelKind label) i)
+                  if label.startsWith "rule:recFunEquiv" then
+                    if let some f ← generalizeFact type prf then facts.modify (·.push f)
+                  return some prf
         let start ← IO.monoMsNow
         -- NOTE: the equivalences of recursive functions are proved by induction (the case analyses tried before it fail
         -- after their budget, e.g., 1.6 s on a CEK evaluation), unless another tactic discharged one with the same label
-        let first? ← match (← preferred.get).get? label with
-          | some i => pure (some i)
-          | none =>
-            if label.startsWith "rule:recFunEquiv:" then pure ((← dischargeTactics).findIdx? (·.1 == "induction"))
-            else pure none
+        -- (or the one of the last obligation of the same kind, e.g., `rule:matchReduction` for the reductions of the
+        -- `match` applications of different matchers, discharged by `grind` after the failures of `simp` and `omega`)
+        let first? ← firstTactic? (← preferred.get) label
         let r ← withoutSharedProofs (dischargeInContext type (first? := first?) (early := early))
         let ms := (← IO.monoMsNow) - start
         if ms ≥ 1000 then
@@ -1457,7 +1558,7 @@ partial def dischargeHoles
         | some (prf, method, i?) =>
             stats.modify (·.record method label)
             solved.modify (·.insert type (prf, method))
-            if let some i := i? then preferred.modify (·.insert label i)
+            if let some i := i? then preferred.modify (·.insert label i |>.insert (labelKind label) i)
             if label.startsWith "rule:recFunEquiv" then
               if let some f ← generalizeFact type prf then facts.modify (·.push f)
             return some prf
