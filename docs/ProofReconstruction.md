@@ -368,8 +368,8 @@ the polymorphic encoding bound by an enclosing context) stay inlined; with all t
 
 Performance on the CEK validators (one theorem per run, `BLASTER_SMT_PROOF=only`, backend `z3rec`, 4 threads, low
 load): the `Governance` theorems are reconstructed and kernel checked in 22 to 28 s in total, Blaster's own check
-included (15 s of Z3; the fourteenth theorem took 392 s before the changes below), the `MintingPolicy` ones in 33 and
-40 s (348 and 382 s), `HelloWorld` in 10 s:
+included (15 s of Z3; the fourteenth theorem took 392 s before the changes below), the `MintingPolicy` ones in 31 and
+36 s (348 and 382 s), `HelloWorld` in 7 s:
  - the optimizer records evidence for the simplifications of `Blaster.dite'` with constant branches
    (`recordDITESimp`), the connectives of `Blaster.decide'` (`recordDecideOp`) and the replacement of a matcher by an
    equivalent one (`mkMatchEquivProof`): 467 of the 672 proof obligations of the fourteenth `Governance` theorem,
@@ -401,7 +401,14 @@ included (15 s of Z3; the fourteenth theorem took 392 s before the changes below
    the generalizations of a datatype lemma together (`proveClosedFirst`): 11 s of rewrites instead of 18 s for the
    fourteenth `Governance` theorem;
  - the case analyses of the unit resolutions are built under their binders (`orElim` was quadratic in the literals of
-   the large clauses, a third of the replay of `MintingPolicy`);
+   the large clauses, a third of the replay of `MintingPolicy`), with the premises of the step as bound variables, and
+   so are the facts derived by the propositional engine (`PropEngine.lam1`): an abstraction traverses the large terms of
+   the clauses (the rewrites of `MintingPolicy` are replayed in 1 s instead of 3.6 s);
+ - the proof obligations of the optimizer not discharged by definitional unfolding are discharged speculatively in
+   parallel (`startDischarges`, 6 tasks, `BLASTER_RECON_PARDISCHARGE`, 0: none), closed over their relevant context and
+   without the costly case analyses, the tactic that discharged an obligation being tried first on the next ones of
+   the same kind (e.g., the reductions of the `match` applications of all the matchers); the obligations of
+   `HelloWorld` are discharged in 2 s instead of 4.6 s;
  - `shareDeepProofs` bounds the proof depth at 512 (128 before, which shared the evidence of depth 211 of a
    `MintingPolicy` theorem in 12 s).
 The rest is mostly Z3's check of the query (15 s for `Governance`, 10 s for `MintingPolicy`, during which the proof run
