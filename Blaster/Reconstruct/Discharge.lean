@@ -80,6 +80,26 @@ def attempt [Monad m] [MonadBacktrack s m] [MonadExcept Exception m] [MonadRunti
       if r.isNone then failed else return r)
     (fun _ => failed)
 
+/-- `x`, with its interrupt exceptions (not caught by `try`/`catch`, see `Core.tryCatch`) handled by `h`. -/
+def catchInterrupt (x h : CoreM α) : CoreM α := fun ctx s => do
+  try x ctx s catch ex => if ex.isInterrupt then h ctx s else throw ex
+
+/-- `x` interrupted after `ms` milliseconds (checked by `checkSystem`, e.g., in `whnf`, `isDefEq` and `simp`):
+    `none` when interrupted, with the state restored. -/
+def withTimeLimit (ms : Nat) (x : TermElabM (Option α)) : TermElabM (Option α) := do
+  let tk ← IO.CancelToken.new
+  let _ ← IO.asTask (prio := .dedicated) do IO.sleep ms.toUInt32; tk.set
+  let s ← saveState
+  let info ← getInfoState
+  let tasks := (← getThe Core.State).snapshotTasks
+  let interrupted : TermElabM (Option α) := do
+    s.restore
+    setInfoState info
+    modifyThe Core.State fun st => { st with snapshotTasks := tasks }
+    return none
+  controlAt CoreM fun runInBase =>
+    catchInterrupt (withReader (fun ctx => { ctx with cancelTk? := some tk }) (runInBase x)) (runInBase interrupted)
+
 /-- Implementation of `dependsOnSorry`.
     NOTE: Each expression is traversed by the native `Expr.findExt?` (whose cache of visited shared subterms is
     much more efficient than the one of `Expr.getUsedConstants`, i.e., on large proofs), the constants of the
@@ -1044,7 +1064,8 @@ mutual
     The tactic of index `first?` (e.g., the one that discharged the previous obligation with the same origin,
     see `dischargeHoles`) is tried first.
 -/
-partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : Option Nat := none) :
+partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : Option Nat := none)
+    (early : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) (cheap := false) :
     TermElabM (Option (Expr × String × Option Nat)) := do
   let type ← instantiateMVars type
   -- ill-typed proof obligations (e.g., due to ill-typed optimized expressions) can't be discharged
@@ -1077,6 +1098,10 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
     let (name, tac) := tacs[i]
     if skip name || first == some i then continue
     if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
+  -- the caller's strategy before the costly case analyses (e.g., the replay of an SMT proof, which proves in less than
+  -- a second obligations of CEK evaluations on which the case analyses below fail after a minute)
+  if let some (prf, m) ← profileAttempt "early" (early type) then return some (prf, m, none)
+  if cheap then return none
   -- deeper case analysis with a larger budget (e.g., equality of nested structures)
   if !large then
     if let some prf ← profileAttempt "deep cases"
@@ -1343,10 +1368,13 @@ def relevantContext? (type : Expr) : MetaM (Option (LocalContext × LocalInstanc
     `simp [*]`) are much faster without them. The obligation is discharged in the whole local context
     otherwise.
 -/
-def dischargeInContext (type : Expr) (first? : Option Nat := none) : TermElabM (Option (Expr × String × Option Nat)) := do
-  let some (lctx, insts) ← relevantContext? type | dischargeOneAux type (first? := first?)
-  if let some r ← withLCtx lctx insts (dischargeOneAux type (first? := first?)) then return some r
-  dischargeOneAux type (first? := first?)
+def dischargeInContext (type : Expr) (first? : Option Nat := none)
+    (early : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) :
+    TermElabM (Option (Expr × String × Option Nat)) := do
+  let some (lctx, insts) ← relevantContext? type | dischargeOneAux type (first? := first?) (early := early)
+  if let some r ← withLCtx lctx insts (dischargeOneAux type (first? := first?) (early := early)) then return some r
+  -- NOTE: the costly strategies (and `early`) failed in the relevant context: the full context only for the tactics
+  dischargeOneAux type (first? := first?) (cheap := true)
 
 /-- Discharge all the proof obligations in `p`.
     Return the updated proof term and the discharge statistics. Proof obligations that cannot be
@@ -1373,6 +1401,12 @@ partial def dischargeHoles
   -- first.
   let solved ← IO.mkRef ({} : Std.HashMap ExprStructEq (Expr × String))
   let preferred ← IO.mkRef ({} : Std.HashMap String Nat)
+  -- the obligations on which `fallback` failed (tried before the costly strategies of the first pass)
+  let fallbackFailed ← IO.mkRef ({} : Std.HashSet ExprStructEq)
+  let early (type : Expr) : TermElabM (Option (Expr × String)) := do
+    let r ← fallback type
+    if r.isNone then fallbackFailed.modify (·.insert type)
+    return r
   -- first pass
   let p' ← withProfile "dischargeHoles.first" (info := fun p' => s!"dag={dagSize p'}") <| transformScoped p fun e => do
     match holeType? e with
@@ -1387,7 +1421,14 @@ partial def dischargeHoles
             stats.modify (·.record method label)
             return some prf
         let start ← IO.monoMsNow
-        let r ← withoutSharedProofs (dischargeInContext type (first? := (← preferred.get).get? label))
+        -- NOTE: the equivalences of recursive functions are proved by induction (the case analyses tried before it fail
+        -- after their budget, e.g., 1.6 s on a CEK evaluation), unless another tactic discharged one with the same label
+        let first? ← match (← preferred.get).get? label with
+          | some i => pure (some i)
+          | none =>
+            if label.startsWith "rule:recFunEquiv:" then pure ((← dischargeTactics).findIdx? (·.1 == "induction"))
+            else pure none
+        let r ← withoutSharedProofs (dischargeInContext type (first? := first?) (early := early))
         let ms := (← IO.monoMsNow) - start
         if ms ≥ 1000 then
           profileLog "obligation" ms fun _ => s!"{label} {(r.map (·.2.1)).getD "failed"} hash={type.hash}"
@@ -1409,12 +1450,16 @@ partial def dischargeHoles
         | none => return some e
   reportAttempts
   -- second pass (with proved equivalences as hypotheses), fallback regions and failure reporting
-  let (p', st) ← withProfile "dischargeHoles.second" (secondPass (← facts.get) labelOf p')
+  let fallback (type : Expr) : TermElabM (Option (Expr × String)) := do
+    if (← fallbackFailed.get).contains type then return none
+    fallback type
+  let (p', st) ← withProfile "dischargeHoles.second" (secondPass (← facts.get) labelOf fallback p')
   reportAttempts
   return (p', (← stats.get).merge st)
 
   where
-    secondPass (facts : Array (Expr × Expr)) (labelOf : Expr → String) (p : Expr) :
+    secondPass (facts : Array (Expr × Expr)) (labelOf : Expr → String)
+      (fallback : Expr → TermElabM (Option (Expr × String))) (p : Expr) :
       TermElabM (Expr × DischargeStats) := do
       let stats ← IO.mkRef ({} : DischargeStats)
       let p' ← transformScoped p fun e => do
@@ -1423,7 +1468,7 @@ partial def dischargeHoles
         withoutSharedProofs do
           if isFallback e then
             let inner := e.consumeMData
-            let (inner', st) ← secondPass facts labelOf inner
+            let (inner', st) ← secondPass facts labelOf fallback inner
             if st.failures.isEmpty && !hasHoles inner' then
               stats.modify (·.merge st)
               return some inner'
