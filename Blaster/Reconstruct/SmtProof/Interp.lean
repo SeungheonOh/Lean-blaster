@@ -1,5 +1,6 @@
 import Lean
 import Blaster.Reconstruct.SmtProof.Term
+import Blaster.Reconstruct.SmtProof.SortInfer
 
 /-!
 # Interpretation of SMT terms in Lean
@@ -84,6 +85,11 @@ structure InterpCtx where
   /-- interpretation of the terms already interpreted in the current scope of local variables (e.g., the body
       of a macro for given arguments): set when the scope is entered (see `withScopeCache`) -/
   scopeCache : Option (IO.Ref (TermCache Expr)) := none
+  /-- instances of the constructor applications that their arguments don't determine (e.g., `List.nil`), inferred on
+      the whole proof (see `SortInfer`), on term object addresses -/
+  sortHints : TermCache SortInfer.Hint := {}
+  /-- the hints of the terms interpreted with undetermined types (see `withSortHint`) -/
+  pendingHints : Option (IO.Ref (Array (Expr × SortInfer.Hint))) := none
 
 abbrev InterpM := ReaderT InterpCtx MetaM
 
@@ -577,6 +583,59 @@ def asProp (e : Expr) : MetaM Expr := do
   if isBoolType t then return mkBoolTrue e
   return e
 
+/-- The type of the (possibly partial) sort hint `h` (see `SortInfer`): the unknown parts are metavariables. -/
+partial def hintType (h : SortInfer.Hint) : InterpM Expr := do
+  if let some s := h.toSExpr? then
+    if let some t ← (try some <$> sortToType s catch _ => pure none) then return t
+  match h with
+  | .unknown => mkFreshTypeMVar
+  | .con n args =>
+      if args.isEmpty then return ← sortToType (.atom n)
+      let some t := (← read).table.sorts.get? n | mkFreshTypeMVar
+      -- NOTE: as in `sortToType`, `Bool` stands for Lean `Bool` in the sort arguments
+      let arg (a : SortInfer.Hint) : InterpM (Option Expr) :=
+        if a == .unknown then pure none
+        else if a == .con "Bool" #[] then pure (some (mkConst ``Bool))
+        else some <$> hintType a
+      let .const c _ := t | return mkAppN t (← args.mapM fun a => do (← arg a).getDM mkFreshTypeMVar)
+      -- NOTE: the type constructor instantiated by unification (not `mkAppM`, whose new metavariable context can't
+      -- assign the universe levels of the metavariables of the unknown parts)
+      let f ← mkConstWithFreshMVarLevels c
+      let (ms, _, _) ← forallMetaTelescopeReducing (← inferType f)
+      if ms.size != args.size then throwError "smt proof: ill-formed sort hint for {c}"
+      for (m, a) in ms.zip args do
+        if let some ty ← arg a then
+          unless ← isDefEq m ty do throwError "smt proof: ill-typed sort hint for {c}"
+      instantiateMVars (mkAppN f ms)
+
+/-- The interpretation `x` of the term `t`, recording the hint of `t` (the instance of a constructor application inferred
+    on the whole proof, see `SortInfer`) when its type is not determined yet: the hints are applied to the types that
+    the whole term leaves undetermined (see `applySortHints`), i.e., they don't override the instances that the term
+    determines (e.g., `List Nat` vs. `List Int`, of the same sort `(@List Int)`). -/
+def withSortHint (t : STerm) (x : InterpM Expr) : InterpM Expr := do
+  let e ← x
+  let some ref := (← read).pendingHints | return e
+  let some h := (← read).sortHints.get? (termAddr t) | return e
+  if e.hasExprMVar then ref.modify (·.push (← inferType e, h))
+  return e
+
+/-- Unify the types of the pending hints (see `withSortHint`) that are still undetermined with their hints (e.g.,
+    `List.nil` interpreted as `@List.nil (Prod Data ?β)` in all the steps, where `?β` is then defaulted like the
+    undetermined instances of the step). -/
+def applySortHints (pending : Array (Expr × SortInfer.Hint)) : InterpM Unit := do
+  for (ty, h) in pending do
+    let ty ← instantiateMVars ty
+    if !ty.hasExprMVar then continue
+    let some hty ← (try some <$> hintType h catch _ => pure none) | continue
+    discard <| isDefEq ty hty
+
+/-- Run `x`, then apply the hints of the terms it interpreted (see `withSortHint`). -/
+def withSortHints (x : InterpM α) : InterpM α := do
+  let ref ← IO.mkRef #[]
+  let r ← withReader (fun c => { c with pendingHints := some ref }) x
+  applySortHints (← ref.get)
+  return r
+
 mutual
 /-- Interpret the SMT term `t` as a Lean term. -/
 partial def interp (t : STerm) : InterpM Expr := do
@@ -609,8 +668,8 @@ partial def interpCore (t : STerm) : InterpM Expr := do
   | .lit s => throwError "smt proof: unsupported literal {s}"
   | .str s => return mkStrLit (decodeSmtString s)
   | .annot t _ => interp t
-  | .sym s => interpApp s #[]
-  | .app f args => interpApp f args
+  | .sym s => withSortHint t (interpApp s #[])
+  | .app f args => withSortHint t (interpApp f args)
   | .qual f sort args =>
       let ty ← sortToType sort
       -- constructors: the parameters of the datatype are given by the sort (e.g., `(as Option.some (Option Nat))`
@@ -679,7 +738,10 @@ partial def interpQuant (k : QuantKind) (vars : Array (String × SExpr)) (body :
         let v := if natParam vars[i].2 then mkIntOfNat x else x
         withReader (fun ctx => { ctx with locals := ctx.locals.insert vars[i].1 v }) (go (i + 1) (fvars.push x))
     else
-      let b ← withScopeCache (← read).locals (interp body)
+      -- NOTE: the hints of the body are applied before its abstraction (the metavariables of the types it leaves
+      -- undetermined would then depend on the bound variables)
+      let b ← withScopeCache (← read).locals do
+        if (← read).pendingHints.isSome then withSortHints (interp body) else interp body
       match k with
       | .forall => mkForallFVars fvars b
       | .lambda => mkLambdaFVars fvars b

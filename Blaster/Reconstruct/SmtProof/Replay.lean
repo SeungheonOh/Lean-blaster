@@ -98,6 +98,8 @@ structure ReplayState where
   /-- proofs of the global steps, in the order of their replay (premises first), represented in the proofs by the
       metavariables (unassigned, such that no instantiation inlines them, see `liftGlobalProofs`) -/
   globalProofs : Array (MVarId × Expr) := #[]
+  /-- the steps of the proofs of `globalProofs` -/
+  globalSteps : Array Nat := #[]
 
 abbrev ReplayM := ReaderT ReplayCtx (StateRefT ReplayState TermElabM)
 
@@ -125,7 +127,9 @@ def stepConcl (i : Nat) : ReplayM Expr := do
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c
   let t0 ← IO.monoMsNow
-  let e ← instantiateMVars (← liftInterp (withReader (fun c => { c with deferTypes := true }) (interpProp c)))
+  -- NOTE: the hints of the constructor applications whose instance the conclusion leaves undetermined (see
+  -- `SortInfer`) are applied before the defaults
+  let e ← instantiateMVars (← liftInterp (withSortHints (withReader (fun c => { c with deferTypes := true }) (interpProp c))))
   -- NOTE: undetermined type parameters are most likely the sort variable of a polymorphic goal (e.g., `List.nil`
   -- in a goal on `List α`), and otherwise irrelevant (e.g., `Option.none` under a tester)
   let e ← defaultTypes (← fillDefaults e) (← defaultTypeParam)
@@ -802,6 +806,42 @@ where
     large proof). -/
 @[implemented_by dagStatsImpl] opaque dagStats (e : Expr) : Nat × Nat
 
+/-- Number of bits set in `n`. -/
+partial def popCount (n : Nat) (acc : Nat := 0) : Nat :=
+  if n == 0 then acc else
+    let w : UInt64 := n.toUInt64
+    let w : UInt64 := w - ((w >>> 1) &&& (0x5555555555555555 : UInt64))
+    let w : UInt64 := (w &&& (0x3333333333333333 : UInt64)) + ((w >>> 2) &&& (0x3333333333333333 : UInt64))
+    let w : UInt64 := (w + (w >>> 4)) &&& (0x0f0f0f0f0f0f0f0f : UInt64)
+    let w : UInt64 := (w * (0x0101010101010101 : UInt64)) >>> 56
+    popCount (n >>> 64) (acc + w.toNat)
+
+/-- Implementation of `instantiationStats`. -/
+unsafe def instantiationStatsImpl (e : Expr) : Nat × Nat × Array Nat :=
+  let (_, (m, total, hist)) := (go e).run ({}, 0, Array.replicate 12 0)
+  (hist.foldl (· + ·) 0, total, hist)
+where
+  -- NOTE: the closed subterms are traversed too (e.g., the closed lambda terms of `liftGlobalProofs`)
+  go (e : Expr) : StateM (Std.HashMap USize Nat × Nat × Array Nat) Nat := do
+    if let some s := (← get).1.get? (ptrAddrUnsafe e) then return s
+    let s ← match e with
+      | .bvar i => pure (1 <<< i)
+      | .app f a => pure ((← go f) ||| (← go a))
+      | .lam _ t b _ | .forallE _ t b _ => pure ((← go t) ||| ((← go b) >>> 1))
+      | .letE _ t v b _ => pure ((← go t) ||| (← go v) ||| ((← go b) >>> 1))
+      | .mdata _ b | .proj _ _ b => go b
+      | _ => pure 0
+    let k := popCount s
+    modify fun (m, total, hist) =>
+      (m.insert (ptrAddrUnsafe e) s, total + k, if k == 0 then hist else hist.modify (min (Nat.log2 k) 11) (· + 1))
+    return s
+
+/-- Cost of the instantiations of the binders of `e` by the kernel (e.g., in `infer_lambda`), which rebuild the subterms
+    referring to the instantiated binder: the number of distinct subterms with loose bound variables, the sum over them
+    of the number of distinct binders they refer to (the number of copies of the subterms built by the instantiations),
+    and the histogram of these numbers (bucket `k`: from `2^k` to `2^(k+1) - 1` binders). -/
+@[implemented_by instantiationStatsImpl] opaque instantiationStats (e : Expr) : Nat × Nat × Array Nat
+
 /-- Implementation of `abstractFVar`: the caches are keyed by the addresses of the subterms (the structural equality of
     large terms is costly). -/
 unsafe def abstractFVarImpl (e : Expr) (x : FVarId) : Expr :=
@@ -849,8 +889,11 @@ where
     NOTE: the proofs use placeholders `P fvs` for the proofs of the global steps they use (such that they are not
     inlined), are abstracted by a single (native) abstraction sharing its cache (e.g., the interpreted terms of the goal
     shared by the proofs of the steps), and the placeholders are then replaced in the order of the steps (premises
-    first). Nothing is lifted when a proof has metavariables. -/
-def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array Expr) : MetaM Expr := do
+    first). Nothing is lifted when a proof has metavariables.
+    With `aux?`, each closed lambda term is replaced by the term that `aux? i (∀ fvs, φᵢ) Λ` returns (e.g., the
+    constant of an auxiliary theorem proved by `Λ`, see `proveBySmtProof`), in the order of the substitutions. -/
+def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array Expr)
+    (aux? : Option (Nat → Expr → Expr → MetaM Expr) := none) : MetaM Expr := do
   -- the proofs inlined (no lifting)
   let inline : MetaM Expr := do
     for (m, v) in globals do m.assign v
@@ -909,7 +952,12 @@ def liftGlobalProofs (p : Expr) (globals : Array (MVarId × Expr)) (fvs : Array 
         order := order.push i
   let mut finals : Std.HashMap FVarId Expr := {}
   for i in order do
-    finals := finals.insert ps[i]! (subst finals (withBody template fvs.size bodies[i]!))
+    let v := subst finals (withBody template fvs.size bodies[i]!)
+    -- the closed term replaced by the term `aux?` builds from its type and itself (e.g., an auxiliary theorem)
+    let v ← match aux? with
+      | some aux => aux i (← mkForallFVars fvs (← instantiateMVars (← globals[i]!.1.getType))) v
+      | none => pure v
+    finals := finals.insert ps[i]! v
   return subst finals root
 
 /-- The steps being replayed (innermost last), written to the file given by `BLASTER_SMTPROOF_CURRENT` (if set)
@@ -966,7 +1014,7 @@ partial def replay (i : Nat) : ReplayM Expr := do
     -- scopes), but held by `globalProofs` (see `liftGlobalProofs`)
     let p ← if p.isFVar || p.isMVar then pure p else do
       let m ← withLCtx ctx.baseLCtx ctx.baseInsts <| mkFreshExprMVar (← stepConcl i) (kind := .syntheticOpaque)
-      modify fun s => { s with globalProofs := s.globalProofs.push (m.mvarId!, p) }
+      modify fun s => { s with globalProofs := s.globalProofs.push (m.mvarId!, p), globalSteps := s.globalSteps.push i }
       pure m
     modify fun s => { s with cache := s.cache.insert i p }
     return p
@@ -1169,11 +1217,15 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       -- `(or (not (forall xs. P)) P[ts])`
       let some (nq, inst) := orArgs? concl | throwError "quant-inst: disjunction expected"
       let some q := nq.not? | throwError "quant-inst: negated quantifier expected"
-      let ts ← liftInterp (step.args.mapM interpInt?) >>= (·.mapM fun t => liftM (fillDefaults t))
+      let pending ← IO.mkRef #[]
+      let ts ← liftInterp (withReader (fun c => { c with pendingHints := some pending }) (step.args.mapM interpInt?)) >>=
+        (·.mapM fun t => liftM (fillDefaults t))
       let dflt ← defaultTypeParam
       let r ← withLocalDeclD `h q fun h => do
         let hi ← instantiateWithCoercion h ts
         if !(← propEq (← inferType hi) inst (deep := true)) then throwError "quant-inst: instance mismatch"
+        -- the hints of the instantiation terms whose instance is still undetermined (see `SortInfer`)
+        liftInterp (applySortHints (← pending.get))
         let hi ← assignDefaultTypes hi dflt
         mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inr) nq inst hi)
       let rn ← withLocalDeclD `h nq fun h => mkLambdaFVars #[h] (mkApp3 (Lean.mkConst ``Or.inl) nq inst h)

@@ -216,7 +216,12 @@ instead of (or in addition to) re-proving them with Lean tactics. This is implem
    Lean functions, constructor fields); `Bool` formulas as propositions; datatype constructors, selectors and
    testers as Lean constructors and case analyses; Blaster's function values (`@@ArrowT`, `@apply`) as Lean
    functions; Blaster's type predicates (`@isNat`, ...) as `True` (Lean values always satisfy them);
-   skolem constants as `Classical.epsilon` terms.
+   skolem constants as `Classical.epsilon` terms. Z3 prints the nullary constructors of parametric datatypes
+   without their sort (`List.nil` for all the instances of `@List`), and the occurrences of a term are one object
+   only when Z3 binds it by a `let`: the instances of the constructor applications that their arguments don't
+   determine are inferred on the whole proof (`SortInfer.lean`: one sort per term object, from the signatures of
+   the query and the constraints of all the steps), such that each occurrence is interpreted in the same instance
+   in all the steps where it occurs; the parts that remain undetermined are defaulted identically in each step.
 4. **Replay** (`Replay.lean`). Each step yields a Lean proof of the interpretation of its conclusion:
    explicit proof terms for resolution (a unit propagation procedure building the proof), modus ponens,
    equality reasoning, quantifier instantiation, skolemization, hypotheses and lemmas; and small tactic
@@ -287,7 +292,7 @@ On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=o
 SMT residuals), the replay of Z3 proofs proves **99.1%** of the goals closed by the SMT solver (338/341, nightly
 Z3; 88.9%, 248/279, before the closed-statement tactics, the universe interpretation of polymorphic goals, the
 nonlinear lemmas and the bridge of normalized `match` patterns). Counting each replay attempt of the `Tests/Smt`
-and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 310 of 320 goals are replayed (283 of
+and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 312 of 321 goals are replayed (283 of
 297 before the interpretation of empty types, of types used as values and of sort quantifiers under binders); the
 remaining ones involve polymorphic structure fields with instance arguments (`Issue15`, `InstanceArgs`), inductive
 propositions with data fields and constructor testers on propositions (`SmtUninhabited`), a nonlinear lemma over
@@ -318,8 +323,43 @@ copied them once per depth. The second `MintingPolicy` theorem (a residual proof
 10.7M distinct subterms at binder depth 216 whose abstraction exceeded 36 GB; it is now lifted in 0.5 s into a proof
 of 2.5M distinct subterms. The second `SellNFT` theorem (a residual proof replayed in 5 minutes, a final proof of
 9.2M distinct subterms at binder depth 964) is kernel checked in 53 minutes in total (17.5 GB; the kernel checks of
-reconstructed proofs have no heartbeat limit, see `kernelOptions`); the replay of the first one fails on steps about
-selectors applied to other constructors.
+reconstructed proofs have no heartbeat limit, see `kernelOptions`). The replay of the first one failed on a `trans*`
+step about `(List.cons.0 List.nil)`, the head of the empty list of pairs of `Data` (a default value of the selector):
+Z3 printed its occurrences in these steps as distinct objects (`let` bindings only share some of the occurrences of a
+term), each conclusion was interpreted by itself, and the steps that don't determine its instance defaulted it, e.g.,
+to a pair of `Data` in a step and to a pair of `Unit` (with another default value) in the next one, such that the
+paths of `trans*` between the interpretations didn't connect. The default values of the selectors are fixed per
+instance (`Inhabited.default`, or a constructor application); the instances were not. With the instances inferred on
+the whole proof (`SortInfer.lean`: 195 hints on the 152,698 steps of its residual proof, in 0.15 s), the residual proof
+is replayed in 5 minutes into a proof of 10.1M distinct subterms at binder depth 1425. Checked as a single
+declaration, it did not fit in the memory of the measurement machine, whose user processes are throttled at 20 GB
+(`memory.high` of `user.slice`): from the 7.3 GB of the replay, the kernel check grew by about 4 GB per minute,
+peaked at 16.9 GB of memory and 16.5 GB of swap, then made no progress while swapping (the check of the second
+theorem, at binder depth 964, peaked at 17.5 GB). The binder depth is not the cause. The 7,207 `lemma` steps are all
+global steps (their subproofs discharge all their hypotheses), whose proofs are already lifted to closed terms, and
+the kernel does not rebuild a closed term when it instantiates the binders it occurs under. Counted on the proof
+(`BLASTER_SMTPROOF_ISTATS`), the kernel's instantiations of the binders, which rebuild the subterms referring to the
+instantiated binder, build 15.7M copies of the 9.3M subterms with loose bound variables (a subterm refers to at most
+63 binders). The memory goes to the kernel's caches, which are kept for the check of a whole declaration: the type
+inferred for each checked subterm, and the equivalences of the types that `is_def_eq` compares (the conclusions of
+the steps, interpreted over the terms of the CEK evaluation, are compared structurally where the kernel's
+instantiations made them pointer-distinct; samples of the kernel's stacks are in `equiv_manager` and `expr_eq_fn`).
+With 4096 global proofs or more (`BLASTER_SMTPROOF_SPLIT`, 0: always), each lifted global proof is checked by the
+kernel as an auxiliary theorem `∀ xs, ¬ goal → φ` over the variables of the goal and the negated goal, and used as
+its constant applied to them (`liftGlobalProofs` with `aux?`): the 19,369 global proofs of the residual of the first
+theorem are checked one at a time in 6.5 minutes (each in less than a second, about 20 ms on average), the memory
+staying at the 7.3 GB of the replay, and the final proof of the residual has 5 distinct subterms. The first
+`SellNFT` theorem is then kernel checked in 33 minutes in total (12.7 GB at most): the residual in 11 minutes (Z3,
+replay and auxiliary theorems), the optimizer's evidence (12.5M distinct subterms, 1,004 proof obligations, 3 of
+them proved by the replay of their own Z3 proofs of 2,674 to 3,608 global proofs, checked as single declarations in
+15 to 32 s) in 14 minutes, and the kernel check of the whole proof (19.7M distinct subterms, which refer to the
+auxiliary theorems) in 32 s. The obligations' proofs are then the peak; checked as auxiliary theorems too
+(`BLASTER_SMTPROOF_SPLIT=1`), the theorem is kernel checked in 35 minutes at 11.0 GB at most. The second `SellNFT`
+theorem (16,946 global proofs in its residual, checked as auxiliary theorems in 5.5 minutes) is now kernel checked
+in 31 minutes at 13.3 GB at most (53 minutes and 17.5 GB as a single declaration), and the second `MintingPolicy`
+theorem (6,928 global proofs) in 5 minutes at 3.7 GB. The proofs that are not closed (e.g., over the variables of
+the polymorphic encoding bound by an enclosing context) stay inlined; with all the proofs as auxiliary theorems
+(`BLASTER_SMTPROOF_SPLIT=0`), the replay of the SMT goals of the test suite is unchanged (312/321).
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional

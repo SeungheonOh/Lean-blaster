@@ -309,7 +309,13 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- CardanoLedgerApiBlaster's Governance); seconds (environment variable `BLASTER_SMTPROOF_DEADLINE`)
         let deadline := (← IO.monoMsNow) + 1000 * ((← IO.getEnv "BLASTER_SMTPROOF_DEADLINE").bind String.toNat? |>.getD 1800)
         let global := (scopedSteps sproof).map (!·)
-        let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache }, cfg, deadline, global,
+        -- the instances of the constructor applications that their arguments don't determine (see `SortInfer`)
+        let t0 ← IO.monoMsNow
+        let (sortHints, conflicts) := SortInfer.inferHints cmds sproof
+        if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
+          traceTimed s!"sort inference: {sortHints.size} hints, {conflicts} unification failures, {(← IO.monoMsNow) - t0} ms"
+            (pure ())
+        let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache, sortHints }, cfg, deadline, global,
                                  openHyps := openHypotheses sproof,
                                  baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
         let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
@@ -327,10 +333,44 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- NOTE: the proofs of the steps are instantiated once (see `replay`), the ones of the global steps as closed
         -- lambda terms over the variables of the goal and the negated goal (see `liftGlobalProofs`), the only free
         -- variables of their proofs as `e` is closed (not the variables of the context of the elaboration)
-        let p ← traceTimed "instantiation" (liftGlobalProofs p st.globalProofs (xs.push hneg))
+        -- NOTE: the proofs of many global steps (environment variable `BLASTER_SMTPROOF_SPLIT`, default 4096; 0: always)
+        -- are auxiliary theorems over the variables of the goal and the negated goal, checked by the kernel one at a
+        -- time: the kernel's caches (e.g., the types inferred for the subterms) are kept for the check of a whole
+        -- declaration, e.g., beyond 30 GB for the 10.1M distinct subterms of the proof of a CEK evaluation of a
+        -- validator (19,369 global proofs), checked as auxiliary theorems in 6.5 minutes without memory increase
+        let trace ← IO.getEnv "BLASTER_SMTPROOF_TRACE"
+        let splitMin := ((← IO.getEnv "BLASTER_SMTPROOF_SPLIT").bind String.toNat?).getD 4096
+        let auxCount ← IO.mkRef 0
+        let aux? : Option (Nat → Expr → Expr → MetaM Expr) :=
+          if st.globalProofs.size < splitMin then none else some fun i ty v => do
+            -- NOTE: inlined when not closed, e.g., over variables of the polymorphic encoding (see `Poly`) bound by the
+            -- enclosing context
+            if ty.hasFVar || v.hasFVar || ty.hasMVar || v.hasMVar then return v
+            let lvls := (collectLevelParams (collectLevelParams {} ty) v).params.toList
+            let t0 ← IO.monoMsNow
+            let n ← withOptions (fun o => maxHeartbeats.set o 0) <| mkAuxLemma lvls ty v (cache := false)
+            auxCount.modify (· + 1)
+            -- the checks taking more than a second (environment variable `BLASTER_SMTPROOF_TRACE`)
+            let ms := (← IO.monoMsNow) - t0
+            if let some f := trace then
+              if ms ≥ 1000 then
+                let k := st.globalSteps.getD i 0
+                let rule := (sproof.steps[k]?.map (·.rule)).getD "?"
+                (← IO.FS.Handle.mk f .append).putStrLn
+                  s!"  auxiliary theorem {← auxCount.get}/{st.globalProofs.size} (step {k} {rule}): {ms} ms, value {(dagStats v).1}, type {(dagStats ty).1}"
+            return mkConst n (lvls.map mkLevelParam)
+        if trace.isSome then
+          traceTimed s!"{st.globalProofs.size} global proofs (auxiliary theorems: {aux?.isSome}), negated goal of {(dagStats (← inferType hneg)).1} distinct subterms" (pure ())
+        let p ← traceTimed "instantiation" (liftGlobalProofs p st.globalProofs (xs.push hneg) aux?)
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
           let (n, d) := dagStats p
           traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
+          -- the cost of the instantiations of the binders by the kernel (environment variable
+          -- `BLASTER_SMTPROOF_ISTATS`, the traversal being costly on large proofs)
+          if (← IO.getEnv "BLASTER_SMTPROOF_ISTATS").isSome then
+            let pf := mkLambda `hneg .default (← inferType hneg) (p.abstract #[hneg])
+            let (m, total, hist) := instantiationStats (← mkLambdaFVars xs pf)
+            traceTimed s!"instantiations: {m} subterms with loose bound variables, {total} copies, histogram {hist}" (pure ())
         -- NOTE: the negated goal only occurs in the proofs of the asserted formulas (see `abstractFVar`)
         let pf ← traceTimed "abstraction of the negated goal" do
           if p.hasMVar then mkLambdaFVars #[hneg] p
