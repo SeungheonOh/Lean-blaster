@@ -4,6 +4,10 @@ import Blaster.Optimize.Hypotheses
 open Lean Meta Blaster.Reconstruct
 namespace Blaster.Optimize
 
+/-- Return `true` if `e` is a proof, i.e., its type is a proposition. -/
+def isProofEnv (e : Expr) : TranslateEnvT Bool := do
+  try isPropEnv (← inferTypeEnv e) catch _ => return false
+
 /-- Return `some true` if op1 and op2 are constructors that are structurally equivalent modulo
     variable name/function equivalence
     Return `some false` if op1 and op2 are constructors that are NOT structurally equivalent.
@@ -31,6 +35,8 @@ partial def structEq? (op1 : Expr) (op2: Expr) : TranslateEnvT (Option Bool) := 
                 -- some false -> some none -> some true
                 let mut lat := some true
                 for h : i in [:as1.size] do
+                  -- NOTE: proof arguments (e.g., proof fields of constructors) are irrelevant, i.e., always equal
+                  if ← isProofEnv as1[i] then continue
                   lat := updateLattice lat (← structEq? as1[i] as2[i]!)
                   unless (!isTop lat) do return lat -- break if false
                 return lat
@@ -326,7 +332,9 @@ def arithEq? (op1 : Expr) (op2 : Expr) : TranslateEnvT (Option Expr) := do
      - e = ¬ e ==> False
      - e = not e ==> False
      - e1 = e2 ==> True (if e1 =ₚₜᵣ e2)
-     - e1 = e2 ==> False (if structEq? e1 e2 = some false) (NOTE: `some true` case already handled by =ₚₜᵣ)
+     - e1 = e2 ==> False (if structEq? e1 e2 = some false)
+     - e1 = e2 ==> True (if structEq? e1 e2 = some true, i.e., e1 and e2 only differ in proof arguments)
+     - e1 = e2 ==> True (if Type(e1) is a proposition, i.e., proof irrelevance)
      - true = not e ==> false = e
      - false = not e ==> true = e
      - ¬ e1 = ¬ e2 ==> e1 = e2 (require classical)
@@ -364,6 +372,10 @@ def optimizeEq (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
  let op2 := args[2]!
  let eqType := args[0]!
  let lhs ← mkApp3Expr f eqType op1 op2
+ -- any two proofs of a proposition are equal (proof irrelevance), e.g., `TwoP.a = TwoP.b` for the constructors of
+ -- `inductive TwoP : Prop | a | b`
+ -- NOTE: before any rule comparing the operands structurally (e.g., `structEq?` on distinct constructors)
+ if ← isPropEnv eqType then return ← withThm lhs (← mkPropTrue) ``eq_proof_irrel #[eqType, op1, op2]
  if let Expr.const ``False _ := op1 then
     setRestart
     return ← withThm lhs (← mkAppExpr (← mkPropNotOp) op2) ``false_eq' #[op2]
@@ -371,7 +383,12 @@ def optimizeEq (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
  if isNotExprOf op2 op1 then return ← withThm lhs (← mkPropFalse) ``eq_not_self' #[op1]
  if isBoolNotExprOf op2 op1 then return ← withThm lhs (← mkPropFalse) ``bool_eq_not_self #[op1]
  if exprEq op1 op2 then return ← withThm lhs (← mkPropTrue) ``eq_self #[eqType, op1] f.constLevels!
- if let some false ← structEq? op1 op2 then return ← mkPropFalse
+ match ← structEq? op1 op2 with
+ | some false => return ← mkPropFalse
+ -- constructor applications that only differ in proof arguments (e.g., `S.mk 0 TwoP.a = S.mk 0 TwoP.b`), which are
+ -- definitionally equal (proof irrelevance)
+ | some true => return ← withThm lhs (← mkPropTrue) ``eq_self #[eqType, op1] f.constLevels!
+ | none => pure ()
  if let some (e1, e2) ← notNegEqSimp? op1 op2 then
    let r ← mkApp3Expr f eqType e1 e2
    match op1, boolNot? op2, boolNot? op1 with

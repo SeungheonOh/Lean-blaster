@@ -44,3 +44,4 @@ import Tests.FixedIssues.NatLog2
 import Tests.FixedIssues.CharBitVec
 import Tests.FixedIssues.LambdaDefGuard
 import Tests.FixedIssues.InstanceArgs
+import Tests.FixedIssues.PropProofEq

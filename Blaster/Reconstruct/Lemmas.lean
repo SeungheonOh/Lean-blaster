@@ -299,6 +299,9 @@ theorem exists_const' (α : Sort u) [Nonempty α] (b : Prop) : (∃ _ : α, b) =
 
 /-! ## Equality (see `optimizeEq`) -/
 
+/-- Any two proofs of a proposition are equal (proof irrelevance). -/
+theorem eq_proof_irrel {p : Prop} (a b : p) : (a = b) = True := eq_true (proof_irrel a b)
+
 theorem false_eq' (e : Prop) : (False = e) = ¬ e :=
   propext ⟨fun h h' => h ▸ h', fun h => propext ⟨False.elim, h⟩⟩
 theorem true_eq' (e : Prop) : (True = e) = e := propext ⟨fun h => h ▸ trivial, fun h => (eq_true h).symm⟩
