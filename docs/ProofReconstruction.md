@@ -142,7 +142,12 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
      by the match equation of the pushed match (`mkMatchPushProof`);
    - `elimMatch` with a common rhs: a case split over the splitter with `rfl` in each case;
    - `elimMatch` with the match context (`matchInHyps?`): the discriminants are rewritten with the
-     equalities `h : dⱼ = pⱼ` of the enclosing alternative, then the match is reduced.
+     equalities `h : dⱼ = pⱼ` of the enclosing alternative, then the match is reduced;
+   - the normalization of a match to a chain of `Blaster.dite'` (`normMatchExpr?`): a proof obligation
+     discharged by `match cases` (see below). The optimizer instantiates the equations of the discriminants
+     (`h : d = p` for `match h : d with`) with `Eq.refl d`, whose type is `d = p` only once `d` is rewritten to
+     `p`. When tracking proofs, they are instead proved from the condition of their branch (e.g., `h.1 : x = 2`
+     for the condition `x = 2 ∧ y = 1`), such that the branches are well-typed.
 
 3. **Discharging proof obligations** (`Reconstruct/Discharge.lean`). Each obligation is
    type-checked, then attempted in its own local context, with every binder and hypothesis of the
@@ -160,7 +165,10 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
    8. `match cases`: for an obligation `match ds with alts = rhs`, a case split over the
       matcher's splitter, where the discriminants are replaced by the patterns in `rhs`. Each case is
       discharged recursively with the portfolio, with the pattern equalities and the overlap
-      hypotheses in the local context.
+      hypotheses in the local context. When no splitter can be generated, the variables a match is stuck on
+      are split instead. Matches stuck on literal patterns (e.g., `Int` literals, whose `Int.decEq` tests
+      `whnf` does not unfold) are then reduced with the matcher's equation theorems, before any lemma
+      normalizes the discriminants (e.g., `Int.ofNat (n + 4)` to `↑n + 4`, which no equation theorem matches).
 
    Obligations are closed terms, but their proofs may use the hypotheses of their local context
    (e.g., `simp [*]` with the pattern equalities). The same obligation can occur under different
@@ -182,8 +190,13 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
    `decide`, `simp`, `omega`, `grind`, seeded instantiation of quantified hypotheses
    (`blaster_inst_hyps`), unfolding of user definitions with case analysis, unfolding of recursive
    functions (`blaster_lit_add` first puts `k + n` in the form `n + k` expected by equation lemmas), case
-   analysis on `match` expressions, witness search for existentials, and `div`/`mod` facts
-   (`blaster_divmod_facts`) with non-linear lemmas. Replaying the solver's own proof certificate is
+   analysis on `match` expressions, witness search for existentials, `div`/`mod` facts
+   (`blaster_divmod_facts`) with non-linear lemmas, and elements of empty types. The arguments of a function
+   into an empty type, like the witnesses of existentials over function types, are constructed from
+   their types when they have no default element (`blaster_inhabit`). For example, for `∀ (f : SomeBig → Empty),
+   False` with `SomeBig.intro (n : Nat) (h : n > 5)`, the term `f ⟨6, _⟩` takes the witness 6 from the literals of the
+   constructor type. Another example is `fun x => absurd x.inv _ : FalseInv → Empty`, where a field of `x`
+   is contradictory. Replaying the solver's own proof certificate is
    future work.
 
 5. **Kernel check.** The proof of the original goal is `Eq.mpr pf r`, applied to the local axioms.
@@ -292,14 +305,15 @@ On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=o
 SMT residuals), the replay of Z3 proofs proves **99.1%** of the goals closed by the SMT solver (338/341, nightly
 Z3; 88.9%, 248/279, before the closed-statement tactics, the universe interpretation of polymorphic goals, the
 nonlinear lemmas and the bridge of normalized `match` patterns). Counting each replay attempt of the `Tests/Smt`
-and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 312 of 321 goals are replayed (283 of
+and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 312 of 322 goals are replayed (283 of
 297 before the interpretation of empty types, of types used as values and of sort quantifiers under binders); the
 remaining ones involve polymorphic structure fields with instance arguments (`Issue15`, `InstanceArgs`), inductive
 propositions with data fields and constructor testers on propositions (`SmtUninhabited`), a nonlinear lemma over
 products of conditionals (`Tests/Smt/SmtMatch.lean`), a bit-vector lemma and a proof-production timeout. With the default mode (`last`), the
-replay complements the tactic strategies: 99.8% of all the reconstruction attempts succeed (3917/3924),
-including all the 383 goals closed by the SMT solver and the 411 goals closed by the optimizer; the 7 failures
-are `#testOptimize` certificates of `match` normalizations.
+replay complements the tactic strategies: all the reconstruction attempts succeed (3949/3949), i.e., the 406 goals
+closed by the SMT solver, the 413 goals closed by the optimizer and the 3130 `#testOptimize` certificates (99.8%,
+3917/3924, before the reduction of stuck matches by their equation theorems, the elements constructed for types
+without default element and the equations of the discriminants proved from the branch conditions).
 
 The replay also scales to the validators of
 [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
@@ -577,17 +591,14 @@ a matcher whose body is `sorry`, which the kernel accepts.
 
 ## Current limitations / next steps
 
-- The remaining failures (14 of 3267 attempts, excluding refused unsound eliminations) fall into a few classes:
-  - `match` expressions over `Int` literal patterns with many alternatives (`MatchToITE_9`, `_10`,
-    `_15`): the `normMatchExpr` obligation (a 15-alternative match against its `dite'` chain) is
-    beyond the budget of the case analysis on stuck matches, and the matcher's splitter cannot be
-    generated;
-  - residual goals of the SMT solver over polymorphic or uninterpreted functions with quantified
-    hypotheses (`Issue15`, `Issue25`, `Issue32`, `SmtPredQualifier`), which need quantifier
-    instantiations from the solver;
-  - non-linear residuals (`SmtNatDiv`), and one kernel
-    rejection (`DIteFalseEqCond_17`, a `dite` whose condition is rewritten without its
-    `Decidable` instance).
+- In the default mode, every reconstruction attempt of the test suite succeeds (3949/3949). The replay of SMT
+  proofs alone (`BLASTER_SMT_PROOF=only`) still fails on polymorphic structure fields with instance arguments
+  (`Issue15`, `InstanceArgs`), on inductive propositions with data fields (`SmtUninhabited`, e.g., the selector
+  `SomeBig.intro.0` of Z3 proofs, which has no counterpart in Lean, as a proof is not eliminated into data), on
+  a nonlinear lemma over products of conditionals (`SmtMatch`), and on proof-production timeouts of Z3 (`Issue17`,
+  `NatLog2`); the tactic strategies prove these goals.
+- The state machine commands (`#bmc`, `#kind`) are not reconstructed: their queries are checked incrementally on
+  one solver session (base and induction cases selected by flags), not as Lean goals.
 - `match` rules that rely on the *negative* match context (`lastPatternReduction?`, i.e., the
   discriminant does not match the patterns of the previous alternatives) are not justified
   explicitly yet. The overlap hypotheses of the splitter could be declared in the alternative's local
