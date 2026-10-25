@@ -55,19 +55,47 @@ private def mkTopHole (lhs rhs : Expr) : MetaM Expr := do
     9M distinct subterms of the proof of a CEK evaluation of CardanoLedgerApiBlaster's `SellNFT` validator). -/
 def kernelOptions (o : Options) : Options := maxHeartbeats.set o 0
 
-/-- Check `proof` against `goal` with the Lean kernel. Fall back to the elaborator's type checker
-    when `goal` contains metavariables or free variables.
+/-- The free variables of `es` and the ones their declarations depend on, in the order of the local context. -/
+def usedFVarsClosure (es : Array Expr) : MetaM (Array Expr) := do
+  let collect (e : Expr) : Array FVarId := (Lean.CollectFVars.main e {}).fvarIds
+  let mut set : FVarIdSet := {}
+  let mut todo : Array FVarId := es.foldl (· ++ collect ·) #[]
+  while h : todo.size > 0 do
+    let fv := todo[todo.size - 1]
+    todo := todo.pop
+    if set.contains fv then continue
+    set := set.insert fv
+    let d ← fv.getDecl
+    todo := todo ++ collect d.type ++ ((d.value?.map collect).getD #[])
+  let decls := (← getLCtx).decls.toArray.filterMap id |>.filter (set.contains ·.fvarId)
+  return decls.map (·.toExpr)
+
+/-- Check `proof` against `goal` with the Lean kernel. When they contain free variables (e.g., the hypotheses of a goal
+    of the `blaster` tactic), both are closed over them first. Fall back to the elaborator's type checker when `goal`
+    contains metavariables.
+    NOTE: the kernel instead of `Meta.check`, which runs out of recursion depth on deep proofs (e.g., the ones of the
+    `Auction` validator of CardanoLedgerApiBlaster).
 -/
 def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) := do
   let goal ← instantiateMVars goal
   let proof ← instantiateMVars proof
   if proof.hasMVar then return some m!"proof term contains metavariables"
-  if goal.hasMVar || goal.hasFVar || proof.hasFVar then
+  let elabCheck : TermElabM (Option MessageData) := do
     try
       Meta.check proof
       if ← isDefEq (← inferType proof) goal then return none
       return some m!"proof term does not have the expected type"
     catch ex => return some ex.toMessageData
+  if goal.hasMVar then return ← elabCheck
+  let (goal', proof') ← if goal.hasFVar || proof.hasFVar then do
+      let xs ← usedFVarsClosure #[goal, proof]
+      pure (← instantiateMVars (← mkForallFVars xs goal), ← instantiateMVars (← mkLambdaFVars xs proof))
+    else pure (goal, proof)
+  -- NOTE: the declarations of the local context may contain metavariables (e.g., universe levels of the hypotheses
+  -- introduced by `induction`)
+  if goal'.hasMVar || proof'.hasMVar || goal'.hasFVar || proof'.hasFVar then return ← elabCheck
+  let goal := goal'
+  let proof := proof'
   let lvls := (collectLevelParams {} goal).params.toList
   let name ← mkFreshUserName `_blaster_reconstructed
   let decl := Declaration.thmDecl { name, levelParams := lvls, type := goal, value := proof }
