@@ -1095,6 +1095,18 @@ partial def collectMatchApps (env : Environment) (e : Expr) (acc : Array Expr :=
   | .letE _ t v b _ => collectMatchApps env b (collectMatchApps env v (collectMatchApps env t acc))
   | _ => acc
 
+/-- Return `true` if `type` is an equality between a `match` application and a `Blaster.dite'` application (e.g., the
+    normalization of a `match` to a chain of `Blaster.dite'`, see `normMatchExpr?`). -/
+def isMatchToDite (env : Environment) (type : Expr) : Bool := Id.run do
+  let some (_, lhs, rhs) := type.consumeMData.eq? | return false
+  let isMatch (e : Expr) := (e.consumeMData.getAppFn.constName?.map (Meta.isMatcherCore env)).getD false
+  let isDite (e : Expr) := e.consumeMData.getAppFn.isConstOf ``Blaster.dite'
+  return (isMatch lhs && isDite rhs) || (isDite lhs && isMatch rhs)
+
+/-- Index in `dischargeTactics` before which the case analysis on stuck `match` applications is tried for the
+    normalizations of `match` applications to `Blaster.dite'` chains (i.e., after `simp`, `omega` and `grind`). -/
+def matchToDiteEarlyIdx : Nat := 3
+
 /-- Return the first free variable a `match` application of `e` is stuck on. -/
 def findMatchStuckFVar? (e : Expr) : MetaM (Option FVarId) := do
   let lctx ← getLCtx
@@ -1206,8 +1218,16 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
     if let some prf ← profileAttempt "wf_eval"
         (proveWithTactic type (← `(tactic| blaster_wf_eval)) (budget := 4 * dischargeHeartbeats)) then
       return some (prf, "decide", none)
+  -- the normalization of a `match` to a chain of `Blaster.dite'` (`normMatchExpr?`): the case analysis on the variables
+  -- the `match` is stuck on, after the cheap tactics but before the costly case analyses of the portfolio (e.g., `split`
+  -- on large terms, which fail after seconds on the `match` normalizations over `Int` literal patterns)
+  let matchToDite := depth == matchCasesDepth && isMatchToDite (← getEnv) type
+  let stuckCases : TermElabM (Option Expr) :=
+    profileAttempt "match stuck cases" (proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats))
   for h : i in [0:tacs.size] do
     let (name, tac) := tacs[i]
+    if matchToDite && i == matchToDiteEarlyIdx then
+      if let some prf ← stuckCases then return some (prf, "match cases", none)
     if skip name || first == some i then continue
     if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
   -- the caller's strategy before the costly case analyses (e.g., the replay of an SMT proof, which proves in less than
@@ -1228,11 +1248,9 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
         (proveWithTactic type (← matchGeneralizeTactic) (budget := 4 * dischargeHeartbeats)) then
       return some (prf, "match cases", none)
   -- case analysis on the variables stuck `match` applications depend on (no splitter needed)
-  if depth == matchCasesDepth then
+  if depth == matchCasesDepth && !matchToDite then
     if (collectMatchApps (← getEnv) type).size > 0 then
-      if let some prf ← profileAttempt "match stuck cases"
-          (proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats)) then
-        return some (prf, "match cases", none)
+      if let some prf ← stuckCases then return some (prf, "match cases", none)
   return none
 
 /-- Try to discharge `m = rhs` (or `rhs = m`) with `m` a `match` application by a case split over the
