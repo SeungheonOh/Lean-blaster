@@ -169,6 +169,8 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
       are split instead. Matches stuck on literal patterns (e.g., `Int` literals, whose `Int.decEq` tests
       `whnf` does not unfold) are then reduced with the matcher's equation theorems, before any lemma
       normalizes the discriminants (e.g., `Int.ofNat (n + 4)` to `↑n + 4`, which no equation theorem matches).
+      For the normalizations of a match to a chain of `Blaster.dite'`, this case analysis comes right after
+      `simp`, `omega` and `grind`, before the costly case analyses of the portfolio.
 
    Obligations are closed terms, but their proofs may use the hypotheses of their local context
    (e.g., `simp [*]` with the pattern equalities). The same obligation can occur under different
@@ -196,7 +198,10 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
    their types when they have no default element (`blaster_inhabit`). For example, for `∀ (f : SomeBig → Empty),
    False` with `SomeBig.intro (n : Nat) (h : n > 5)`, the term `f ⟨6, _⟩` takes the witness 6 from the literals of the
    constructor type. Another example is `fun x => absurd x.inv _ : FalseInv → Empty`, where a field of `x`
-   is contradictory. Replaying the solver's own proof certificate is
+   is contradictory. On residuals with `match` applications, the case analyses (`split`, `match cases`, unfolding
+   with case analysis) are attempted in parallel right after `omega` and `grind` (`raceTactics`, on the goal closed
+   over its local context), as the best one depends on the goal (e.g., 0.3 s for one of them on a goal where another
+   one exhausts its budget). Replaying the solver's own proof certificate is
    future work.
 
 5. **Kernel check.** The proof of the original goal is `Eq.mpr pf r`, applied to the local axioms.
@@ -430,6 +435,14 @@ of 5 and 8 s and the reconstruction are performed), Z3's search for a proof of t
 depending on the fresh names of the query), the replay of the residual (11 to 20 s: the arithmetic local differences of
 the rewrites for `Governance`, the lemmas of the recursive functions and of the datatypes for `MintingPolicy`) and the
 kernel checks (1 to 4 s).
+
+In the default mode (`last`), the tactic strategies are tried on the residual before the replay; on the CEK residuals,
+each of them runs out of its budget (7.5 s each, 13 s for the deeper case analysis), i.e., the replay came after 75 s.
+The replay is now tried as soon as two attempts exhaust their budget (`proveResidual` with `hard`; the case analyses
+attempted in parallel count as two when they fail after 5 s or more): in the default mode, `HelloWorld` is
+reconstructed in 16 s (83 s before), the fourteenth `Governance` theorem in 36 s (120 s) and the second `MintingPolicy`
+theorem in 51 s (one theorem per run, while other measurements were running). The 26 theorems of the `Auction` validator
+are kernel checked in 3.5 minutes in the default mode.
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional

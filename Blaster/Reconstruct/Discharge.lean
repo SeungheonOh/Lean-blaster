@@ -1907,10 +1907,62 @@ syntax (name := blasterNoMatch) "blaster_nomatch" : tactic
         Core.setMessageLog msgs
   throwError "blaster_nomatch: no element of an empty type"
 
+/-- `goal` closed over its free variables (and the ones their declarations depend on) and over the hypotheses of the local
+    context that only mention them, together with these variables and hypotheses (in the order of the local context). -/
+def closeOverLocals (goal : Expr) : MetaM (Array Expr × Expr) := do
+  let collect (e : Expr) : Array FVarId := (Lean.CollectFVars.main e {}).fvarIds
+  let mut set : FVarIdSet := {}
+  let mut todo : Array FVarId := collect goal
+  while h : todo.size > 0 do
+    let fv := todo[todo.size - 1]
+    todo := todo.pop
+    if set.contains fv then continue
+    set := set.insert fv
+    let d ← fv.getDecl
+    todo := todo ++ collect d.type ++ ((d.value?.map collect).getD #[])
+  let mut xs := #[]
+  for d in ← getLCtx do
+    if d.isImplementationDetail then continue
+    if set.contains d.fvarId then xs := xs.push d.toExpr
+    else if !d.isLet && (← isProp d.type) && (collect d.type).all set.contains then xs := xs.push d.toExpr
+  return (xs, ← mkForallFVars xs goal)
+
+/-- The first of the tactics `tacs` proving the closed goal `goal` (with the budget `budget` each), attempted in parallel,
+    each in a task with fresh states (see `SmtProof.Local.runAsync`), the other attempts being interrupted once a proof
+    is found. The proofs are usable in the current environment (see `SmtProof.Local.inlineNewConstants`). -/
+def raceTactics (goal : Expr) (tacs : Array (String × TSyntax `tactic)) (budget : Nat) :
+    TermElabM (Option (Expr × String)) := do
+  let base ← getEnv
+  let tk ← IO.CancelToken.new
+  let mut pending := #[]
+  for (name, tac) in tacs do
+    let t ← SmtProof.Local.runAsync <| withTheReader Core.Context (fun c => { c with cancelTk? := some tk }) do
+      let r ← proveWithTactic goal tac (budget := budget)
+      r.mapM fun p => do SmtProof.Local.inlineNewConstants base (← instantiateMVars p)
+    pending := pending.push (name, t)
+  try
+    while !pending.isEmpty do
+      let l := pending.toList.map (·.2)
+      if h : l.length > 0 then discard <| IO.waitAny l h
+      let mut rest := #[]
+      for (name, t) in pending do
+        if !(← IO.hasFinished t) then rest := rest.push (name, t); continue
+        let .ok (some p) := t.get | continue
+        -- the realizations of the task (e.g., the splitters of matchers), shared between the environments
+        SmtProof.Local.realizeReservedNames p
+        let env ← getEnv
+        if p.getUsedConstants.all (env.contains · (skipRealize := true)) then return some (p, name)
+      pending := rest
+    return none
+  finally
+    tk.set
+
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
+    `hard` (e.g., the replay of a proof of the SMT solver) is tried once, as soon as two attempts exhaust their budget.
 -/
-def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
+def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure none) :
+    TermElabM (Option (Expr × String)) := do
   if !(← isTypeCorrectObligation e) then return none
   let tacs : Array (String × TSyntax `tactic) := #[
     ("decide", ← `(tactic| decide)),
@@ -1982,13 +2034,64 @@ def proveResidual (e : Expr) : TermElabM (Option (Expr × String)) := do
     ("empty", ← `(tactic| (intros <;> blaster_nomatch))),
   ]
   let large ← involvesLargeMatch e
-  for (name, tac) in tacs do
-    if large && name ∈ ["unfold + cases", "unfold", "split"] then continue
-    if let some prf ← proveWithTactic e tac (budget := 4 * dischargeHeartbeats) then
-      return some (prf, name)
-  if !large then
-    if let some prf ← proveWithTactic e (← deepCases) (budget := 8 * dischargeHeartbeats) then
-      return some (prf, "unfold + cases")
-  return none
+  -- the residuals with `match` applications (e.g., on the variables of the goal): the case analyses first, the other
+  -- tactics (e.g., `simp`, the instantiations and the case analysis on variables of inductive types) rarely prove them
+  let env ← getEnv
+  -- the steps of the strategy: one tactic, or several ones attempted in parallel (on closed goals)
+  let idx := (List.range tacs.size).toArray
+  let steps : Array (Array Nat) :=
+    if !large && e.getUsedConstants.any (Meta.isMatcherCore env) then
+      -- the case analyses (attempted in parallel, as the best one depends on the goal, e.g., 0.3 s for one of them
+      -- while another one exhausts its budget) right after the cheap tactics
+      let get (n : String) := (idx.find? (tacs[·]!.1 == n)).toArray
+      let cases := #["split", "match cases", "unfold + cases"]
+      let firstSteps := #[get "decide", get "omega", get "grind"] ++
+        (if e.hasMVar then cases.map get else #[cases.flatMap get])
+      let used := #["decide", "omega", "grind"] ++ cases
+      firstSteps.filter (!·.isEmpty) ++ (idx.filter (fun i => !used.contains tacs[i]!.1)).map (#[·])
+    else idx.map (#[·])
+  -- NOTE: a separate action, such that `return` does not exit `proveResidual`
+  let budget := 4 * dischargeHeartbeats
+  let attempts : TermElabM (Option (Expr × String)) := do
+    let mut hardTried := false
+    let mut exhausted := 0
+    for step in steps do
+      let step := step.filter fun i => !(large && tacs[i]!.1 ∈ ["unfold + cases", "unfold", "split"])
+      if step.isEmpty then continue
+      let start ← IO.getNumHeartbeats
+      let t0 ← IO.monoMsNow
+      let r ← if h : step.size = 1 then
+          let (name, tac) := tacs[step[0]]!
+          pure <| (← profileAttempt s!"residual:{step[0]}:{name}" (proveWithTactic e tac (budget := budget))).map (·, name)
+        else profileAttempt s!"residual:race" do
+          -- NOTE: on the goal closed over its local context (the attempts are run in empty local contexts)
+          let (xs, closed) ← closeOverLocals e
+          if closed.hasFVar || closed.hasMVar then return none
+          return (← raceTactics closed (step.map (tacs[·]!)) budget).map fun (p, n) => (mkAppN p xs, n)
+      if let some r := r then return some r
+      -- a goal on which two attempts exhaust their budget (e.g., the residual of a CEK evaluation, on which each tactic
+      -- runs out of heartbeats): the caller's alternative (e.g., the replay of a proof of the SMT solver) is tried
+      -- before the remaining tactics
+      -- NOTE: not after the first one, as the replay may take longer than the tactics after it (e.g., 28 s instead of
+      -- 1.5 s for a case analysis)
+      -- NOTE: the attempts in parallel are counted by their duration (their heartbeats are counted by their threads)
+      let hb := (← IO.getNumHeartbeats) - start
+      let ms := (← IO.monoMsNow) - t0
+      -- NOTE: the failed attempts in parallel taking 5 s or more (e.g., the case analyses on the residuals of CEK
+      -- evaluations, each running out of heartbeats) count as two
+      let spent := if step.size = 1 then (if 10 * hb ≥ 9 * budget * 1000 then 1 else 0) else (if ms ≥ 5000 then 2 else 0)
+      if !hardTried && spent > 0 then
+        exhausted := exhausted + spent
+        if exhausted ≥ 2 then
+          hardTried := true
+          if let some r ← profileAttempt "residual:hard" hard then return some r
+    if !large then
+      if let some prf ← profileAttempt "residual:deep cases"
+          (proveWithTactic e (← deepCases) (budget := 8 * dischargeHeartbeats)) then
+        return some (prf, "unfold + cases")
+    return none
+  let r ← attempts
+  reportAttempts
+  return r
 
 end Blaster.Reconstruct

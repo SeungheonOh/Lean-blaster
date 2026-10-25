@@ -267,21 +267,28 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | .proof p => some <$> alignEnds task.fullGoal task.optExpr p
     | _ => some <$> mkTopHole task.fullGoal task.optExpr
   -- Proof of the residual goal
+  profileLog "residualGoal" 0 fun _ => s!"dag={dagSize task.optExpr}"
   let (residual, residualMethod) ← withProfile "residual" (info := (·.2)) <| match task.optExpr with
     | .const ``True _ => pure (some (Lean.mkConst ``True.intro), "optimizer")
     | e => do
         -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
         -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
-        let bySmtProof : TermElabM (Option (Expr × String)) := do
+        let replayed ← IO.mkRef false
+        let replay : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
-          let some (p, m) ← bySmtProofReplay checked task "residual" e | return none
+          replayed.set true
+          bySmtProofReplay checked task "residual" e
+        let bySmtProof : TermElabM (Option (Expr × String)) := do
+          let some (p, m) ← replay | return none
           return some (p, s!"smt residual by {m}")
         let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
         match first? with
         | some (p, m) => pure (some p, m)
         | none =>
         if mode == "only" then pure (none, "none") else
-        match ← proveResidual e with
+        -- NOTE: in the `last` mode, the replay is tried as soon as a tactic exhausts its budget (e.g., on the residuals
+        -- of CEK evaluations, on which each tactic runs out of heartbeats), see `proveResidual`
+        match ← proveResidual e (hard := if mode == "last" then replay else pure none) with
         | some (p, m) => pure (some p, s!"smt residual by {m}")
         | none =>
             -- equivalences between recursive functions established by the optimizer as hypotheses
@@ -289,7 +296,7 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
             match ← dischargeWithFacts e facts with
             | some p => pure (some p, "smt residual by induction+facts")
             | none =>
-                match ← (if mode == "last" then bySmtProof else pure none) with
+                match ← (if mode == "last" && !(← replayed.get) then bySmtProof else pure none) with
                 | some (p, m) => pure (some p, m)
                 | none => pure (none, "none")
   let out := { out with residual := residualMethod }
