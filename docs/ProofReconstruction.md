@@ -441,8 +441,12 @@ each of them runs out of its budget (7.5 s each, 13 s for the deeper case analys
 The replay is now tried as soon as two attempts exhaust their budget (`proveResidual` with `hard`; the case analyses
 attempted in parallel count as two when they fail after 5 s or more): in the default mode, `HelloWorld` is
 reconstructed in 16 s (83 s before), the fourteenth `Governance` theorem in 36 s (120 s) and the second `MintingPolicy`
-theorem in 51 s (one theorem per run, while other measurements were running). The 26 theorems of the `Auction` validator
-are kernel checked in 3.5 minutes in the default mode.
+theorem in 51 s (one theorem per run, while other measurements were running). In the default mode, the 26 theorems of
+the `Auction` validator are kernel checked in 3.5 minutes (7 of them failed before the proofs of the goals of the
+`blaster` tactic were checked by the kernel, see `kernelCheck`), the theorem of `UnlockPIN` in 14 s, the one of
+`ParamFeed` in 4 s and the 4 goals of `Tests/Functions/Fibonacci` (including the equivalence of two implementations) in
+2 s; 8 of the `Auction` theorems are concrete evaluations closed by the optimizer, whose evidence takes 11 s of kernel
+check each (the type checker's caches).
 
 Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
 `commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
