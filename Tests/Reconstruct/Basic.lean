@@ -138,6 +138,21 @@ inductive Color where
 
 #blaster (reconstruct: 2) [∀ (x y : Color), x == y → x == Color.transparent → y == Color.transparent]
 
+/-! ## Residual goals over types without a default element (elements constructed from the types) -/
+
+structure FalseInv : Prop where
+  inv : 1 > 2
+
+structure TrueInv : Prop where
+  inv : 1 < 2
+
+inductive SomeBig : Prop
+  | intro (n : Nat) (h : n > 5)
+
+#blaster (reconstruct: 2) [∃ (_f : FalseInv → Empty), True]
+#blaster (reconstruct: 2) [∀ (_f : SomeBig → Empty), False]
+#blaster (reconstruct: 2) [∀ (_f : (FalseInv → TrueInv) → Empty), False]
+
 /-! ## Tactic: the goal is closed with a kernel-checked proof instead of `admit` -/
 
 theorem and_left_rec : ∀ (a b : Prop), a ∧ b → a := by blaster (reconstruct: 2)

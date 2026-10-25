@@ -700,6 +700,72 @@ partial def witnessCandidates (t : Expr) (seeds : Array Nat) (vars : Array Ident
       cs := cs.push (← `($(mkIdent ctor) $args*))
   return cs.extract 0 512
 
+syntax (name := blasterInhabit) "blaster_inhabit" : tactic
+
+/-- Case analysis on the hypotheses of inductive propositions with at most one constructor (e.g., `x : FalseInv`
+    with the field `inv : 1 > 2`), exposing their fields (at most `fuel` steps).
+-/
+partial def casesPropHyps (g : MVarId) (fuel : Nat) : MetaM (List MVarId) := g.withContext do
+  if fuel == 0 then return [g]
+  for d in ← getLCtx do
+    if d.isImplementationDetail then continue
+    let ty ← whnfR (← instantiateMVars d.type)
+    let .const n _ := ty.getAppFn | continue
+    let .inductInfo info ← getConstInfo n | continue
+    unless info.ctors.length ≤ 1 && info.numIndices == 0 && !info.isRec && (← isProp ty) do continue
+    let some subgoals ← observing? (g.cases d.fvarId) | continue
+    let mut res := []
+    for sg in subgoals do res := res ++ (← casesPropHyps sg.mvarId (fuel - 1))
+    return res
+  return [g]
+
+/-- Run `tac` on the goals and keep its effect only when it closes all of them. -/
+def closesGoals (tac : TacticM Unit) : TacticM Bool := do
+  let s ← saveState
+  try
+    tac
+    if (← getUnsolvedGoals).isEmpty then return true
+  catch _ => pure ()
+  s.restore
+  return false
+
+/-- Construct an element of the type of the main goal (e.g., `SomeBig` with the constructor
+    `intro (n : Nat) (h : n > 5)`, `FalseInv → TrueInv`, or `FalseInv → Empty` with `FalseInv` false):
+    a default element, a contradiction among the fields of the hypotheses, or a constructor application with
+    witnesses for its fields (the literals of the constructor types and their neighbours, see `literalSeeds`)
+    and its propositional fields constructed recursively (up to `depth` nested constructors).
+-/
+partial def inhabitGoal (depth : Nat) : TacticM Bool := do
+  evalTactic (← `(tactic| intros))
+  if ← closesGoals (evalTactic (← `(tactic| first | exact default | trivial | decide | omega))) then return true
+  let contra : TacticM Unit := do
+    evalTactic (← `(tactic| exfalso))
+    replaceMainGoal (← casesPropHyps (← getMainGoal) 8)
+    evalTactic (← `(tactic| all_goals first | omega | decide | (simp_all; done)))
+  if ← closesGoals contra then return true
+  if depth == 0 then return false
+  let g ← getMainGoal
+  let t ← g.withContext do whnfR (← instantiateMVars (← g.getType))
+  let .const n _ := t.getAppFn | return false
+  let .inductInfo info ← getConstInfo n | return false
+  let mut seeds := literalSeeds t
+  for c in info.ctors do seeds := seeds ++ literalSeeds (← getConstInfo c).type
+  let seeds' := (seeds.qsort (· < ·)).toList.eraseDups.toArray
+  for c in (← g.withContext (witnessCandidates t seeds' #[] 1)).extract 0 64 do
+    let close : TacticM Unit := do
+      evalTactic (← `(tactic| refine $c))
+      for g' in ← getUnsolvedGoals do
+        setGoals [g']
+        unless ← closesGoals (evalTactic (← `(tactic| first | omega | decide | (simp_all; done)))) do
+          unless ← inhabitGoal (depth - 1) do throwError "blaster_inhabit: field not constructed"
+      setGoals []
+    if ← closesGoals close then return true
+  return false
+
+@[tactic blasterInhabit] def evalBlasterInhabit : Tactic := fun _ =>
+  focus do
+    unless ← inhabitGoal 2 do throwError "blaster_inhabit: no element constructed"
+
 @[tactic blasterExists] def evalBlasterExists : Tactic := fun _ => do
   let g ← getMainGoal
   let target ← instantiateMVars (← g.getType)
@@ -715,6 +781,13 @@ partial def witnessCandidates (t : Expr) (seeds : Array Nat) (vars : Array Ident
     try
       evalTactic (← `(tactic| (refine ⟨$c, ?_⟩ <;>
         (try blaster_unfold_user) <;> first | omega | decide | (simp_all; done) | (simp_all <;> omega))))
+      if (← getUnsolvedGoals).isEmpty then return
+      s.restore
+    catch _ => s.restore
+  -- a witness constructed from the type (e.g., `FalseInv → Empty` with `FalseInv` false)
+  if candidates.isEmpty then
+    try
+      evalTactic (← `(tactic| (refine ⟨?_, ?_⟩ <;> first | blaster_inhabit | trivial | omega | (simp_all; done))))
       if (← getUnsolvedGoals).isEmpty then return
       s.restore
     catch _ => s.restore
@@ -931,6 +1004,16 @@ def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
     ("split", ← `(tactic| (blaster_denorm <;>
         simp (disch := decide) only [Blaster.Reconstruct.neg_natCast_add_eq_negSucc, Nat.reduceSub, Nat.add_zero] at * <;>
         (repeat' split) <;> first | omega | (simp_all; done) | grind))),
+    -- case analysis with the casts moved out of the arithmetic terms (e.g., `(3 + ↑m).toNat` as `3 + m`, the symbolic
+    -- `Int.negSucc` normalized by the optimizer)
+    ("split", ← `(tactic| (blaster_denorm <;> (repeat' split) <;> (try simp_all) <;> (try norm_cast at *) <;>
+        (try simp only [Int.toNat_natCast, Int.natAbs_natCast] at *) <;> first | omega | grind))),
+    -- case analysis by `grind` beyond its default number of case splits (e.g., two chains of conditionals over the same
+    -- conditions, the optimized one with its conditions normalized; `split` fails on such large terms, its `simp`
+    -- exceeding its maximum number of steps)
+    -- NOTE: `grind` and its configuration on the same line (its parser checks the column of the configuration)
+    ("grind", ← `(tactic| (blaster_denorm <;>
+        (try simp (config := { maxSteps := 1000000 }) only [Int.negSucc_eq] at *) <;> grind (splits := 100)))),
     -- case analysis on conditions applied to additional arguments
     ("split", ← `(tactic| (blaster_denorm <;> blaster_by_cases <;> (try simp_all [Int.sub_eq_add_neg]) <;>
                           first | done | omega | grind))),
@@ -1050,7 +1133,21 @@ syntax (name := blasterMatchCases) "blaster_match_cases" : tactic
 def matchCasesTactic : TermElabM (TSyntax `tactic) :=
   `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> blaster_match_cases <;>
               (try dsimp only at *) <;>
-              first | rfl | omega | (simp_all; done) | decide
+              -- the `match` applications `dsimp` leaves stuck (e.g., the `Int` literal patterns, whose `Int.decEq` tests
+              -- `whnf` does not unfold), reduced by the equation theorems of the matcher; before any lemma normalizing
+              -- the discriminants (e.g., `Int.ofNat (n + 4)` as `↑n + 4`, which no equation theorem matches)
+              (try simp (config := { decide := true }) only [] at *) <;>
+              first | rfl | omega
+                    -- the conditionals of the other side (e.g., the `Blaster.dite'` chain of the optimizer), decided
+                    -- by the constructors of the discriminants
+                    -- NOTE: before `simp_all` and `decide`, which exhaust the budget on the cases of large `match`
+                    -- applications (e.g., 72 cases for 15 overlapping patterns on two `Int` discriminants)
+                    -- NOTE: `grind` beyond its default number of case splits, for the remaining chain of conditionals
+                    -- (and its configuration on the same line, see `dischargeTactics`)
+                    | ((try simp (config := { maxSteps := 1000000 }) only [Blaster.Reconstruct.dite'_eq_dite] at *) <;>
+                       (try simp +arith at *) <;>
+                       first | rfl | omega | grind (splits := 100))
+                    | (simp_all; done) | decide
                     | (simp only [Int.ofNat_eq_coe, Int.toNat_natCast, Nat.succ_eq_add_one,
                                   Nat.zero_add, Nat.add_sub_cancel] at * <;>
                        first | omega | grind)
@@ -1773,20 +1870,23 @@ syntax (name := blasterNoMatch) "blaster_nomatch" : tactic
   for c in cands.extract 0 16 do
     let arity ← forallTelescopeReducing (← inferType c) fun xs _ => pure xs.size
     for k in [0:min arity 3 + 1] do
-      -- NOTE: created for each attempt, as the state is restored after a failed attempt
-      let t ← Term.exprToSyntax c
-      let args := Array.replicate k (← `(default))
-      -- NOTE: `nomatch` reports missing cases as an error message (with a `sorry` proof)
-      let msgs ← Core.getMessageLog
-      Core.setMessageLog {}
-      try
-        evalTactic (← `(tactic| exact nomatch ($t $args*)))
-        if (← getGoals).isEmpty && !(← Core.getMessageLog).hasErrors then
-          Core.setMessageLog msgs
-          return
-      catch _ => pure ()
-      s.restore
-      Core.setMessageLog msgs
+      -- the arguments as default elements, or constructed from their types (e.g., `SomeBig` with the constructor
+      -- `intro (n : Nat) (h : n > 5)`, without an `Inhabited` instance)
+      for constructed in (if k == 0 then [false] else [false, true]) do
+        -- NOTE: created for each attempt, as the state is restored after a failed attempt
+        let t ← Term.exprToSyntax c
+        let args := Array.replicate k (← if constructed then `((by blaster_inhabit)) else `(default))
+        -- NOTE: `nomatch` reports missing cases as an error message (with a `sorry` proof)
+        let msgs ← Core.getMessageLog
+        Core.setMessageLog {}
+        try
+          evalTactic (← `(tactic| exact nomatch ($t $args*)))
+          if (← getGoals).isEmpty && !(← Core.getMessageLog).hasErrors then
+            Core.setMessageLog msgs
+            return
+        catch _ => pure ()
+        s.restore
+        Core.setMessageLog msgs
   throwError "blaster_nomatch: no element of an empty type"
 
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
