@@ -4,7 +4,7 @@ import Blaster.Optimize.Rewriting.OptimizeNat
 import Blaster.Optimize.Rewriting.OptimizeInt
 
 
-open Lean Meta Elab
+open Lean Meta Elab Blaster.Reconstruct
 namespace Blaster.Optimize
 
 
@@ -345,12 +345,70 @@ def normMatchExprAux?
   (acc : Option Expr) : TranslateEnvT (Option Expr) := do
   let plhs ← removeNamedPatterns lhs
   if !(← isItePattern plhs) then return none
-  let rhs ← betaLambdaShared rhs params
-  if lastPattern then return some (← mkRhs lhs rhs (lastPattern := true)) -- last pattern
+  -- NOTE: when tracking proof terms, the equations of the discriminants (i.e., `h : d = p` for `match h : d with`)
+  -- are still free variables of `params` (see `matchExprRewriter`)
+  let heqs ← heqParams
+  if lastPattern then
+    let rhs ← betaLambdaShared rhs (← reflHeqs params heqs)
+    return some (← mkRhs lhs rhs (lastPattern := true)) -- last pattern
   let some elseExpr := acc | return acc
-  mkIte lhs plhs rhs elseExpr
+  let rhs ← betaLambdaShared rhs params
+  mkIte lhs plhs rhs elseExpr heqs
 
  where
+
+   /-- The positions in `params` of the equations of the discriminants, together with the discriminants and their
+       types (see `assignEqRefl`).
+       NOTE: the parameters of the alternatives and the discriminants are free variables of the optimizer's local
+       context (see `withLocalContext`).
+   -/
+   heqParams : TranslateEnvT (Array (Nat × Expr × Expr)) := do
+     if !(← isTracking) then return #[]
+     let discrsType ← getLambdaBinderTypes margs[mInfo.getFirstDiscrPos - 1]!
+     let mut heqs := #[]
+     let mut nbHeq := 0
+     for i in [:mInfo.discrInfos.size] do
+       let idxDiscr := mInfo.discrInfos.size - i - 1
+       if (mInfo.discrInfos[idxDiscr]!).hName?.isSome then
+         nbHeq := nbHeq + 1
+         if nbHeq ≤ params.size && params[params.size - nbHeq]!.isFVar then
+           heqs := heqs.push (params.size - nbHeq, margs[mInfo.getFirstDiscrPos + idxDiscr]!, discrsType[idxDiscr]!)
+     return heqs
+
+   /-- `Eq.refl d` for each equation `h : d = p` of the discriminants (see `assignEqRefl`). -/
+   reflHeqs (params : Array Expr) (heqs : Array (Nat × Expr × Expr)) : TranslateEnvT (Array Expr) := do
+     let mut params := params
+     for (j, d, dType) in heqs do
+       params := params.set! j (← mkApp2Expr (← mkEqRefl [← getLevelEnv dType]) dType d)
+     return params
+
+   /-- Replace each equation `h : d = p` of the discriminants occurring in `e` with its proof from the conjuncts
+       `cs` (proof and type) of the condition of the branch (e.g., `h.1 : x = 2` for `h : x = 2 ∧ y = 1`), or with
+       `Eq.refl d` when no conjunct proves it (e.g., a pattern with variables). Unlike `Eq.refl d`, which only has
+       the expected type `d = p` once `d` is rewritten to `p`, the proofs keep the branch well-typed.
+   -/
+   proveHeqs (e : Expr) (heqs : Array (Nat × Expr × Expr)) (cs : Array (Expr × Expr)) : TranslateEnvT Expr := do
+     let mut fvars := #[]
+     let mut proofs := #[]
+     for (j, d, dType) in heqs do
+       let hq := params[j]!
+       let lvl ← getLevelEnv dType
+       let refl ← mkApp2Expr (← mkEqRefl [lvl]) dType d
+       let ty ← inferTypeEnv hq
+       -- NOTE: the pattern variables are bound in the branch (see `mkRhs`)
+       let hasPatternVar := (ty.find? fun s => s.isFVar && params.contains s).isSome
+       let mut pf? := none
+       if !hasPatternVar then
+         for (c, ct) in cs do
+           let some (α, a, b) := ct.eq? | continue
+           let same (t : Expr) : TranslateEnvT Bool := do
+             try withLocalContext (withNewMCtxDepth (isDefEq t ty)) catch _ => pure false
+           if ← same ct then pf? := some c; break
+           if ← same (mkApp3 (mkConst ``Eq [lvl]) α b a) then
+             pf? := some (mkApp4 (mkConst ``Eq.symm [lvl]) α a b c); break
+       fvars := fvars.push hq
+       proofs := proofs.push (pf?.getD refl)
+     hashcons (e.replaceFVars fvars proofs)
 
    removeNamedPatterns (lhs : Array Expr) : TranslateEnvT (Array Expr) := do
      let mut plhs := Array.emptyWithCapacity lhs.size
@@ -387,7 +445,8 @@ def normMatchExprAux?
       mrhs ← mkLet discr lhs[idx]! mrhs (λ x => return x)
     return mrhs
 
-   mkIte (lhs : Array Expr) (plhs: Array Expr) (rhs : Expr) (elseExpr : Expr) : TranslateEnvT (Option Expr) := do
+   mkIte (lhs : Array Expr) (plhs: Array Expr) (rhs : Expr) (elseExpr : Expr) (heqs : Array (Nat × Expr × Expr)) :
+     TranslateEnvT (Option Expr) := do
      let matchType := margs[mInfo.getFirstDiscrPos - 1]!
      let discrsType ← getLambdaBinderTypes matchType
      let thenExpr ← mkRhs lhs rhs
@@ -395,14 +454,30 @@ def normMatchExprAux?
      for h : i in [:plhs.size] do
        andTerms ← mkCond margs[mInfo.getFirstDiscrPos + i]! plhs[i] discrsType[i]! andTerms
      let nbCond := andTerms.size
-     if nbCond == 0 then return thenExpr -- case when else unreachable (i.e., renaming pattern redundant)
+     if nbCond == 0 then -- case when else unreachable (i.e., renaming pattern redundant)
+       return ← if heqs.isEmpty then pure thenExpr else proveHeqs thenExpr heqs #[]
      let mut condTerm := andTerms[nbCond-1]!
      let andOp ← mkPropAndOp
      for i in [1:nbCond] do
        let idx := nbCond - i - 1
        condTerm ← mkApp2Expr andOp andTerms[idx]! condTerm
      let hName ← Term.mkFreshBinderName
-     let lam1 ← mkLambdaExpr hName BinderInfo.default condTerm thenExpr
+     let lam1 ←
+       if heqs.isEmpty then mkLambdaExpr hName BinderInfo.default condTerm thenExpr
+       else withLocalDecl' hName BinderInfo.default condTerm fun h => do
+         -- the proofs of the conjuncts of the condition (i.e., `andTerms[0] ∧ (andTerms[1] ∧ ...)`)
+         let mut cs := #[]
+         let mut cur := h
+         let mut curType := condTerm
+         for i in [:nbCond] do
+           if i + 1 == nbCond then cs := cs.push (cur, andTerms[i]!)
+           else
+             let rest := curType.appArg!
+             cs := cs.push (mkApp3 (mkConst ``And.left) andTerms[i]! rest cur, andTerms[i]!)
+             cur := mkApp3 (mkConst ``And.right) andTerms[i]! rest cur
+             curType := rest
+         let thenExpr ← proveHeqs thenExpr heqs cs
+         mkLambdaExpr hName BinderInfo.default condTerm (thenExpr.abstract #[h])
      let notCond ← mkAppExpr (← mkPropNotOp) condTerm
      let lam2 ← mkLambdaExpr hName BinderInfo.default notCond elseExpr
      mkBlasterDIteApp (getLambdaBody matchType) condTerm lam1 lam2
@@ -445,11 +520,14 @@ partial def assignEqRefl (mInfo : MatchInfo) (rhs_params : Array Expr) (margs : 
      - the first application is passed the `none` accumulator
      - the `Nat` argument corresponding to the traversed index, starting with 0.
    NOTE: The evaluation stops when at least one of the `rewriter` invocation return `none`.
+   NOTE: The equations of the discriminants (i.e., `h : d = p` for `match h : d with`) are passed to `rewriter` as
+   `Eq.refl d`, unless `keepHeq` is set, in which case they are left as free variables, to be eliminated by `rewriter`.
 -/
 @[specialize]
 def matchExprRewriter
     (mInfo : MatchInfo) (args : Array Expr)
-    (rewriter : Bool → MatchInfo → Array Expr → Array Expr → Expr → Array Expr → Option α → TranslateEnvT (Option α)) :
+    (rewriter : Bool → MatchInfo → Array Expr → Array Expr → Expr → Array Expr → Option α → TranslateEnvT (Option α))
+    (keepHeq := false) :
     TranslateEnvT (Option α) := do
     commonMatchRewriter args (← getMatchAlts args mInfo)
 
@@ -465,7 +543,7 @@ def matchExprRewriter
             let mut lhs := b.getAppArgs
             -- trace[Optimize.normMatch.pattern] "match patterns to optimize {reprStr lhs}"
             -- NOTE: lhs is now implicitly normalized when computing MatchInfo
-            let xs ← assignEqRefl mInfo xs margs
+            let xs ← if keepHeq then pure xs else assignEqRefl mInfo xs margs
             rewriter (i == 0) mInfo margs lhs args[mInfo.getFirstAltPos + idx]! xs accExpr
         unless (accExpr.isSome) do return accExpr -- break if accExpr is still none
       return accExpr
@@ -552,10 +630,10 @@ def matchExprRewriter
 -/
 def normMatchExpr? (args : Array Expr) (mInfo : MatchInfo) : TranslateEnvT (Option Expr) := do
   match (← get).optEnv.memCache.isMatchToIte.get? mInfo.name with
-  | some b => if b then matchExprRewriter mInfo args normMatchExprAux?
+  | some b => if b then matchExprRewriter mInfo args normMatchExprAux? (keepHeq := ← isTracking)
                    else return none
   | none =>
-      let r ← matchExprRewriter mInfo args normMatchExprAux?
+      let r ← matchExprRewriter mInfo args normMatchExprAux? (keepHeq := ← isTracking)
       updateMatchToIteCache mInfo.name r.isSome
       return r
 
