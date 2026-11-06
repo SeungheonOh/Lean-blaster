@@ -1224,6 +1224,13 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
   let matchToDite := depth == matchCasesDepth && isMatchToDite (← getEnv) type
   let stuckCases : TermElabM (Option Expr) :=
     profileAttempt "match stuck cases" (proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats))
+  -- case analysis on `match` expressions with generalized discriminants (e.g., symbolic `Int.negSucc` normalized by the
+  -- optimizer), which fails at once on the `match` expressions without such discriminants
+  let matchGeneralize : TermElabM (Option Expr) := do
+    if large then return none
+    profileAttempt "match generalize"
+      (proveWithTactic type (← matchGeneralizeTactic) (budget := 4 * dischargeHeartbeats))
+  let mut generalizeTried := false
   -- the cheap strategies (unless `skipCheap`)
   if !skipCheap then
     if let some i := first then
@@ -1244,6 +1251,11 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
       if matchToDite && !stuckTried && !matchToDiteCheapTactics.contains name then
         stuckTried := true
         if let some prf ← stuckCases then return some (prf, "match cases", none)
+        -- NOTE: the discriminants normalized by the optimizer (e.g., `Int.negSucc m` as `(Int.ofNat (1 + m)).neg`),
+        -- on which the case analysis on the stuck variables and the tactics of the portfolio fail (e.g., after 9 s on
+        -- the `match` of `Tests/FixedIssues/Issue331.lean`)
+        generalizeTried := true
+        if let some prf ← matchGeneralize then return some (prf, "match cases", none)
       if skip name || first == some i then continue
       if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
   -- the caller's strategy before the costly case analyses (e.g., the replay of an SMT proof, which proves in less than
@@ -1255,18 +1267,17 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
     if let some prf ← profileAttempt "deep cases"
         (proveWithTactic type (← deepCases) (budget := 8 * dischargeHeartbeats)) then
       return some (prf, "cases", none)
-  if let some prf ← profileAttempt "match cases" (proveByMatchCases type depth) then
-    return some (prf, "match cases", none)
-  -- case analysis on `match` expressions with generalized discriminants (e.g., symbolic `Int.negSucc`
-  -- normalized by the optimizer)
-  if !large then
-    if let some prf ← profileAttempt "match generalize"
-        (proveWithTactic type (← matchGeneralizeTactic) (budget := 4 * dischargeHeartbeats)) then
-      return some (prf, "match cases", none)
   -- case analysis on the variables stuck `match` applications depend on (no splitter needed)
   if depth == matchCasesDepth && !matchToDite then
     if (collectMatchApps (← getEnv) type).size > 0 then
       if let some prf ← stuckCases then return some (prf, "match cases", none)
+  if !generalizeTried then
+    if let some prf ← matchGeneralize then return some (prf, "match cases", none)
+  -- case split over the alternatives via the splitter
+  -- NOTE: last, as it discharges each alternative with the strategies above (no success on the `match` tests, where
+  -- its 61 attempts failed after 0.6 s on average)
+  if let some prf ← profileAttempt "match cases" (proveByMatchCases type depth) then
+    return some (prf, "match cases", none)
   return none
 
 /-- Try to discharge `m = rhs` (or `rhs = m`) with `m` a `match` application by a case split over the

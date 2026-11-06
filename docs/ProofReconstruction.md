@@ -202,8 +202,9 @@ and info trees are restored). The portfolio, in order:
 | 6    | induction for equivalences between recursive functions (`blaster_funind`)                                |
 | 7    | SMT proof replay of the obligation (`obligationBySmtProof`, Section 4), unless the replay mode is `off`  |
 | 8    | a deeper case analysis with a larger budget                                                              |
-| 9    | `match cases` over the splitter, then case analysis on `match`es with generalized discriminants          |
-| 10   | case analysis on the variables that stuck `match` applications depend on                                 |
+| 9    | case analysis on the variables that stuck `match` applications depend on                                 |
+| 10   | case analysis on `match`es with generalized discriminants                                                |
+| 11   | `match cases` over the splitter                                                                          |
 
 - **Closed computations.** `blaster_wf_eval` evaluates well-founded recursion by unfolding its equation lemmas, since
   the kernel cannot reduce well-founded recursion efficiently.
@@ -215,14 +216,19 @@ and info trees are restored). The portfolio, in order:
   obligations without variables, which are computations left to kernel evaluation, and it is only the last resort for
   the equivalences of recursive functions, which need induction: on both, the backends ran until their timeouts (40 s
   for the constant folding of `Nat.log2 (2 ^ 65536)`, and for `powerNat x y = Nat.pow x y`).
+- **Stuck matches.** The variables a match is stuck on are split (no splitter is needed). Matches stuck on literal
+  patterns (e.g., `Int` literals, whose `Int.decEq` tests `whnf` does not unfold) are reduced with the matcher's
+  equation theorems before any lemma normalizes the discriminants (e.g., `Int.ofNat (n + 4)` to `↑n + 4`, which no
+  equation theorem matches). For the obligations of `normMatchExpr?`, this step and the next one come right after
+  step 2, before the costly case analyses.
+- **Generalized discriminants.** The discriminants that are not variables (e.g., `Int.negSucc m`, normalized by the
+  optimizer as `(Int.ofNat (1 + m)).neg`) are generalized before the case analysis. The step fails at once on the
+  matches without such discriminants; on the `match` normalizations of `Tests/FixedIssues/Issue331.lean`, the tactics
+  before it fail for 9 s.
 - **`match cases`.** For an obligation `match ds with alts = rhs`, a case split over the matcher's splitter, where the
   discriminants are replaced by the patterns in `rhs`. Each case is discharged recursively with the portfolio, with the
-  pattern equalities and the overlap hypotheses in the local context.
-- **Stuck matches.** When no splitter can be generated, the variables a match is stuck on are split instead. Matches
-  stuck on literal patterns (e.g., `Int` literals, whose `Int.decEq` tests `whnf` does not unfold) are reduced with the
-  matcher's equation theorems before any lemma normalizes the discriminants (e.g., `Int.ofNat (n + 4)` to `↑n + 4`,
-  which no equation theorem matches). For the obligations of `normMatchExpr?`, this step comes right after step 2,
-  before the costly case analyses.
+  pattern equalities and the overlap hypotheses in the local context. It comes last, as it is costly to fail: on the
+  `match` tests, its 61 attempts all failed, after 0.6 s on average.
 
 Before the sequential portfolio runs, the obligations that are not definitional are discharged speculatively in
 parallel (`startDischarges`, 6 tasks, `BLASTER_RECON_PARDISCHARGE`), closed over their relevant context and without
@@ -448,8 +454,9 @@ tractable:
   interpreted once (memoization on shared terms, by object address; the memo keeps its terms alive, since a term
   built during the replay and then freed, e.g., the conclusion of a `proof-bind` step as a quantifier, would leave
   its address to a later term, which then got its interpretation), and the steps that don't depend on a scope are
-  replayed in increasing order (bounded recursion on deep proofs). The case analyses of unit resolutions and the facts derived by
-  the propositional engine are built under their binders, with the premises of the step as bound variables.
+  replayed in increasing order (bounded recursion on deep proofs). The case analyses of unit resolutions and the
+  facts derived by the propositional engine are built under their binders, with the premises of the step as bound
+  variables.
 - **Lifting global proofs** (`liftGlobalProofs`). The proofs of the global steps are held by unassigned metavariables
   during the replay and lifted at the end to closed lambda terms over the variables of the goal and the negated goal.
   They are shared by the nested `lemma` scopes at various binder depths, where abstracting the inlined proofs copied
@@ -645,6 +652,15 @@ of the obligations without variables and of the equivalences of recursive functi
 proofs without obligations brought `MatchToITE.lean` from 67 s to 59 s. The subterms containing obligations are
 computed once for the two traversals of `dischargeHoles` (the speculative discharge and the first pass), at about
 8 µs per distinct subterm: `dischargeHoles` on the four goals of `Tests/Reconstruct/DeepProofs.lean` 12.7 s → 7.3 s.
+
+The order of the strategies follows profiles of the goals of the test suite, each goal in its own file: the commands
+of a file run concurrently (each `#blaster` command in its own task), so that their times overlap and include the
+contention between them. With the orders of Sections 3.4 and 3.5 (native code, see Section 9), the three slowest
+goals of `Tests/Smt/SmtNat/SmtNatDiv.lean` take 1 s instead of 7 s each (the file 3.5 s instead of 9.5 s), the
+`Nat.log2` goal of `NatLog2.lean` 0.9 s instead of 8 s (the file 3.3 s instead of 11.4 s), the theorem
+`negLit_negSucc` of `Tests/FixedIssues/Issue331.lean` 2.3 s instead of 15.6 s, and the goals over the 15 overlapping
+patterns of `Tests/Smt/SmtMatch.lean` 0.9 s less each on average. With the `#testOptimize` audit, `Issue331.lean`
+takes 8 s instead of 50 s and `MatchReduce.lean` 31 s instead of 53 s.
 
 `orElim` was quadratic in the literals of large clauses (a third of the replay of `MintingPolicy`). The parallel
 tactic tasks run without the replay's state, whose objects would otherwise be marked as multi-threaded; the auxiliary
