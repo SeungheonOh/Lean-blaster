@@ -2056,6 +2056,11 @@ def raceTactics (goal : Expr) (tacs : Array (String × TSyntax `tactic)) (budget
   finally
     tk.set
 
+/-- The division and modulo functions (see `proveResidual`). -/
+def divModConsts : Array Name :=
+  #[``HDiv.hDiv, ``HMod.hMod, ``Nat.div, ``Nat.mod, ``Int.ediv, ``Int.emod, ``Int.tdiv, ``Int.tmod, ``Int.fdiv,
+    ``Int.fmod]
+
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
     `hard` (e.g., the replay of a proof of the SMT solver) is tried once, as soon as two attempts exhaust their budget;
@@ -2094,6 +2099,10 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
     ("unfold", ← `(tactic| (intros <;> blaster_denorm <;>
         (try blaster_lit_add) <;>
         blaster_unfold_user <;> (try simp_all) <;> done))),
+    -- `Nat.log2` (opaque for the solver, defined with `Nat.rec` in core): one unfolding step
+    -- NOTE: before the costly tactics below (e.g., 7 s for the `grind` with core lemmas on
+    -- `n ≥ 2 → Nat.log2 n = Nat.log2 (n / 2) + 1`), as it fails at once on the goals without `Nat.log2`
+    ("unfold", ← `(tactic| (intros <;> blaster_denorm <;> rw [Nat.log2_def] <;> split <;> first | omega | grind))),
     -- equivalence of recursive functions (e.g., when the solver unfolds both definitions)
     ("induction", ← `(tactic| (intros <;> blaster_funind))),
     -- division/modulo facts
@@ -2104,6 +2113,19 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
       | grind))),
     -- non-linear division
     ("nonlinear", ← `(tactic| (intros <;> blaster_denorm <;> blaster_nl_div))),
+    -- non-linear division/modulo identities
+    -- NOTE: before the `grind` with core lemmas below, which exhausts its budget (5 s) on some of the goals this
+    -- `simp_all` proves in 30 ms (e.g., `x / y / z = x / (y * z)`)
+    ("arith simp", ← `(tactic| (intros <;> blaster_denorm <;>
+        first
+        | (simp_all [Nat.mod_add_div, Nat.div_add_mod, Nat.mul_div_mul_left, Nat.mul_div_cancel_left,
+                     Nat.mul_mod_right, Nat.mul_mod_left, Nat.mod_mod, Nat.mod_self, Nat.div_self,
+                     Nat.div_div_eq_div_mul, Nat.div_le_self, Nat.mod_le, Nat.mod_lt, Nat.mod_eq_of_lt,
+                     Nat.add_mul_div_right, Nat.add_div_right, Nat.mul_self_inj, Nat.div_lt_iff_lt_mul,
+                     Nat.le_div_iff_mul_le, Nat.div_lt_self, Nat.mod_def, Nat.mul_div_le, Nat.not_lt,
+                     Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_mul_ediv,
+                     Int.mul_ediv_add_emod, Int.fmod_add_mul_fdiv, Int.tmod_add_mul_tdiv, Nat.pos_iff_ne_zero]; done)
+        | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega)))),
     -- non-linear arithmetic with core lemmas
     ("nonlinear", ← `(tactic| (intros <;> blaster_denorm <;> first
       | (grind [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mul_le_mul, Nat.eq_of_mul_eq_mul_left,
@@ -2115,19 +2137,6 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
       | (simp_all [Nat.div_eq_sub_div, Nat.mod_eq_sub_mod, Nat.mul_left_cancel_iff, Nat.pos_iff_ne_zero,
                    Int.mul_eq_mul_left_iff]; done)
       | (rw [Nat.div_eq, Nat.mod_eq]; split <;> simp_all <;> omega)))),
-    -- non-linear division/modulo identities
-    ("arith simp", ← `(tactic| (intros <;> blaster_denorm <;>
-        first
-        | (simp_all [Nat.mod_add_div, Nat.div_add_mod, Nat.mul_div_mul_left, Nat.mul_div_cancel_left,
-                     Nat.mul_mod_right, Nat.mul_mod_left, Nat.mod_mod, Nat.mod_self, Nat.div_self,
-                     Nat.div_div_eq_div_mul, Nat.div_le_self, Nat.mod_le, Nat.mod_lt, Nat.mod_eq_of_lt,
-                     Nat.add_mul_div_right, Nat.add_div_right, Nat.mul_self_inj, Nat.div_lt_iff_lt_mul,
-                     Nat.le_div_iff_mul_le, Nat.div_lt_self, Nat.mod_def, Nat.mul_div_le, Nat.not_lt,
-                     Int.emod_emod_of_dvd, Int.mul_emod_right, Int.mul_emod_left, Int.emod_add_mul_ediv,
-                     Int.mul_ediv_add_emod, Int.fmod_add_mul_fdiv, Int.tmod_add_mul_tdiv, Nat.pos_iff_ne_zero]; done)
-        | (simp_all [Nat.div_lt_iff_lt_mul, Nat.le_div_iff_mul_le, Nat.mod_def, Nat.mul_comm]; omega)))),
-    -- `Nat.log2` (opaque for the solver, defined with `Nat.rec` in core): one unfolding step
-    ("unfold", ← `(tactic| (intros <;> blaster_denorm <;> rw [Nat.log2_def] <;> split <;> first | omega | grind))),
     -- existential goals over types (e.g., `∃ (α : Type) (x : α), α = Nat`)
     ("exists", ← `(tactic| (intros <;> first | exact ⟨_, rfl⟩ | exact ⟨_, default, rfl⟩ | exact ⟨_, _, rfl⟩))),
     -- goals valid due to an empty type (e.g., `g : Nat → E` with `E` empty)
@@ -2135,19 +2144,39 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
   ]
   let large ← involvesLargeMatch e
   let env ← getEnv
-  let idx := (List.range tacs.size).toArray
+  -- the tactics in order, with the induction after the arithmetic tactics on the goals with a division or a modulo
+  -- NOTE: the induction (e.g., on the `Nat` variables) doesn't prove them and takes 0.1 to 0.5 s to fail on each of
+  -- them (3.5 s on `Tests/Smt/SmtNat/SmtNatDiv.lean`)
+  let idx : Array Nat := Id.run do
+    let all := (List.range tacs.size).toArray
+    if !e.getUsedConstants.any divModConsts.contains then return all
+    let ind := all.filter (tacs[·]!.1 == "induction")
+    let lastArith := (all.filter (#["div/mod facts", "nonlinear", "arith simp"].contains tacs[·]!.1)).back?
+    let mut r := #[]
+    for i in all do
+      if ind.contains i then continue
+      r := r.push i
+      if some i == lastArith then r := r ++ ind
+    return r
   -- the steps of the strategy: one tactic, or several ones attempted in parallel
-  -- NOTE: on the residuals with `match` applications (e.g., on the variables of the goal), the case analyses are
-  -- attempted in parallel right after the cheap tactics, as the best one depends on the goal (e.g., 0.3 s for one of
-  -- them while another one exhausts its budget); the other tactics (e.g., `simp`, the instantiations and the case
-  -- analysis on the variables of inductive types) rarely prove them
+  let named (names : Array String) := idx.filter (names.contains tacs[·]!.1)
   let steps : Array (Array Nat) :=
     if !large && e.getUsedConstants.any (Meta.isMatcherCore env) then
-      let named (names : Array String) := idx.filter (names.contains tacs[·]!.1)
-      let cheap := named #["decide", "omega", "grind"]
-      let cases := named #["split", "match cases", "unfold + cases"]
-      cheap.map (#[·]) ++ #[cases] ++ (idx.filter fun i => !cheap.contains i && !cases.contains i).map (#[·])
-    else idx.map (#[·])
+      -- NOTE: on the residuals with `match` applications (e.g., on the variables of the goal), the case analyses are
+      -- attempted in parallel with `omega` and `grind` right after `decide`, as the best one depends on the goal (e.g.,
+      -- 0.3 s for one of them while another one exhausts its budget, or `omega` and `grind` failing after 1.6 s on the
+      -- 15 overlapping patterns of `Tests/Smt/SmtMatch.lean`); the other tactics (e.g., `simp`, the instantiations and
+      -- the case analysis on the variables of inductive types) rarely prove them
+      let first := named #["decide"]
+      let race := named #["omega", "grind", "split", "match cases", "unfold + cases"]
+      first.map (#[·]) ++ #[race] ++ (idx.filter fun i => !first.contains i && !race.contains i).map (#[·])
+    else
+      -- the case analyses on the variables of inductive types with and without the unfolding of the user definitions,
+      -- in parallel, as each one proves goals on which the other one fails (e.g., the unfolding is needed for the
+      -- derived `BEq` instances, on which the other one fails after 0.2 s)
+      let race := named #["cases", "unfold + cases"]
+      idx.foldl (init := #[]) fun r i =>
+        if !race.contains i then r.push #[i] else if some i == race[0]? then r.push race else r
   let budget := 4 * dischargeHeartbeats
   -- an attempt of the `i`-th tactic, with the number of attempts that exhausted their budget (0 or 1)
   let attempt (i : Nat) : TermElabM (Option (Expr × String) × Nat) := do

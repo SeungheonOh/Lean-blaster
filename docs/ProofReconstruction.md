@@ -260,10 +260,19 @@ types, are constructed from their types when they have no default element (`blas
 from the literals of the constructor type. Another example is `fun x => absurd x.inv _ : FalseInv → Empty`, where a
 field of `x` is contradictory.
 
-**Racing case analyses.** On residuals with `match` applications, the case analyses (`split`, `match cases`, unfolding
-with case analysis) are attempted in parallel right after `omega` and `grind` (`raceTactics`), on the goal closed over
-its local context, because the best one depends on the goal (e.g., 0.3 s for one of them on a goal where another one
-exhausts its budget). Each attempt's heartbeat budget is measured inside its own task.
+**Racing case analyses.** On residuals with `match` applications, `omega`, `grind` and the case analyses (`split`,
+`match cases`, unfolding with case analysis) are attempted in parallel right after `decide` (`raceTactics`), on the
+goal closed over its local context, because the best one depends on the goal (e.g., 0.3 s for one of them on a goal
+where another one exhausts its budget, or `omega` and `grind` failing after 1.6 s on the 15 overlapping patterns of
+`Tests/Smt/SmtMatch.lean`). On the other residuals, the case analyses on the variables of inductive types with and
+without the unfolding of user definitions race each other (the unfolding is needed for derived `BEq` instances). Each
+attempt's heartbeat budget is measured inside its own task.
+
+**Order on arithmetic goals.** The unfolding of `Nat.log2` comes before the costly tactics, since it fails at once on
+the goals without `Nat.log2`. The `simp` with division and modulo identities comes before the `grind` with core
+nonlinear lemmas, which exhausts its budget (5 s) on goals the `simp` proves in 30 ms (e.g., `x / y / z = x / (y * z)`).
+On goals with a division or a modulo, the induction comes after the arithmetic tactics: it does not prove them and
+takes 0.1 to 0.5 s to fail on each.
 
 **When to replay.** In the default mode (`last`), the SMT proof replay is tried once, as soon as two attempts exhaust
 their budget (`proveResidual` with `hard`), the attempts of a race counting individually. On the
