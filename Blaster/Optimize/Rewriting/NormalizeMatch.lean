@@ -359,8 +359,9 @@ def normMatchExprAux?
 
    /-- The positions in `params` of the equations of the discriminants, together with the discriminants and their
        types (see `assignEqRefl`).
-       NOTE: the parameters of the alternatives and the discriminants are free variables of the optimizer's local
-       context (see `withLocalContext`).
+       NOTE: the parameters of the alternatives are free variables of the optimizer's local context (see
+       `withLocalContext`); the equations are still free variables only when tracking proof terms (see `keepHeq` in
+       `matchExprRewriter`), i.e., none is returned otherwise.
    -/
    heqParams : TranslateEnvT (Array (Nat × Expr × Expr)) := do
      if !(← isTracking) then return #[]
@@ -383,9 +384,10 @@ def normMatchExprAux?
      return params
 
    /-- Replace each equation `h : d = p` of the discriminants occurring in `e` with its proof from the conjuncts
-       `cs` (proof and type) of the condition of the branch (e.g., `h.1 : x = 2` for `h : x = 2 ∧ y = 1`), or with
-       `Eq.refl d` when no conjunct proves it (e.g., a pattern with variables). Unlike `Eq.refl d`, which only has
-       the expected type `d = p` once `d` is rewritten to `p`, the proofs keep the branch well-typed.
+       `cs` (proof and type) of the condition of the branch (e.g., `Eq.symm h.1 : x = 2` for the condition
+       `h : 2 = x ∧ 1 = y`, see `mkCond`), or with `Eq.refl d` when no conjunct proves it (e.g., a pattern with
+       variables). Unlike `Eq.refl d`, which only has the expected type `d = p` once `d` is rewritten to `p`, the proofs
+       keep the branch well-typed.
    -/
    proveHeqs (e : Expr) (heqs : Array (Nat × Expr × Expr)) (cs : Array (Expr × Expr)) : TranslateEnvT Expr := do
      let mut fvars := #[]
@@ -399,13 +401,15 @@ def normMatchExprAux?
        let hasPatternVar := (ty.find? fun s => s.isFVar && params.contains s).isSome
        let mut pf? := none
        if !hasPatternVar then
+         let (tl, tr) := (ty.eq?.map fun (_, l, r) => (l, r)).getD (ty, ty)
+         let same (t : Expr) : TranslateEnvT Bool := do
+           tryCatchRuntimeEx (withLocalContext (withNewMCtxDepth (isDefEq t ty))) fun _ => pure false
          for (c, ct) in cs do
            let some (α, a, b) := ct.eq? | continue
-           let same (t : Expr) : TranslateEnvT Bool := do
-             try withLocalContext (withNewMCtxDepth (isDefEq t ty)) catch _ => pure false
-           if ← same ct then pf? := some c; break
-           if ← same (mkApp3 (mkConst ``Eq [lvl]) α b a) then
+           -- NOTE: the conditions have the pattern first (see `mkCond`), i.e., the symmetric equation first
+           if (exprEq a tr && exprEq b tl) || (← same (mkApp3 (mkConst ``Eq [lvl]) α b a)) then
              pf? := some (mkApp4 (mkConst ``Eq.symm [lvl]) α a b c); break
+           if (exprEq a tl && exprEq b tr) || (← same ct) then pf? := some c; break
        fvars := fvars.push hq
        proofs := proofs.push (pf?.getD refl)
      hashcons (e.replaceFVars fvars proofs)
@@ -477,7 +481,7 @@ def normMatchExprAux?
              cur := mkApp3 (mkConst ``And.right) andTerms[i]! rest cur
              curType := rest
          let thenExpr ← proveHeqs thenExpr heqs cs
-         mkLambdaExpr hName BinderInfo.default condTerm (thenExpr.abstract #[h])
+         mkLambdaExpr hName BinderInfo.default condTerm (← abstractFVars thenExpr #[h])
      let notCond ← mkAppExpr (← mkPropNotOp) condTerm
      let lam2 ← mkLambdaExpr hName BinderInfo.default notCond elseExpr
      mkBlasterDIteApp (getLambdaBody matchType) condTerm lam1 lam2

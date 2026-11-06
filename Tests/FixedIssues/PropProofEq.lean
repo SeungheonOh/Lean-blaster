@@ -4,11 +4,12 @@ import Blaster
 namespace Tests.PropProofEq
 
 -- Issue: Unexpected Valid for falsifiable goals distinguishing the proofs of a proposition.
--- Diagnosis: Any two proofs of a proposition are (definitionally) equal in Lean, e.g., the two constructors of
---            `TwoP` below. The optimizer reduced `TwoP.a = TwoP.b` to `False` (distinct constructors) and the
---            translation of an inductive proposition to an smt datatype distinguishes its values. An equality
---            between proofs is now reduced to `True`, and the proof arguments of constructor applications are
---            ignored when comparing them structurally.
+-- Diagnosis: Any two proofs of a proposition are (definitionally) equal in Lean (proof irrelevance), e.g., the
+--            two constructors of `TwoP` below. The optimizer reduced `TwoP.a = TwoP.b` to `False` (distinct
+--            constructors), and the translation of an inductive proposition to an Smt datatype distinguishes
+--            its values.
+-- Fix: An equality between proofs is reduced to `True`, and the proof arguments of constructor applications
+--      are ignored when comparing them structurally (see `structEq?`).
 
 inductive TwoP : Prop
   | a

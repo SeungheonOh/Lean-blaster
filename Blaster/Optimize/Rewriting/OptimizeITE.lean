@@ -220,9 +220,10 @@ def recordDITESimp (f iteType c t e r : Expr) : TranslateEnvT Unit := do
   let (Expr.lam _ _ a _, Expr.lam _ _ b _) := (t, e) | return
   if a.hasLooseBVars || b.hasLooseBVars then return
   let notC := mkApp (mkConst ``Not) c
-  -- NOTE: by pattern matching (the compiler may evaluate `r.bindingDomain!` and the like out of the guards)
+  -- NOTE: `r` is matched against patterns rather than tested with accessors guarded by `r.isForall` (and the like),
+  -- since the compiler may hoist `r.bindingDomain!` out of such guards (a panic on other terms)
   let isImp (d body : Expr) : Bool := match r with
-    | .forallE _ t b _ => t == d && b == body
+    | .forallE _ dom body' _ => dom == d && body' == body
     | _ => false
   let isAnd (x y : Expr) : Bool := match r with
     | .app (.app (.const ``And _) x') y' => x' == x && y' == y

@@ -4,13 +4,14 @@ import Blaster.Optimize.Hypotheses
 open Lean Meta Blaster.Reconstruct
 namespace Blaster.Optimize
 
-/-- Return `true` if `e` is a proof, i.e., its type is a proposition. -/
-def isProofEnv (e : Expr) : TranslateEnvT Bool := do
-  try isPropEnv (← inferTypeEnv e) catch _ => return false
+/-- Return `some true` if `e` is a proof (i.e., its type is a proposition), `some false` if it is not, and `none` when
+    its type cannot be inferred. -/
+def isProofEnv? (e : Expr) : TranslateEnvT (Option Bool) := do
+  try some <$> isPropEnv (← inferTypeEnv e) catch _ => return none
 
-/-- Return `some true` if op1 and op2 are constructors that are structurally equivalent modulo
-    variable name/function equivalence
-    Return `some false` if op1 and op2 are constructors that are NOT structurally equivalent.
+/-- Return `some true` if op1 and op2 are constructor applications that are structurally equivalent modulo their proof
+    arguments, i.e., definitionally equal (proof irrelevance).
+    Return `some false` if op1 and op2 are constructor applications that are NOT structurally equivalent.
     Return `none` otherwise.
     Assume that memoization is performed on expressions.
 -/
@@ -35,9 +36,14 @@ partial def structEq? (op1 : Expr) (op2: Expr) : TranslateEnvT (Option Bool) := 
                 -- some false -> some none -> some true
                 let mut lat := some true
                 for h : i in [:as1.size] do
+                  let r ← structEq? as1[i] as2[i]!
                   -- NOTE: proof arguments (e.g., proof fields of constructors) are irrelevant, i.e., always equal
-                  if ← isProofEnv as1[i] then continue
-                  lat := updateLattice lat (← structEq? as1[i] as2[i]!)
+                  -- (unknown when their types cannot be inferred)
+                  let r ← if r == some true then pure r else match ← isProofEnv? as1[i] with
+                    | some true => pure (some true)
+                    | some false => pure r
+                    | none => pure none
+                  lat := updateLattice lat r
                   unless (!isTop lat) do return lat -- break if false
                 return lat
               else return false
@@ -331,10 +337,10 @@ def arithEq? (op1 : Expr) (op2 : Expr) : TranslateEnvT (Option Expr) := do
      - True = e ==> e
      - e = ¬ e ==> False
      - e = not e ==> False
+     - e1 = e2 ==> True (if Type(e1) is a proposition, i.e., proof irrelevance, applied first)
      - e1 = e2 ==> True (if e1 =ₚₜᵣ e2)
      - e1 = e2 ==> False (if structEq? e1 e2 = some false)
      - e1 = e2 ==> True (if structEq? e1 e2 = some true, i.e., e1 and e2 only differ in proof arguments)
-     - e1 = e2 ==> True (if Type(e1) is a proposition, i.e., proof irrelevance)
      - true = not e ==> false = e
      - false = not e ==> true = e
      - ¬ e1 = ¬ e2 ==> e1 = e2 (require classical)
@@ -518,7 +524,7 @@ def optimizeEq (f : Expr) (args: Array Expr) : TranslateEnvT Expr := do
      - true == e ==> e
      - e == not e ==> false
      - e1 == e2 ==> true (if e1 =ₚₜᵣ e2)
-     - e1 = e2 ==> false (if structEq? e1 e2 = some false) (NOTE: `some true` case already handled by =ₚₜᵣ)
+     - e1 == e2 ==> false (if structEq? e1 e2 = some false)
      - not e1 == not e2 ==> e1 == e2
      - e1 == e2 ==> e2 == e1 (if e2 <ₒ e1)
 

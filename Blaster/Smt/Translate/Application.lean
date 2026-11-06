@@ -492,7 +492,7 @@ def createAppNAux (pInfo : FunEnvInfo) (s : Sum SmtQualifiedIdent SmtTerm)
     -- NOTE: the instance arguments of function values are erased (see `removeClassConstraintsInFunType`), which is
     -- only faithful for the canonical instances of their classes: e.g., a function field `f [LT α] : α → α` applied
     -- to two different instances of `LT Nat` would otherwise denote the same SMT function
-    for h : i in [:nbSize] do
+    for i in [:nbSize] do
       if pInfo.paramsInfo[i]!.binderInfo.isInstImplicit then
         let a := args[i]!
         -- NOTE: the instance-implicit binders of the goal (e.g., `[LT α]`) stand for the instances of their classes

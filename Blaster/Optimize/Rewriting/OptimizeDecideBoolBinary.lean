@@ -55,7 +55,8 @@ def optimizeDecideBoolAnd (f : Expr) (args : Array Expr) : TranslateEnvT Expr :=
  let some (op1, op2) := boolAnd? e | return e
  if let some r ← decideOpDecide? op1 op2 (mkApp2Expr (← mkPropAndOp)) then
    return ← recordDecideOp e r op1 op2
-     ``Blaster.Reconstruct.decide'_and_decide' ``Blaster.Reconstruct.decide'_and_bool ``Blaster.Reconstruct.bool_and_decide'
+     ``Blaster.Reconstruct.decide'_and_decide' ``Blaster.Reconstruct.decide'_and_bool
+     ``Blaster.Reconstruct.bool_and_decide'
  return e
 
 /-- Call `optimizeBoolOr f args` and apply the following `decide` simplification/normalization
@@ -76,7 +77,8 @@ def optimizeDecideBoolOr (f : Expr) (args : Array Expr) : TranslateEnvT Expr := 
  let some (op1, op2) := boolOr? e | return e
  if let some r ← decideOpDecide? op1 op2 (mkApp2Expr (← mkPropOrOp)) then
    return ← recordDecideOp e r op1 op2
-     ``Blaster.Reconstruct.decide'_or_decide' ``Blaster.Reconstruct.decide'_or_bool ``Blaster.Reconstruct.bool_or_decide'
+     ``Blaster.Reconstruct.decide'_or_decide' ``Blaster.Reconstruct.decide'_or_bool
+     ``Blaster.Reconstruct.bool_or_decide'
  return e
 
 

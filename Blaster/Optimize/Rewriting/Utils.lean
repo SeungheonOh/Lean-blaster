@@ -231,7 +231,7 @@ def isInstanceFreeClass (t : Expr) : TranslateEnvT Bool := do
   Return `false` otherwise, in particular for type variables, which may be instantiated with an empty type.
  TODO: extends check to also consider parametric constructor for which each parameter type satisfy `isSortOrInhabited`.
 -/
-partial def isSortOrInhabited (t : Expr) (existsQuantifier := false) : TranslateEnvT Bool := do
+partial def isSortOrInhabited (t : Expr) : TranslateEnvT Bool := do
  if (← isPropEnv t) then return false
  else
    match t.consumeMData with
