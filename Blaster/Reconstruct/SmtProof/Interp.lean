@@ -77,14 +77,15 @@ structure InterpCtx where
   /-- bound variables (quantifiers, `proof-bind`, fresh definitions) -/
   locals : Std.HashMap String Expr := {}
   /-- interpretation of the (closed) terms already interpreted, on term object addresses: terms are
-      shared DAGs (e.g., after the expansion of `let`), which must not be traversed as trees -/
-  cache : Option (IO.Ref (TermCache Expr)) := none
+      shared DAGs (e.g., after the expansion of `let`), which must not be traversed as trees; the terms are kept alive
+      (see `TermMemo`), e.g., the quantifiers built for the conclusions of `proof-bind` steps -/
+  cache : Option (IO.Ref (TermMemo Expr)) := none
   /-- the type parameters of applications that nothing determines are left as metavariables, to be assigned by
       unification with the context or defaulted after the interpretation of the whole term (see `defaultTypes`) -/
   deferTypes : Bool := false
   /-- interpretation of the terms already interpreted in the current scope of local variables (e.g., the body
       of a macro for given arguments): set when the scope is entered (see `withScopeCache`) -/
-  scopeCache : Option (IO.Ref (TermCache Expr)) := none
+  scopeCache : Option (IO.Ref (TermMemo Expr)) := none
   /-- instances of the constructor applications that their arguments don't determine (e.g., `List.nil`), inferred on
       the whole proof (see `SortInfer`), on term object addresses -/
   sortHints : TermCache SortInfer.Hint := {}
@@ -642,20 +643,21 @@ mutual
 partial def interp (t : STerm) : InterpM Expr := do
   let ctx ← read
   -- NOTE: terms are memoized when no local variable is in scope (closed terms)
+  -- NOTE: the memos keep the terms alive (see `TermMemo`), such that their addresses aren't reused by other terms
   if let some ref := ctx.cache then
     if ctx.locals.isEmpty then
       let addr := termAddr t
-      if let some e := (← ref.get).get? addr then return e
+      if let some (_, e) := (← ref.get).get? addr then return e
       let e ← interpCore t
-      if !e.hasMVar then ref.modify (·.insert addr e)
+      if !e.hasMVar then ref.modify (·.insert addr (t, e))
       return e
   -- NOTE: terms below binders are memoized for their scope (e.g., the shared subterms of macro bodies)
   if let some ref := ctx.scopeCache then
     if !ctx.locals.isEmpty then
       let addr := termAddr t
-      if let some e := (← ref.get).get? addr then return e
+      if let some (_, e) := (← ref.get).get? addr then return e
       let e ← interpCore t
-      if !e.hasMVar then ref.modify (·.insert addr e)
+      if !e.hasMVar then ref.modify (·.insert addr (t, e))
       return e
   interpCore t
 

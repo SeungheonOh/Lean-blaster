@@ -436,8 +436,10 @@ tractable:
 
 - **Linear construction.** The proofs of the top-level steps are held by metavariables, and binders are abstracted
   syntactically, so the construction of a step does not traverse the proofs of the previous ones. SMT terms are
-  interpreted once (memoization on shared terms), and the steps that don't depend on a scope are replayed in
-  increasing order (bounded recursion on deep proofs). The case analyses of unit resolutions and the facts derived by
+  interpreted once (memoization on shared terms, by object address; the memo keeps its terms alive, since a term
+  built during the replay and then freed, e.g., the conclusion of a `proof-bind` step as a quantifier, would leave
+  its address to a later term, which then got its interpretation), and the steps that don't depend on a scope are
+  replayed in increasing order (bounded recursion on deep proofs). The case analyses of unit resolutions and the facts derived by
   the propositional engine are built under their binders, with the premises of the step as bound variables.
 - **Lifting global proofs** (`liftGlobalProofs`). The proofs of the global steps are held by unassigned metavariables
   during the replay and lifted at the end to closed lambda terms over the variables of the goal and the negated goal.

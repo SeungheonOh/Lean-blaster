@@ -125,7 +125,8 @@ def stepConcl (i : Nat) : ReplayM Expr := do
     if let some e := (← get).conclCache.get? i then return e
   let step := ctx.proof.steps[i]!
   -- NOTE: the conclusion of `proof-bind` is a lambda over the conclusion of its premise, i.e.,
-  -- the premise holds for all values of the bound variables
+  -- the premise holds for all values of the bound variables (a new term, kept alive by the memo of the
+  -- interpretation, see `TermMemo`)
   let c := match step.rule, step.concl with
     | "proof-bind", .quant .lambda vars body => .quant .forall vars body
     | _, c => c

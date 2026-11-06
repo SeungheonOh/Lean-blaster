@@ -6,3 +6,4 @@ import Tests.Reconstruct.SmtProof
 import Tests.Reconstruct.NlArith
 import Tests.Reconstruct.DeepProofs
 import Tests.Reconstruct.SortInfer
+import Tests.Reconstruct.InterpMemo

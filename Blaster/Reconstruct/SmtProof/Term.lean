@@ -155,8 +155,14 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
           | _ => throw s!"unsupported application head: {SExpr.list hd}"
       | h => throw s!"unsupported application head: {h}"
 
-/-- Cache on term object addresses, for traversals of terms with sharing. -/
+/-- Cache on term object addresses, for traversals of terms with sharing. The terms must be alive while the cache is
+    used (e.g., the subterms of a proof): the address of a freed term may be reused by another term (see `TermMemo`). -/
 abbrev TermCache (α : Type) := Std.HashMap USize α
+
+/-- Cache on term object addresses that keeps its terms alive, for traversals of terms that may be built during the
+    traversal and freed afterwards (e.g., the conclusion of a `proof-bind` step as a quantifier, see `stepConcl`): the
+    address of a freed term could be reused by a term built afterwards, which would get the entry of the freed one. -/
+abbrev TermMemo (α : Type) := Std.HashMap USize (STerm × α)
 
 @[inline] unsafe def termAddrImpl (t : STerm) : USize := ptrAddrUnsafe t
 @[implemented_by termAddrImpl] opaque termAddr (t : STerm) : USize
