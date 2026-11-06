@@ -1357,6 +1357,14 @@ def proveEquivalences (equivs : Array (Expr × Expr)) : TermElabM (Array (Expr �
     if let some fact := r then facts := facts.push fact
   return facts
 
+/-- The representation of the subterms of a term containing proof obligations (see `obligationNodesOf`). -/
+opaque ObligationNodesImpl : NonemptyType
+
+/-- The subterms of a term containing proof obligations (see `obligationNodesOf`). -/
+def ObligationNodes : Type := ObligationNodesImpl.type
+
+instance : Nonempty ObligationNodes := ObligationNodesImpl.property
+
 namespace TransformScoped
 
 /-- Return the subterms of `e` (by pointer) containing a proof obligation, i.e., the ones mapped to `true`.
@@ -1367,6 +1375,9 @@ namespace TransformScoped
 unsafe def obligationNodes (e : Expr) : PtrMap Expr Bool := Id.run do
   let mut m : PtrMap Expr Bool := mkPtrMap
   let mut todo : Array (Expr × Bool) := #[(e, false)]
+  -- NOTE: the children of a node (the head and the arguments of an application) are enumerated without allocating
+  -- arrays, and looked up without closures (a fifth faster, e.g., 0.7 s for the 86K subterms of a proof of
+  -- DeepProofs.lean)
   while !todo.isEmpty do
     let (x, expanded) := todo.back!
     todo := todo.pop
@@ -1374,18 +1385,33 @@ unsafe def obligationNodes (e : Expr) : PtrMap Expr Bool := Id.run do
     if (isHole? x).isSome then
       m := m.insert x true
       continue
-    let cs : Array Expr := match x with
-      | .app .. => #[x.getAppFn] ++ x.getAppArgs
-      | .lam _ t b _ | .forallE _ t b _ => #[t, b]
-      | .letE _ t v b _ => #[t, v, b]
-      | .mdata _ b | .proj _ _ b => #[b]
-      | _ => #[]
-    if !expanded && !cs.isEmpty then
-      todo := todo.push (x, true)
-      for c in cs do
-        if !m.contains c then todo := todo.push (c, false)
+    if !expanded then
+      match x with
+      | .app .. =>
+          todo := todo.push (x, true)
+          let mut y := x
+          while y.isApp do
+            if !m.contains y.appArg! then todo := todo.push (y.appArg!, false)
+            y := y.appFn!
+          if !m.contains y then todo := todo.push (y, false)
+      | .lam _ t b _ | .forallE _ t b _ => todo := todo.push (x, true) |>.push (t, false) |>.push (b, false)
+      | .letE _ t v b _ => todo := todo.push (x, true) |>.push (t, false) |>.push (v, false) |>.push (b, false)
+      | .mdata _ b | .proj _ _ b => todo := todo.push (x, true) |>.push (b, false)
+      | _ => m := m.insert x false
       continue
-    m := m.insert x (cs.any fun c => (m.find? c).getD false)
+    let found : Bool := match x with
+      | .app .. => Id.run do
+          let mut y := x
+          let mut r := false
+          while y.isApp && !r do
+            r := (m.find? y.appArg!).getD false
+            y := y.appFn!
+          return r || (m.find? y).getD false
+      | .lam _ t b _ | .forallE _ t b _ => (m.find? t).getD false || (m.find? b).getD false
+      | .letE _ t v b _ => (m.find? t).getD false || (m.find? v).getD false || (m.find? b).getD false
+      | .mdata _ b | .proj _ _ b => (m.find? b).getD false
+      | _ => false
+    m := m.insert x found
   return m
 
 mutual
@@ -1462,14 +1488,26 @@ unsafe def visitLets (obl : PtrMap Expr Bool) (f : Expr → TermElabM (Option Ex
   return r
 end
 
-unsafe def transformScopedImpl (e : Expr) (f : Expr → TermElabM (Option Expr)) : TermElabM Expr := do
-  go (obligationNodes e) f #[] (← IO.mkRef mkPtrMap) (← IO.mkRef mkPtrMap) e
+unsafe def obligationNodesOfImpl (e : Expr) : ObligationNodes := unsafeCast (obligationNodes e)
+
+unsafe def transformScopedImpl (e : Expr) (f : Expr → TermElabM (Option Expr)) (obl? : Option ObligationNodes := none) :
+    TermElabM Expr := do
+  let obl : PtrMap Expr Bool := match obl? with
+    | some obl => unsafeCast obl
+    | none => obligationNodes e
+  go obl f #[] (← IO.mkRef mkPtrMap) (← IO.mkRef mkPtrMap) e
 
 end TransformScoped
 
+/-- The subterms of `e` containing proof obligations (see `transformScoped`), e.g., computed once for several
+    traversals of the same term (about 8 µs per distinct subterm). -/
+@[implemented_by TransformScoped.obligationNodesOfImpl]
+opaque obligationNodesOf (e : Expr) : ObligationNodes
+
 /-- Traverse `e` and replace each proof obligation or fallback region `s` containing proof obligations such that
     `f s = some r` with `r` (in the local context of the binders of `e` enclosing `s`). Fallback regions for which
-    `f` returns `none` are traversed.
+    `f` returns `none` are traversed. `obl?` is `obligationNodesOf e` when already computed (e.g., for several
+    traversals of the same term).
     NOTE: Unlike `Meta.transform`, results are only shared within the same binder scope. Proof obligations
     are closed terms, but their proofs may depend on the hypotheses of the local context (e.g., `simp [*]`).
     Hence, the same obligation occurring under different binders must be discharged in each context.
@@ -1478,7 +1516,8 @@ end TransformScoped
     enclosing them), and the results of `f` are abstracted accordingly.
 -/
 @[implemented_by TransformScoped.transformScopedImpl]
-opaque transformScoped (e : Expr) (f : Expr → TermElabM (Option Expr)) : TermElabM Expr
+opaque transformScoped (e : Expr) (f : Expr → TermElabM (Option Expr)) (obl? : Option ObligationNodes := none) :
+    TermElabM Expr
 
 /-- Return the local context (and local instances) restricted to the declarations `type` depends on
     (transitively) and to the hypotheses only depending on them (e.g., the equalities of the match context of
@@ -1642,13 +1681,15 @@ partial def dischargeHoles
   let width := ((← IO.getEnv "BLASTER_RECON_PARDISCHARGE").bind String.toNat?).getD 6
   -- NOTE: set after the first pass (or on an exception), i.e., once the speculative results can no longer be used
   let stop ← IO.CancelToken.new
+  -- NOTE: the subterms containing obligations, shared by the traversals of the speculation and of the first pass
+  let obl := obligationNodesOf p
   let spec : Std.HashMap ExprStructEq (Task (Option (Expr × String × Option Nat))) ←
     if width == 0 || holes.size < 2 then pure {} else
     withProfile "dischargeHoles.speculation" do
       let goals ← IO.mkRef (#[] : Array (Expr × Nat × String))
       let seen ← IO.mkRef ({} : Std.HashSet ExprStructEq)
       let byDefEq ← IO.mkRef ({} : Std.HashMap ExprStructEq (Task (Option (Expr × String × Option Nat))))
-      discard <| transformScoped p fun e => do
+      discard <| transformScoped p (obl? := some obl) fun e => do
         let some type := holeType? e | return none
         let some (g, xs) ← closedObligation? (← instantiateMVars type) | return none
         if (← seen.get).contains g then return none
@@ -1667,7 +1708,8 @@ partial def dischargeHoles
       return (goals.zip tasks).foldl (init := ← byDefEq.get) fun m ((g, _), t) => m.insert g t
   -- first pass
   let firstPass : TermElabM Expr :=
-    withProfile "dischargeHoles.first" (info := fun p' => s!"dag={dagSize p'}") <| transformScoped p fun e => do
+    withProfile "dischargeHoles.first" (info := fun p' => s!"dag={dagSize p'}") <|
+    transformScoped p (obl? := some obl) fun e => do
       match holeType? e with
       | none => return none
       | some type =>

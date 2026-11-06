@@ -631,7 +631,9 @@ fourteenth `Governance` theorem (#14 below) took 392 s, and the `MintingPolicy` 
 On the test suite (wall time per file, with the `#testOptimize` audit of `BLASTER_RECON_STATS`), skipping the replay
 of the obligations without variables and of the equivalences of recursive functions (3.4) brought `NatLog2.lean` from
 44 s to 8.5 s and `Tests/Reconstruct/Basic.lean` from 43 s to 2.5 s, and skipping the passes of `dischargeHoles` on
-proofs without obligations brought `MatchToITE.lean` from 67 s to 59 s.
+proofs without obligations brought `MatchToITE.lean` from 67 s to 59 s. The subterms containing obligations are
+computed once for the two traversals of `dischargeHoles` (the speculative discharge and the first pass), at about
+8 µs per distinct subterm: `dischargeHoles` on the four goals of `Tests/Reconstruct/DeepProofs.lean` 12.7 s → 7.3 s.
 
 `orElim` was quadratic in the literals of large clauses (a third of the replay of `MintingPolicy`). The parallel
 tactic tasks run without the replay's state, whose objects would otherwise be marked as multi-threaded; the auxiliary

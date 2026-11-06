@@ -99,23 +99,40 @@ abbrev Item := Expr × Bool
 unsafe def proofDepths (env : Environment) (e : Expr) : PtrMap Expr Nat := Id.run do
   let mut done : PtrMap Expr Nat := mkPtrMap
   let mut todo : Array Item := #[(e, false)]
+  -- NOTE: the children of a node (the head and the arguments of an application) are enumerated without allocating
+  -- arrays, and looked up without closures (see `TransformScoped.obligationNodes`)
   while !todo.isEmpty do
     let (x, expanded) := todo.back!
     todo := todo.pop
     if done.contains x then continue
-    let cs : Array Expr := match x with
-      | .app .. => #[x.getAppFn] ++ x.getAppArgs
-      | .lam _ t b _ | .forallE _ t b _ => #[t, b]
-      | .letE _ _ v b _ => #[v, b]
-      | .mdata d b => if d.contains holeKey then #[] else #[b]
-      | .proj _ _ b => #[b]
-      | _ => #[]
-    if !expanded && !cs.isEmpty then
-      todo := todo.push (x, true)
-      for c in cs do
-        if !done.contains c then todo := todo.push (c, false)
+    if !expanded then
+      match x with
+      | .app .. =>
+          todo := todo.push (x, true)
+          let mut y := x
+          while y.isApp do
+            if !done.contains y.appArg! then todo := todo.push (y.appArg!, false)
+            y := y.appFn!
+          if !done.contains y then todo := todo.push (y, false)
+      | .lam _ t b _ | .forallE _ t b _ => todo := todo.push (x, true) |>.push (t, false) |>.push (b, false)
+      | .letE _ _ v b _ => todo := todo.push (x, true) |>.push (v, false) |>.push (b, false)
+      | .mdata d b => todo := if d.contains holeKey then todo.push (x, true) else todo.push (x, true) |>.push (b, false)
+      | .proj _ _ b => todo := todo.push (x, true) |>.push (b, false)
+      | _ => done := done.insert x (if isProofNode env x then 1 else 0)
       continue
-    let d := cs.foldl (fun acc c => max acc ((done.find? c).getD 0)) 0
+    let d : Nat := match x with
+      | .app .. => Id.run do
+          let mut y := x
+          let mut r := 0
+          while y.isApp do
+            r := max r ((done.find? y.appArg!).getD 0)
+            y := y.appFn!
+          return max r ((done.find? y).getD 0)
+      | .lam _ t b _ | .forallE _ t b _ => max ((done.find? t).getD 0) ((done.find? b).getD 0)
+      | .letE _ _ v b _ => max ((done.find? v).getD 0) ((done.find? b).getD 0)
+      | .mdata d b => if d.contains holeKey then 0 else (done.find? b).getD 0
+      | .proj _ _ b => (done.find? b).getD 0
+      | _ => 0
     done := done.insert x (if isProofNode env x then d + 1 else d)
   return done
 
