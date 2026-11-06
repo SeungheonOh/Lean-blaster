@@ -149,9 +149,26 @@ structure TrueInv : Prop where
 inductive SomeBig : Prop
   | intro (n : Nat) (h : n > 5)
 
+-- a function from `FalseInv`, which has no element
 #blaster (reconstruct: 2) [∃ (_f : FalseInv → Empty), True]
+-- an element of `SomeBig` (`SomeBig.intro 6 _`), refuting `_f`
 #blaster (reconstruct: 2) [∀ (_f : SomeBig → Empty), False]
+-- an element of `FalseInv → TrueInv` (from the one of `TrueInv`), refuting `_f`
 #blaster (reconstruct: 2) [∀ (_f : (FalseInv → TrueInv) → Empty), False]
+
+/-! ## Equalities between proofs (proof irrelevance, see `Tests.PropProofEq`) -/
+
+inductive TwoP : Prop
+  | a
+  | b
+
+structure WithProof where
+  n : Nat
+  h : TwoP
+
+#blaster (reconstruct: 2) [TwoP.a = TwoP.b]
+#blaster (reconstruct: 2) [∀ (x y : TwoP), x = y]
+#blaster (reconstruct: 2) [∀ (n : Nat), WithProof.mk n TwoP.a = WithProof.mk n TwoP.b]
 
 /-! ## Tactic: the goal is closed with a kernel-checked proof instead of `admit` -/
 

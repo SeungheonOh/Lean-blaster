@@ -150,6 +150,17 @@ def isPos (n : Int) : Prop :=
 
 #blaster (reconstruct: 2) [∀ (n : Int), isPos n → n > 0]
 
+-- match binding the equality between the discriminant and the pattern, used by the alternative
+def toFin (x : Nat) (h : x = 2) : Fin 3 := ⟨x, by omega⟩
+
+def withEq (x : Nat) : Nat :=
+  match h : x with
+  | 2 => (toFin x h).val
+  | _ => 0
+
+#blaster (reconstruct: 2) [∀ (x : Nat), withEq x ≤ 2]
+#blaster (reconstruct: 2) [∀ (x : Nat), withEq x = 2 → x = 2]
+
 /-! ## Validator-like goals: matches on projections optimized under the match context, case of case,
     `· = true` pushed into the alternatives -/
 
