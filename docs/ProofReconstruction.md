@@ -1,12 +1,14 @@
 # Proof reconstruction
 
-Blaster decides goals by (1) aggressively rewriting the Lean goal with its optimizer and (2) sending
-whatever remains to an SMT solver. Without reconstruction, a `Valid` verdict trusts both steps: the
-`blaster` tactic closes the goal with `admit`.
+## 1. Overview
 
-Proof reconstruction moves proof checking back to the **Lean kernel**. For a `Valid` verdict, Blaster
-builds an ordinary proof term for the original goal and checks it with the kernel. The verdict is
-then reported as kernel-checked, and the tactic closes the goal with that term instead of `admit`.
+Blaster decides a goal in two stages: its optimizer aggressively rewrites the Lean goal, and an SMT solver decides
+whatever remains. Without reconstruction, a `Valid` verdict trusts both stages, and the `blaster` tactic closes the
+goal with `admit`.
+
+Proof reconstruction moves the trust back to the **Lean kernel**. For a `Valid` verdict, Blaster builds an ordinary
+proof term for the original goal and has the kernel check it. The verdict is then reported as kernel-checked, and the
+tactic closes the goal with that term instead of `admit`. Neither the optimizer nor the SMT solver is trusted.
 
 ```lean
 #blaster (reconstruct: 1) [∀ (x y : Nat), x < y → x + 1 ≤ y]
@@ -17,23 +19,42 @@ theorem t : ∀ (a b : Prop), a ∧ b → a := by blaster (reconstruct: 2)
 #print axioms t   -- 't' depends on axioms: [propext, Quot.sound]
 ```
 
-## Options
+Status on branch `feat/smt-proof-replay` (Z3 5.3.1):
 
-| option             | meaning                                                                                 |
-|--------------------|-----------------------------------------------------------------------------------------|
-| `(reconstruct: 0)` | default; no reconstruction (previous behavior)                                          |
-| `(reconstruct: 1)` | best effort; a warning is reported when reconstruction fails and the result is trusted  |
-| `(reconstruct: 2)` | required; an error is reported when reconstruction fails                                |
-| `(gen-proof: 1)`   | proof generation; implies `(reconstruct: 2)` and checks the axioms of the proof (below) |
+- In the default mode, every reconstruction attempt of Blaster's test suite yields a kernel-checked proof:
+  3959 of 3959 attempts, i.e., 420 goals closed by the optimizer, 409 goals closed by the SMT solver and 3130
+  `#testOptimize` certificates.
+- Replaying the SMT solver's own proofs, without any tactic for the goals the solver closed, proves 311 of the 323
+  SMT goals of `Tests/Smt` and `Tests/FixedIssues`.
+- The validators of [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose
+  goals are evaluations of UPLC programs by the CEK machine, are kernel-checked in seconds to half an hour per theorem
+  (Section 6.2).
+- Working on reconstruction surfaced several soundness bugs of Blaster's trusted pipeline (Section 7.1).
 
-The environment variable `BLASTER_RECONSTRUCT=<n>` sets the default level for every `#blaster`
-command and `blaster` tactic. Options given explicitly take precedence. Use `(verbose: 1)` to see
-statistics for each reconstruction.
+Sections 2 and 5 are for users; Sections 3 and 4 describe the design; Section 6 gives the measurements. Terms such as
+*evidence*, *proof obligation* or *global step* are defined in the [glossary](#glossary).
 
-## Generating proofs
+## 2. Usage
 
-`blaster_theorem` proves a statement with Blaster and adds it to the environment as an ordinary
-theorem whose proof term was checked by the kernel:
+### 2.1 Options
+
+| option             | meaning                                                                                  |
+|--------------------|------------------------------------------------------------------------------------------|
+| `(reconstruct: 0)` | default; no reconstruction (previous behavior)                                           |
+| `(reconstruct: 1)` | best effort: when reconstruction fails, a warning is reported and the verdict is trusted |
+| `(reconstruct: 2)` | required: when reconstruction fails, an error is reported                                |
+| `(gen-proof: 1)`   | proof generation: implies `(reconstruct: 2)` and checks the axioms of the proof (2.2)    |
+| `(smt-proof: n)`   | when to replay the SMT solver's proof: 0 `off`, 1 `last`, 2 `first`, 3 `only` (4.1)      |
+| `(verbose: 1)`     | also reports statistics for each reconstruction                                          |
+
+`BLASTER_RECONSTRUCT=<n>` sets the default level for every `#blaster` command and `blaster` tactic, and
+`BLASTER_SMT_PROOF` the default replay mode (`last` if unset). Options given explicitly take precedence. All
+environment variables are listed in Section 5.
+
+### 2.2 Generating proofs
+
+`blaster_theorem` proves a statement with Blaster and adds it to the environment as an ordinary theorem whose proof
+term was kernel-checked:
 
 ```lean
 blaster_theorem lt_succ_le : ∀ (x y : Nat), x < y → x + 1 ≤ y
@@ -45,42 +66,17 @@ blaster_theorem lt_succ_le : ∀ (x y : Nat), x < y → x + 1 ≤ y
 theorem foo : ∀ (a b : Prop), a ∧ b → a := by blaster (gen-proof: 1)
 ```
 
-A generated proof never depends on `sorryAx` or `Lean.ofReduceBool` (`native_decide`). Proof generation
-fails if the proof term depends on any axiom other than Lean's three standard axioms (`propext`,
-`Classical.choice`, `Quot.sound`) and the local axioms of the module used as hypotheses by Blaster.
-`Classical.choice` comes from `Blaster.dite'`, Blaster's classical encoding of `if-then-else`, and from
-Lean's decision procedures.
+A generated proof never depends on `sorryAx` or `Lean.ofReduceBool` (`native_decide`). Proof generation fails if the
+proof term depends on any axiom other than Lean's three standard axioms (`propext`, `Classical.choice`, `Quot.sound`)
+and the local axioms of the module used as hypotheses by Blaster. `Classical.choice` comes from `Blaster.dite'`,
+Blaster's classical encoding of `if-then-else`, and from Lean's decision procedures.
 
-The generated theorems are stored in the module's `.olean` file like any other theorem, so they can be
-re-checked independently of Blaster (e.g., with `lean4checker`). Blaster's own definitions
-(`Blaster.dite'`, `Blaster.decide'`, the lemmas of `Blaster/Reconstruct/Lemmas.lean`) occur in the proof
-terms, but they are ordinary, kernel-checked definitions and theorems. Neither the optimizer nor the SMT
-solver is trusted.
+The generated theorems are stored in the module's `.olean` file like any other theorem, so they can be re-checked
+independently of Blaster (e.g., with `lean4checker`). Blaster's own definitions (`Blaster.dite'`, `Blaster.decide'`,
+the lemmas of `Blaster/Reconstruct/Lemmas.lean`) occur in the proof terms, but they are ordinary, kernel-checked
+definitions and theorems.
 
-## Real-world examples: PlutusCoreBlaster
-
-[PlutusCoreBlaster](https://github.com/input-output-hk/PlutusCoreBlaster) (commit `c9dc0eb`) pins the
-`beta-lambda-cache-optimization` branch of Blaster. It was built against this port of proof
-reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as required by the branch).
-
-- **CBOR encoding.** All 31 `encode_example_i` goals of `PlutusCore/Cbor/Tests.lean` become
-  kernel-checked theorems with `blaster_theorem` (see
-  [`docs/examples/PlutusCoreCbor.lean`](examples/PlutusCoreCbor.lean)). They only depend on `propext`,
-  `Classical.choice` and `Quot.sound`; upstream checks them with `native_decide` or with an unchecked
-  `#blaster`. Running `PlutusCore/Cbor/Tests.lean` unchanged with `BLASTER_RECONSTRUCT=1` also
-  reconstructs a kernel-checked proof for each of its 33 `#blaster` commands and `blaster` tactics
-  (the 3 expected counterexamples need no proof). The examples splitting long strings evaluate the
-  well-founded recursion `splitToChunksLoop` by unfolding its equation lemmas (`blaster_wf_eval`),
-  since the kernel can't reduce well-founded recursion efficiently.
-- **Lemmas.** 17 statements from `PlutusCore/{Integer,List,Bitwise,Cbor}` were restated with
-  `blaster_theorem` (see [`docs/examples/PlutusCoreBlaster.lean`](examples/PlutusCoreBlaster.lean)).
-  14 become kernel-checked theorems, including `divide_add_mod`, `quotient_add_remainder`, the error
-  cases of `integerToByteString` and `replicateByte_zero_l`. The other 3
-  (`integerToByteString_w_bounds_err`, `integerToByteString_neg_n`,
-  `integerToByteString_n_bounds_err`) fail before reconstruction: Blaster's SMT translation rejects
-  `Nat.log2`, which core defines directly with `Nat.rec` (`translateApp: unexpected application`).
-
-## How it works
+## 3. How it works
 
 ```
  G  ──(local axioms)──▶  G'  ──optimizer──▶  G''  ──(True | SMT)──▶  Valid
@@ -89,546 +85,801 @@ reconstruction onto that branch (with a nightly Z3 providing `recfun-finder`, as
               proof of G  ◀── Eq.mpr pf r ◀── r : G''   (kernel-checked)
 ```
 
-0. **Verdict run and proof run.** The verdict (`Valid`, `Falsified`, ...) always comes from Blaster's
-   unchanged pipeline. Only for a `Valid` verdict, the goal is optimized a second time while tracking
-   proof terms (the *proof run*). The proof run differs from the verdict run in a few places where the
-   optimizer's output is not a valid Lean term. Universe levels are kept instead of being normalized,
-   and some rewritten binder types are kept (see Findings). As a result, reconstruction never changes
-   Blaster's verdicts.
+The proof of the original goal `G` combines the optimizer's evidence `pf : G' = G''` (Sections 3.2 to 3.4) with a
+proof `r` of the residual goal `G''` (Section 3.5, and Section 4 for goals closed by the SMT solver).
 
-1. **Proof-producing optimizer.** The optimizer is a stack machine (`Optimize/Basic.lean`,
-   `Optimize/OptimizeStack.lean`). Every frame that waits for the optimized form `v` of an
-   expression `e` also receives *evidence* `EqPf` that `e = v` (`Reconstruct/Types.lean`):
-   - `defeq`: `e` and `v` are definitionally equal (beta, delta of non-recursive definitions,
-     iota, zeta, eta, mdata, projections). No proof term is needed.
-   - `proof p`: an explicit proof term `p : e = v`.
-   - `unknown`: no evidence. It is turned into a *proof obligation* (hole) at the nearest frame
-     boundary, where both `e` and `v` are known.
+### 3.1 Verdict run and proof run
 
-   Evidence is composed by transitivity and congruence: `congrArg`, `congrFun`, `funext`,
-   `forall_congr`, `implies_congr_ctx` and `implies_dep_congr_ctx`. Hypothesis-dependent rewrites
-   inside an implication `a → b` stay valid because the body's evidence is abstracted over the
-   hypothesis. Arguments with forward dependencies, such as the condition of `Blaster.dite'`, are
-   handled by dedicated congruence lemmas (`dite'_congr`). Rewrites served from the optimizer's
-   cache reuse the cached evidence after a scope check.
+The verdict (`Valid`, `Falsified`, ...) always comes from Blaster's unchanged pipeline, the *verdict run*. With
+reconstruction, the goal is optimized a second time while tracking proof terms, the *proof run*:
 
-   `match` alternatives are optimized under a *match context*: fvar patterns are replaced by their
-   discriminants, and nested matches on the same discriminants are eliminated. When tracking proof
-   terms, the equalities `h : dⱼ = pⱼ` between the discriminants and the patterns of the alternative
-   are declared in the local context (`optimizeMatchAlt`). The evidence for an alternative is then
-   `p : ∀ args h₁ ... hₙ, alt args = alt' args` (`EqPf.matchAlt`). Once all the alternatives are
-   optimized, the evidence is combined by a case split over the matcher's *splitter*
-   (`Reconstruct/Match.lean`, `mkMatchCongr`). The splitter is applied to the motive
-   `fun xs => (d = xs) → match xs with alts = match xs with alts'`, and each case is closed with
-   the match equations (or by iota for `casesOn`). Unreachable alternatives (e.g., wildcard
-   alternatives of a match over structures) are closed from the splitter's overlap hypotheses.
+- **Concurrency.** The proof run is performed while the backend solver checks the query and, for the `blaster`
+  tactic, the reconstruction itself right after it. Both are interrupted as soon as the solver answers that the goal is
+  not valid (or when the elaboration is interrupted, e.g., by an edit of the file), and their results are discarded
+  unless the goal is `Valid`: the verdict and its reporting (e.g., counterexamples) are unchanged. Their heartbeats
+  are not counted in the heartbeat limit of the enclosing declaration.
+- **Well-typed output.** The proof run differs from the verdict run where the optimizer's output is not a valid Lean
+  term: universe levels are kept instead of being normalized, and some rewritten binder types are kept
+  (Section 7.2). Reconstruction therefore never changes Blaster's verdicts.
+- **Optimizer caches.** On the `beta-lambda-cache-optimization` lineage (hash-consing, context reuse, equality maps,
+  shared beta reduction), the proof run disables context reuse, equality-map lookups and shared beta reduction, and
+  hash-conses its input in a fresh environment. It keeps the match context (Section 3.2): the equalities between the
+  discriminants and the patterns are removed from the scope when leaving their alternative, and cached proofs using
+  them are not reused outside.
 
-2. **Rule certificates.** Each rewriting rule can record the lemma that justifies it:
-   `withThm lhs rhs thm args`, or `withHypThm` when the rule relies on a hypothesis. The stack machine
-   collects the recorded steps after each rule application and chains them (`ruleStep`). Any gap
-   becomes a typed proof obligation `lhs = rhs`, so rules can be instrumented one at a time.
-   Rules currently instrumented: propositional connectives, Boolean operators, `decide'`, `BEq`,
-   equality, quantifiers/implications, existentials, commutativity normalization, cancellation under
-   non-zero hypotheses, `dite'` propagation, and opaque-constant normalization (`ite`, `dite`,
-   `decide`, `Nat.succ`, ...). The lemmas live in `Reconstruct/Lemmas.lean`.
-   The `match` rules are justified as follows:
-   - `matchReduction` on constructor discriminants: definitional (iota), once the discriminants resolved
-     with the match context are rewritten with the equalities of the enclosing alternatives
-     (`proveMatchReduction`);
-   - `matchReduction` pushing a match over `Blaster.dite'` (`constMatchPropagation?`): `apply_dite'`;
-   - case of case (`constMatchPropagation?`), a function over a match (`funPropagation?`) and a match
-     applied to extra arguments (`normChoiceApplication?`), i.e., `F[match d with alts] = match d with
-     (F[·] ∘ alts)`: a case split over the alternatives of the resulting match, each case being justified
-     by the match equation of the pushed match (`mkMatchPushProof`);
-   - `elimMatch` with a common rhs: a case split over the splitter with `rfl` in each case;
-   - `elimMatch` with the match context (`matchInHyps?`): the discriminants are rewritten with the
-     equalities `h : dⱼ = pⱼ` of the enclosing alternative, then the match is reduced;
-   - the normalization of a match to a chain of `Blaster.dite'` (`normMatchExpr?`): a proof obligation
-     discharged by `match cases` (see below). The optimizer instantiates the equations of the discriminants
-     (`h : d = p` for `match h : d with`) with `Eq.refl d`, whose type is `d = p` only once `d` is rewritten to
-     `p`. When tracking proofs, they are instead proved from the condition of their branch (e.g., `h.1 : x = 2`
-     for the condition `x = 2 ∧ y = 1`), such that the branches are well-typed.
+When reconstruction is off (`reconstruct: 0`), the proof run is skipped, so the optimizer's behavior and cost are
+unchanged.
 
-3. **Discharging proof obligations** (`Reconstruct/Discharge.lean`). Each obligation is
-   type-checked, then attempted in its own local context, with every binder and hypothesis of the
-   rewrite available. The portfolio, in order:
-   1. definitional equality (`rfl`), and `decide +kernel` for closed obligations;
-   2. `simp [*]`, `omega`, `grind`;
-   3. cancellation of non-zero divisors (`simp` with `omega` as discharger);
-   4. case analysis: `split`, case analysis on the conditions of applied `dite`s, cancellation of
-      non-zero factors;
-   5. case analysis on the variables of inductive types and their constructor fields, unfolding
-      user definitions and instances (e.g., derived `BEq` instances);
-   6. induction for equivalences between recursive functions (`blaster_funind`): functional induction
-      following one of the functions of the equation, or structural induction on one variable;
-   7. a deeper case analysis with a larger budget.
-   8. `match cases`: for an obligation `match ds with alts = rhs`, a case split over the
-      matcher's splitter, where the discriminants are replaced by the patterns in `rhs`. Each case is
-      discharged recursively with the portfolio, with the pattern equalities and the overlap
-      hypotheses in the local context. When no splitter can be generated, the variables a match is stuck on
-      are split instead. Matches stuck on literal patterns (e.g., `Int` literals, whose `Int.decEq` tests
-      `whnf` does not unfold) are then reduced with the matcher's equation theorems, before any lemma
-      normalizes the discriminants (e.g., `Int.ofNat (n + 4)` to `↑n + 4`, which no equation theorem matches).
-      For the normalizations of a match to a chain of `Blaster.dite'`, this case analysis comes right after
-      `simp`, `omega` and `grind`, before the costly case analyses of the portfolio.
+### 3.2 Proof-producing optimizer
 
-   Obligations are closed terms, but their proofs may use the hypotheses of their local context
-   (e.g., `simp [*]` with the pattern equalities). The same obligation can occur under different
-   binders, for example when a proof is reused through the proof cache. It is therefore discharged
-   once per binder scope (`transformScoped`), not once per term as `Meta.transform` would do.
+The optimizer is a stack machine (`Optimize/Basic.lean`, `Optimize/OptimizeStack.lean`). Every frame that waits for
+the optimized form `v` of an expression `e` also receives *evidence* (`EqPf`, `Reconstruct/Types.lean`) that `e = v`:
 
-   The congruence over a `match` application is a *fallback region*. If one of the obligations of its
-   alternatives cannot be discharged, the whole region is replaced by the coarse obligation
-   `match ds with alts = match ds with alts'`. Finer evidence therefore never loses a goal that the
-   coarse obligation could prove. This matters when an alternative contains ill-typed intermediate
-   rewrites (see below).
+| evidence  | meaning                                                                                               |
+|-----------|-------------------------------------------------------------------------------------------------------|
+| `defeq`   | `e` and `v` are definitionally equal (beta, delta of non-recursive definitions, iota, zeta, eta, ...) |
+| `proof p` | an explicit proof term `p : e = v`                                                                    |
+| `unknown` | no evidence: a *proof obligation* (hole) `e = v`, created at the nearest frame boundary               |
 
-   Each attempt has a heartbeat budget, and failed attempts leave no trace (state, messages and info
-   trees are restored). Blaster's internal forms (`Nat.add`, `Blaster.dite'`, `Nat.beq`, ...) are first
-   rewritten back to standard notation (`blaster_denorm`).
+Evidence is composed by transitivity and congruence: `congrArg`, `congrFun`, `funext`, `forall_congr`,
+`implies_congr_ctx` and `implies_dep_congr_ctx`. Hypothesis-dependent rewrites inside an implication `a → b` stay
+valid because the body's evidence is abstracted over the hypothesis. Arguments with forward dependencies, such as the
+condition of `Blaster.dite'`, are handled by dedicated congruence lemmas (`dite'_congr`). Rewrites served from the
+optimizer's cache reuse the cached evidence after a scope check. The proof run's own caches (proofs without proof
+obligations, congruences of `match` applications) live in its state.
 
-4. **Residual goal.** If the optimizer reduced the goal to `True`, the residual proof is
-   `True.intro`. If the SMT solver proved the residual goal, Lean decision procedures re-prove it:
-   `decide`, `simp`, `omega`, `grind`, seeded instantiation of quantified hypotheses
-   (`blaster_inst_hyps`), unfolding of user definitions with case analysis, unfolding of recursive
-   functions (`blaster_lit_add` first puts `k + n` in the form `n + k` expected by equation lemmas), case
-   analysis on `match` expressions, witness search for existentials, `div`/`mod` facts
-   (`blaster_divmod_facts`) with non-linear lemmas, and elements of empty types. The arguments of a function
-   into an empty type, like the witnesses of existentials over function types, are constructed from
-   their types when they have no default element (`blaster_inhabit`). For example, for `∀ (f : SomeBig → Empty),
-   False` with `SomeBig.intro (n : Nat) (h : n > 5)`, the term `f ⟨6, _⟩` takes the witness 6 from the literals of the
-   constructor type. Another example is `fun x => absurd x.inv _ : FalseInv → Empty`, where a field of `x`
-   is contradictory. On residuals with `match` applications, the case analyses (`split`, `match cases`, unfolding
-   with case analysis) are attempted in parallel right after `omega` and `grind` (`raceTactics`, on the goal closed
-   over its local context), as the best one depends on the goal (e.g., 0.3 s for one of them on a goal where another
-   one exhausts its budget). Replaying the solver's own proof certificate is
-   future work.
+**`match` alternatives.** Alternatives are optimized under a *match context*: fvar patterns are replaced by their
+discriminants, and nested matches on the same discriminants are eliminated. When tracking proof terms, the equalities
+`h : dⱼ = pⱼ` between the discriminants and the patterns of the alternative are declared in the local context
+(`optimizeMatchAlt`). The evidence for an alternative is then `p : ∀ args h₁ ... hₙ, alt args = alt' args`
+(`EqPf.matchAlt`). Once all the alternatives are optimized, the evidence is combined:
 
-5. **Kernel check.** The proof of the original goal is `Eq.mpr pf r`, applied to the local axioms.
-   It is checked synchronously by the kernel (`Kernel.Environment.addDecl`). Only kernel-accepted
-   proofs are reported as reconstructed or used to close tactic goals.
+- by a case split over the matcher's *splitter* (`Reconstruct/Match.lean`, `mkMatchCongr`). The splitter is applied
+  to the motive `fun xs => (d = xs) → match xs with alts = match xs with alts'`, and each case is closed with the
+  match equations (or by iota for `casesOn`). Unreachable alternatives (e.g., wildcard alternatives of a match over
+  structures) are closed from the splitter's overlap hypotheses;
+- without case split, by `congr` and `funext` (`mkMatchCongrByAlts?`), when the evidence of the alternatives has no
+  proof obligation and does not use the pattern equalities. This halves the evidence of `MintingPolicy`.
 
-6. **Direct fallback.** If the steps above fail, the decision procedures of step 4 are tried on the
-   original goal itself (e.g., `rfl` or `decide +kernel` for closed computations).
+`MatcherApp.transform` is used without its type check of the new motive (`transformMatcherApp`), which traversed the
+alternatives of nested `match` applications again at each level, and the match equations are cached.
 
-When tracking is off (`reconstruct: 0`), the proof run is skipped, so the optimizer's behavior and cost
-are unchanged.
+### 3.3 Rule certificates
 
-## Replaying SMT proofs
+Each rewriting rule can record the lemma that justifies it: `withThm lhs rhs thm args`, or `withHypThm` when the rule
+relies on a hypothesis. The stack machine collects the recorded steps after each rule application and chains them
+(`ruleStep`). Any gap becomes a typed proof obligation `lhs = rhs`, so rules can be instrumented one at a time. The
+lemmas live in `Reconstruct/Lemmas.lean`.
 
-Goals left to the SMT solver can also be proved by replaying a proof produced by an SMT backend,
-instead of (or in addition to) re-proving them with Lean tactics. This is implemented in
-`Blaster/Reconstruct/SmtProof/` and works with several backends through a common representation:
+| rule                                                                     | justification                       |
+|--------------------------------------------------------------------------|-------------------------------------|
+| propositional connectives, Boolean operators, `decide'`, `BEq`, equality | lemma (`withThm`)                   |
+| quantifiers and implications, existentials, commutativity normalization  | lemma (`withThm`)                   |
+| `dite'` propagation, opaque constants (`ite`, `decide`, `Nat.succ`, ...) | lemma (`withThm`)                   |
+| cancellation under non-zero hypotheses                                   | lemma (`withHypThm`)                |
+| equality between proofs                                                  | `eq_proof_irrel`                    |
+| `Blaster.dite'` with constant branches                                   | `recordDITESimp`                    |
+| connectives of `Blaster.decide'`                                         | `recordDecideOp`                    |
+| `matchReduction` on constructor discriminants                            | iota (`proveMatchReduction`)        |
+| `matchReduction` over `Blaster.dite'` (`constMatchPropagation?`)         | `apply_dite'`                       |
+| case of case, function over a match, match applied to extra arguments    | match push (`mkMatchPushProof`)     |
+| `elimMatch?` with a common right-hand side                               | splitter case split, `rfl` per case |
+| `elimMatch?` by the negative match context (`lastPatternReduction?`)     | proof obligation                    |
+| replacement of a matcher by an equivalent one (`structEqMatch`)          | `mkMatchEquivProof`                 |
+| `match` to a chain of `Blaster.dite'` (`normMatchExpr?`)                 | proof obligation (`match cases`)    |
+| arithmetic (`Nat`/`Int`) constant folding                                | proof obligation                    |
 
-1. **Query.** The residual goal is translated again with Blaster's translation, after introducing its
-   leading variables as Lean free variables, such that the SMT constants `$k` can be mapped back to them.
-   Definitional axioms of recursive functions over `Nat` (`∀ x, f x = f_LRec x`) are guarded with `0 ≤ x`
-   (this only weakens the query).
-2. **Backends** (`BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`): Z3 with legacy proof objects
-   (`:produce-proofs true`, `pp.simplify_implies false`), and cvc5 with Alethe proofs (`--parsing-mode=lenient`,
-   `--proof-granularity=dsl-rewrite`). Each adapter translates the proof into a DAG of steps (`IR.lean`):
+Notes on the `match` rules:
+
+- **`matchReduction`.** The discriminants, resolved with the match context, are rewritten with the equalities of the
+  enclosing alternatives; the match then reduces by iota.
+- **Match push.** Case of case (`constMatchPropagation?`), a function over a match (`funPropagation?`) and a match
+  applied to extra arguments (`normChoiceApplication?`) all rewrite `F[match d with alts]` to
+  `match d with (F[·] ∘ alts)`. The proof is a case split over the alternatives of the resulting match, each case
+  being justified by the match equation of the pushed match.
+- **`normMatchExpr?`.** The optimizer instantiates the equations of the discriminants (`h : d = p` for
+  `match h : d with`) with `Eq.refl d`, whose type is `d = p` only once `d` is rewritten to `p`. When tracking proofs,
+  they are instead proved from the condition of their branch (e.g., `h.1 : x = 2` for the condition
+  `x = 2 ∧ y = 1`), so that the branches are well-typed. The equality between the `match` and its `dite'` chain is a
+  proof obligation, discharged by `match cases` (Section 3.4).
+
+### 3.4 Discharging proof obligations
+
+Proof obligations are discharged in `Reconstruct/Discharge.lean`. Each obligation is type-checked (an ill-typed
+obligation fails), then attempted in its own local context, with every binder and hypothesis of the rewrite
+available. Blaster's internal forms (`Nat.add`, `Blaster.dite'`, `Nat.beq`, ...) are first rewritten back to standard
+notation (`blaster_denorm`). Each attempt has a heartbeat budget, and failed attempts leave no trace (state, messages
+and info trees are restored). The portfolio, in order:
+
+| step | strategy                                                                                                 |
+|------|----------------------------------------------------------------------------------------------------------|
+| 0    | the tactic that discharged the previous obligation of the same kind (e.g., all the `match` reductions)   |
+| 1    | definitional equality (`rfl`); for closed obligations, `decide +kernel` and `blaster_wf_eval`            |
+| 2    | `simp [*]`, `omega`, `grind`                                                                             |
+| 3    | cancellation of non-zero divisors (`simp` with `omega` as discharger)                                    |
+| 4    | case analysis: `split`, the conditions of applied `dite`s, cancellation of non-zero factors              |
+| 5    | case analysis on variables of inductive types and their fields, unfolding user definitions and instances |
+| 6    | induction for equivalences between recursive functions (`blaster_funind`)                                |
+| 7    | SMT proof replay of the obligation (`obligationBySmtProof`, Section 4), unless the replay mode is `off`  |
+| 8    | a deeper case analysis with a larger budget                                                              |
+| 9    | `match cases` over the splitter, then case analysis on `match`es with generalized discriminants          |
+| 10   | case analysis on the variables that stuck `match` applications depend on                                 |
+
+- **Closed computations.** `blaster_wf_eval` evaluates well-founded recursion by unfolding its equation lemmas, since
+  the kernel cannot reduce well-founded recursion efficiently.
+- **Induction.** `blaster_funind` uses functional induction following one of the functions of the equation, or
+  structural induction on one variable. Nested equivalences are proved bottom-up and reused.
+- **SMT proof replay.** The obligation is closed over the variables it mentions and the hypotheses on them (e.g., the
+  conditions under which the optimizer rewrote). It comes before the costly case analyses: on CEK evaluations, the
+  replay proves in less than a second obligations on which the case analyses fail after a minute.
+- **`match cases`.** For an obligation `match ds with alts = rhs`, a case split over the matcher's splitter, where the
+  discriminants are replaced by the patterns in `rhs`. Each case is discharged recursively with the portfolio, with the
+  pattern equalities and the overlap hypotheses in the local context.
+- **Stuck matches.** When no splitter can be generated, the variables a match is stuck on are split instead. Matches
+  stuck on literal patterns (e.g., `Int` literals, whose `Int.decEq` tests `whnf` does not unfold) are reduced with the
+  matcher's equation theorems before any lemma normalizes the discriminants (e.g., `Int.ofNat (n + 4)` to `↑n + 4`,
+  which no equation theorem matches). For the obligations of `normMatchExpr?`, this step comes right after step 2,
+  before the costly case analyses.
+
+Before the sequential portfolio runs, the obligations that are not definitional are discharged speculatively in
+parallel (`startDischarges`, 6 tasks, `BLASTER_RECON_PARDISCHARGE`), closed over their relevant context and without
+the costly case analyses.
+
+**Scopes.** Obligations are closed terms, but their proofs may use the hypotheses of their local context (e.g.,
+`simp [*]` with the pattern equalities). The same obligation can occur under different binders, for example when a
+proof is reused through the proof cache. It is therefore discharged once per binder scope (`transformScoped`), not
+once per term as `Meta.transform` would do.
+
+**Fallback regions.** The congruence over a `match` application is a *fallback region*: if one of the obligations of
+its alternatives cannot be discharged, the whole region is replaced by the coarse obligation
+`match ds with alts = match ds with alts'`. Finer evidence therefore never loses a goal that the coarse obligation
+could prove. This matters when an alternative contains ill-typed intermediate rewrites (Section 7.2).
+
+### 3.5 Residual goal
+
+If the optimizer reduced the goal to `True`, the residual proof is `True.intro`. If the SMT solver proved the residual
+goal, it is proved again in Lean, with tactics (`proveResidual`) or by SMT proof replay (Section 4), depending on the
+mode. The tactic strategies:
+
+| strategy            | tactics                                                                                |
+|---------------------|----------------------------------------------------------------------------------------|
+| decision procedures | `decide`, `simp`, `omega`, `grind`                                                     |
+| instantiation       | seeded (`blaster_inst_hyps`), with structure invariants (`blaster_struct_facts`)       |
+| case analysis       | variables of inductive types (unfolding user definitions), `split`, `match cases`      |
+| recursive functions | unfolding equation lemmas (after `blaster_lit_add`), induction (`blaster_funind`)      |
+| existentials        | witness search (`blaster_exists`), including existentials over types                   |
+| arithmetic          | `div`/`mod` facts (`blaster_divmod_facts`), nonlinear lemmas                           |
+| empty types         | elements of empty types (`blaster_nomatch`), constructed arguments (`blaster_inhabit`) |
+
+**Empty types.** The arguments of a function into an empty type, like the witnesses of existentials over function
+types, are constructed from their types when they have no default element (`blaster_inhabit`). For example, for
+`∀ (f : SomeBig → Empty), False` with `SomeBig.intro (n : Nat) (h : n > 5)`, the term `f ⟨6, _⟩` takes the witness 6
+from the literals of the constructor type. Another example is `fun x => absurd x.inv _ : FalseInv → Empty`, where a
+field of `x` is contradictory.
+
+**Racing case analyses.** On residuals with `match` applications, the case analyses (`split`, `match cases`, unfolding
+with case analysis) are attempted in parallel right after `omega` and `grind` (`raceTactics`), on the goal closed over
+its local context, because the best one depends on the goal (e.g., 0.3 s for one of them on a goal where another one
+exhausts its budget). Each attempt's heartbeat budget is measured inside its own task.
+
+**When to replay.** In the default mode (`last`), the SMT proof replay is tried once, as soon as two attempts exhaust
+their budget (`proveResidual` with `hard`), the attempts of a race counting individually. On the
+residuals of CEK evaluations, every tactic runs out of its budget (7.5 s each, 13 s for the deeper case analysis), so
+waiting for all of them delayed the replay by about 75 s. If every strategy fails, the equivalences between recursive
+functions established by the optimizer are proved and used as facts, and the replay is tried last if it has not been
+tried yet.
+
+### 3.6 Kernel check
+
+The proof of the original goal is `Eq.mpr pf r`, applied to the local axioms. Every proof is checked once by the
+kernel, synchronously, as an auxiliary theorem (`checkedProof`, `Kernel.Environment.addDecl`). The declarations using
+it (e.g., the theorem proved by `blaster`) refer to the auxiliary theorem, so the proof term is neither checked again
+nor traversed by later phases.
+
+- **Free variables.** Goals with free variables (e.g., the goals of the `blaster` tactic, with its hypotheses) are
+  closed over the declarations of their local context they depend on, then checked as auxiliary theorems too.
+  `Meta.check`, used before, ran out of recursion depth on deep proofs (7 of the 26 `Auction` theorems failed).
+- **Fallbacks.** A proof depending on `let` variables of the local context is checked by the kernel without being
+  added as an auxiliary theorem (`kernelCheck`), and one whose goal still has metavariables (e.g., in the
+  declarations of its local context, such as the universe levels of the hypotheses introduced by `induction`) by the
+  elaborator's type checker. A proof term with metavariables is refused.
+- **No heartbeat limit.** The kernel checks of reconstructed proofs have no heartbeat limit (`kernelOptions`).
+- **Large proofs.** Large SMT proofs are split into auxiliary theorems checked in parallel (Section 4.5).
+- **`sorryAx`.** A proof that depends on `sorryAx` is refused, including through auxiliary declarations created by
+  tactics. For example, `nomatch` reports missing cases as an error message and still produces a matcher whose body is
+  `sorry`, which the kernel accepts.
+
+Only kernel-accepted proofs are reported as reconstructed or used to close tactic goals.
+
+### 3.7 Direct fallback
+
+If the steps above fail, the strategies of Section 3.5 are tried on the original goal itself (e.g., `rfl` or
+`decide +kernel` for closed computations), with the local axioms as `simp` lemmas.
+
+## 4. SMT proof replay
+
+Goals closed by the SMT solver can also be proved by replaying a proof produced by an SMT backend, instead of (or in
+addition to) re-proving them with Lean tactics. The same replay serves the proof obligations of the optimizer that no
+tactic discharges (Section 3.4). It is implemented in `Blaster/Reconstruct/SmtProof/` and works with several backends
+through a common representation.
+
+### 4.1 Modes
+
+| `BLASTER_SMT_PROOF` | `(smt-proof: n)` | behavior for goals closed by the SMT solver                              |
+|---------------------|------------------|--------------------------------------------------------------------------|
+| `off`               | 0                | never replay                                                             |
+| `last` (default)    | 1                | tactics first; replay once two attempts exhaust their budget or all fail |
+| `first`             | 2                | replay first, then the tactics                                           |
+| `only`              | 3                | replay only, no tactics (to measure the replay)                          |
+
+In every mode but `off`, the proof obligations of the optimizer that the cheaper tactics don't discharge are also
+replayed, before the costly case analyses (step 7 of Section 3.4).
+
+### 4.2 Backends
+
+| backend | solver and proof format | notes                                                                         |
+|---------|-------------------------|-------------------------------------------------------------------------------|
+| `z3`    | Z3, legacy proofs       | Blaster's simplifier commands are dropped (finer proofs)                      |
+| `z3rec` | Z3, legacy proofs       | recursive functions as `define-funs-rec` (Section 4.3); only for such queries |
+| `z3+`   | Z3, legacy proofs       | keeps Blaster's simplifiers (`recfun-finder`, `macro_finder`): coarser proofs |
+| `cvc5`  | cvc5, Alethe            | optional, not in the default list                                             |
+
+The backends are tried in order (`BLASTER_SMTPROOF_BACKENDS`, default `z3,z3rec,z3+`). Z3 runs with
+`:produce-proofs true` and `pp.simplify_implies false`; cvc5 with `--parsing-mode=lenient`,
+`--proof-format-mode=alethe` and `--proof-granularity=dsl-rewrite`. Z3 runs as a portfolio of random seeds (3 by
+default), started a quarter of the timeout apart (at most 10 s) while no proof is found: on CEK evaluations, the time
+Z3 takes to find a proof varies from 30 to 170 s with the seed. The Alethe parser (`Alethe.lean`) also reads veriT's
+proofs, but no veriT backend is provided.
+
+### 4.3 Pipeline
+
+1. **Query** (`Driver.lean`). The residual goal is translated again with Blaster's translation, after introducing its
+   leading variables as Lean free variables, so that the SMT constants `$k` can be mapped back to them. Definitional
+   axioms of recursive functions over `Nat` (`∀ x, f x = f_LRec x`) are guarded with `0 ≤ x` (this only weakens the
+   query).
+2. **Proof** (`Z3.lean`, `Alethe.lean`, `IR.lean`). Each adapter translates the backend's proof into a DAG of steps:
    rule, premises, arguments (e.g., quantifier instantiations) and conclusion (clauses as disjunctions).
-   The Alethe adapter also serves veriT.
-3. **Interpretation** (`Interp.lean`). SMT terms are interpreted as Lean terms: `Int` arithmetic on Lean
-   `Int`, with casts (`↑n`, `Int.toNat`) where Lean terms of type `Nat` occur (arguments and results of
-   Lean functions, constructor fields); `Bool` formulas as propositions; datatype constructors, selectors and
-   testers as Lean constructors and case analyses; Blaster's function values (`@@ArrowT`, `@apply`) as Lean
-   functions; Blaster's type predicates (`@isNat`, ...) as `True` (Lean values always satisfy them);
-   skolem constants as `Classical.epsilon` terms. Z3 prints the nullary constructors of parametric datatypes
-   without their sort (`List.nil` for all the instances of `@List`), and the occurrences of a term are one object
-   only when Z3 binds it by a `let`: the instances of the constructor applications that their arguments don't
-   determine are inferred on the whole proof (`SortInfer.lean`: one sort per term object, from the signatures of
-   the query and the constraints of all the steps), such that each occurrence is interpreted in the same instance
-   in all the steps where it occurs; the parts that remain undetermined are defaulted identically in each step.
-4. **Replay** (`Replay.lean`). Each step yields a Lean proof of the interpretation of its conclusion:
-   explicit proof terms for resolution (a unit propagation procedure building the proof), modus ponens,
-   equality reasoning, quantifier instantiation, skolemization, hypotheses and lemmas; and small tactic
-   calls (`simp`, `omega`, `grind`, unfolding of user definitions) proving `premises → conclusion` for
-   rewriting and theory lemmas. Large equalities (e.g., Z3 `rewrite`s inside big formulas) are related by
-   congruence on their common structure, and only their differences are given to tactics, with the
-   subterms common to both sides generalized (`Local.lean`); arithmetic lemmas over large atoms are
-   generalized the same way, with facts on `div`/`mod` for `omega`; nonlinear integer lemmas are proved by
-   `blaster_nlarith` (`NlArith.lean`: case splits, products of hypotheses, polynomials normalized with the
-   commutative ring lemmas of `grind`, then `omega` with the monomials as atoms). Tactics run on the statement of
-   the step closed over the variables it mentions, in an empty local context: a step holds by itself (its
-   premises are hypotheses of the statement), and the hypotheses of the context (e.g., the negated goal of a CEK
-   evaluation) only slowed down `simp_all` and case analyses, by one to two orders of magnitude. The proof of
-   `False` is turned into a proof of the goal and checked by the kernel like any other reconstructed proof.
-5. **Bridge** (`Bridge.lean`). The asserted formula is the translation of the negated goal, interpreted
-   back. It is related to the negated goal by a simultaneous traversal of both terms: congruence on their
-   common structure, and a lemma for each encoding of the translation where they differ: `match` as `ite`
-   chains over testers and selectors (an auxiliary theorem per matcher instance, stated for abstract
-   discriminants and alternatives, and proved by evaluating the conditions with case analyses), `Nat`
-   terms as `Int` terms and quantifiers over `Nat` as guarded quantifiers over `Int`, `Bool` terms as
-   formulas, `dite'`/`ite`, functions translated as SMT macros (e.g., `@Nat.sub`, `@Int.toNat`, expanded by
-   the backends; an auxiliary lemma per function relating it to its macro), Blaster's type predicates. The
-   definitions of the other functions are bridged by tactics. The traversal is linear in the size of the
-   (shared) terms, which matters for goals such as the CEK evaluation of validators.
+3. **Interpretation** (`Interp.lean`). SMT terms are interpreted as Lean terms:
+   - `Int` arithmetic on Lean `Int`, with casts (`↑n`, `Int.toNat`) where Lean terms of type `Nat` occur (arguments
+     and results of Lean functions, constructor fields);
+   - `Bool` formulas as propositions;
+   - datatype constructors, selectors and testers as Lean constructors and case analyses;
+   - Blaster's function values (`@@ArrowT`, `@apply`) as Lean functions;
+   - Blaster's type predicates (`@isNat`, ...) as `True` (Lean values always satisfy them);
+   - skolem constants as `Classical.epsilon` terms;
+   - the polymorphic encoding as described in Section 4.4.
+4. **Sort inference** (`SortInfer.lean`). Z3 prints the nullary constructors of parametric datatypes without their
+   sort (`List.nil` for all the instances of `@List`), and the occurrences of a term are one object only when Z3 binds
+   it by a `let`. The instances of the constructor applications that their arguments don't determine are therefore
+   inferred on the whole proof (one sort per term object, from the signatures of the query and the constraints of all
+   the steps). Each occurrence is then interpreted in the same instance in all the steps where it occurs, and the
+   parts that remain undetermined are defaulted identically in each step.
+5. **Replay** (`Replay.lean`). Each step yields a Lean proof of the interpretation of its conclusion:
+   - explicit proof terms for resolution (a unit propagation procedure building the proof), modus ponens, equality
+     reasoning (`trans`, `symm`, `monotonicity`, `commutativity`), quantifier instantiation, skolemization,
+     hypotheses and lemmas;
+   - the propositional engine (`Prop.lean`) for `def-axiom`, `not-or-elim`, `and-elim`, propositional `rewrite`s and
+     Alethe's Tseitin rules;
+   - small tactic calls (`simp`, `omega`, `grind`, unfolding of user definitions) proving `premises → conclusion`
+     for arithmetic (`th-lemma`, arithmetic `rewrite`s), with a portfolio ordered adaptively by success rate per time
+     unit for each rule and goal shape, attempted in parallel on closed goals (`portfolioParMulti`).
 
-Blaster's polymorphic encoding (`@Type` for the types denoted by sort variables, `@Instance` for their
-values, membership predicates `@isInstance v t`) is interpreted in two ways. With a single sort variable `α`
-of an inhabited type, `@Instance` is interpreted as `α`, `@Type` as `Unit` and membership predicates as `True`.
-Otherwise (several, possibly empty, or quantified sort variables; `Poly.lean`), `@Type` is interpreted as
-`Sort u`, `@Instance` as the always inhabited universe `Option (PSigma fun α : Sort u => α)`, values as their
-injections (lifted through lists, options, pairs and functions), and membership predicates as "lies in the
-image of the injection"; the bridge relates the goal to the asserted formula with an additional world for
-these injections. The values of the other inductive types over sort variables (e.g., `Term (List α)` for a
-nested or mutual datatype of the user) are mapped to their instances at the universe by maps defined with
-their recursors (each constructor to itself, its fields by their worlds, its nested occurrences, e.g.,
-`List (Term α)`, by the auxiliary recursors), auxiliary definitions per instance with the proofs of their
-injectivity (case analysis and injection) and, per constructor, its equation in the world (with the nested
-occurrences as `List.map`) and its image (`Img W (C ys) = Img Ŵ₁ y₁ ∧ …`), used by the bridge (constructors,
-case analyses, definitions of the membership predicates expanded by the backend) and by the tactics proving
-the axioms of the encoding and the naturality lemmas. A `match` on such a datatype (or on a list or an option of
-a sort variable), whose `ite` encoding would need default values of the selectors at the sort variables, is
-related to its interpretation by case analysis on its discriminant (generalized in both terms), with the
-equations of the constructors in the world and the testers and selectors of the interpretation reduced.
-Polymorphic Lean functions instantiated at sort variables (e.g., `@List.zipWith α β γ`, whose SMT function is
-shared by all the instantiations of a universe) are interpreted at the universe (`@List.zipWith Univ Univ Univ`,
-with the universe levels inferred by type checking), such that their definitional axioms hold on all the values
-of the universe; the bridge relates their applications in the goal to their interpretations by *naturality*
-lemmas, e.g., `List.zipWith (lift f) (List.map (inj α) xs) (List.map (inj β) ys) =
-List.map (inj γ) (List.zipWith f xs ys)`, stated from the types of the function and proved once per function and
-instantiation by functional induction (`blaster_poly_nat`), and relates the testers and selectors of lists and
-options of sort variables to those of their interpretations (the default values of selectors by contradiction with
-the conditions of their branch). Naturality only holds for parametric functions: axioms and opaque functions at sort
-variables (e.g., `hash : α → String`) and functions with instance arguments that don't exist at the universe (e.g.,
-`[BEq α]`) are only interpreted with `@Instance` as the sort variable. Lambda terms of the translation (`@lambda`,
-`@global_lambda` with their definitional axioms) are interpreted as Lean lambdas, with their `Nat` parameters as
-Lean `Nat` variables; with the universe, they are guarded by the membership predicates of their parameters as their
-definitions are (`fun x => if Img w x then b else dflt x`), such that they are images of Lean functions whatever
-their bodies outside of their domain (e.g., constant functions).
+   Large equalities (e.g., Z3 `rewrite`s inside big formulas) are related by congruence on their common structure,
+   and only their *local differences* are given to tactics, with the subterms common to both sides generalized
+   (`Local.lean`). Arithmetic lemmas over large atoms are generalized the same way, with facts on `div`/`mod` for
+   `omega`. Nonlinear integer lemmas are proved by `blaster_nlarith` (`NlArith.lean`: case splits, products of
+   hypotheses, polynomials normalized with the commutative ring lemmas of `grind`, then `omega` with the monomials as
+   atoms). Tactics run on the statement of the step closed over the variables it mentions, in an empty local context:
+   a step holds by itself (its premises are hypotheses of the statement), and the hypotheses of the context (e.g.,
+   the negated goal of a CEK evaluation) slowed down `simp_all` and case analyses by one to two orders of magnitude.
+6. **Bridge** (`Bridge.lean`, `BridgeMatch.lean`). The asserted formula is the translation of the negated goal,
+   interpreted back. It is related to the negated goal by a simultaneous traversal of both terms: congruence on their
+   common structure, and a lemma for each encoding of the translation where they differ:
+   - `match` as `ite` chains over testers and selectors: an auxiliary theorem per matcher instance, stated for
+     abstract discriminants and alternatives, and proved by evaluating the conditions with case analyses; named and
+     normalized `Int` patterns are supported;
+   - `Nat` terms as `Int` terms, and quantifiers over `Nat` as guarded quantifiers over `Int`;
+   - `Bool` terms as formulas, `dite'`/`ite`, and Blaster's type predicates;
+   - functions translated as SMT macros (e.g., `@Nat.sub`, `@Int.toNat`, expanded by the backends), with an auxiliary
+     lemma per function relating it to its macro.
 
-The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a
-`Nat` function instantiated with a negative integer) simply fails to replay. Soundness only relies on the
-kernel. `BLASTER_SMT_PROOF` selects when the replay is tried for SMT residuals: `last` (default, after the
-tactic strategies), `first`, `only` (no tactic strategies, to measure the replay), or `off`.
+   The definitions of the other functions are bridged by tactics. The traversal is linear in the size of the shared
+   terms, which matters for goals such as CEK evaluations.
+7. **Recursive functions** (`RecFun.lean`, backend `z3rec`). Z3's `recfun-finder` simplifier, which turns the
+   definitional axioms of recursive functions into recursive definitions, is a no-op under proof production, and Z3
+   then times out on the CEK goals it proves without proofs. The `z3rec` backend rewrites the query into
+   `define-funs-rec` at the SMT-LIB level, which yields a proof in seconds, and Z3's `recfun` lemmas are replayed with
+   kernel-checked definitional equations. These equations are proved in parallel while the backend searches for a
+   proof (`RecFun.preStartEqTasks`, `RecFun.startEqTasks`).
 
-### Results
+The proof of `False` is turned into a proof of the goal and kernel-checked like any other reconstructed proof.
 
-On the whole test suite (`scripts/recon_coverage.sh`), with `BLASTER_SMT_PROOF=only` (no tactic strategy for
-SMT residuals), the replay of Z3 proofs proves **99.1%** of the goals closed by the SMT solver (338/341, nightly
-Z3; 88.9%, 248/279, before the closed-statement tactics, the universe interpretation of polymorphic goals, the
-nonlinear lemmas and the bridge of normalized `match` patterns). Counting each replay attempt of the `Tests/Smt`
-and `Tests/FixedIssues` files (`covreplay`, optimizer obligations excluded), 312 of 322 goals are replayed (283 of
-297 before the interpretation of empty types, of types used as values and of sort quantifiers under binders); the
-remaining ones involve polymorphic structure fields with instance arguments (`Issue15`, `InstanceArgs`), inductive
-propositions with data fields and constructor testers on propositions (`SmtUninhabited`), a nonlinear lemma over
-products of conditionals (`Tests/Smt/SmtMatch.lean`), a bit-vector lemma and a proof-production timeout. With the default mode (`last`), the
-replay complements the tactic strategies: all the reconstruction attempts succeed (3949/3949), i.e., the 406 goals
-closed by the SMT solver, the 413 goals closed by the optimizer and the 3130 `#testOptimize` certificates (99.8%,
-3917/3924, before the reduction of stuck matches by their equation theorems, the elements constructed for types
-without default element and the equations of the discriminants proved from the branch conditions).
+### 4.4 Polymorphic encoding
 
-The replay also scales to the validators of
-[CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster), whose goals are the
-evaluation of UPLC programs by the CEK machine. With `BLASTER_SMT_PROOF=only` (SMT residuals proved by replay
-only), `HelloWorld` (1 theorem), `UnlockPIN` (2), `ParamFeed` (1) and `Auction` (26) are fully reconstructed
-and kernel checked. The residual of `HelloWorld` is a 927-step Z3 proof replayed in 1.8 s (step time; 33 s before
-the tactics were run on statements closed over their variables, see below), `UnlockPIN` 917 steps in 1.8 s,
-the `Auction` residuals 44 to 197 steps in at most 0.2 s each; the optimizer's evidence for the rewrites of
-`match` alternatives (case of case, functions pushed into `match`es) completes the proofs (about 26 s of
-reconstruction for `HelloWorld`). `MintingPolicy`, `SellNFT` and 19 of the 20 `Governance` theorems are proved
-by Z3 without proofs but time out with proof production: Z3's `recfun-finder` simplifier, which turns the
-definitional axioms of recursive functions into recursive definitions, is disabled under `produce-proofs`.
-The backend `z3rec` rewrites the query into `define-funs-rec` at the SMT-LIB level, which yields a proof in
-seconds, and replays Z3's `recfun` lemmas with kernel-checked definitional equations (`RecFun.lean`): all the 20
-`Governance` theorems (residual proofs of about 4K steps replayed in 4.5 minutes, 7 to 9 minutes per theorem in
-total) and both `MintingPolicy` theorems (6 minutes each, at most 7 GB) are kernel checked. The proofs of the steps
-that don't depend on a scope are held by unassigned metavariables during the replay and lifted at the end to closed
-lambda terms over the variables of the goal and the negated goal (`liftGlobalProofs`): they are shared by the nested
-`lemma` scopes at various binder depths, and abstracting the negated goal and the variables in the inlined proof
-copied them once per depth. The second `MintingPolicy` theorem (a residual proof of 31.7K steps) gave a proof of
-10.7M distinct subterms at binder depth 216 whose abstraction exceeded 36 GB; it is now lifted in 0.5 s into a proof
-of 2.5M distinct subterms. The second `SellNFT` theorem (a residual proof replayed in 5 minutes, a final proof of
-9.2M distinct subterms at binder depth 964) is kernel checked in 53 minutes in total (17.5 GB; the kernel checks of
-reconstructed proofs have no heartbeat limit, see `kernelOptions`). The replay of the first one failed on a `trans*`
-step about `(List.cons.0 List.nil)`, the head of the empty list of pairs of `Data` (a default value of the selector):
-Z3 printed its occurrences in these steps as distinct objects (`let` bindings only share some of the occurrences of a
-term), each conclusion was interpreted by itself, and the steps that don't determine its instance defaulted it, e.g.,
-to a pair of `Data` in a step and to a pair of `Unit` (with another default value) in the next one, such that the
-paths of `trans*` between the interpretations didn't connect. The default values of the selectors are fixed per
-instance (`Inhabited.default`, or a constructor application); the instances were not. With the instances inferred on
-the whole proof (`SortInfer.lean`: 195 hints on the 152,698 steps of its residual proof, in 0.15 s), the residual proof
-is replayed in 5 minutes into a proof of 10.1M distinct subterms at binder depth 1425. Checked as a single
-declaration, it did not fit in the memory of the measurement machine, whose user processes are throttled at 20 GB
-(`memory.high` of `user.slice`): from the 7.3 GB of the replay, the kernel check grew by about 4 GB per minute,
-peaked at 16.9 GB of memory and 16.5 GB of swap, then made no progress while swapping (the check of the second
-theorem, at binder depth 964, peaked at 17.5 GB). The binder depth is not the cause. The 7,207 `lemma` steps are all
-global steps (their subproofs discharge all their hypotheses), whose proofs are already lifted to closed terms, and
-the kernel does not rebuild a closed term when it instantiates the binders it occurs under. Counted on the proof
-(`BLASTER_SMTPROOF_ISTATS`), the kernel's instantiations of the binders, which rebuild the subterms referring to the
-instantiated binder, build 15.7M copies of the 9.3M subterms with loose bound variables (a subterm refers to at most
-63 binders). The memory goes to the kernel's caches, which are kept for the check of a whole declaration: the type
-inferred for each checked subterm, and the equivalences of the types that `is_def_eq` compares (the conclusions of
-the steps, interpreted over the terms of the CEK evaluation, are compared structurally where the kernel's
-instantiations made them pointer-distinct; samples of the kernel's stacks are in `equiv_manager` and `expr_eq_fn`).
-With 4096 global proofs or more (`BLASTER_SMTPROOF_SPLIT`, 0: always) in a proof of 5M distinct subterms or more
-(`BLASTER_SMTPROOF_SPLIT_DAG`), each lifted global proof is checked by the kernel as an auxiliary theorem `∀ xs, ¬ goal → φ` over the variables of the goal and the negated goal, and used as
-its constant applied to them (`liftGlobalProofs` with `aux?`): the 19,369 global proofs of the residual of the first
-theorem are checked one at a time in 6.5 minutes (each in less than a second, about 20 ms on average), the memory
-staying at the 7.3 GB of the replay, and the final proof of the residual has 5 distinct subterms. The first
-`SellNFT` theorem is then kernel checked in 33 minutes in total (12.7 GB at most): the residual in 11 minutes (Z3,
-replay and auxiliary theorems), the optimizer's evidence (12.5M distinct subterms, 1,004 proof obligations, 3 of
-them proved by the replay of their own Z3 proofs of 2,674 to 3,608 global proofs, checked as single declarations in
-15 to 32 s) in 14 minutes, and the kernel check of the whole proof (19.7M distinct subterms, which refer to the
-auxiliary theorems) in 32 s. The obligations' proofs are then the peak; checked as auxiliary theorems too
-(`BLASTER_SMTPROOF_SPLIT=1`), the theorem is kernel checked in 35 minutes at 11.0 GB at most. The second `SellNFT`
-theorem (16,946 global proofs in its residual, checked as auxiliary theorems in 5.5 minutes) is now kernel checked
-in 31 minutes at 13.3 GB at most (53 minutes and 17.5 GB as a single declaration). One at a time, the auxiliary
-theorems check the shared subterms of their statements again (the 2.5M distinct subterms of the residual of the second
-`MintingPolicy` theorem, 6,928 global proofs: 35 s as auxiliary theorems at 3.7 GB, 25 s as a single declaration at
-6.2 GB): with 1024 global proofs or more (`BLASTER_SMTPROOF_PARCHECK_MIN`), they are checked in parallel instead
-(`BLASTER_SMTPROOF_PARCHECK`, 8 threads, 0: none), each added without checking and checked by the kernel against the
-environment before it (`startKernelChecks`, such that it only uses the auxiliary theorems before it), the proof being
-accepted once all the checks succeeded (`awaitKernelChecks`): 4 s at 2.3 GB for the second `MintingPolicy` theorem. The proofs that are not closed (e.g., over the variables of
-the polymorphic encoding bound by an enclosing context) stay inlined; with all the proofs as auxiliary theorems
-(`BLASTER_SMTPROOF_SPLIT=0`), the replay of the SMT goals of the test suite is unchanged (312/321).
+Blaster encodes polymorphism with `@Type` (the types denoted by sort variables), `@Instance` (their values) and
+membership predicates `@isInstance v t`. The replay interprets this encoding in one of two ways:
 
-Performance on the CEK validators (one theorem per run, `BLASTER_SMT_PROOF=only`, backend `z3rec`, 4 threads, low
-load): the `Governance` theorems are reconstructed and kernel checked in 22 to 28 s in total, Blaster's own check
-included (15 s of Z3; the fourteenth theorem took 392 s before the changes below), the `MintingPolicy` ones in 31 and
-36 s (348 and 382 s), `HelloWorld` in 7 s:
- - the optimizer records evidence for the simplifications of `Blaster.dite'` with constant branches
-   (`recordDITESimp`), the connectives of `Blaster.decide'` (`recordDecideOp`) and the replacement of a matcher by an
-   equivalent one (`mkMatchEquivProof`): 467 of the 672 proof obligations of the fourteenth `Governance` theorem,
-   whose discharge took 40 s;
- - the proof run (the optimization tracking proof terms) is performed while the backend solver checks the query (its
-   result is discarded unless the goal is valid); `MatcherApp.transform` is used without its type check of the new
-   motive (`transformMatcherApp`, the check traversed the alternatives of the nested `match` applications again at each
-   level), the match equations are cached and the congruences of `match` applications reused; the congruences of the
-   `match` applications whose alternatives' evidence neither has proof obligations nor uses the equalities between the
-   discriminants and the patterns are built with `congr` and `funext` (`mkMatchCongrByAlts?`, without case split: half
-   the distinct subterms of the evidence of `MintingPolicy`); the caches of the proof run (proofs without proof
-   obligations, congruences of `match` applications) are in its state: the values of global references are marked as
-   multi-threaded, and their maps were copied at each update (25 s of proof run for `MintingPolicy` instead of 9 s);
- - the tactics on the local differences of large steps are bounded in time (1 s, `BLASTER_SMTPROOF_LOCAL_MS`; the
-   tactic running past the deadline is interrupted, see `withTimeLimit`), not attempted on generalizations refuted by
-   instances of their variables at small values (`Local.refuted`), and their lossless generalization is not attempted
-   after a timeout; comparisons whose operands differ at their heads are first tried as a whole, the branches of a
-   conditional whose condition is negated are swapped (`classical_ite_not`), and the results on the generalizations are
-   cached per replay; the other differences of large terms are bounded at 120 times the budget (runaway attempts);
- - the occurrences of a term are abstracted syntactically before `kabstract` (`monotonicity`, `substProof?`), which
-   checks every subterm with the head of the term for definitional equality;
- - the definitional equations of the recursive functions are proved in parallel (`RecFun.startEqTasks`, tasks without
-   the state of the replay, whose objects would be marked as multi-threaded), from the axioms of the query while the
-   backend searches for a proof (`RecFun.preStartEqTasks`); the auxiliary lemmas of the tactics of a task are inlined in
-   its proof and the reserved names (e.g., the splitters of matchers) realized again (`Local.inlineNewConstants`,
-   `Local.realizeReservedNames`), such that the proof is usable in the environment of the replay;
- - the tactics of the portfolios on closed goals are attempted in parallel, 6 at a time (`portfolioParMulti`,
-   `BLASTER_SMTPROOF_PARPORTFOLIO`, 0: sequential), each in a task, the first proof found interrupting the others, and
-   the generalizations of a datatype lemma together (`proveClosedFirst`): 11 s of rewrites instead of 18 s for the
-   fourteenth `Governance` theorem;
- - the case analyses of the unit resolutions are built under their binders (`orElim` was quadratic in the literals of
-   the large clauses, a third of the replay of `MintingPolicy`), with the premises of the step as bound variables, and
-   so are the facts derived by the propositional engine (`PropEngine.lam1`): an abstraction traverses the large terms of
-   the clauses (the rewrites of `MintingPolicy` are replayed in 1 s instead of 3.6 s);
- - the proof obligations of the optimizer not discharged by definitional unfolding are discharged speculatively in
-   parallel (`startDischarges`, 6 tasks, `BLASTER_RECON_PARDISCHARGE`, 0: none), closed over their relevant context and
-   without the costly case analyses, the tactic that discharged an obligation being tried first on the next ones of
-   the same kind (e.g., the reductions of the `match` applications of all the matchers); the obligations of
-   `HelloWorld` are discharged in 2 s instead of 4.6 s;
- - `shareDeepProofs` bounds the proof depth at 512 (128 before, which shared the evidence of depth 211 of a
-   `MintingPolicy` theorem in 12 s).
-The rest is mostly Z3's check of the query (15 s for `Governance`, 10 s for `MintingPolicy`, during which the proof run
-of 5 and 8 s and the reconstruction are performed), Z3's search for a proof of the residual (from 0.2 to 7 s, also
-depending on the fresh names of the query), the replay of the residual (11 to 20 s: the arithmetic local differences of
-the rewrites for `Governance`, the lemmas of the recursive functions and of the datatypes for `MintingPolicy`) and the
-kernel checks (1 to 4 s).
+- **One sort variable `α` of an inhabited type:** `@Instance` is `α`, `@Type` is `Unit`, and membership predicates
+  are `True`.
+- **Otherwise** (several, possibly empty, or quantified sort variables; `Poly.lean`): `@Type` is `Sort u`, and
+  `@Instance` is the always inhabited *universe* `Option (PSigma fun α : Sort u => α)`. Values are interpreted as their
+  injections (lifted through lists, options, pairs and functions), and membership predicates as "lies in the image of
+  the injection". The bridge relates the goal to the asserted formula with an additional *world* for these injections.
+  - **User datatypes over sort variables** (e.g., `Term (List α)` for a nested or mutual datatype) are mapped to their
+    instances at the universe by maps defined with their recursors: each constructor to itself, its fields by their
+    worlds, its nested occurrences (e.g., `List (Term α)`) by the auxiliary recursors. Each instance comes with
+    auxiliary definitions, proofs of their injectivity, and per constructor its equation in the world (nested
+    occurrences as `List.map`) and its image (`Img W (C ys) = Img Ŵ₁ y₁ ∧ …`).
+  - **`match` on such a datatype** (or on a list or an option of a sort variable), whose `ite` encoding would need
+    default values of the selectors at the sort variables, is related to its interpretation by case analysis on its
+    discriminant, generalized in both terms.
+  - **Polymorphic Lean functions** instantiated at sort variables (e.g., `@List.zipWith α β γ`, whose SMT function is
+    shared by all the instantiations of a universe) are interpreted at the universe (`@List.zipWith Univ Univ Univ`),
+    so that their definitional axioms hold on all the values of the universe. The bridge relates their applications
+    by *naturality lemmas*, e.g.,
+    `List.zipWith (lift f) (List.map (inj α) xs) (List.map (inj β) ys) = List.map (inj γ) (List.zipWith f xs ys)`,
+    proved once per function and instantiation by functional induction (`blaster_poly_nat`).
+  - **Lambda terms** of the translation (`@lambda`, `@global_lambda`, with their definitional axioms) are interpreted
+    as Lean lambdas, with their `Nat` parameters as Lean `Nat` variables. At the universe, they are guarded by the
+    membership predicates of their parameters, as their definitions are (`fun x => if Img w x then b else dflt x`).
+- **Not interpreted at the universe:** naturality only holds for parametric functions, so axioms and opaque functions
+  at sort variables (e.g., `hash : α → String`) and functions with instance arguments that don't exist at the universe
+  (e.g., `[BEq α]`) are only interpreted with `@Instance` as the sort variable.
 
-In the default mode (`last`), the tactic strategies are tried on the residual before the replay; on the CEK residuals,
-each of them runs out of its budget (7.5 s each, 13 s for the deeper case analysis), i.e., the replay came after 75 s.
-The replay is now tried as soon as two attempts exhaust their budget (`proveResidual` with `hard`; the case analyses
-attempted in parallel count as two when they fail after 5 s or more): in the default mode, `HelloWorld` is
-reconstructed in 16 s (83 s before), the fourteenth `Governance` theorem in 36 s (120 s) and the second `MintingPolicy`
-theorem in 51 s (one theorem per run, while other measurements were running). In the default mode, the 26 theorems of
-the `Auction` validator are kernel checked in 3.5 minutes (7 of them failed before the proofs of the goals of the
-`blaster` tactic were checked by the kernel, see `kernelCheck`), the theorem of `UnlockPIN` in 14 s, the one of
-`ParamFeed` in 4 s and the 4 goals of `Tests/Functions/Fibonacci` (including the equivalence of two implementations) in
-2 s; 8 of the `Auction` theorems are concrete evaluations closed by the optimizer, whose evidence takes 11 s of kernel
-check each (the type checker's caches).
+### 4.5 Large proofs
 
-Most steps are replayed with explicit proof terms (`unit-resolution`, `mp`, `trans`, `symm`, `monotonicity`,
-`commutativity`, `quant-inst`, `lemma`/`hypothesis`, resolution of Alethe proofs) or by the propositional
-engine (`def-axiom`, `not-or-elim`, `and-elim`, propositional `rewrite`s, Alethe's Tseitin rules); tactics are
-used for arithmetic (`th-lemma`, arithmetic `rewrite`s: `omega`, `simp`, `grind`), with a portfolio ordered
-adaptively by success rate per time unit for each rule and goal shape. Performance notes:
- - proofs of the top-level steps are held by assigned metavariables and binders are abstracted syntactically,
-   such that the construction of a step does not traverse the proofs of the previous ones (it was quadratic);
- - SMT terms are interpreted once (memoization on shared terms);
- - steps that don't depend on a scope are replayed in increasing order (bounded recursion on deep proofs).
-For instance, a 245-step Z3 proof involving a recursive function replays in ~6 s, and a 2458-step cvc5
-(Alethe) proof of the same goal in ~30 s.
+The residual proofs of CEK evaluations have up to 150K steps. Several measures keep their replay and kernel check
+tractable:
 
-Limitations: polymorphic goals with several sort variables over datatypes of the user without world (indices,
-recursive fields of function types, proof fields whose propositions mention the sort variables, e.g., properties
-quantified over the instances of a class), constructor applications whose instance only the sort of a quantified
-variable determines (the undetermined type parameters of the conclusions of steps default to the universe), axioms
-and non-parametric functions;
-`match` patterns on `Nat`/`Int` with variables (e.g., `n + 1`, whose translation needs the conditions of the
-branch) and named patterns; cvc5's native CPC format (whose steps often leave their conclusion
-implicit) is not supported; Z3 may not find a proof without Blaster's `recfun-finder` tactic (incompatible
-with proof production), and proof production may time out where the verdict did not.
+- **Linear construction.** The proofs of the top-level steps are held by metavariables, and binders are abstracted
+  syntactically, so the construction of a step does not traverse the proofs of the previous ones. SMT terms are
+  interpreted once (memoization on shared terms), and the steps that don't depend on a scope are replayed in
+  increasing order (bounded recursion on deep proofs). The case analyses of unit resolutions and the facts derived by
+  the propositional engine are built under their binders, with the premises of the step as bound variables.
+- **Lifting global proofs** (`liftGlobalProofs`). The proofs of the global steps are held by unassigned metavariables
+  during the replay and lifted at the end to closed lambda terms over the variables of the goal and the negated goal.
+  They are shared by the nested `lemma` scopes at various binder depths, where abstracting the inlined proofs copied
+  them once per depth: the second `MintingPolicy` proof (31.7K steps, 10.7M distinct subterms at binder depth 216)
+  needed more than 36 GB to abstract; lifted, it takes 0.5 s and has 2.5M distinct subterms.
+- **Auxiliary theorems.** The kernel's memory goes to its per-declaration caches (the types inferred for checked
+  subterms, and the equivalences that `is_def_eq` records), not to binder depth: the first `SellNFT` proof (152,698
+  steps, 10.1M distinct subterms) did not fit in 20 GB as a single declaration. Each lifted global proof is therefore
+  checked as an auxiliary theorem `∀ xs, ¬ goal → φ` over the variables of the goal and the negated goal, and used as
+  its constant applied to them (`liftGlobalProofs` with `aux?`). Proofs that are not closed (e.g., over variables of
+  the polymorphic encoding bound by an enclosing context) stay inlined.
+- **Parallel kernel checks.** With at least 1024 global proofs (`BLASTER_SMTPROOF_PARCHECK_MIN`), the auxiliary
+  theorems are added without checking and checked by the kernel in parallel (`startKernelChecks`, 8 threads,
+  `BLASTER_SMTPROOF_PARCHECK`), each against the environment before it, so that it only uses the auxiliary theorems
+  before it. The proof is accepted once all the checks succeed (`awaitKernelChecks`). For the second `MintingPolicy`
+  proof (6,928 global proofs), this takes 4 s at 2.3 GB, against 35 s at 3.7 GB for sequential auxiliary theorems and
+  25 s at 6.2 GB as a single declaration.
+- **Sequential split.** Without parallel checks (`BLASTER_SMTPROOF_PARCHECK=0`), the global proofs become sequentially
+  checked auxiliary theorems when there are at least 4096 of them (`BLASTER_SMTPROOF_SPLIT`, 0: always) in a proof of
+  at least 5M distinct subterms (`BLASTER_SMTPROOF_SPLIT_DAG`). With parallel checks, the threshold is
+  `BLASTER_SMTPROOF_PARCHECK_MIN` alone.
+- **Proof depth.** `shareDeepProofs` bounds the proof depth at 512.
 
-## Findings
+With every global proof as an auxiliary theorem (`BLASTER_SMTPROOF_SPLIT=0`), the replay results on the test suite are
+unchanged.
 
-Reconstruction checks every individual rewrite, so it surfaces problems in the trusted pipeline:
+### 4.6 What the replay relies on
 
-- **Unsound rewrite (soundness bug).** `∀ (x : α), e ⟶ e` is applied whenever `isSortOrInhabited α`
-  holds. That check returns `true` for any type variable. As a result Blaster reports
-  `∀ (α : Type), (∀ (_x : α), False) → False` as `Valid`, although `α := Empty` refutes it.
-  Reconstruction refuses the goal and pinpoints `(∀ (_x : α), False) = False`; see
-  `Tests/Reconstruct/Unsound.lean`. The same holds for `∃ (x : α), e ⟶ e`. These refusals are counted
-  separately in the coverage measurements.
-- **Unguarded definitions of lambda terms (soundness bug, fixed).** The definitional axioms of lambda terms
-  (`@lambda_n_def_cstr`, `@global_lambda_n_def_cstr`) constrained their applications on all the values of the
-  sorts of their parameters: the values of all the types denoted by sort variables (`@Instance`), and the
-  negative integers for `Nat` parameters. Function equality being translated as SMT equality, two lambda terms
-  equal in Lean were equal on all the values of their sorts, which is inconsistent when they differ outside
-  their domain: `∀ (α β : Type) (c : α) (b1 b2 : β), (∀ x : α, x = c) → (fun x : α => x) = (fun _ => c) →
-  b1 ≠ b2 → False` and `∀ (b : Bool), (fun n : Nat => n - 1 + 1) = (fun n : Nat => if n = 0 then 1 else n) →
-  b = true` were reported `Valid`. The definitions are now guarded by the membership predicates of the
-  parameters (`Tests/FixedIssues/LambdaDefGuard.lean`). The replay of SMT proofs could not prove these goals
+The interpretation is a *choice*: a step whose conclusion does not hold for it (e.g., an axiom of a `Nat` function
+instantiated with a negative integer) simply fails to replay. Soundness only relies on the kernel.
+
+## 5. Configuration reference
+
+Options of the `#blaster` command and the `blaster` tactic are listed in Section 2.1. Environment variables:
+
+**User-facing.**
+
+| variable                    | meaning                                                   | default                 |
+|-----------------------------|-----------------------------------------------------------|-------------------------|
+| `BLASTER_RECONSTRUCT`       | default reconstruction level (`0`, `1`, `2`)              | `0`                     |
+| `BLASTER_SMT_PROOF`         | replay mode: `off`, `last`, `first`, `only` (Section 4.1) | `last`                  |
+| `BLASTER_SMTPROOF_BACKENDS` | comma-separated backends, tried in order (Section 4.2)    | `z3,z3rec,z3+`          |
+| `BLASTER_SMTPROOF_Z3`       | Z3 executable                                             | `z3`                    |
+| `BLASTER_SMTPROOF_CVC5`     | cvc5 executable                                           | `cvc5`                  |
+| `BLASTER_SMTPROOF_TIMEOUT`  | timeout of each backend (s)                               | `(timeout: n)`, else 20 |
+| `BLASTER_SMTPROOF_DEADLINE` | deadline of the replay of one proof (s)                   | 1800                    |
+
+**Tuning.**
+
+| variable                        | meaning                                                    | default             |
+|---------------------------------|------------------------------------------------------------|---------------------|
+| `BLASTER_SMTPROOF_SEEDS`        | Z3 random seeds raced per query                            | 3 (cvc5: 1)         |
+| `BLASTER_SMTPROOF_SEED_DELAY`   | delay between the starts of two seeds (ms)                 | timeout / 4, ≤ 10 s |
+| `BLASTER_SMTPROOF_LOCAL_MS`     | budget of tactics on local differences of large steps (ms) | 1000                |
+| `BLASTER_SMTPROOF_PARPORTFOLIO` | parallel tactic attempts on closed goals (0: sequential)   | 6                   |
+| `BLASTER_SMTPROOF_PARCHECK`     | threads for parallel kernel checks (0: none)               | 8                   |
+| `BLASTER_SMTPROOF_PARCHECK_MIN` | minimum global proofs for parallel kernel checks           | 1024                |
+| `BLASTER_SMTPROOF_SPLIT`        | minimum global proofs for a sequential split (0: always)   | 4096                |
+| `BLASTER_SMTPROOF_SPLIT_DAG`    | minimum distinct subterms for a sequential split           | 5,000,000           |
+| `BLASTER_RECON_PARDISCHARGE`    | tasks for speculative discharge of obligations (0: none)   | 6                   |
+
+**Measurement and debugging hooks.** Variables taking a file append to it.
+
+| variable                                  | effect                                                                   |
+|-------------------------------------------|--------------------------------------------------------------------------|
+| `BLASTER_RECON_STATS`                     | file: JSON lines per reconstruction attempt; `#testOptimize` audit       |
+| `BLASTER_RECON_PROFILE`                   | file: durations of the reconstruction phases and attempts                |
+| `BLASTER_SMTPROOF_LOG`                    | file: one JSON line per replay (`kind`: `residual` or `obligation`)      |
+| `BLASTER_SMTPROOF_TRACE`                  | file: start and duration of the reconstruction and replay phases         |
+| `BLASTER_SMTPROOF_ISTATS`                 | count the kernel's binder instantiations on the final proof (costly)     |
+| `BLASTER_RECON_DEBUG`                     | full failure messages in the statistics; type-check failing obligations  |
+| `BLASTER_SMTPROOF_DEBUG`                  | file: failures of steps and of the bridge                                |
+| `BLASTER_BRIDGE_DEBUG`                    | file, or `1` for stderr: failures of the matcher lemmas of the bridge    |
+| `BLASTER_RECEQN_DEBUG`                    | trace the case analyses of the equations of recursive functions          |
+| `BLASTER_SMTPROOF_CURRENT`                | file: the steps being replayed (a stale mtime shows a stuck step)        |
+| `BLASTER_SMTPROOF_CHECK`                  | check the proofs of steps for unknown free variables                     |
+| `BLASTER_SMTPROOF_CHECKFINAL`             | report free variables escaping their scopes in the final proof           |
+| `BLASTER_SMTPROOF_DUMP`                   | file: the query sent to the backend                                      |
+| `BLASTER_SMTPROOF_PROOFDUMP`              | file, suffixed with the backend's name: the backend's proof output       |
+| `BLASTER_SMTPROOF_PROOFFILE`              | file, suffixed likewise: proof read instead of running the backend       |
+| `BLASTER_SMTPROOF_FAILDUMP`               | file: the failed steps with their conclusions                            |
+| `BLASTER_SMTPROOF_GOALDUMP`               | file: closed statements of failed steps, as Lean examples                |
+| `BLASTER_SMTPROOF_STEPDUMP`, `_STEPS`     | file and comma-separated step indices: their conclusions as Lean         |
+| `BLASTER_SMTPROOF_BRIDGE_DUMP`, `_DUMP_N` | file and count (default 3): mismatching pairs of the bridge              |
+| `BLASTER_SMTPROOF_SLOWGOALS`              | file: goals proved by tactics in 200 ms or more                          |
+| `BLASTER_SMTPROOF_NOINHERIT`              | disable the reuse of step proofs across nested `lemma` scopes (ablation) |
+
+`BLASTER_SMTPROOF_PROOFFILE` (e.g., `proof` for the file `proof.z3rec` written by `BLASTER_SMTPROOF_PROOFDUMP=proof`)
+is read for every call of that backend, including the replays of proof obligations, so it is only meaningful for a
+single replay.
+
+## 6. Results
+
+### 6.1 Test suite
+
+Measured on branch `feat/smt-proof-replay` with Z3 5.3.1 (Section 9 describes the measurement):
+
+| mode                 | scope                                            | kernel-checked               |
+|----------------------|--------------------------------------------------|------------------------------|
+| default (`last`)     | all reconstruction attempts                      | 3959 / 3959                  |
+|                      | goals closed by the optimizer                    | 420 / 420                    |
+|                      | goals closed by the SMT solver                   | 409 / 409                    |
+|                      | `#testOptimize` certificates                     | 3130 / 3130                  |
+| replay only (`only`) | SMT goals of `Tests/Smt` and `Tests/FixedIssues` | 311 / 323                    |
+
+The twelve goals the replay alone does not prove are listed in Section 8; the tactic strategies prove all of them.
+
+### 6.2 CardanoLedgerApiBlaster validators
+
+The goals of [CardanoLedgerApiBlaster](https://github.com/input-output-hk/CardanoLedgerApiBlaster) evaluate UPLC
+programs with the CEK machine. One theorem per run, 4 threads, low machine load; the `only` runs use the `z3rec`
+backend. Measured at commit `3c64b27`, before the review commits that follow it.
+
+| validator                     | theorems | mode            | time per theorem                | peak memory   |
+|-------------------------------|----------|-----------------|---------------------------------|---------------|
+| `HelloWorld`                  | 1        | `only` / `last` | 7 s / 16 s                      |               |
+| `UnlockPIN`                   | 1 ¹      | `last`          | 14 s                            |               |
+| `ParamFeed`                   | 1        | `last`          | 4 s                             |               |
+| `Auction`                     | 26 ²     | `last`          | 3.5 min for all 26              |               |
+| `Governance`                  | 20       | `only`          | 22–28 s (#14: 36 s in `last`)   |               |
+| `MintingPolicy`               | 2        | `only`          | 31 s, 36 s (#2: 51 s in `last`) |               |
+| `SellNFT`                     | 2        | `only`          | 33 min, 31 min ³                | 12.7, 13.3 GB |
+| `Tests/Functions/Fibonacci` ⁴ | 4        | `last`          | 2 s for all 4                   |               |
+
+¹ The file has three commands; the other two are expected-`Falsified` checks.
+
+² Plus two expected-`Falsified` commands. Eight of the theorems are concrete evaluations closed by the optimizer,
+whose evidence takes about 11 s of kernel check each (the type checker's caches).
+
+³ Measured before the performance work of Section 6.4, with the global proofs checked as sequential auxiliary
+theorems.
+
+⁴ A test file of CardanoLedgerApiBlaster (not of this repository); its goals include the equivalence of two
+implementations.
+
+The `last` times of `Governance` #14 and `MintingPolicy` #2 were measured while other measurements were running.
+In the `only` runs, the time goes mostly to Z3's check of the query (15 s for `Governance`, 10 s for
+`MintingPolicy`, during which the proof run, 5 and 8 s, and the reconstruction are performed), Z3's search for a proof
+of the residual (0.2 to 7 s, depending also on the fresh names of the query), the replay of the residual (11 to 20 s:
+the arithmetic local differences of the rewrites for `Governance`, the lemmas of the recursive functions and of the
+datatypes for `MintingPolicy`) and the kernel checks (1 to 4 s).
+
+`SellNFT` #1 has a residual proof of 152,698 steps, replayed in 5 minutes; its 19,369 global proofs are checked as
+auxiliary theorems in 6.5 minutes. Three of the 1,004 proof obligations of its optimizer evidence are proved by the
+replay of their own Z3 proofs.
+
+### 6.3 PlutusCoreBlaster
+
+Measured on branch `feat/kernel-proof-reconstruction-beta` (proof reconstruction ported onto
+`beta-lambda-cache-optimization`, before SMT proof replay), with a nightly Z3 providing `recfun-finder`.
+[PlutusCoreBlaster](https://github.com/input-output-hk/PlutusCoreBlaster) (commit `c9dc0eb`) pins the
+`beta-lambda-cache-optimization` branch of Blaster.
+
+- **CBOR encoding.** All 31 `encode_example_i` goals of `PlutusCore/Cbor/Tests.lean` become kernel-checked theorems
+  with `blaster_theorem` (see [`docs/examples/PlutusCoreCbor.lean`](examples/PlutusCoreCbor.lean)). They only depend
+  on `propext`, `Classical.choice` and `Quot.sound`; upstream checks them with `native_decide` or with an unchecked
+  `#blaster`. Running `PlutusCore/Cbor/Tests.lean` unchanged with `BLASTER_RECONSTRUCT=1` also reconstructs a
+  kernel-checked proof for each of its 33 `#blaster` commands and `blaster` tactics (the 3 expected counterexamples
+  need no proof). The examples splitting long strings evaluate the well-founded recursion `splitToChunksLoop` with
+  `blaster_wf_eval`.
+- **Lemmas.** 17 statements from `PlutusCore/{Integer,List,Bitwise,Cbor}` were restated with `blaster_theorem` (see
+  [`docs/examples/PlutusCoreBlaster.lean`](examples/PlutusCoreBlaster.lean)). 14 become kernel-checked theorems,
+  including `divide_add_mod`, `quotient_add_remainder`, the error cases of `integerToByteString` and
+  `replicateByte_zero_l`. The other 3 (`integerToByteString_w_bounds_err`, `integerToByteString_neg_n`,
+  `integerToByteString_n_bounds_err`) failed before reconstruction on that branch, because the SMT translation
+  rejected `Nat.log2`, which core defines directly with `Nat.rec`. `Nat.log2` is now translated as an opaque recursive
+  SMT function (`Tests/FixedIssues/NatLog2.lean`); these three lemmas have not been measured again.
+
+### 6.4 Performance notes
+
+The following changes brought the CEK validators from minutes to seconds in the `only` mode. Before them, the
+fourteenth `Governance` theorem (#14 below) took 392 s, and the `MintingPolicy` theorems 348 and 382 s; they now take
+22–28 s (every `Governance` theorem) and 31 and 36 s.
+
+| change                                                                   | effect                                   |
+|--------------------------------------------------------------------------|------------------------------------------|
+| optimizer evidence for `dite'`, `decide'` and equivalent matchers (3.3)  | 467 of 672 obligations of #14 removed    |
+| proof run while the solver checks the query (3.1)                        | #14: 42 s → 34 s                         |
+| proof-run caches in its state instead of global references               | proof run 25 s → 9 s (`MintingPolicy`)   |
+| `match` congruences without case split (`mkMatchCongrByAlts?`)           | evidence of `MintingPolicy` halved       |
+| local differences: 1 s bound, refuted generalizations skipped            | no runaway tactic attempts               |
+| syntactic abstraction before `kabstract` (`monotonicity`, `substProof?`) | fewer definitional checks                |
+| recursive-function equations proved during the proof search (4.3)        | off the critical path                    |
+| parallel tactic portfolios on closed goals (`portfolioParMulti`)         | rewrites of #14: 18 s → 11 s             |
+| unit resolutions built under binders (`orElim`, `PropEngine.lam1`)       | rewrites of `MintingPolicy`: 3.6 s → 1 s |
+| speculative parallel discharge of proof obligations (`startDischarges`)  | obligations of `HelloWorld`: 4.6 s → 2 s |
+| proof depth bound 512 instead of 128 (`shareDeepProofs`)                 | 12 s of proof sharing removed            |
+| in `last` mode, replay after two exhausted attempts (3.5)                | `HelloWorld` 83 → 16 s, #14 120 → 36 s   |
+
+`orElim` was quadratic in the literals of large clauses (a third of the replay of `MintingPolicy`). The parallel
+tactic tasks run without the replay's state, whose objects would otherwise be marked as multi-threaded; the auxiliary
+lemmas created in a task are inlined in its proof and the reserved names it used (e.g., splitters) realized again
+(`Local.inlineNewConstants`, `Local.realizeReservedNames`).
+
+## 7. Findings
+
+### 7.1 Soundness bugs
+
+Reconstruction checks every individual rewrite, and the SMT proof replay checks the solver's reasoning step by step,
+so they surface problems in the trusted pipeline. All the bugs below made false statements `Valid`.
+
+| bug                                          | status on this branch | regression test                         |
+|----------------------------------------------|-----------------------|-----------------------------------------|
+| type variables assumed inhabited             | fixed                 | `Tests/Reconstruct/Unsound.lean`        |
+| unguarded definitions of lambda terms        | fixed                 | `Tests/FixedIssues/LambdaDefGuard.lean` |
+| non-canonical `LT`/`LE` instances            | fixed                 | `Tests/FixedIssues/InstanceArgs.lean`   |
+| equality between proofs                      | fixed                 | `Tests/FixedIssues/PropProofEq.lean`    |
+| sort quantifiers, `Prop` domains (`staging`) | not affected          | `Tests/Smt/SmtUninhabited.lean`         |
+
+- **Type variables assumed inhabited (found by reconstruction).** The optimizer rewrote `∀ (x : α), e` to `e` (and
+  `∃ (x : α), e` likewise) whenever `isSortOrInhabited α` held, which was the case for any type variable, and the SMT
+  translation mapped every type variable to the non-empty sort `@@Type`. Blaster reported
+  `∀ (α : Type), (∀ (_x : α), False) → False` as `Valid`, although `α := Empty` refutes it; reconstruction refused the
+  goal and pinpointed the rewrite `(∀ (_x : α), False) = False`. The optimizer now keeps quantifiers over possibly
+  empty types, and each type variable universally quantified at the top level of the goal gets its own, possibly
+  empty, membership predicate; the solver now finds the counterexample.
+- **Unguarded definitions of lambda terms (found by SMT proof replay).** The definitional axioms of lambda terms
+  (`@lambda_n_def_cstr`, `@global_lambda_n_def_cstr`) constrained their applications on all the values of the sorts of
+  their parameters: the values of all the types denoted by sort variables (`@Instance`), and the negative integers for
+  `Nat` parameters. Function equality being translated as SMT equality, two lambda terms equal in Lean were equal on
+  all the values of their sorts, which is inconsistent when they differ outside their domain. For example,
+  `∀ (b : Bool), (fun n : Nat => n - 1 + 1) = (fun n : Nat => if n = 0 then 1 else n) → b = true` was `Valid`. The
+  definitions are now guarded by the membership predicates of the parameters. The replay could not prove these goals
   (the axioms have no model in its interpretation), which is how the bug was found. Two induction steps of
   `Tests/FixedIssues/Issue26.lean` are no longer proved by Blaster.
-- **Non-canonical instances (soundness bug, fixed).** `@LT.lt α inst` (resp. `LE.le`) was taken as the relation of the
-  SMT theory for `α ∈ [Nat, Int, Bool, String]` whatever `inst`, and the instance arguments of function values
-  (e.g., a structure field `f [LT α] : α → α`) are erased by the translation. With `lt1 := ⟨(· < ·)⟩` and
+- **Non-canonical instances (found by SMT proof replay).** `@LT.lt α inst` (resp. `LE.le`) was taken as the relation
+  of the SMT theory for `α ∈ [Nat, Int, Bool, String]` whatever `inst`, and the instance arguments of function values
+  (e.g., a structure field `f [LT α] : α → α`) were erased by the translation. With `lt1 := ⟨(· < ·)⟩` and
   `lt2 := ⟨fun a b => b < a⟩ : LT Nat` passed explicitly, `∀ x y, @g Nat lt1 _ x y = @g Nat lt2 _ x y` (with
-  `g x y := decide (x < y)`) and `∀ r x, @FunRel.f r Nat lt1 x = @FunRel.f r Nat lt2 x` were reported `Valid`.
-  Other instances of `LT`/`LE` are now unfolded, and applications of function values are only translated when their
-  instance arguments are canonical or instance-implicit binders of the goal (`Tests/FixedIssues/InstanceArgs.lean`;
-  two instance-implicit binders of the same class are still not distinguished). Found by the replay of SMT proofs
-  on polymorphic datatypes, which could not prove the goal.
-- **Sort quantifiers outside the goal prefix and proposition domains (soundness bugs of `staging`, fixed on
-  `sho/prop-domain-fun-guard`).** On `staging`, sort quantifiers that are not in the leading `∀` prefix of the goal
-  were instantiated with the non-empty sort `@@Type` (e.g., `∀ p, p ∨ ∀ (α : Type), (∀ (_x : α), False) → False`
-  was `Valid`), and the co-domain constraints of functions with a proposition domain (`P → β`, which is inhabited
-  when `P` does not hold, even for an empty `β`) were not guarded (e.g., `∀ (_f : Bad → Empty), False` for
-  `structure Bad : Prop where inv : 1 > 2`). `beta-lambda-cache-optimization` (c7e80b2) reports 18 of the false
-  statements of the regression tests (`Tests/Smt/SmtUninhabited.lean`) as `Valid`; the translation of this branch
-  none of them (it reports four theorems of these tests with a spurious counterexample, as `beta` does, which are
-  kept commented out).
-- **Ill-typed optimizer output.** The proof run avoids the following issues; the verdict run is unchanged.
-  - The else branch of `Blaster.dite'` received the *normalized* type of `¬ c` (e.g. `false = c`
-    instead of `¬ (true = c)`), so `dite'` applications were ill-typed. When tracking proofs, the
-    branch binder now keeps type `¬ c` while the normalized form is still used as the hypothesis.
-  - `andBoolReduction?` returned the proposition `False` for a Boolean `&&`; this is fixed.
-  - `isCstImplies?` substitutes `True.intro` for a hypothesis whose type was simplified to `True`.
-    This yields ill-typed terms such as `Char.ofNatAux 84 True.intro`. When tracking proofs, proof
-    arguments are not rewritten.
-  - Universe levels are normalized to `1` (`normLevel`), so goals over `Sort u` are rewritten to
-    goals over `Type`, and `Blaster.dite'` is always built at level `1`. This includes unassigned *or
-    uninstantiated* level metavariables; for example, `#testOptimize` passes terms with assigned but
-    uninstantiated level metavariables. The proof run keeps the universe levels.
-  - The `dite'` branch-swap rule (`isITESwap?`) produced a then-branch of type `¬¬c → α` instead of
-    `c → α`. When tracking proofs, the branches are now retyped.
-  - Rewriting the domain of quantified *function* variables (e.g. `f : c = true → α` to
-    `f : true = c → α`) leaves their dependent uses ill-typed. When tracking proofs, functions over
-    proofs keep their original type.
+  `g x y := decide (x < y)`) was `Valid`. Other instances of `LT`/`LE` are now unfolded, and applications of function
+  values are only translated when their instance arguments are canonical or instance-implicit binders of the goal.
+  Two instance-implicit binders of the same class are still not distinguished.
+- **Equality between proofs.** Any two proofs of a proposition are definitionally equal in Lean, but the optimizer
+  reduced `TwoP.a = TwoP.b` to `False` for the distinct constructors of `inductive TwoP : Prop | a | b`, and the SMT
+  datatype of an inductive proposition distinguishes its values: `TwoP.a ≠ TwoP.b` and `∃ (x y : SomeBig), x ≠ y`
+  were reported `Valid`. An equality `@Eq P a b` with `P : Prop` is now reduced to `True` (`eq_proof_irrel`), and
+  `structEq?` ignores proof arguments, so constructor applications that differ only in proof arguments are equal. The
+  fix is also on branches `fix/prop-proof-equality` (off `main`) and `fix/beta-prop-proof-equality` (off
+  `beta-lambda-cache-optimization`), not merged.
+- **Sort quantifiers outside the goal prefix and `Prop` domains (upstream `staging`).** On `staging`, sort quantifiers
+  that are not in the leading `∀` prefix of the goal were instantiated with the non-empty sort `@@Type` (e.g.,
+  `∀ p, p ∨ ∀ (α : Type), (∀ (_x : α), False) → False` was `Valid`), and the co-domain constraints of functions with a
+  proposition domain (`P → β`, inhabited when `P` does not hold, even for an empty `β`) were not guarded (e.g.,
+  `∀ (_f : Bad → Empty), False` for `structure Bad : Prop where inv : 1 > 2`). The fix for `staging` is on branch
+  `sho/prop-domain-fun-guard`. This branch's translation is sound on all their regression tests, which are merged
+  into `Tests/Smt/SmtUninhabited.lean`; four theorems of these tests get a spurious counterexample, as on
+  `beta-lambda-cache-optimization`, and are kept commented out. Upstream `beta-lambda-cache-optimization` (c7e80b2)
+  reports 18 of the false statements of these tests as `Valid`.
 
-## Measuring coverage
+### 7.2 Ill-typed optimizer output
 
-```
+The proof run avoids the following issues; the verdict run is unchanged.
+
+- The else branch of `Blaster.dite'` received the *normalized* type of `¬ c` (e.g., `false = c` instead of
+  `¬ (true = c)`), so `dite'` applications were ill-typed. When tracking proofs, the branch binder keeps type `¬ c`,
+  while the normalized form is still used as the hypothesis.
+- `andBoolReduction?` returned the proposition `False` for a Boolean `&&` (fixed upstream, #177).
+- `forallReduction?` substitutes `True.intro` for a hypothesis whose type was simplified to `True`. This yields
+  ill-typed terms such as `Char.ofNatAux 84 True.intro`. When tracking proofs, proof arguments are not rewritten.
+- Universe levels are normalized to `1` (`normLevel`), so goals over `Sort u` are rewritten to goals over `Type`, and
+  `Blaster.dite'` is always built at level `1`. This includes unassigned *or uninstantiated* level metavariables; for
+  example, `#testOptimize` passes terms with assigned but uninstantiated level metavariables. The proof run keeps the
+  universe levels.
+- The `dite'` branch-swap rule (`isITESwap?`) produced a then-branch of type `¬¬c → α` instead of `c → α`. When
+  tracking proofs, the branches are retyped.
+- Rewriting the domain of quantified *function* variables (e.g., `f : c = true → α` to `f : true = c → α`) leaves
+  their dependent uses ill-typed. When tracking proofs, functions over proofs keep their original type.
+
+## 8. Limitations and future work
+
+**Optimizer evidence.**
+
+- `match` rules relying on the *negative* match context (`lastPatternReduction?`, i.e., the discriminant does not
+  match the patterns of the previous alternatives) leave a proof obligation. The overlap hypotheses of the splitter
+  could be declared in the alternative's local context, like the pattern equalities.
+- The normalization of matches to `Blaster.dite'` chains (`normMatchExpr?`) and arithmetic (`Nat`/`Int`) constant
+  folding rely on tactic discharge rather than explicit lemmas.
+- Match equations and splitters are generated by Lean on demand (`Match.getEquationsFor`). For matchers with many
+  overlapping patterns, the generation can exceed Lean's fixed heartbeat budget; these matchers fall back to coarse
+  obligations and to the case analysis on stuck variables.
+- Equivalences between recursive functions that need a generalized induction hypothesis or mutual induction fail.
+- The state machine commands (`#bmc`, `#kind`) are not reconstructed: their queries are checked incrementally on one
+  solver session (base and induction cases selected by flags), not as Lean goals.
+
+**SMT proof replay.** The twelve SMT goals of the test suite that the replay alone does not prove (Section 6.1):
+
+| cause                                                                              | goals                                   |
+|------------------------------------------------------------------------------------|-----------------------------------------|
+| polymorphic structure fields with instance arguments                               | `Issue15` (3), `InstanceArgs`           |
+| functions into empty types from inductive propositions (e.g., `SomeBig → Empty`)   | `SmtUninhabited` (3)                    |
+| a sort quantifier depending on an existential variable                             | `SmtUninhabited`                        |
+| nonlinear lemmas (products of conditionals, `(z * x) % (z * y) = z * (x % y)`)     | `SmtMatch`, `SmtNatMod`                 |
+| proof-production timeouts of Z3                                                    | `Issue17`, `SmtNatMod`                  |
+
+For inductive propositions, the selectors of Z3 proofs (e.g., `SomeBig.intro.0`) have no counterpart in Lean, as a
+proof is not eliminated into data. Other limitations of the replay:
+
+- Polymorphic goals with several sort variables over user datatypes without a world: indices, recursive fields of
+  function types, proof fields whose propositions mention the sort variables (e.g., properties quantified over the
+  instances of a class). Also constructor applications whose instance only the sort of a quantified variable
+  determines (the undetermined type parameters of the conclusions of steps default to the universe), and axioms and
+  non-parametric functions at sort variables (Section 4.4).
+- `match` patterns on `Nat`/`Int` with variables (e.g., `n + 1`), whose translation needs the conditions of the
+  branch.
+- cvc5: the native CPC format (whose steps often leave their conclusion implicit) is not supported, and Alethe
+  exports containing skolems (e.g., division by zero) fail.
+- Proof production may time out where the verdict did not: `z3rec` and `z3+` make up for the missing
+  `recfun-finder` on the CEK goals, but not in general.
+- The kernel check of the largest proofs (`SellNFT`) takes about half an hour and 13 GB.
+
+## 9. Measuring coverage
+
+```sh
 ./scripts/recon_coverage.sh stats.jsonl 8
 ```
 
-This runs every test file with `BLASTER_RECONSTRUCT=1`. Each `#testOptimize` case is also audited
-for a kernel-checked proof of `e = optimize(e)`. The audit runs after the test's own check, and it
-optimizes with a dedicated name-generator prefix. Otherwise names created while building proof
-terms could clash with those created during reconstruction. One JSON line per attempt is written, and
-`scripts/recon_report.py` summarizes the results. The summary covers success rates per category,
-discharge methods, failure reasons, and proof obligations per rewrite site. The rewrite-site
-breakdown is the to-do list for further rule instrumentation.
+This runs every test file with `BLASTER_RECONSTRUCT=1` and `BLASTER_RECON_STATS=stats.jsonl`, which writes one JSON
+line per reconstruction attempt. With `BLASTER_RECON_STATS` set, each `#testOptimize` case is also audited for a
+kernel-checked proof of `e = optimize(e)`. The audit runs after the test's own check, and it optimizes with a dedicated
+name-generator prefix, so that names created while building proof terms don't clash with those created during
+reconstruction. `scripts/recon_report.py` summarizes the results: success rates per category, discharge methods,
+failure reasons, and proof obligations per rewrite site. The rewrite-site breakdown is the to-do list for further rule
+instrumentation.
 
-## Coverage history
+The replay-only figure of Section 6.1 runs the test files of `Tests/Smt` and `Tests/FixedIssues` with
+`BLASTER_SMT_PROOF=only` and `BLASTER_SMTPROOF_LOG=<file>`, and counts the logged replay attempts whose `kind` is not
+`obligation`.
 
-Measured with `scripts/recon_coverage.sh` on the full test suite. Each row adds one milestone; percentages
-are the fraction of attempts producing a kernel-checked proof. The last column excludes the goals refused
-because of the unsound rewrite above (18 attempts).
+## Appendix A. Coverage history on `feat/kernel-proof-reconstruction`
 
-| milestone                                            | `#testOptimize` certificates | goals closed by optimizer | goals closed by SMT | all   | all except unsound |
-|------------------------------------------------------|------------------------------|---------------------------|---------------------|-------|--------------------|
-| proof-producing optimizer + tactic discharge         | 85.7%                        | 77.1%                     | 36.7%               | 82.4% |                    |
-| + `dite'` congruence, denormalization, sync kernel check, explicit Prop/Bool/`decide'` rules | 91.4% | 84.4% | 33.3%¹ | 87.0% |  |
-| + forall/Eq/arith rule lemmas, seeded instantiation, validated steps | 90.9%¹       | 92.0%                     | 39.8%               | 87.4% |                    |
-| + robust discharge (runtime exceptions), relational lemmas, split strategy | 92.8%  | 92.0%                     | 39.8%               | 89.0% |                    |
-| + dependent `dite'` congruence, `dite'` propagation lemmas, arithmetic residuals | 92.9% | 92.0%                | 44.2%               | 89.5% |                    |
-| + residual: user-definition unfolding with bounded case analysis | 92.9%                  | 92.0%                     | 65.5%               | 91.0% |                    |
-| + non-linear `div`/`mod` lemmas, induction for recursive-function equivalences | 95.1%  | 93.1%                     | 70.9%               | 93.3% |                    |
-| + nested recursive-function equivalences (proved bottom-up and reused) | 95.4%           | 93.2%                     | 70.9%               | 93.5% |                    |
-| + well-typed tracking (casts for proof arguments and function binders), `BEq`/`decide'` lemmas | 98.3% | 93.8%       | 71.1%               | 96.1% | 96.6%              |
-| + existential witnesses, non-linear residual strategies | 98.4%                        | 93.8%                     | 78.5%               | 96.7% | 97.3%              |
-| + separate proof run (universe levels kept)           | 98.4%                        | 93.2%                     | 80.4%               | 96.8% | 97.3%              |
-| + functional induction, case analysis of nested structures, `div`/`mod` facts | 99.0%  | 97.9%                     | 89.6%               | 98.2% | 98.8%              |
-| + existential elimination lemma, applied `dite` case analysis, direct fallback | 99.1% | 99.5%                     | 93.9%               | 98.7% | **99.3%**          |
-| + `match` alternatives (splitter congruence, `match cases`, fallback regions, stuck-match case analysis) | 99.2%² | 99.5% | 96.4%        | 99.0% | **99.6%**          |
+Measured with `scripts/recon_coverage.sh` on the test suite of `feat/kernel-proof-reconstruction` (based on upstream
+`staging`), before SMT proof replay. Percentages are the fraction of attempts producing a kernel-checked proof. The
+last column excludes the 18 attempts refused because of the rewrite assuming type variables inhabited (Section 7.1,
+since fixed).
 
-¹ more tests were measured in this run, as earlier runs aborted some test files.
-² measured against `deaf200` with the same harness. The row includes the match tests of
-`Tests/Reconstruct/Basic.lean` and `Tests/Reconstruct/MatchEdge.lean`. Excluding them, the rates go from
-99.1% / 99.4% / 93.8% / 98.7% / 99.3% to 99.2% / 99.4% / 96.0% / 99.0% / 99.6% (3188 to 3197 of 3229 attempts),
-and no goal regresses. `Tests/Smt/SmtMatch.lean` goes from 69 to 74 of 74 goals and
-`Tests/Optimize/OptimizeMatch/*` from 62 to 65 of 68 certificates. Unresolved obligations drop from 127 to 62.
-Over all attempts, `frame::*match*` obligations (coarse obligations over whole `match` applications) go
-from 196 (7 unresolved) to 0, and `rule:matchReduction:*` obligations from 632 (63 unresolved) to 4.
-`elimMatch` no longer leaves obligations. The `match`-to-`ite` normalization is now visible as
-99 `rule:normMatchExpr:*` obligations (3 unresolved); these were previously hidden inside frame obligations.
+| milestone | `#testOptimize` | goals closed by optimizer | goals closed by SMT | all   | all but refused |
+|-----------|-----------------|---------------------------|---------------------|-------|-----------------|
+| 1         | 85.7%           | 77.1%                     | 36.7%               | 82.4% |                 |
+| 2         | 91.4%           | 84.4%                     | 33.3%¹              | 87.0% |                 |
+| 3         | 90.9%¹          | 92.0%                     | 39.8%               | 87.4% |                 |
+| 4         | 92.8%           | 92.0%                     | 39.8%               | 89.0% |                 |
+| 5         | 92.9%           | 92.0%                     | 44.2%               | 89.5% |                 |
+| 6         | 92.9%           | 92.0%                     | 65.5%               | 91.0% |                 |
+| 7         | 95.1%           | 93.1%                     | 70.9%               | 93.3% |                 |
+| 8         | 95.4%           | 93.2%                     | 70.9%               | 93.5% |                 |
+| 9         | 98.3%           | 93.8%                     | 71.1%               | 96.1% | 96.6%           |
+| 10        | 98.4%           | 93.8%                     | 78.5%               | 96.7% | 97.3%           |
+| 11        | 98.4%           | 93.2%                     | 80.4%               | 96.8% | 97.3%           |
+| 12        | 99.0%           | 97.9%                     | 89.6%               | 98.2% | 98.8%           |
+| 13        | 99.1%           | 99.5%                     | 93.9%               | 98.7% | 99.3%           |
+| 14        | 99.2%²          | 99.5%                     | 96.4%               | 99.0% | 99.6%           |
 
-Over the same milestones, the number of rewrite steps justified by an explicit lemma grew from about 1.1k
-to 16.6k. Proof obligations left to tactics dropped from 13.2k to 4.0k, of which only 127 remain
-unresolved (down from 796).
+Milestones (each adds to the previous one):
 
-### Port to `beta-lambda-cache-optimization`
+1. proof-producing optimizer and tactic discharge;
+2. `dite'` congruence, denormalization, synchronous kernel check, explicit Prop/Bool/`decide'` rules;
+3. forall/Eq/arithmetic rule lemmas, seeded instantiation, validated steps;
+4. robust discharge (runtime exceptions), relational lemmas, split strategy;
+5. dependent `dite'` congruence, `dite'` propagation lemmas, arithmetic residuals;
+6. residuals: user-definition unfolding with bounded case analysis;
+7. nonlinear `div`/`mod` lemmas, induction for recursive-function equivalences;
+8. nested recursive-function equivalences (proved bottom-up and reused);
+9. well-typed tracking (casts for proof arguments and function binders), `BEq`/`decide'` lemmas;
+10. existential witnesses, nonlinear residual strategies;
+11. separate proof run (universe levels kept);
+12. functional induction, case analysis of nested structures, `div`/`mod` facts;
+13. existential elimination lemma, applied `dite` case analysis, direct fallback;
+14. `match` alternatives (splitter congruence, `match cases`, fallback regions, stuck-match case analysis).
 
-The reconstruction was ported onto Blaster's `beta-lambda-cache-optimization` branch (hash-consing,
-context reuse, equality maps and metavariable-based beta reduction). When tracking proofs, the proof run
-disables context reuse, equality-map lookups and shared beta reduction, and hash-conses its input in a
-fresh environment. The match context (i.e., the equalities between the discriminants and the patterns
-declared for each alternative, see above) is kept, such that a `match` whose alternatives are optimized
-under the match context is justified by the splitter congruence instead of a coarse obligation (e.g., the
-`match` expressions on `Data` produced by the CEK evaluation of validators); the equalities are removed
-from the scope when leaving the alternative (cached proofs using them are not reused outside).
-On that branch's test suite (3865 attempts, run with a nightly Z3):
+¹ More tests were measured in this run, as earlier runs aborted some test files.
 
-| `#testOptimize` certificates | goals closed by optimizer | goals closed by SMT | all |
-|------------------------------|---------------------------|---------------------|-----|
-| 99.7% (3121 / 3130)          | 100% (399 / 399)          | 98.8% (332 / 336)   | **99.7%** (3852 / 3865) |
+² Measured against commit `deaf200` of that branch with the same harness; the row includes the match tests of
+`Tests/Reconstruct/Basic.lean` and `Tests/Reconstruct/MatchEdge.lean`. On the tests of milestone 13 alone, the rates
+go from 99.1% / 99.4% / 93.8% / 98.7% / 99.3% to 99.2% / 99.4% / 96.0% / 99.0% / 99.6% (3188 to 3197 of 3229
+attempts), and no goal regresses. `Tests/Smt/SmtMatch.lean` goes from 69 to 74 of 74 goals, and
+`Tests/Optimize/OptimizeMatch/*` from 62 to 65 of 68 certificates. Over all attempts, coarse obligations over whole
+`match` applications (`frame::*match*`) go from 196 (7 unresolved) to 0, and `rule:matchReduction:*` obligations from
+632 (63 unresolved) to 4. The `match`-to-`ite` normalization becomes visible as 99 `rule:normMatchExpr:*` obligations
+(3 unresolved), previously hidden inside frame obligations.
 
-Three of the SMT failures are goals that are *false* (`Tests/Smt/SmtUninhabited.lean`, e.g.
-`∀ (α : Type), (α → Empty) → False`). The beta branch reports them `Valid`, as it doesn't include the
-soundness fix for type variables that may be empty. Reconstruction correctly refuses them. The
-remaining failures are 9 `match` normalizations over `Int` patterns or dependent discriminants
-(`MatchToITE_9/10/15/20/21`, `MatchOverFun_3`, `MatchOverMatch_5`, `MatchReduceUnchanged_6`,
-`NegLitSymOffset`) and one SMT residual (`Issue287`).
+Over milestones 1 to 13, the number of rewrite steps justified by an explicit lemma grew from about 1.1k to 16.6k,
+and the proof obligations left to tactics dropped from 13.2k to 4.0k, the unresolved ones from 796 to 127.
+Milestone 14 brought the unresolved obligations from 127 to 62.
 
-Reconstruction refuses a proof that depends on `sorryAx`, including through auxiliary declarations
-created by tactics. For example, `nomatch` reports missing cases as an error message and still produces
-a matcher whose body is `sorry`, which the kernel accepts.
+## Appendix B. Port to `beta-lambda-cache-optimization`
 
-## Current limitations / next steps
+Measured on branch `feat/kernel-proof-reconstruction-beta` (the port of Appendix A onto
+`beta-lambda-cache-optimization`, before SMT proof replay), on that branch's test suite (3865 attempts) with a
+nightly Z3:
 
-- In the default mode, every reconstruction attempt of the test suite succeeds (3949/3949). The replay of SMT
-  proofs alone (`BLASTER_SMT_PROOF=only`) still fails on polymorphic structure fields with instance arguments
-  (`Issue15`, `InstanceArgs`), on inductive propositions with data fields (`SmtUninhabited`, e.g., the selector
-  `SomeBig.intro.0` of Z3 proofs, which has no counterpart in Lean, as a proof is not eliminated into data), on
-  a nonlinear lemma over products of conditionals (`SmtMatch`), and on proof-production timeouts of Z3 (`Issue17`,
-  `NatLog2`); the tactic strategies prove these goals.
-- The state machine commands (`#bmc`, `#kind`) are not reconstructed: their queries are checked incrementally on
-  one solver session (base and induction cases selected by flags), not as Lean goals.
-- `match` rules that rely on the *negative* match context (`lastPatternReduction?`, i.e., the
-  discriminant does not match the patterns of the previous alternatives) are not justified
-  explicitly yet. The overlap hypotheses of the splitter could be declared in the alternative's local
-  context, like the pattern equalities. Matches normalized to `ite` (`normMatchExpr?`) rely on the
-  `match cases` discharge.
-- Match equations and splitters are generated by Lean on demand (`Match.getEquationsFor`). For
-  matchers with many overlapping patterns, the generation can exceed Lean's fixed heartbeat
-  budget. These matchers fall back to coarse obligations.
-- Goals proved by the SMT solver are reconstructed with Lean decision procedures and by the replay of SMT
-  proofs (see above); the replay fails on Z3 proofs that need Blaster's `recfun-finder` (disabled under proof
-  production), on polymorphic user datatypes and polymorphic Lean functions in the universe interpretation, and
-  on cvc5 proofs whose Alethe export contains skolems (e.g., division by zero).
-- Equivalences between recursive functions that need a generalized induction hypothesis or mutual
-  induction still fail.
-- Arithmetic (`Nat`/`Int`) constant folding and `match` normalization rules still rely on tactic
-  discharge rather than explicit lemmas.
+| `#testOptimize`     | goals closed by optimizer | goals closed by SMT | all                     |
+|---------------------|---------------------------|---------------------|-------------------------|
+| 99.7% (3121 / 3130) | 100% (399 / 399)          | 98.8% (332 / 336)   | **99.7%** (3852 / 3865) |
+
+Three of the SMT failures were *false* goals of `Tests/Smt/SmtUninhabited.lean` (e.g.,
+`∀ (α : Type), (α → Empty) → False`), reported `Valid` because that branch did not include the fix for type variables
+that may be empty yet; reconstruction correctly refused them. The remaining failures were 9 `match` normalizations
+over `Int` patterns or dependent discriminants (`MatchToITE_9/10/15/20/21`, `MatchOverFun_3`, `MatchOverMatch_5`,
+`MatchReduceUnchanged_6`, `NegLitSymOffset`) and one SMT residual (`Issue287`). All of them are proved on
+`feat/smt-proof-replay` (Section 6.1).
+
+## Appendix C. Earlier measurements on `feat/smt-proof-replay`
+
+Superseded by Sections 6.1 and 6.2; kept to show the effect of individual changes.
+
+- **Test suite, replay only.** 88.9% (248/279) of the goals closed by the SMT solver, then 99.1% (338/341) after the
+  closed-statement tactics, the universe interpretation of polymorphic goals, the nonlinear lemmas and the bridge of
+  normalized `match` patterns. Counting the replay attempts of `Tests/Smt` and `Tests/FixedIssues`: 283 of 297, then
+  312 of 322 after the interpretation of empty types, of types used as values and of sort quantifiers under binders
+  (with a nightly Z3; 311 of 323 with Z3 5.3.1, the same before and after the last review).
+- **Test suite, default mode.** 99.8% (3917/3924) before the reduction of stuck matches by their equation theorems,
+  the elements constructed for types without default element and the discriminant equations proved from the branch
+  conditions.
+- **Early replay.** A 245-step Z3 proof involving a recursive function replayed in about 6 s, and a 2458-step cvc5
+  (Alethe) proof of the same goal in about 30 s.
+- **First CEK replays** (`only`). The residual of `HelloWorld`, a 927-step Z3 proof, replayed in 1.8 s of step time
+  (33 s before the tactics ran on closed statements), with about 26 s of reconstruction in total; `UnlockPIN` 917
+  steps in 1.8 s; the `Auction` residuals 44 to 197 steps in at most 0.2 s each.
+- **First `z3rec` runs.** All 20 `Governance` theorems kernel-checked in 7 to 9 minutes each (residual proofs of about
+  4K steps replayed in 4.5 minutes); both `MintingPolicy` theorems in 6 minutes each (at most 7 GB); after lifting,
+  `Governance` #14 in 392 s and `MintingPolicy` in 348 and 382 s.
+- **`SellNFT`.** #2 kernel-checked in 53 minutes at 17.5 GB as a single declaration, before auxiliary theorems. The
+  replay of #1 first failed on a `trans*` step about `(List.cons.0 List.nil)`, whose occurrences were interpreted in
+  different instances by different steps; inferring the instances on the whole proof (`SortInfer.lean`: 195 hints on
+  152,698 steps, in 0.15 s) fixed it. With the proofs of the replayed obligations split into auxiliary theorems too
+  (`BLASTER_SMTPROOF_SPLIT=1`), #1 took 35 minutes at 11.0 GB instead of 33 minutes at 12.7 GB.
+
+## Glossary
+
+| term                   | meaning                                                                                 |
+|------------------------|-----------------------------------------------------------------------------------------|
+| binder depth           | the largest number of binders enclosing a subterm of a proof                            |
+| bridge                 | the proof relating the negated goal to the SMT assertion interpreted back (Section 4.3) |
+| CEK evaluation         | a goal of CardanoLedgerApiBlaster: a UPLC program evaluated by the CEK machine          |
+| distinct subterms      | the size of a proof term as a DAG (shared subterms counted once)                        |
+| evidence               | what the proof run records for a rewrite `e ⟶ v`: `defeq`, `proof p` or `unknown`       |
+| fallback region        | a `match` congruence replaced by one coarse obligation when a finer one fails           |
+| global step            | an SMT proof step whose proof does not depend on the hypotheses of an enclosing `lemma` |
+| lifting                | turning global step proofs into closed terms over the goal's variables (Section 4.5)    |
+| local differences      | the subterms where the two sides of a large equality differ, given to tactics           |
+| match context          | the equalities between discriminants and patterns known inside a `match` alternative    |
+| proof obligation       | an equality `lhs = rhs` the optimizer did not justify (a *hole*), proved afterwards     |
+| proof run, verdict run | the optimization tracking proof terms; Blaster's unchanged optimization                 |
+| propositional engine   | `Prop.lean`: derives propositional facts with explicit proof terms                      |
+| residual goal          | the optimizer's output `G''`, closed as `True` or by the SMT solver                     |
+| splitter               | Lean's case-analysis theorem for a matcher's alternatives, with overlap hypotheses      |
+| universe, world        | the interpretation of `@Instance` (Section 4.4); a world injects a Lean type into it    |
