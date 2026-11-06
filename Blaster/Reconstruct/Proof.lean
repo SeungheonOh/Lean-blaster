@@ -56,10 +56,6 @@ def isFallback (e : Expr) : Bool :=
 def hasHoles (e : Expr) : Bool :=
   (e.find? fun s => (isHole? s).isSome).isSome
 
-/-- Mark `p` as a fallback region when it contains proof obligations (see `fallbackKey`). -/
-def mkFallback (p : Expr) : Expr :=
-  if hasHoles p then mkMData (KVMap.empty.insert fallbackKey (.ofBool true)) p else p
-
 /-- Implementation of `hasHolesIn`. -/
 unsafe def hasHolesInImpl (free : Std.HashMap USize Expr) (p : Expr) : Bool :=
   (p.findExt? fun s =>
@@ -88,7 +84,7 @@ def hasHolesMemo (p : Expr) : TranslateEnvT Bool := do
   modify fun env => { env with recon.holeFree := free }
   return found
 
-/-- Same as `mkFallback` (see `hasHolesMemo`). -/
+/-- Mark `p` as a fallback region when it contains proof obligations (see `fallbackKey` and `hasHolesMemo`). -/
 def mkFallbackM (p : Expr) : TranslateEnvT Expr := do
   return if ← hasHolesMemo p then mkMData (KVMap.empty.insert fallbackKey (.ofBool true)) p else p
 
@@ -704,8 +700,9 @@ def addArgEvidence
 /-- Resolve pending dependent rewrites on the arguments of `f a₁ ... aₙ` (see `addArgEvidence`).
     The following applications are currently supported:
       - `Blaster.dite' c t e`: via `dite'_congr` (when the condition has been rewritten).
-      - `match` and `casesOn` applications: via the matcher's splitter, when alternatives have been
-        rewritten under the match context (see `mkMatchCongr`).
+      - `match` and `casesOn` applications, when alternatives have been rewritten under the match context: via
+        `mkMatchCongr` (by `congr` and `funext` when the evidence has no proof obligation, by a case split over the
+        matcher's splitter otherwise).
 -/
 def resolveDepArgs (f : Expr) (args : Array Expr) (pf : EqPf) : TranslateEnvT EqPf := do
   match pf with

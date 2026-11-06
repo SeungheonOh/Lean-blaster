@@ -55,50 +55,39 @@ private def mkTopHole (lhs rhs : Expr) : MetaM Expr := do
     9M distinct subterms of the proof of a CEK evaluation of CardanoLedgerApiBlaster's `SellNFT` validator). -/
 def kernelOptions (o : Options) : Options := maxHeartbeats.set o 0
 
-/-- The free variables of `es` and the ones their declarations depend on, in the order of the local context. -/
-def usedFVarsClosure (es : Array Expr) : MetaM (Array Expr) := do
-  let collect (e : Expr) : Array FVarId := (Lean.CollectFVars.main e {}).fvarIds
-  let mut set : FVarIdSet := {}
-  let mut todo : Array FVarId := es.foldl (· ++ collect ·) #[]
-  while h : todo.size > 0 do
-    let fv := todo[todo.size - 1]
-    todo := todo.pop
-    if set.contains fv then continue
-    set := set.insert fv
-    let d ← fv.getDecl
-    todo := todo ++ collect d.type ++ ((d.value?.map collect).getD #[])
-  let decls := (← getLCtx).decls.toArray.filterMap id |>.filter (set.contains ·.fvarId)
-  return decls.map (·.toExpr)
+/-- `goal` and `proof` closed over the declarations of the local context they depend on (see `fvarClosure`), together
+    with these declarations, or `none` when metavariables remain (e.g., in the declarations of the local context, such
+    as the universe levels of the hypotheses introduced by `induction`). -/
+def closeOverContext? (goal proof : Expr) : MetaM (Option (Array LocalDecl × Expr × Expr)) := do
+  let decls ← fvarClosure #[goal, proof]
+  let xs := decls.map (·.toExpr)
+  let goal ← instantiateMVars (← mkForallFVars xs goal)
+  let proof ← instantiateMVars (← mkLambdaFVars xs proof)
+  if goal.hasMVar || proof.hasMVar then return none
+  return some (decls, goal, proof)
 
-/-- Check `proof` against `goal` with the Lean kernel. When they contain free variables (e.g., the hypotheses of a goal
-    of the `blaster` tactic), both are closed over them first. Fall back to the elaborator's type checker when `goal`
-    contains metavariables.
-    NOTE: the kernel instead of `Meta.check`, which runs out of recursion depth on deep proofs (e.g., the ones of the
+/-- Check `proof` against `goal` with the elaborator's type checker. -/
+def elabCheck (goal proof : Expr) : TermElabM (Option MessageData) :=
+  tryCatchRuntimeEx (do
+      Meta.check proof
+      if ← isDefEq (← inferType proof) goal then return none
+      return some m!"proof term does not have the expected type")
+    fun ex => return some ex.toMessageData
+
+/-- Check `proof` against `goal` with the Lean kernel (in a declaration that is not added to the environment), both
+    closed over the declarations of the local context they depend on (e.g., the hypotheses of a goal of the `blaster`
+    tactic, see `closeOverContext?`). The elaborator's type checker is used when metavariables remain.
+    NOTE: the kernel rather than `Meta.check`, which runs out of recursion depth on deep proofs (e.g., the proofs of the
     `Auction` validator of CardanoLedgerApiBlaster).
 -/
 def kernelCheck (goal : Expr) (proof : Expr) : TermElabM (Option MessageData) := do
   let goal ← instantiateMVars goal
   let proof ← instantiateMVars proof
   if proof.hasMVar then return some m!"proof term contains metavariables"
-  let elabCheck : TermElabM (Option MessageData) := do
-    try
-      Meta.check proof
-      if ← isDefEq (← inferType proof) goal then return none
-      return some m!"proof term does not have the expected type"
-    catch ex => return some ex.toMessageData
-  if goal.hasMVar then return ← elabCheck
-  let (goal', proof') ← if goal.hasFVar || proof.hasFVar then do
-      let xs ← usedFVarsClosure #[goal, proof]
-      pure (← instantiateMVars (← mkForallFVars xs goal), ← instantiateMVars (← mkLambdaFVars xs proof))
-    else pure (goal, proof)
-  -- NOTE: the declarations of the local context may contain metavariables (e.g., universe levels of the hypotheses
-  -- introduced by `induction`)
-  if goal'.hasMVar || proof'.hasMVar || goal'.hasFVar || proof'.hasFVar then return ← elabCheck
-  let goal := goal'
-  let proof := proof'
-  let lvls := (collectLevelParams {} goal).params.toList
+  let some (_, goal', proof') ← closeOverContext? goal proof | elabCheck goal proof
+  let lvls := (collectLevelParams {} goal').params.toList
   let name ← mkFreshUserName `_blaster_reconstructed
-  let decl := Declaration.thmDecl { name, levelParams := lvls, type := goal, value := proof }
+  let decl := Declaration.thmDecl { name, levelParams := lvls, type := goal', value := proof' }
   -- NOTE: `addDecl` may perform kernel checking asynchronously, i.e., errors are reported
   -- as messages instead of exceptions. We here call the kernel synchronously.
   match Lean.Kernel.Environment.addDecl (← getEnv).toKernelEnv (kernelOptions (← getOptions)) decl with
@@ -135,12 +124,14 @@ def logSmtProof (kind : String) (res : Except String SmtProof.SmtProofResult) : 
   h.putStrLn (Json.compress (Json.mkObj ([("file", toJson (← getFileName)), ("line", toJson line),
     ("kind", toJson kind)] ++ fields)))
 
-/-- Check the closed proof `proof` of `goal` with the Lean kernel and return the auxiliary theorem added to the
-    environment for it (applied to its universe levels), or the reason of the failure. Hence, a proof is checked
-    once by the kernel: the declarations using it only refer to the auxiliary theorem (e.g., the theorem proved
-    by `blaster`, or the proof of the original goal for a proof of the residual goal), such that its proof term
-    is neither checked again nor traversed by the subsequent phases (e.g., `dischargeHoles`).
-    Same as `kernelCheck` (i.e., `proof` is returned) when `goal` or `proof` is not closed.
+/-- Check the proof `proof` of `goal` with the Lean kernel and return the auxiliary theorem added to the environment for
+    it (applied to its universe levels and, when `goal` or `proof` has free variables, to the declarations of the local
+    context they depend on, see `closeOverContext?`), or the reason of the failure. Hence, a proof is checked once by
+    the kernel: the declarations using it only refer to the auxiliary theorem (e.g., the theorem proved by `blaster`, or
+    the proof of the original goal for a proof of the residual goal), such that its proof term is neither checked again
+    nor traversed by the subsequent phases (e.g., `dischargeHoles`).
+    Same as `kernelCheck` (i.e., `proof` is returned) when metavariables remain, or when `goal` or `proof` depends on
+    `let` variables.
     The proof must not depend on `sorryAx`: the auxiliary theorems are recorded in `checked`, i.e., they are not
     traversed again when checking the proofs referring to them (see `dependsOnSorry`).
     NOTE: the state is restored on failure (`addDecl` then adds the declaration as an axiom).
@@ -152,48 +143,57 @@ def checkedProof (checked : IO.Ref (Array (Name × Expr))) (goal proof : Expr) :
   -- error), which the kernel accepts.
   if ← withProfile "sorryCheck" (dependsOnSorry proof (← checked.get)) then
     return .error m!"the reconstructed proof depends on sorryAx"
-  if goal.hasMVar || goal.hasFVar || proof.hasMVar || proof.hasFVar then
-    return match ← kernelCheck goal proof with
+  let closed? ← if proof.hasMVar then pure none else closeOverContext? goal proof
+  let some (decls, goal', proof') := closed?.filter fun (decls, _, _) => !decls.any (·.isLet)
+    | return match ← kernelCheck goal proof with
       | some msg => .error msg
       | none => .ok proof
   let s ← saveState
-  try
-    -- NOTE: the declaration is checked synchronously, i.e., kernel errors are reported as exceptions
-    let lvls := (collectLevelParams {} goal).params.toList
-    let n ← withOptions (fun o => kernelOptions (Elab.async.set o false)) <| mkAuxLemma lvls goal proof (cache := false)
-    checked.modify (·.push (n, proof))
-    return .ok (Lean.mkConst n (lvls.map mkLevelParam))
-  catch ex =>
-    s.restore
-    return .error m!"kernel rejected the reconstructed proof: {ex.toMessageData}"
+  tryCatchRuntimeEx (do
+      -- NOTE: the declaration is checked synchronously, i.e., kernel errors are reported as exceptions
+      let lvls := (collectLevelParams {} goal').params.toList
+      let n ← withOptions (fun o => kernelOptions (Elab.async.set o false)) <|
+        mkAuxLemma lvls goal' proof' (cache := false)
+      checked.modify (·.push (n, proof'))
+      return .ok (mkAppN (Lean.mkConst n (lvls.map mkLevelParam)) (decls.map (·.toExpr))))
+    fun ex => do
+      s.restore
+      return .error m!"kernel rejected the reconstructed proof: {ex.toMessageData}"
 
-/-- Proof of the closed proposition `goal` by the replay of a proof of the SMT backend, checked by the
-    kernel such that the other strategies can be tried otherwise (the state is restored on failure). -/
+/-- Proof of the proposition `goal` by the replay of a proof of the SMT backend, checked by the kernel such that the
+    other strategies can be tried otherwise (the state, including `checked`, is restored on failure, and the kernel
+    checks still running are interrupted). -/
 def bySmtProofReplay (checked : IO.Ref (Array (Name × Expr))) (task : ReconTask) (kind : String) (goal : Expr) :
     TermElabM (Option (Expr × String)) := do
   let st ← saveState
+  let checked₀ ← checked.get
+  -- the parallel kernel checks of the auxiliary theorems of the proof (see `SmtProof.startKernelChecks`)
+  let kernelChecks ← IO.mkRef ({} : SmtProof.KernelChecks)
   -- NOTE: the auxiliary declarations of the replay (e.g., the definitional equations of recursive functions) are
   -- checked by the kernel synchronously (`Elab.async` false), such that an ill-typed one fails the replay (instead of
   -- an error reported after the reconstruction)
-  let res ← tryCatchRuntimeEx (withOptions (Elab.async.set · false) <| withReconTrace s!"{kind} replay" <|
-      SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout })
-    (fun ex => do return .error s!"runtime exception: {← ex.toMessageData.toString}")
-  let res ← match res with
-    | .ok r =>
-        profileLog s!"smtProof.{kind}" 0 fun _ => s!"dag={dagSize r.proof} steps={r.steps}"
-        checked.modify (· ++ r.sorryFree)
-        match ← withProfile s!"smtProof.{kind}.kernelCheck" (checkedProof checked goal r.proof) with
-        | .ok p =>
-            -- the parallel kernel checks of the auxiliary theorems of the proof (see `SmtProof.startKernelChecks`)
-            match ← withProfile s!"smtProof.{kind}.parallelKernelChecks" (SmtProof.awaitKernelChecks r.kernelChecks) with
-            | none => pure (.ok { r with proof := p })
-            | some msg => pure (.error s!"kernel: {msg}")
-        | .error msg => pure (.error s!"kernel: {← msg.toString}")
-    | err => pure err
+  let res ← tryCatchRuntimeEx (do
+      let r ← withOptions (Elab.async.set · false) <| withReconTrace s!"{kind} replay" <|
+        SmtProof.proveBySmtProof goal { randomSeed := task.randomSeed, timeout := task.timeout }
+      let .ok r := r | return r
+      kernelChecks.set r.kernelChecks
+      profileLog s!"smtProof.{kind}" 0 fun _ => s!"dag={dagSize r.proof} steps={r.steps}"
+      checked.modify (· ++ r.sorryFree)
+      match ← withProfile s!"smtProof.{kind}.kernelCheck" (checkedProof checked goal r.proof) with
+      | .error msg => return .error s!"kernel: {← msg.toString}"
+      | .ok p =>
+          match ← withProfile s!"smtProof.{kind}.parallelKernelChecks" (SmtProof.awaitKernelChecks r.kernelChecks) with
+          | some msg => return .error s!"kernel: {msg}"
+          | none => return .ok { r with proof := p })
+    fun ex => return .error s!"runtime exception: {← ex.toMessageData.toString}"
   logSmtProof kind res
   match res with
   | .ok r => return some (r.proof, s!"{r.backend} proof replay")
-  | .error _ => st.restore; return none
+  | .error _ =>
+      (← kernelChecks.get).cancel
+      st.restore
+      checked.set checked₀
+      return none
 
 /-- Proof of a proof obligation `type` of the optimizer (in the local context of the evidence) by the replay
     of an SMT proof: the obligation is closed over the variables it mentions and the hypotheses on them
@@ -271,8 +271,9 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let (residual, residualMethod) ← withProfile "residual" (info := (·.2)) <| match task.optExpr with
     | .const ``True _ => pure (some (Lean.mkConst ``True.intro), "optimizer")
     | e => do
-        -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`), tried before or after
-        -- the tactic based strategies (environment variable `BLASTER_SMT_PROOF`: `first`, `last` or `off`)
+        -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`; option `smt-proof`, environment
+        -- variable `BLASTER_SMT_PROOF`): `first` (before the tactic strategies), `last` (after them, or as soon as two
+        -- of them exhaust their budget, see `proveResidual`), `only` (without them, to measure the replay) or `off`
         let replayed ← IO.mkRef false
         let replay : TermElabM (Option (Expr × String)) := do
           if mode == "off" || !task.bySmt then return none
@@ -286,8 +287,6 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
         | some (p, m) => pure (some p, m)
         | none =>
         if mode == "only" then pure (none, "none") else
-        -- NOTE: in the `last` mode, the replay is tried as soon as a tactic exhausts its budget (e.g., on the residuals
-        -- of CEK evaluations, on which each tactic runs out of heartbeats), see `proveResidual`
         match ← proveResidual e (hard := if mode == "last" then replay else pure none) with
         | some (p, m) => pure (some p, s!"smt residual by {m}")
         | none =>

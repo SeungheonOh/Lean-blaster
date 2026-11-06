@@ -492,11 +492,12 @@ syntax (name := blasterRecEqn) "blaster_rec_eqn" : tactic
     try evalTactic (← `(tactic| dsimp only)) catch _ => pure ()
     let some g ← (do return (← getGoals).head?) | continue
     setGoals [g]
-    -- NOTE: `simp_all` closes the contradictory cases (e.g., the patterns excluded by the hypotheses of `split`); `simp`
-    -- closes other goals (e.g., a third of the nodes of the equations of the CEK evaluation of a validator), `simp only []`
-    -- none (while costing a quarter of the time of these attempts)
+    -- NOTE: `simp_all` closes the contradictory cases (e.g., the patterns excluded by the hypotheses of `split`);
+    -- `simp` closes other goals (e.g., a third of the nodes of the equations of the CEK evaluation of a validator),
+    -- `simp only []` none (while costing a quarter of the time of these attempts)
     let hasHyps ← g.withContext do (← getLCtx).anyM fun d => do return !d.isImplementationDetail && (← isProp d.type)
-    try evalTactic (← if hasHyps then `(tactic| first | (simp [smt_str_empty_lt]; done) | (simp_all [smt_str_empty_lt]; done))
+    try evalTactic (← if hasHyps
+                       then `(tactic| first | (simp [smt_str_empty_lt]; done) | (simp_all [smt_str_empty_lt]; done))
                        else `(tactic| (simp [smt_str_empty_lt]; done)))
     catch _ => pure ()
     if (← getGoals).isEmpty then continue
@@ -664,7 +665,7 @@ def mkCtx (tbl : SymTable) (aux : NameSet) (pairs : Array Pair) (defs : Array Fu
         if h == head then stmts := stmts.push stmt
     if !stmts.isEmpty then
       let started := tasks.filter fun (stmt, _) => stmts.contains stmt
-      debugLog m!"recfun: {stmts.size} statements of the equation of {head} (the same: {stmts.all (· == stmts[0]!)}), {started.size} started beforehand"
+      debugLog m!"recfun: {stmts.size} statements of the equation of {head}, {started.size} started beforehand"
       eqs := eqs.push { stmts, head, fns := #[p.fn, p.defn], proof := ← IO.mkRef none, tasks := ← IO.mkRef started }
   return { eqs, aux, proveDef, proveImp, proveDiff }
 
@@ -673,37 +674,39 @@ def proveEqn (stmt : Expr) : TermElabM (Option Expr) := do
   if stmt.hasFVar then return none
   withLCtx {} {} <| proveWithTactic stmt (← `(tactic| blaster_rec_eqn)) (budget := 2000000)
 
-/-- The proof of the closed definitional equation `stmt` by `blaster_rec_eqn` in a task (see `Local.runAsync`), usable in
-    the current environment (see `Local.inlineNewConstants`). -/
-def proveEqnAsync (stmt : Expr) : TermElabM (Task (Except Exception (Option Expr))) := do
+/-- The proof of the closed definitional equation `stmt` by `blaster_rec_eqn` in a task (see `Local.runAsync`), usable
+    in the current environment (see `Local.inlineNewConstants`), interrupted when `cancelTk?` is set. -/
+def proveEqnAsync (stmt : Expr) (cancelTk? : Option IO.CancelToken := none) :
+    TermElabM (Task (Except Exception (Option Expr))) := do
   let base ← getEnv
-  Local.runAsync do
+  Local.runAsync (cancelTk? := cancelTk?) do
     let some p ← proveEqn stmt | return none
     return some (← Local.inlineNewConstants base (← instantiateMVars p))
 
 /-- Start the proofs of the definitional equations of the functions `fns` (SMT symbols, e.g., the ones of the recursive
-    functions unfolded by the lemmas of the proof) in parallel (see `Local.runAsync`), their case analyses taking seconds each
-    (e.g., 12 s in sequence for the 8 equations of the CEK evaluation of a validator). The proofs are used by
-    `DefEq.get` when they are closed and only use constants of its environment. -/
-def startEqTasks (ctx : Ctx) (fns : Std.HashSet String) : TermElabM Unit := do
+    functions unfolded by the lemmas of the proof) in parallel (see `Local.runAsync`), their case analyses taking
+    seconds each (e.g., 12 s in sequence for the 8 equations of the CEK evaluation of a validator). The proofs are used
+    by `DefEq.get` when they are closed and only use constants of its environment. -/
+def startEqTasks (ctx : Ctx) (fns : Std.HashSet String) (cancelTk? : Option IO.CancelToken := none) :
+    TermElabM Unit := do
   for eq in ctx.eqs do
     if !eq.fns.any fns.contains then continue
     let some stmt := eq.stmts[0]? | continue
     if stmt.hasFVar || stmt.hasMVar then continue
     if (← eq.tasks.get).any (·.1 == stmt) then continue
-    eq.tasks.modify (·.push (stmt, ← proveEqnAsync stmt))
+    eq.tasks.modify (·.push (stmt, ← proveEqnAsync stmt cancelTk?))
 
 /-- Start the proofs of the definitional equations of the recursive functions `pairs` from their axioms in the query
     (see `startEqTasks`), i.e., before the proof of the backend is available (e.g., during the 6 s of the search of Z3
     for a proof of the CEK evaluation of a validator): the started proofs, given to `mkCtx`. -/
-def preStartEqTasks (tbl : SymTable) (pairs : Array Pair) :
+def preStartEqTasks (tbl : SymTable) (pairs : Array Pair) (cancelTk? : Option IO.CancelToken := none) :
     TermElabM (Array (Expr × Task (Except Exception (Option Expr)))) := do
   let mut r := #[]
   for p in pairs do
     let .ok φ := STerm.ofSExpr {} p.formula | continue
     let some (stmt, _) ← interpEqStmt tbl φ | continue
     if stmt.hasFVar || stmt.hasMVar || r.any (·.1 == stmt) then continue
-    r := r.push (stmt, ← proveEqnAsync stmt)
+    r := r.push (stmt, ← proveEqnAsync stmt cancelTk?)
   return r
 
 /-- Proof of the definitional equation `eq` (attempted once; the proof is shared by the lemmas using it). -/
@@ -716,9 +719,6 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
       let t0 ← IO.monoMsNow
       -- the proof started beforehand (see `startEqTasks`), unless it uses declarations of its own environment (e.g.,
       -- equations realized on its branch only, `skipRealize`)
-      let env ← getEnv
-      let usable (p : Expr) : Bool := !p.hasMVar && !p.hasFVar &&
-        (p.find? fun e => e.isConst && !env.contains e.constName! (skipRealize := true)).isNone
       let p ← match tasks.find? (·.1 == stmt) with
         | some (_, t) => match ← traceSlow s!"wait for the equation of {eq.head}" (IO.wait t) with
           | .ok (some p) =>
@@ -730,7 +730,9 @@ def DefEq.get (eq : DefEq) (ctx : Ctx) : TermElabM (Option (Expr × Expr)) := do
                 let missing := (p.getUsedConstants.filter (!env.contains · (skipRealize := true))).toList.take 5
                 debugLog m!"recfun: the proof of the equation of {eq.head} started beforehand uses {missing}"
                 traceSlow "blaster_rec_eqn" (proveEqn stmt)
-          | _ => traceSlow "blaster_rec_eqn" (proveEqn stmt)
+          -- NOTE: the same tactic failed in the task, with the same budget (only an exception of the task is retried)
+          | .ok none => pure none
+          | .error _ => traceSlow "blaster_rec_eqn" (proveEqn stmt)
         | none => traceSlow "blaster_rec_eqn" (proveEqn stmt)
       debugLog m!"recfun: blaster_rec_eqn {if p.isSome then "proved" else "failed"} for {eq.head} ({(← IO.monoMsNow) - t0} ms)"
       if p.isSome then return p

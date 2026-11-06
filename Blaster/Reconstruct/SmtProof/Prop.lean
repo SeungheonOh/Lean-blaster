@@ -46,8 +46,8 @@ def get? (t : Expr) : M (Option Expr) := return (← get).facts.get? t
 
 /-- `fun h : t => b h` built under the binder: `b` places its argument as is (a loose bound variable), the other
     subterms of its result having no loose bound variables (e.g., terms over the local hypotheses of the engine), such
-    that the proofs of the facts are not traversed again by an abstraction at each derivation (quadratic in the length of
-    the derivations, e.g., on the clauses of CEK evaluations). -/
+    that the proofs of the facts are not traversed again by an abstraction at each derivation (quadratic in the length
+    of the derivations, e.g., on the clauses of CEK evaluations). -/
 @[inline] def lam1 (n : Name) (t : Expr) (b : Expr → Expr) : Expr := .lam n t (b (.bvar 0)) .default
 
 /-- Proof of `¬ t` if known (as `¬ t`, or `t := ¬ a` with `a` known). -/
@@ -59,12 +59,8 @@ def getNeg? (t : Expr) : M (Option Expr) := do
   return none
 
 /-- `propext (Iff.intro ab ba) : a = b`. -/
-def mkPropextPure (a b ab ba : Expr) : Expr :=
+def mkPropext (a b ab ba : Expr) : Expr :=
   mkApp3 (mkConst ``propext) a b (mkApp4 (mkConst ``Iff.intro) a b ab ba)
-
-/-- `propext (Iff.intro ab ba) : a = b`. -/
-def mkPropext (a b ab ba : Expr) : MetaM Expr :=
-  return mkPropextPure a b ab ba
 
 /-- `Classical.byContradiction (fun h : ¬ t => k h)` (see `lam1`). -/
 def byContra (t : Expr) (k : Expr → Expr) : Expr :=
@@ -92,7 +88,8 @@ def process (t p : Expr) : M Unit := do
       let b := na.bindingBody!
       if (← isProp' a) && !b.hasLooseBVars then
         addFact a (byContra a fun hna =>
-          mkApp p (lam1 `ha a fun ha => mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp (hna.liftLooseBVars 0 1) ha)))
+          mkApp p (lam1 `ha a fun ha =>
+            mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp (hna.liftLooseBVars 0 1) ha)))
         addFact (mkNot b) (lam1 `hb b fun hb => mkApp p (lam1 `ha a fun _ => hb.liftLooseBVars 0 1))
     -- ¬(ite c a b) (propositions) with `c` (resp. `¬ c`) known: ¬a (resp. ¬b)
     if na.isAppOfArity ``ite 5 && (na.getArg! 0).isProp then
@@ -126,14 +123,14 @@ def process (t p : Expr) : M Unit := do
         if let some pa ← get? a then
           -- b → (a = b)
           let nb := lam1 `hb b fun hb =>
-            mkApp p (mkPropextPure a b (lam1 `x a fun _ => hb.liftLooseBVars 0 1) (lam1 `x b fun _ => pa))
+            mkApp p (mkPropext a b (lam1 `x a fun _ => hb.liftLooseBVars 0 1) (lam1 `x b fun _ => pa))
           addFact (mkNot b) nb
         if let some pna ← getNeg? a then
           -- ¬ b → (a = b)
           let pb := byContra b fun hnb =>
             let ab := lam1 `x a fun x => mkApp2 (mkConst ``False.elim [levelZero]) b (mkApp pna x)
             let ba := lam1 `x b fun x => mkApp2 (mkConst ``False.elim [levelZero]) a (mkApp (hnb.liftLooseBVars 0 1) x)
-            mkApp p (mkPropextPure a b ab ba)
+            mkApp p (mkPropext a b ab ba)
           addFact b pb
     return
   -- a ∧ b
@@ -228,7 +225,7 @@ partial def prove (hyps : Array (Expr × Expr)) (goal : Expr) (splits := 2) : Me
           | some p => some <$> mkLambdaFVars #[h] p
           | none => pure none
         | return none
-      return some (← mkPropext a b ab ba)
+      return some (mkPropext a b ab ba)
   let r ← withLocalDeclD `hn (mkNot goal) fun hn => do
     let act : M (Option Expr) := do
       addFact (mkConst ``True) (mkConst ``True.intro)

@@ -25,8 +25,9 @@ abbrev MatchCongrs := Std.HashMap (Expr × Array Expr × Array (Option Expr)) Ex
 /-- Matchers for which the generation of the match equations and splitter failed. -/
 initialize matchEqnsFailures : IO.Ref NameSet ← IO.mkRef {}
 
-
-/-- The match equations generated so far (see `getEquationsFor?`). -/
+/-- The match equations generated so far (see `getEquationsFor?`).
+    NOTE: keyed by the name of the matcher, e.g., `_example.match_1` for the matchers of different `example`s, which is
+    harmless: only the names of the equations and of the splitter are used, the same for all of them. -/
 initialize matchEqnsCache : IO.Ref (Std.HashMap Name Match.MatchEqns) ← IO.mkRef {}
 
 /-- Same as `Lean.Meta.Match.getEquationsFor` but return `none` when the match equations cannot be
@@ -40,8 +41,10 @@ def getEquationsFor? (n : Name) : MetaM (Option Match.MatchEqns) := do
   -- called for each alternative of the many `match` applications of an optimization (e.g., a fifth of the proof run of
   -- a CEK evaluation); the equations are cached while their declarations are in the environment
   if let some eqns := (← matchEqnsCache.get)[n]? then
-    -- NOTE: the splitter is realized (see `realizeConst`), i.e., possibly on another environment branch
-    if (← getEnv).contains eqns.splitterName (skipRealize := false) then return some eqns
+    -- NOTE: the splitter is realized (see `realizeConst`) on the current environment branch, or generated again: the
+    -- realizations of the other branches are not looked up (e.g., the ones of the previous theorems, which would wait
+    -- for their kernel checks)
+    if (← getEnv).contains eqns.splitterName (skipRealize := true) then return some eqns
   let tasks := (← getThe Core.State).snapshotTasks
   let msgs := (← getThe Core.State).messages
   tryCatchRuntimeEx (do
@@ -167,7 +170,8 @@ def forallAltTelescopeAux
   ) k
 
 /-- `Lean.Meta.MatcherApp.transform` (Lean 4 core, `Lean/Meta/Match/MatcherApp/Transform.lean`, Apache 2.0) without the
-    type checking of the new motive applied to the discriminants (`isTypeCorrect`), whose type is only inferred.
+    type checking of the new motive applied to the discriminants (`isTypeCorrect`), whose type is only inferred (by
+    `inferArgumentTypesN`), and with the match equations of `getEquationsFor?` (cached).
     NOTE: the check traverses the alternatives of the right-hand side of the motive of `mkMatchCasesProof`, i.e., the
     alternatives of the nested `match` applications again at each level (a third of the proof run of a CEK evaluation);
     `mkMatchCasesProof` checks that the sides of the equation of its motive have the same type, the alternatives being
@@ -240,17 +244,16 @@ def transformMatcherApp
     let aux1 := mkAppN (mkConst matcherApp.matcherName matcherLevels.toList) params'
     let aux1 := mkApp aux1 motive'
     let aux1 := mkAppN aux1 discrs'
-    discard <| liftMetaM (inferType aux1)
     let origAltTypes ← inferArgumentTypesN matcherApp.alts.size aux1
 
     -- We replace the matcher with the splitter
-    let matchEqns ← Match.getEquationsFor matcherApp.matcherName
+    let some matchEqns ← liftMetaM (getEquationsFor? matcherApp.matcherName)
+      | throwError "the splitter of {matcherApp.matcherName} cannot be generated"
     let splitter := matchEqns.splitterName
 
     let aux2 := mkAppN (mkConst splitter matcherLevels.toList) params'
     let aux2 := mkApp aux2 motive'
     let aux2 := mkAppN aux2 discrs'
-    discard <| liftMetaM (inferType aux2)
     let altTypes ← inferArgumentTypesN matcherApp.alts.size aux2
 
     let mut alts' := #[]
@@ -290,7 +293,6 @@ def transformMatcherApp
     let aux := mkAppN (mkConst matcherApp.matcherName matcherLevels.toList) params'
     let aux := mkApp aux motive'
     let aux := mkAppN aux discrs'
-    discard <| liftMetaM (inferType aux)
     let altTypes ← inferArgumentTypesN matcherApp.alts.size aux
 
     let mut alts' := #[]
@@ -319,7 +321,6 @@ def transformMatcherApp
       alts          := alts'
       remaining     := remaining'
     }
-
 
 /-- Given a match application `m := matcher ps motive d₁ ... dₙ alt₁ ... altₖ` and `rhsFn` returning
     `rhs[x₁ ... xₙ]` for motive arguments `x₁ ... xₙ`, return a proof of `m = rhsFn #[d₁, ..., dₙ]`.
@@ -367,8 +368,8 @@ def mkMatchCasesProof {n} [MonadLiftT MetaM n] [MonadControlT MetaM n] [Monad n]
       liftMetaM (mkEqTrans pLhs pAlt))
   return app'.toExpr
 
-/-- `p` without its `m` binders following its first `n` binders (i.e., `fun xs ys => b` as `fun xs => b`), when they don't
-    occur in its body. -/
+/-- `p` without its `m` binders following its first `n` binders (i.e., `fun xs ys => b` as `fun xs => b`), when they
+    don't occur in its body. -/
 def dropUnusedBinders? (p : Expr) (n m : Nat) : Option Expr :=
   match n, p with
   | n + 1, .lam x d b bi => (dropUnusedBinders? b n m).map fun b' => .lam x d b' bi
@@ -381,8 +382,9 @@ where
       | .lam _ _ b _ => strip b k
       | _ => none
 
-/-- Proof of `f = g` from `pf := fun x₁ ... xₖ => b` with `b : f x₁ ... xₖ = g x₁ ... xₖ`, where `ty := ∀ x₁ ... xₖ, R` is the
-    type of `f` and `g`: nested applications of `funext`, built under the binders of `pf` (no abstraction of its body). -/
+/-- Proof of `f = g` from `pf := fun x₁ ... xₖ => b` with `b : f x₁ ... xₖ = g x₁ ... xₖ`, where `ty := ∀ x₁ ... xₖ, R`
+    is the type of `f` and `g`: nested applications of `funext`, built under the binders of `pf` (no abstraction of its
+    body). -/
 partial def mkFunExtN (f g pf ty : Expr) (k : Nat) : MetaM Expr := do
   let lvls ← forallBoundedTelescope ty k fun xs r => do
     if xs.size != k then throwError "mkFunExtN: {k} binders expected"
@@ -399,10 +401,11 @@ partial def mkFunExtN (f g pf ty : Expr) (k : Nat) : MetaM Expr := do
     return mkApp5 (mkConst ``funext [u, v]) a (.lam n' a b' bi') (mkAppN f vs) (mkAppN g vs) (.lam n d inner bi)
   go 0 pf ty
 
-/-- `mkMatchCongr` by congruence on the alternatives (`congr`, `funext`), when the evidence of the alternatives doesn't use
-    the equalities between the discriminants and the patterns, nor has proof obligations (`noHoles`, which may use them):
-    no case split (i.e., no instance of the splitter and of the match equations of the alternatives). -/
-def mkMatchCongrByAlts? (app : MatcherApp) (alts' : Array Expr) (altPfs : Array (Option Expr)) : MetaM (Option Expr) := do
+/-- `mkMatchCongr` by congruence on the alternatives (`congr`, `funext`), when the evidence of the alternatives doesn't
+    use the equalities between the discriminants and the patterns, nor has proof obligations (`noHoles`, which may use
+    them): no case split (i.e., no instance of the splitter and of the match equations of the alternatives). -/
+def mkMatchCongrByAlts? (app : MatcherApp) (alts' : Array Expr) (altPfs : Array (Option Expr)) :
+    MetaM (Option Expr) := do
   if app.alts.size != alts'.size || app.alts.size != altPfs.size || app.altNumParams.size != altPfs.size then
     return none
   let nDiscrs := app.discrs.size
@@ -448,12 +451,15 @@ def mkMatchCongrByAlts? (app : MatcherApp) (alts' : Array Expr) (altPfs : Array 
     return a proof of `m = matcher ps motive ds alts'`. The evidence `altPfs[i]` for alternative `i` is:
       - `none` when `altᵢ` and `alt'ᵢ` are definitionally equal;
       - `some p` with `p : ∀ args (h₁ : d₁ = pᵢ₁) ... (hₙ : dₙ = pᵢₙ), altᵢ args = alt'ᵢ args`.
+    When `noHoles` (the evidence has no proof obligation), the congruence is first built without case split (see
+    `mkMatchCongrByAlts?`). The congruences of `cache` are reused when well-scoped; the result tells whether the
+    congruence may be added to it (i.e., whether it is new and has no metavariable).
+    NOTE: the congruence is not type checked here (the kernel checks the resulting proof).
 -/
 def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) (noHoles := false)
     (cache : MatchCongrs := {}) : MetaM (Expr × Bool) := do
   -- NOTE: the optimizer may justify the same rewrite of a `match` application several times (e.g., about a third of
-  -- the congruences of a CEK evaluation), the congruences are reused when they are well-scoped
-  -- (`cache`, the result telling whether the congruence may be added to it, i.e., whether it is new and has no metavariable)
+  -- the congruences of a CEK evaluation)
   if let some p := cache[(m, alts', altPfs)]? then
     let lctx ← getLCtx
     if !p.hasAnyFVar (!lctx.contains ·) then return (p, false)
@@ -461,9 +467,9 @@ def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) 
     | throwError "mkMatchCongr: match application expected"
   -- extra arguments (i.e., match returning a function) are handled via `congrFun`
   if noHoles then
-    if let some p ← (try mkMatchCongrByAlts? app alts' altPfs catch _ => pure none) then
-      let p ← app.remaining.foldlM (init := p) fun acc a => mkCongrFun acc a
-      return (p, true)
+    if let some p ← tryCatchRuntimeEx (mkMatchCongrByAlts? app alts' altPfs) fun _ => pure none then
+      let p ← instantiateMVars (← app.remaining.foldlM (init := p) fun acc a => mkCongrFun acc a)
+      return (p, !p.hasMVar)
   let isCasesOn := isCasesOnRecursor (← getEnv) app.matcherName
   let mkM (discrs : Array Expr) (alts : Array Expr) : Expr :=
     mkAppN (mkConst app.matcherName app.matcherLevels.toList) (app.params ++ #[app.motive] ++ discrs ++ alts)
@@ -480,11 +486,10 @@ def mkMatchCongr (m : Expr) (alts' : Array Expr) (altPfs : Array (Option Expr)) 
   let p ← instantiateMVars p
   return (p, !p.hasMVar)
 
-/-- Given the applications `m := matcher ps motive ds alts` and `m' := matcher' ps' motive ds alts` of two matchers with the
-    same patterns (e.g., the generated matchers of two functions matching on the same patterns, see
+/-- Given the applications `m := matcher ps motive ds alts` and `m' := matcher' ps' motive ds alts` of two matchers with
+    the same patterns (e.g., the generated matchers of two functions matching on the same patterns, see
     `Blaster.Optimize.structEqMatch`), return a proof of `m = m'`: a case split over the alternatives of `m`, the `i`-th
-    alternative of `m'` being reduced by the `i`-th match equation of `matcher'`.
--/
+    alternative of `m'` being reduced by the `i`-th match equation of `matcher'`. -/
 def mkMatchEquivProof (m m' : Expr) : MetaM Expr := do
   let some app ← matchMatcherApp? m | throwError "mkMatchEquivProof: matcher application expected"
   let some app' ← matchMatcherApp? m' | throwError "mkMatchEquivProof: matcher application expected"

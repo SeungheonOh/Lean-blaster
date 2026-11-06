@@ -33,6 +33,7 @@ structure Sig where
   result : SExpr
   deriving Inhabited
 
+/-- The signatures of the symbols of a query and of a proof (see `signatures`). -/
 structure Signatures where
   funs : Std.HashMap String Sig := {}
   /-- constructors of parametric datatypes whose instances are not determined by their arguments (e.g., `List.nil`,
@@ -70,8 +71,9 @@ def signatures (cmds : Array SExpr) (defs : Array FunDef) : Signatures := Id.run
     for c in ctors do
       let (cname, fields) := match c with
         | .atom a => (a, #[])
-        | .list xs => (xs[0]!.atom?.getD "", xs.extract 1 xs.size)
+        | .list xs => ((xs[0]? >>= SExpr.atom?).getD "", xs.extract 1 xs.size)
         | _ => ("", #[])
+      if cname.isEmpty then continue
       let fieldSorts := fields.filterMap fun f => match f with
         | .list #[_, s] => some s
         | _ => none
@@ -80,7 +82,8 @@ def signatures (cmds : Array SExpr) (defs : Array FunDef) : Signatures := Id.run
       for f in fields do
         if let .list #[.atom sel, s] := f then funs := funs.insert sel { params, args := #[dt], result := s }
       sigs := { sigs with funs }
-      if params.any (fun p => !fieldSorts.any (occursIn p)) then sigs := { sigs with hinted := sigs.hinted.insert cname }
+      if params.any (fun p => !fieldSorts.any (occursIn p)) then
+        sigs := { sigs with hinted := sigs.hinted.insert cname }
     return sigs
   for c in cmds do
     let some xs := c.list? | continue
@@ -111,6 +114,7 @@ def signatures (cmds : Array SExpr) (defs : Array FunDef) : Signatures := Id.run
     sigs := { sigs with funs := sigs.funs.insert d.name { args := d.params.map (·.2), result := d.sort } }
   return sigs
 
+/-- The state of the inference: the sort variables, the sorts of the term objects and the hinted terms. -/
 structure State where
   /-- bindings of the sort variables -/
   binds : Array (Option SSort) := #[]
@@ -121,8 +125,10 @@ structure State where
   /-- number of unification failures (e.g., symbols of the query not interpreted as declared) -/
   conflicts : Nat := 0
 
+/-- The monad of the inference. -/
 abbrev M := StateM State
 
+/-- A fresh sort variable. -/
 def fresh : M SSort := modifyGet fun s => (.var s.binds.size, { s with binds := s.binds.push none })
 
 /-- `s` with its bound variables substituted at the root. -/
@@ -144,6 +150,7 @@ partial def zonk (s : SSort) : M SSort := do
   | .con n args => return .con n (← args.mapM zonk)
   | s => return s
 
+/-- Whether the sort variable `i` occurs in `s` (occurs check of `unify`). -/
 partial def occurs (i : Nat) (s : SSort) : M Bool := do
   match ← resolve s with
   | .var j => return i == j
@@ -160,6 +167,7 @@ partial def unify (a b : SSort) : M Unit := do
       if n != m || as.size != bs.size then modify fun s => { s with conflicts := s.conflicts + 1 }
       else for (x, y) in as.zip bs do unify x y
 
+/-- The sorts of the literals and of the built-in operations. -/
 def boolSort : SSort := .con "Bool" #[]
 def intSort : SSort := .con "Int" #[]
 def stringSort : SSort := .con "String" #[]
@@ -193,7 +201,8 @@ where
     | .sym f => app t f #[]
     | .app f args => app t f args
     | .qual f srt args =>
-        let r ← app t f args
+        -- NOTE: no hint, the sort of the application being given
+        let r ← app t f args (hint := false)
         unify r (← ofSExpr sigs.aliases {} srt)
         return r
     | .iapp f idx args =>
@@ -211,8 +220,8 @@ where
         let env' ← vars.foldlM (fun m (x, s) => return m.insert x (← ofSExpr sigs.aliases {} s)) env
         discard <| infer sigs env' body
         if k == .lambda then fresh else return boolSort
-  /-- Application of the symbol `f` (term `t`) to `args`. -/
-  app (t : STerm) (f : String) (args : Array STerm) : M SSort := do
+  /-- Application of the symbol `f` (term `t`) to `args`, recorded as hinted when `hint` (see `Signatures.hinted`). -/
+  app (t : STerm) (f : String) (args : Array STerm) (hint := true) : M SSort := do
     if args.isEmpty then
       if let some s := env.get? f then return s
     let ss ← args.mapM (infer sigs env)
@@ -252,7 +261,7 @@ where
     | "seq.unit" | "seq.empty" => return stringSort
     | _ =>
         let r ← applySig f ss
-        if sigs.hinted.contains f then
+        if hint && sigs.hinted.contains f then
           modify fun st => { st with hintedTerms := st.hintedTerms.push (termAddr t, r) }
         return r
   /-- Application of the declared symbol `f` to arguments of sorts `ss` (a fresh sort when `f` is unknown). -/
@@ -269,6 +278,7 @@ inductive Hint where
   | con (name : String) (args : Array Hint)
   deriving Inhabited, BEq
 
+/-- The hint of a sort (its sort variables being unknown). -/
 partial def SSort.toHint : SSort → Hint
   | .var _ => .unknown
   | .con n args => .con n (args.map SSort.toHint)
@@ -285,15 +295,17 @@ def inferHints (cmds : Array SExpr) (p : Proof) : TermCache Hint × Nat := Id.ru
   let sigs := signatures cmds p.defs
   if sigs.hinted.isEmpty then return ({}, 0)
   let run : M Unit := do
-    -- NOTE: the consumers first, e.g., the conclusion of a `proof-bind` (a lambda) before the conclusion of its premise,
-    -- whose free variables are its bound variables
+    -- NOTE: the consumers first, e.g., the conclusion of a `proof-bind` (a lambda) before the conclusion of its
+    -- premise, whose free variables are its bound variables
     for i' in [:p.steps.size] do
       let step := p.steps[p.steps.size - 1 - i']!
       discard <| infer sigs {} step.concl
       for a in step.args do discard <| infer sigs {} a
   let ((), st) := run.run {}
+  -- NOTE: the hints without any known part are not recorded
   let (hints, st) := (st.hintedTerms.foldlM (init := ({} : TermCache Hint)) fun m (addr, s) => do
-    return m.insert addr (← zonk s).toHint : M (TermCache Hint)).run st
+    let h := (← zonk s).toHint
+    return if h == .unknown then m else m.insert addr h : M (TermCache Hint)).run st
   return (hints, st.conflicts)
 
 end Blaster.Reconstruct.SmtProof.SortInfer

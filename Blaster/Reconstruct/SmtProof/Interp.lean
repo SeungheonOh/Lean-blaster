@@ -590,7 +590,8 @@ partial def hintType (h : SortInfer.Hint) : InterpM Expr := do
   match h with
   | .unknown => mkFreshTypeMVar
   | .con n args =>
-      if args.isEmpty then return ← sortToType (.atom n)
+      -- NOTE: an atomic sort not interpreted by `sortToType` (see above) is unknown
+      if args.isEmpty then return ← mkFreshTypeMVar
       let some t := (← read).table.sorts.get? n | mkFreshTypeMVar
       -- NOTE: as in `sortToType`, `Bool` stands for Lean `Bool` in the sort arguments
       let arg (a : SortInfer.Hint) : InterpM (Option Expr) :=
@@ -608,10 +609,10 @@ partial def hintType (h : SortInfer.Hint) : InterpM Expr := do
           unless ← isDefEq m ty do throwError "smt proof: ill-typed sort hint for {c}"
       instantiateMVars (mkAppN f ms)
 
-/-- The interpretation `x` of the term `t`, recording the hint of `t` (the instance of a constructor application inferred
-    on the whole proof, see `SortInfer`) when its type is not determined yet: the hints are applied to the types that
-    the whole term leaves undetermined (see `applySortHints`), i.e., they don't override the instances that the term
-    determines (e.g., `List Nat` vs. `List Int`, of the same sort `(@List Int)`). -/
+/-- The interpretation `x` of the term `t`, recording the hint of `t` (the instance of a constructor application
+    inferred on the whole proof, see `SortInfer`) when its type is not determined yet: the hints are applied to the
+    types that the whole term leaves undetermined (see `applySortHints`), i.e., they don't override the instances that
+    the term determines (e.g., `List Nat` vs. `List Int`, of the same sort `(@List Int)`). -/
 def withSortHint (t : STerm) (x : InterpM Expr) : InterpM Expr := do
   let e ← x
   let some ref := (← read).pendingHints | return e

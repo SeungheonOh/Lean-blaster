@@ -69,16 +69,18 @@ structure State where
 
 abbrev BridgeM := ReaderT Cfg (StateRefT State Term.TermElabM)
 
-/-- Whether `p` contains one of the hypotheses `facts` of the current branch. Memoized across the walk (linear in
-    total): a proof built in a branch only contains the hypotheses of that branch and of the enclosing ones (those of
-    the other branches are abstracted), such that the hypotheses of all the branches met so far can be checked.
+/-- Whether `p` contains one of the hypotheses of the branches met so far (`facts` being those of the current branch).
+    Memoized across the walk (linear in total): a proof built in a branch only contains the hypotheses of that branch
+    and of the enclosing ones (those of the other branches are abstracted), such that the hypotheses of all the branches
+    met so far can be checked.
     NOTE: `Expr.hasAnyFVar` on the proof of each node re-traverses the proofs of the subterms (e.g., 40 s for the
     asserted formula of a CEK evaluation, under nested conditionals). -/
 def containsFact (facts : Array Expr) (p : Expr) : BridgeM Bool := do
   if !p.hasFVar then return false
   modify fun s => { s with factIds := facts.foldl (fun acc h => acc.insert h.fvarId!) s.factIds }
   let ids := (← get).factIds
-  let mut memo := (← get).factMemo
+  -- NOTE: taken out of the state, such that it is updated in place
+  let mut memo ← modifyGet fun s => (s.factMemo, { s with factMemo := {} })
   let mut stack : Array (Expr × Bool) := #[(p, false)]
   while !stack.isEmpty do
     let (e, expanded) := stack.back!

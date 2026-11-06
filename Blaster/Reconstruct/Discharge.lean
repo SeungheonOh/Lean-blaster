@@ -50,6 +50,10 @@ def DischargeStats.summary (s : DischargeStats) : String :=
 /-- Maximum number of heartbeats (in thousands) allowed for each discharge attempt. -/
 def dischargeHeartbeats : Nat := 50000
 
+/-- Return `true` if an attempt that consumed `used` heartbeats exhausted its budget of `budget` thousand heartbeats
+    (at least 90%, see `withHeartbeatBudget`). -/
+def budgetExhausted (budget used : Nat) : Bool := 10 * used ≥ 9 * budget * 1000
+
 /-- Execute `x` with a fresh heartbeat budget of `n` thousand heartbeats. -/
 @[inline] def withHeartbeatBudget [Monad m] [MonadWithReaderOf Core.Context m] [MonadLiftT BaseIO m]
   [MonadControlT CoreM m] (n : Nat) (x : m α) : m α :=
@@ -719,15 +723,22 @@ partial def casesPropHyps (g : MVarId) (fuel : Nat) : MetaM (List MVarId) := g.w
     return res
   return [g]
 
-/-- Run `tac` on the goals and keep its effect only when it closes all of them. -/
+/-- Run `tac` on the goals and keep its effect only when it closes all of them (any exception, including runtime ones
+    such as the maximum recursion depth, is a failure). -/
 def closesGoals (tac : TacticM Unit) : TacticM Bool := do
   let s ← saveState
-  try
-    tac
-    if (← getUnsolvedGoals).isEmpty then return true
-  catch _ => pure ()
-  s.restore
-  return false
+  let closed ← tryCatchRuntimeEx (do tac; return (← getUnsolvedGoals).isEmpty) fun _ => pure false
+  if !closed then s.restore
+  return closed
+
+/-- Maximum number of case analyses on hypotheses when looking for a contradiction (see `inhabitGoal`). -/
+def inhabitCasesFuel : Nat := 8
+
+/-- Maximum number of constructor applications tried for an element of a type (see `inhabitGoal`). -/
+def inhabitMaxCandidates : Nat := 64
+
+/-- Maximum number of nested constructors of an element of a type (see `inhabitGoal`). -/
+def inhabitDepth : Nat := 2
 
 /-- Construct an element of the type of the main goal (e.g., `SomeBig` with the constructor
     `intro (n : Nat) (h : n > 5)`, `FalseInv → TrueInv`, or `FalseInv → Empty` with `FalseInv` false):
@@ -740,7 +751,7 @@ partial def inhabitGoal (depth : Nat) : TacticM Bool := do
   if ← closesGoals (evalTactic (← `(tactic| first | exact default | trivial | decide | omega))) then return true
   let contra : TacticM Unit := do
     evalTactic (← `(tactic| exfalso))
-    replaceMainGoal (← casesPropHyps (← getMainGoal) 8)
+    replaceMainGoal (← casesPropHyps (← getMainGoal) inhabitCasesFuel)
     evalTactic (← `(tactic| all_goals first | omega | decide | (simp_all; done)))
   if ← closesGoals contra then return true
   if depth == 0 then return false
@@ -751,10 +762,12 @@ partial def inhabitGoal (depth : Nat) : TacticM Bool := do
   let mut seeds := literalSeeds t
   for c in info.ctors do seeds := seeds ++ literalSeeds (← getConstInfo c).type
   let seeds' := (seeds.qsort (· < ·)).toList.eraseDups.toArray
-  for c in (← g.withContext (witnessCandidates t seeds' #[] 1)).extract 0 64 do
+  for c in (← g.withContext (witnessCandidates t seeds' #[] 1)).extract 0 inhabitMaxCandidates do
     let close : TacticM Unit := do
       evalTactic (← `(tactic| refine $c))
       for g' in ← getUnsolvedGoals do
+        -- NOTE: a goal may be assigned when closing an earlier one (e.g., a data field determined by a proof field)
+        if ← g'.isAssigned then continue
         setGoals [g']
         unless ← closesGoals (evalTactic (← `(tactic| first | omega | decide | (simp_all; done)))) do
           unless ← inhabitGoal (depth - 1) do throwError "blaster_inhabit: field not constructed"
@@ -764,7 +777,7 @@ partial def inhabitGoal (depth : Nat) : TacticM Bool := do
 
 @[tactic blasterInhabit] def evalBlasterInhabit : Tactic := fun _ =>
   focus do
-    unless ← inhabitGoal 2 do throwError "blaster_inhabit: no element constructed"
+    unless ← inhabitGoal inhabitDepth do throwError "blaster_inhabit: no element constructed"
 
 @[tactic blasterExists] def evalBlasterExists : Tactic := fun _ => do
   let g ← getMainGoal
@@ -776,21 +789,16 @@ partial def inhabitGoal (depth : Nat) : TacticM Bool := do
     if d.isImplementationDetail || d.userName.isInaccessibleUserName then continue
     if ← g.withContext (isDefEq d.type t) then vars := vars.push (mkIdent d.userName)
   let candidates ← g.withContext (witnessCandidates t (literalSeeds target) vars 2)
-  let s ← saveState
   for c in candidates do
-    try
-      evalTactic (← `(tactic| (refine ⟨$c, ?_⟩ <;>
-        (try blaster_unfold_user) <;> first | omega | decide | (simp_all; done) | (simp_all <;> omega))))
-      if (← getUnsolvedGoals).isEmpty then return
-      s.restore
-    catch _ => s.restore
-  -- a witness constructed from the type (e.g., `FalseInv → Empty` with `FalseInv` false)
+    if ← closesGoals (evalTactic (← `(tactic| (refine ⟨$c, ?_⟩ <;>
+        (try blaster_unfold_user) <;> first | omega | decide | (simp_all; done) | (simp_all <;> omega))))) then
+      return
+  -- a witness constructed from the type when it has no candidate witnesses (e.g., the function type `FalseInv → Empty`
+  -- with `FalseInv` false)
   if candidates.isEmpty then
-    try
-      evalTactic (← `(tactic| (refine ⟨?_, ?_⟩ <;> first | blaster_inhabit | trivial | omega | (simp_all; done))))
-      if (← getUnsolvedGoals).isEmpty then return
-      s.restore
-    catch _ => s.restore
+    if ← closesGoals (evalTactic
+        (← `(tactic| (refine ⟨?_, ?_⟩ <;> first | blaster_inhabit | trivial | omega | (simp_all; done))))) then
+      return
   throwError "blaster_exists: no witness found"
 
 /-! ## Equivalence of recursive functions
@@ -1103,9 +1111,9 @@ def isMatchToDite (env : Environment) (type : Expr) : Bool := Id.run do
   let isDite (e : Expr) := e.consumeMData.getAppFn.isConstOf ``Blaster.dite'
   return (isMatch lhs && isDite rhs) || (isDite lhs && isMatch rhs)
 
-/-- Index in `dischargeTactics` before which the case analysis on stuck `match` applications is tried for the
-    normalizations of `match` applications to `Blaster.dite'` chains (i.e., after `simp`, `omega` and `grind`). -/
-def matchToDiteEarlyIdx : Nat := 3
+/-- The tactics of `dischargeTactics` tried before the case analysis on stuck `match` applications for the
+    normalizations of `match` applications to `Blaster.dite'` chains (see `dischargeOneAux`). -/
+def matchToDiteCheapTactics : List String := ["simp", "omega", "grind"]
 
 /-- Return the first free variable a `match` application of `e` is stuck on. -/
 def findMatchStuckFVar? (e : Expr) : MetaM (Option FVarId) := do
@@ -1145,9 +1153,10 @@ syntax (name := blasterMatchCases) "blaster_match_cases" : tactic
 def matchCasesTactic : TermElabM (TSyntax `tactic) :=
   `(tactic| (intros <;> (try subst_vars) <;> blaster_denorm <;> blaster_match_cases <;>
               (try dsimp only at *) <;>
-              -- the `match` applications `dsimp` leaves stuck (e.g., the `Int` literal patterns, whose `Int.decEq` tests
-              -- `whnf` does not unfold), reduced by the equation theorems of the matcher; before any lemma normalizing
-              -- the discriminants (e.g., `Int.ofNat (n + 4)` as `↑n + 4`, which no equation theorem matches)
+              -- the `match` applications `dsimp` leaves stuck (e.g., the `Int` literal patterns, whose `Int.decEq`
+              -- tests `whnf` does not unfold), reduced by the equation theorems of the matcher; before any lemma
+              -- normalizing the discriminants (e.g., `Int.ofNat (n + 4)` as `↑n + 4`, which no equation theorem
+              -- matches)
               (try simp (config := { decide := true }) only [] at *) <;>
               first | rfl | omega
                     -- the conditionals of the other side (e.g., the `Blaster.dite'` chain of the optimizer), decided
@@ -1186,18 +1195,21 @@ mutual
 /-- Try to discharge proof obligation `type` (expected to be an equality) and return the proof together with
     the method used and, when the proof is given by a tactic of `dischargeTactics`, its index.
     The tactic of index `first?` (e.g., the one that discharged the previous obligation with the same origin,
-    see `dischargeHoles`) is tried first.
+    see `dischargeHoles`) is tried first. The strategies are tried in increasing cost: the cheap ones (`rfl`, kernel
+    evaluation, the tactics of `dischargeTactics`), then `early` (the caller's strategy, e.g., the replay of an SMT
+    proof), then the costly case analyses, which are skipped when `cheap` is set. The cheap strategies are skipped when
+    `skipCheap` is set (e.g., when they already failed in a speculative attempt, see `startDischarges`).
 -/
 partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : Option Nat := none)
-    (early : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) (cheap := false) :
+    (early : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) (cheap := false) (skipCheap := false) :
     TermElabM (Option (Expr × String × Option Nat)) := do
   let type ← instantiateMVars type
   -- ill-typed proof obligations (e.g., due to ill-typed optimized expressions) can't be discharged
   if !(← isTypeCorrectObligation type) then
     if (← IO.getEnv "BLASTER_RECON_DEBUG").isSome then
-      try Meta.check type catch ex => logInfo m!"ill-typed proof obligation: {ex.toMessageData}"
+      tryCatchRuntimeEx (Meta.check type) fun ex => logInfo m!"ill-typed proof obligation: {ex.toMessageData}"
     if ← isProfiling then
-      let msg ← try Meta.check type; pure "budget" catch ex => pure (← ex.toMessageData.toString)
+      let msg ← tryCatchRuntimeEx (do Meta.check type; pure "budget") fun ex => ex.toMessageData.toString
       profileLog "obligation.illtyped" 0 fun _ => msg.take 2000
     return none
   -- NOTE: case analysis on (or unfolding of) large `match` expressions requires the generation of
@@ -1206,30 +1218,34 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
   let tacs ← dischargeTactics
   let skip (name : String) : Bool := large && name ∈ ["split", "cases", "induction"]
   let first := first?.filter fun i => i < tacs.size && !skip tacs[i]!.1
-  if let some i := first then
-    let (name, tac) := tacs[i]!
-    if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
-  if let some prf ← profileAttempt "rfl" (proveByDefEq type) then return some (prf, "rfl", none)
-  -- closed obligations (e.g., concrete computations) are decided by kernel evaluation
-  if !type.hasFVar && !type.hasMVar then
-    if let some prf ← profileAttempt "decide" (proveWithTactic type (← `(tactic| decide +kernel))) then
-      return some (prf, "decide", none)
-    -- closed computations involving well-founded recursion
-    if let some prf ← profileAttempt "wf_eval"
-        (proveWithTactic type (← `(tactic| blaster_wf_eval)) (budget := 4 * dischargeHeartbeats)) then
-      return some (prf, "decide", none)
   -- the normalization of a `match` to a chain of `Blaster.dite'` (`normMatchExpr?`): the case analysis on the variables
-  -- the `match` is stuck on, after the cheap tactics but before the costly case analyses of the portfolio (e.g., `split`
-  -- on large terms, which fail after seconds on the `match` normalizations over `Int` literal patterns)
+  -- the `match` is stuck on, after the cheap tactics but before the costly case analyses of the portfolio (e.g.,
+  -- `split` on large terms, which fail after seconds on the `match` normalizations over `Int` literal patterns)
   let matchToDite := depth == matchCasesDepth && isMatchToDite (← getEnv) type
   let stuckCases : TermElabM (Option Expr) :=
     profileAttempt "match stuck cases" (proveWithTactic type (← matchCasesTactic) (budget := 4 * dischargeHeartbeats))
-  for h : i in [0:tacs.size] do
-    let (name, tac) := tacs[i]
-    if matchToDite && i == matchToDiteEarlyIdx then
-      if let some prf ← stuckCases then return some (prf, "match cases", none)
-    if skip name || first == some i then continue
-    if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
+  -- the cheap strategies (unless `skipCheap`)
+  if !skipCheap then
+    if let some i := first then
+      let (name, tac) := tacs[i]!
+      if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
+    if let some prf ← profileAttempt "rfl" (proveByDefEq type) then return some (prf, "rfl", none)
+    -- closed obligations (e.g., concrete computations) are decided by kernel evaluation
+    if !type.hasFVar && !type.hasMVar then
+      if let some prf ← profileAttempt "decide" (proveWithTactic type (← `(tactic| decide +kernel))) then
+        return some (prf, "decide", none)
+      -- closed computations involving well-founded recursion
+      if let some prf ← profileAttempt "wf_eval"
+          (proveWithTactic type (← `(tactic| blaster_wf_eval)) (budget := 4 * dischargeHeartbeats)) then
+        return some (prf, "decide", none)
+    let mut stuckTried := false
+    for h : i in [0:tacs.size] do
+      let (name, tac) := tacs[i]
+      if matchToDite && !stuckTried && !matchToDiteCheapTactics.contains name then
+        stuckTried := true
+        if let some prf ← stuckCases then return some (prf, "match cases", none)
+      if skip name || first == some i then continue
+      if let some prf ← profileAttempt s!"{i}:{name}" (proveWithTactic type tac) then return some (prf, name, some i)
   -- the caller's strategy before the costly case analyses (e.g., the replay of an SMT proof, which proves in less than
   -- a second obligations of CEK evaluations on which the case analyses below fail after a minute)
   if let some (prf, m) ← profileAttempt "early" (early type) then return some (prf, m, none)
@@ -1495,14 +1511,17 @@ def relevantContext? (type : Expr) : MetaM (Option (LocalContext × LocalInstanc
     `relevantContext?`), i.e., without the hypotheses on other variables.
     NOTE: The hypotheses of the goal (e.g., the evaluation of a validator) may be large, while proof
     obligations usually only depend on a few variables. Tactics using all the hypotheses (e.g., `grind`,
-    `simp [*]`) are much faster without them. The obligation is discharged in the whole local context
-    otherwise.
+    `simp [*]`) are much faster without them. When all the strategies fail in the relevant local context, the cheap
+    ones are tried in the whole local context.
 -/
 def dischargeInContext (type : Expr) (first? : Option Nat := none)
-    (early : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) :
+    (early : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) (skipCheap := false) :
     TermElabM (Option (Expr × String × Option Nat)) := do
-  let some (lctx, insts) ← relevantContext? type | dischargeOneAux type (first? := first?) (early := early)
-  if let some r ← withLCtx lctx insts (dischargeOneAux type (first? := first?) (early := early)) then return some r
+  let some (lctx, insts) ← relevantContext? type
+    | dischargeOneAux type (first? := first?) (early := early) (skipCheap := skipCheap)
+  if let some r ← withLCtx lctx insts
+      (dischargeOneAux type (first? := first?) (early := early) (skipCheap := skipCheap)) then
+    return some r
   -- NOTE: the costly strategies (and `early`) failed in the relevant context: the full context only for the tactics
   dischargeOneAux type (first? := first?) (cheap := true)
 
@@ -1526,36 +1545,42 @@ def closedObligation? (type : Expr) : MetaM (Option (Expr × Array Expr)) := do
     applications of all the matchers). -/
 def labelKind (label : String) : String := ":".intercalate ((label.splitOn ":").take 2)
 
+/-- Return `true` if `label` is the label of an equivalence between recursive functions (see `storeRecFunDef`). -/
+def isRecFunEquivLabel (label : String) : Bool := label.startsWith "rule:recFunEquiv:"
+
 /-- The index of the tactic tried first on a proof obligation with label `label` (see `dischargeOneAux`): the one that
-    discharged the last obligation with the same label, or of the same kind (`preferred`), induction for the equivalences
-    of recursive functions (the case analyses tried before it fail after their budget, e.g., 1.6 s on a CEK evaluation). -/
+    discharged the last obligation with the same label, or of the same kind (`preferred`), induction for the
+    equivalences of recursive functions (the case analyses tried before it fail after their budget, e.g., 1.6 s on a CEK
+    evaluation). -/
 def firstTactic? (preferred : Std.HashMap String Nat) (label : String) : TermElabM (Option Nat) := do
   match preferred.get? label, preferred.get? (labelKind label) with
   | some i, _ => return some i
   | none, some i => return some i
   | none, none =>
-    if label.startsWith "rule:recFunEquiv:" then return (← dischargeTactics).findIdx? (·.1 == "induction")
+    if isRecFunEquivLabel label then return (← dischargeTactics).findIdx? (·.1 == "induction")
     else return none
 
-/-- The speculative discharge of the closed proof obligations `goals` (see `closedObligation?`, with their labels) by the
-    strategies of `dischargeOneAux` without its costly case analyses, in tasks (see `SmtProof.Local.runAsync`), `width`
-    at a time in the order of `goals`, the tactics that discharged them being preferred for the next ones (see
-    `firstTactic?`): their closed proofs, usable in the current environment (see `SmtProof.Local.inlineNewConstants`),
-    with their method and tactic. -/
-def startDischarges (goals : Array (Expr × String)) (width : Nat) :
+/-- The speculative discharge of the closed proof obligations `goals` (see `closedObligation?`: the closed form, its
+    number of variables and the label of the obligation) by the strategies of `dischargeOneAux` without its costly case
+    analyses, in tasks (see `SmtProof.Local.runAsync`), `width` at a time in the order of `goals`, the tactics that
+    discharged them being preferred for the next ones (see `firstTactic?`): their closed proofs, usable in the current
+    environment (see `SmtProof.Local.inlineNewConstants`), with their method and tactic. The tasks stop (and their
+    pending results are `none`) once `stop` is set. -/
+def startDischarges (goals : Array (Expr × Nat × String)) (width : Nat) (stop : IO.CancelToken) :
     TermElabM (Array (Task (Option (Expr × String × Option Nat)))) := do
   let base ← getEnv
   let promises ← goals.mapM fun _ => (IO.Promise.new : BaseIO (IO.Promise (Option (Expr × String × Option Nat))))
   let next ← IO.mkRef 0
   let preferred ← IO.mkRef ({} : Std.HashMap String Nat)
   for _ in [:min width goals.size] do
-    discard <| SmtProof.Local.runAsync do
+    discard <| SmtProof.Local.runAsync (cancelTk? := some stop) do
       repeat
+        if ← stop.isSet then break
         let i ← next.modifyGet fun i => (i, i + 1)
-        let (some (g, label), some p) := (goals[i]?, promises[i]?) | break
+        let (some (g, n, label), some p) := (goals[i]?, promises[i]?) | break
         let r ← tryCatchRuntimeEx (do
             let first? ← firstTactic? (← preferred.get) label
-            forallTelescope g fun xs body => do
+            forallBoundedTelescope g (some n) fun xs body => do
               let some (prf, m, i?) ← dischargeOneAux body (first? := first?) (cheap := true) | return none
               if let some j := i? then preferred.modify (·.insert label j |>.insert (labelKind label) j)
               let prf ← instantiateMVars (← mkLambdaFVars xs prf)
@@ -1590,98 +1615,109 @@ partial def dischargeHoles
   -- first.
   let solved ← IO.mkRef ({} : Std.HashMap ExprStructEq (Expr × String))
   let preferred ← IO.mkRef ({} : Std.HashMap String Nat)
-  -- the obligations on which `fallback` failed (tried before the costly strategies of the first pass)
+  -- the obligations on which `fallback` failed (tried before the costly strategies of the first pass), by their closed
+  -- form when they have one (see `closedObligation?`)
+  -- NOTE: each traversal (see `transformScoped`) declares the binders enclosing an obligation with fresh free variables
+  let obligationKey (type : Expr) : TermElabM ExprStructEq := do
+    return ((← closedObligation? type).map (·.1)).getD type
   let fallbackFailed ← IO.mkRef ({} : Std.HashSet ExprStructEq)
   let early (type : Expr) : TermElabM (Option (Expr × String)) := do
     let r ← fallback type
-    if r.isNone then fallbackFailed.modify (·.insert type)
+    if r.isNone then fallbackFailed.modify (·.insert (← obligationKey type))
     return r
+  -- the bookkeeping of a discharged obligation (the proof reused for the same obligation, the tactic preferred for the
+  -- next ones with the same label, the equivalences of recursive functions used as hypotheses by the second pass)
+  let record (type : Expr) (label : String) (prf : Expr) (method : String) (i? : Option Nat) : TermElabM Unit := do
+    stats.modify (·.record method label)
+    solved.modify (·.insert type (prf, method))
+    if let some i := i? then preferred.modify (·.insert label i |>.insert (labelKind label) i)
+    if isRecFunEquivLabel label then
+      if let some f ← generalizeFact type prf then facts.modify (·.push f)
   -- the obligations discharged speculatively, in parallel (see `startDischarges`; environment variable
-  -- `BLASTER_RECON_PARDISCHARGE`: the number of tasks, default 6, 0: none), e.g., the obligations of the CEK evaluation of
-  -- a validator proved by `grind` in about 0.4 s each
+  -- `BLASTER_RECON_PARDISCHARGE`: the number of tasks, default 6, 0: none), e.g., the obligations of the CEK evaluation
+  -- of a validator proved by `grind` in about 0.4 s each
   let width := ((← IO.getEnv "BLASTER_RECON_PARDISCHARGE").bind String.toNat?).getD 6
+  -- NOTE: set after the first pass (or on an exception), i.e., once the speculative results can no longer be used
+  let stop ← IO.CancelToken.new
   let spec : Std.HashMap ExprStructEq (Task (Option (Expr × String × Option Nat))) ←
     if width == 0 || holes.size < 2 then pure {} else
     withProfile "dischargeHoles.speculation" do
-      let goals ← IO.mkRef (#[] : Array (Expr × String))
+      let goals ← IO.mkRef (#[] : Array (Expr × Nat × String))
       let seen ← IO.mkRef ({} : Std.HashSet ExprStructEq)
+      let byDefEq ← IO.mkRef ({} : Std.HashMap ExprStructEq (Task (Option (Expr × String × Option Nat))))
       discard <| transformScoped p fun e => do
         let some type := holeType? e | return none
-        let type ← instantiateMVars type
+        let some (g, xs) ← closedObligation? (← instantiateMVars type) | return none
+        if (← seen.get).contains g then return none
+        seen.modify (·.insert g)
         -- NOTE: the obligations discharged by definitional unfolding (most of them, e.g., the projections of
-        -- constructor applications) are discharged here (see `solved`), the other ones speculatively
-        if (← solved.get).contains type then return none
+        -- constructor applications) are discharged here, the other ones speculatively
         if let some prf ← proveByDefEq type then
-          solved.modify (·.insert type (prf, "rfl"))
-          return none
-        if let some (g, _) ← closedObligation? type then
-          if !(← seen.get).contains g then
-            seen.modify (·.insert g)
-            goals.modify (·.push (g, labelOf e))
+          let prf ← instantiateMVars (← mkLambdaFVars xs prf)
+          if !prf.hasFVar && !prf.hasMVar then
+            byDefEq.modify (·.insert g (.pure (some (prf, "rfl", none))))
+            return none
+        goals.modify (·.push (g, xs.size, labelOf e))
         return none
       let goals ← goals.get
-      let tasks ← startDischarges goals width
-      return (goals.zip tasks).foldl (init := ({} : Std.HashMap ExprStructEq (Task (Option (Expr × String × Option Nat)))))
-        fun m ((g, _), t) => m.insert g t
+      let tasks ← startDischarges goals width stop
+      return (goals.zip tasks).foldl (init := ← byDefEq.get) fun m ((g, _), t) => m.insert g t
   -- first pass
-  let p' ← withProfile "dischargeHoles.first" (info := fun p' => s!"dag={dagSize p'}") <| transformScoped p fun e => do
-    match holeType? e with
-    | none => return none
-    | some type =>
-        let label := labelOf e
-        stats.modify fun s => { s with total := s.total + 1 }
-        let type ← instantiateMVars type
-        if let some (prf, method) := (← solved.get).get? type then
-          let lctx ← getLCtx
-          if !prf.hasAnyFVar (!lctx.contains ·) then
-            stats.modify (·.record method label)
-            return some prf
-        -- the speculative discharge (see `startDischarges`)
-        if !spec.isEmpty then
-          if let some (g, xs) ← closedObligation? type then
-            if let some t := spec.get? g then
-              if let some (pf, method, i?) ← IO.wait t then
-                -- the realizations of the task (e.g., the splitters of matchers), shared between the environments
-                SmtProof.Local.realizeReservedNames pf
-                let env ← getEnv
-                if pf.getUsedConstants.all (env.contains · (skipRealize := true)) then
-                  let prf := pf.beta xs
-                  stats.modify (·.record method label)
-                  solved.modify (·.insert type (prf, method))
-                  if let some i := i? then preferred.modify (·.insert label i |>.insert (labelKind label) i)
-                  if label.startsWith "rule:recFunEquiv" then
-                    if let some f ← generalizeFact type prf then facts.modify (·.push f)
-                  return some prf
-        let start ← IO.monoMsNow
-        -- NOTE: the equivalences of recursive functions are proved by induction (the case analyses tried before it fail
-        -- after their budget, e.g., 1.6 s on a CEK evaluation), unless another tactic discharged one with the same label
-        -- (or the one of the last obligation of the same kind, e.g., `rule:matchReduction` for the reductions of the
-        -- `match` applications of different matchers, discharged by `grind` after the failures of `simp` and `omega`)
-        let first? ← firstTactic? (← preferred.get) label
-        let r ← withoutSharedProofs (dischargeInContext type (first? := first?) (early := early))
-        let ms := (← IO.monoMsNow) - start
-        if ms ≥ 1000 then
-          profileLog "obligation" ms fun _ => s!"{label} {(r.map (·.2.1)).getD "failed"} hash={type.hash}"
-          if ← isProfiling then
-            let fvs := (collectFVars {} type).fvarIds.size
-            profileLog "obligation.type" 0 fun _ => s!"fvars={fvs} dag={dagSize type}"
-            if !(← preferred.get).contains label then
-              let (lctx, insts) := (← relevantContext? type).getD (← getLCtx, ← getLocalInstances)
-              let pp := toString (← withLCtx lctx insts (Meta.ppGoal (← mkFreshExprMVar type).mvarId!))
-              profileLog "obligation.goal" 0 fun _ => (pp.take 4000).replace "\n" "\n    "
-        match r with
-        | some (prf, method, i?) =>
-            stats.modify (·.record method label)
-            solved.modify (·.insert type (prf, method))
-            if let some i := i? then preferred.modify (·.insert label i |>.insert (labelKind label) i)
-            if label.startsWith "rule:recFunEquiv" then
-              if let some f ← generalizeFact type prf then facts.modify (·.push f)
-            return some prf
-        | none => return some e
+  let firstPass : TermElabM Expr :=
+    withProfile "dischargeHoles.first" (info := fun p' => s!"dag={dagSize p'}") <| transformScoped p fun e => do
+      match holeType? e with
+      | none => return none
+      | some type =>
+          let label := labelOf e
+          stats.modify fun s => { s with total := s.total + 1 }
+          let type ← instantiateMVars type
+          if let some (prf, method) := (← solved.get).get? type then
+            let lctx ← getLCtx
+            if !prf.hasAnyFVar (!lctx.contains ·) then
+              stats.modify (·.record method label)
+              return some prf
+          -- the speculative discharge (see `startDischarges`), whose cheap strategies are not tried again when it
+          -- failed (in the relevant local context, i.e., the one of the closed form of the obligation)
+          let mut skipCheap := false
+          if !spec.isEmpty then
+            if let some (g, xs) ← closedObligation? type then
+              if let some t := spec.get? g then
+                match ← IO.wait t with
+                | some (pf, method, i?) =>
+                    if ← SmtProof.Local.usableProof pf then
+                      let prf := pf.beta xs
+                      record type label prf method i?
+                      return some prf
+                | none => skipCheap := true
+          let start ← IO.monoMsNow
+          -- NOTE: the equivalences of recursive functions are proved by induction (the case analyses tried before it
+          -- fail after their budget, e.g., 1.6 s on a CEK evaluation), unless another tactic discharged one with the
+          -- same label (or the one of the last obligation of the same kind, e.g., `rule:matchReduction` for the
+          -- reductions of the `match` applications of different matchers, discharged by `grind` after the failures of
+          -- `simp` and `omega`)
+          let first? ← firstTactic? (← preferred.get) label
+          let r ← withoutSharedProofs
+            (dischargeInContext type (first? := first?) (early := early) (skipCheap := skipCheap))
+          let ms := (← IO.monoMsNow) - start
+          if ms ≥ 1000 then
+            profileLog "obligation" ms fun _ => s!"{label} {(r.map (·.2.1)).getD "failed"} hash={type.hash}"
+            if ← isProfiling then
+              let fvs := (collectFVars {} type).fvarIds.size
+              profileLog "obligation.type" 0 fun _ => s!"fvars={fvs} dag={dagSize type}"
+              if !(← preferred.get).contains label then
+                let (lctx, insts) := (← relevantContext? type).getD (← getLCtx, ← getLocalInstances)
+                let pp := toString (← withLCtx lctx insts (Meta.ppGoal (← mkFreshExprMVar type).mvarId!))
+                profileLog "obligation.goal" 0 fun _ => (pp.take 4000).replace "\n" "\n    "
+          match r with
+          | some (prf, method, i?) =>
+              record type label prf method i?
+              return some prf
+          | none => return some e
+  let p' ← try firstPass finally stop.set
   reportAttempts
   -- second pass (with proved equivalences as hypotheses), fallback regions and failure reporting
   let fallback (type : Expr) : TermElabM (Option (Expr × String)) := do
-    if (← fallbackFailed.get).contains type then return none
+    if (← fallbackFailed.get).contains (← obligationKey type) then return none
     fallback type
   let (p', st) ← withProfile "dischargeHoles.second" (secondPass (← facts.get) labelOf fallback p')
   reportAttempts
@@ -1907,12 +1943,12 @@ syntax (name := blasterNoMatch) "blaster_nomatch" : tactic
         Core.setMessageLog msgs
   throwError "blaster_nomatch: no element of an empty type"
 
-/-- `goal` closed over its free variables (and the ones their declarations depend on) and over the hypotheses of the local
-    context that only mention them, together with these variables and hypotheses (in the order of the local context). -/
-def closeOverLocals (goal : Expr) : MetaM (Array Expr × Expr) := do
+/-- The declarations of the local context that the free variables of `es` depend on (transitively, through the types
+    and values of the declarations), in the order of the local context. -/
+def fvarClosure (es : Array Expr) : MetaM (Array LocalDecl) := do
   let collect (e : Expr) : Array FVarId := (Lean.CollectFVars.main e {}).fvarIds
   let mut set : FVarIdSet := {}
-  let mut todo : Array FVarId := collect goal
+  let mut todo : Array FVarId := es.foldl (· ++ collect ·) #[]
   while h : todo.size > 0 do
     let fv := todo[todo.size - 1]
     todo := todo.pop
@@ -1920,26 +1956,40 @@ def closeOverLocals (goal : Expr) : MetaM (Array Expr × Expr) := do
     set := set.insert fv
     let d ← fv.getDecl
     todo := todo ++ collect d.type ++ ((d.value?.map collect).getD #[])
+  return (← getLCtx).decls.toArray.filterMap fun d? => d?.filter (set.contains ·.fvarId)
+
+/-- `goal` closed over its free variables (see `fvarClosure`) and over the hypotheses of the local context that only
+    mention them, together with these variables and hypotheses (in the order of the local context), or `none` when it
+    depends on `let` variables. -/
+def closeOverLocals (goal : Expr) : MetaM (Option (Array Expr × Expr)) := do
+  let decls ← fvarClosure #[goal]
+  if decls.any (·.isLet) then return none
+  let set : FVarIdSet := decls.foldl (·.insert ·.fvarId) {}
   let mut xs := #[]
   for d in ← getLCtx do
     if d.isImplementationDetail then continue
     if set.contains d.fvarId then xs := xs.push d.toExpr
-    else if !d.isLet && (← isProp d.type) && (collect d.type).all set.contains then xs := xs.push d.toExpr
-  return (xs, ← mkForallFVars xs goal)
+    else if !d.isLet && (← isProp d.type) && !d.type.hasAnyFVar (!set.contains ·) then xs := xs.push d.toExpr
+  return some (xs, ← mkForallFVars xs goal)
 
-/-- The first of the tactics `tacs` proving the closed goal `goal` (with the budget `budget` each), attempted in parallel,
-    each in a task with fresh states (see `SmtProof.Local.runAsync`), the other attempts being interrupted once a proof
-    is found. The proofs are usable in the current environment (see `SmtProof.Local.inlineNewConstants`). -/
+/-- The first of the tactics `tacs` proving the closed goal `goal` (with the budget `budget` each), attempted in
+    parallel, each in a task with fresh states (see `SmtProof.Local.runAsync`), the other attempts being interrupted
+    once a proof is found, together with the number of failed attempts that exhausted their budget (the heartbeats of
+    each attempt are counted by its own thread). The proofs are usable in the current environment (see
+    `SmtProof.Local.inlineNewConstants`). -/
 def raceTactics (goal : Expr) (tacs : Array (String × TSyntax `tactic)) (budget : Nat) :
-    TermElabM (Option (Expr × String)) := do
+    TermElabM (Option (Expr × String) × Nat) := do
   let base ← getEnv
   let tk ← IO.CancelToken.new
   let mut pending := #[]
   for (name, tac) in tacs do
-    let t ← SmtProof.Local.runAsync <| withTheReader Core.Context (fun c => { c with cancelTk? := some tk }) do
+    let t ← SmtProof.Local.runAsync (cancelTk? := some tk) do
+      let start ← IO.getNumHeartbeats
       let r ← proveWithTactic goal tac (budget := budget)
-      r.mapM fun p => do SmtProof.Local.inlineNewConstants base (← instantiateMVars p)
+      let exhausted := budgetExhausted budget ((← IO.getNumHeartbeats) - start)
+      return (← r.mapM fun p => do SmtProof.Local.inlineNewConstants base (← instantiateMVars p), exhausted)
     pending := pending.push (name, t)
+  let mut exhausted := 0
   try
     while !pending.isEmpty do
       let l := pending.toList.map (·.2)
@@ -1947,19 +1997,19 @@ def raceTactics (goal : Expr) (tacs : Array (String × TSyntax `tactic)) (budget
       let mut rest := #[]
       for (name, t) in pending do
         if !(← IO.hasFinished t) then rest := rest.push (name, t); continue
-        let .ok (some p) := t.get | continue
-        -- the realizations of the task (e.g., the splitters of matchers), shared between the environments
-        SmtProof.Local.realizeReservedNames p
-        let env ← getEnv
-        if p.getUsedConstants.all (env.contains · (skipRealize := true)) then return some (p, name)
+        let .ok (r, e) := t.get | continue
+        if e then exhausted := exhausted + 1
+        let some p := r | continue
+        if ← SmtProof.Local.usableProof p then return (some (p, name), exhausted)
       pending := rest
-    return none
+    return (none, exhausted)
   finally
     tk.set
 
 /-- Try to prove the residual goal `e` (i.e., an optimized expression proved valid by the
     backend SMT solver) using decision procedures available in Lean.
-    `hard` (e.g., the replay of a proof of the SMT solver) is tried once, as soon as two attempts exhaust their budget.
+    `hard` (e.g., the replay of a proof of the SMT solver) is tried once, as soon as two attempts exhaust their budget;
+    it is not tried otherwise (the caller tries it after the other strategies, see `Blaster.Reconstruct.reconstruct`).
 -/
 def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure none) :
     TermElabM (Option (Expr × String)) := do
@@ -2034,64 +2084,67 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
     ("empty", ← `(tactic| (intros <;> blaster_nomatch))),
   ]
   let large ← involvesLargeMatch e
-  -- the residuals with `match` applications (e.g., on the variables of the goal): the case analyses first, the other
-  -- tactics (e.g., `simp`, the instantiations and the case analysis on variables of inductive types) rarely prove them
   let env ← getEnv
-  -- the steps of the strategy: one tactic, or several ones attempted in parallel (on closed goals)
   let idx := (List.range tacs.size).toArray
+  -- the steps of the strategy: one tactic, or several ones attempted in parallel
+  -- NOTE: on the residuals with `match` applications (e.g., on the variables of the goal), the case analyses are
+  -- attempted in parallel right after the cheap tactics, as the best one depends on the goal (e.g., 0.3 s for one of
+  -- them while another one exhausts its budget); the other tactics (e.g., `simp`, the instantiations and the case
+  -- analysis on the variables of inductive types) rarely prove them
   let steps : Array (Array Nat) :=
     if !large && e.getUsedConstants.any (Meta.isMatcherCore env) then
-      -- the case analyses (attempted in parallel, as the best one depends on the goal, e.g., 0.3 s for one of them
-      -- while another one exhausts its budget) right after the cheap tactics
-      let get (n : String) := (idx.find? (tacs[·]!.1 == n)).toArray
-      let cases := #["split", "match cases", "unfold + cases"]
-      let firstSteps := #[get "decide", get "omega", get "grind"] ++
-        (if e.hasMVar then cases.map get else #[cases.flatMap get])
-      let used := #["decide", "omega", "grind"] ++ cases
-      firstSteps.filter (!·.isEmpty) ++ (idx.filter (fun i => !used.contains tacs[i]!.1)).map (#[·])
+      let named (names : Array String) := idx.filter (names.contains tacs[·]!.1)
+      let cheap := named #["decide", "omega", "grind"]
+      let cases := named #["split", "match cases", "unfold + cases"]
+      cheap.map (#[·]) ++ #[cases] ++ (idx.filter fun i => !cheap.contains i && !cases.contains i).map (#[·])
     else idx.map (#[·])
-  -- NOTE: a separate action, such that `return` does not exit `proveResidual`
   let budget := 4 * dischargeHeartbeats
-  let attempts : TermElabM (Option (Expr × String)) := do
-    let mut hardTried := false
+  -- an attempt of the `i`-th tactic, with the number of attempts that exhausted their budget (0 or 1)
+  let attempt (i : Nat) : TermElabM (Option (Expr × String) × Nat) := do
+    let (name, tac) := tacs[i]!
+    let start ← IO.getNumHeartbeats
+    let r ← profileAttempt s!"residual:{i}:{name}" (proveWithTactic e tac (budget := budget))
+    return (r.map (·, name), if budgetExhausted budget ((← IO.getNumHeartbeats) - start) then 1 else 0)
+  -- the attempts of a step: in parallel on the goal closed over its local context (see `closeOverLocals`, the tasks are
+  -- run in empty local contexts), one after the other otherwise
+  let runStep (step : Array Nat) : TermElabM (Option (Expr × String) × Nat) := do
+    if h : step.size = 1 then return ← attempt step[0]
+    if let some (xs, closed) ← closeOverLocals e then
+      if !closed.hasMVar then
+        let exhausted ← IO.mkRef 0
+        let r ← profileAttempt "residual:race" do
+          let (r, n) ← raceTactics closed (step.map (tacs[·]!)) budget
+          exhausted.set n
+          return r.map fun (p, name) => (mkAppN p xs, name)
+        return (r, ← exhausted.get)
     let mut exhausted := 0
+    for i in step do
+      let (r, n) ← attempt i
+      exhausted := exhausted + n
+      if r.isSome then return (r, exhausted)
+    return (none, exhausted)
+  try
+    let mut exhausted := 0
+    let mut hardTried := false
     for step in steps do
       let step := step.filter fun i => !(large && tacs[i]!.1 ∈ ["unfold + cases", "unfold", "split"])
       if step.isEmpty then continue
-      let start ← IO.getNumHeartbeats
-      let t0 ← IO.monoMsNow
-      let r ← if h : step.size = 1 then
-          let (name, tac) := tacs[step[0]]!
-          pure <| (← profileAttempt s!"residual:{step[0]}:{name}" (proveWithTactic e tac (budget := budget))).map (·, name)
-        else profileAttempt s!"residual:race" do
-          -- NOTE: on the goal closed over its local context (the attempts are run in empty local contexts)
-          let (xs, closed) ← closeOverLocals e
-          if closed.hasFVar || closed.hasMVar then return none
-          return (← raceTactics closed (step.map (tacs[·]!)) budget).map fun (p, n) => (mkAppN p xs, n)
+      let (r, n) ← runStep step
       if let some r := r then return some r
       -- a goal on which two attempts exhaust their budget (e.g., the residual of a CEK evaluation, on which each tactic
-      -- runs out of heartbeats): the caller's alternative (e.g., the replay of a proof of the SMT solver) is tried
-      -- before the remaining tactics
+      -- runs out of heartbeats): `hard` (e.g., the replay of a proof of the SMT solver) before the remaining tactics
       -- NOTE: not after the first one, as the replay may take longer than the tactics after it (e.g., 28 s instead of
       -- 1.5 s for a case analysis)
-      -- NOTE: the attempts in parallel are counted by their duration (their heartbeats are counted by their threads)
-      let hb := (← IO.getNumHeartbeats) - start
-      let ms := (← IO.monoMsNow) - t0
-      -- NOTE: the failed attempts in parallel taking 5 s or more (e.g., the case analyses on the residuals of CEK
-      -- evaluations, each running out of heartbeats) count as two
-      let spent := if step.size = 1 then (if 10 * hb ≥ 9 * budget * 1000 then 1 else 0) else (if ms ≥ 5000 then 2 else 0)
-      if !hardTried && spent > 0 then
-        exhausted := exhausted + spent
-        if exhausted ≥ 2 then
-          hardTried := true
-          if let some r ← profileAttempt "residual:hard" hard then return some r
+      exhausted := exhausted + n
+      if !hardTried && exhausted ≥ 2 then
+        hardTried := true
+        if let some r ← profileAttempt "residual:hard" hard then return some r
     if !large then
       if let some prf ← profileAttempt "residual:deep cases"
           (proveWithTactic e (← deepCases) (budget := 8 * dischargeHeartbeats)) then
         return some (prf, "unfold + cases")
     return none
-  let r ← attempts
-  reportAttempts
-  return r
+  finally
+    reportAttempts
 
 end Blaster.Reconstruct

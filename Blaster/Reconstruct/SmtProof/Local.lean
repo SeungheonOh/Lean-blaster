@@ -59,6 +59,18 @@ theorem or_congr_ctx {a a' b b' : Prop} (ha : a = a') (hb : ¬a → b = b') : (a
   exact propext ⟨fun h => h.elim Or.inl (fun y => Classical.byCases (p := a) Or.inl (fun x => Or.inr (hb x ▸ y))),
     fun h => h.elim Or.inl (fun y => Classical.byCases (p := a) Or.inl (fun x => Or.inr ((hb x).symm ▸ y)))⟩
 
+
+/-- The size (in distinct subterms, see `sizeLe`) beyond which a statement is large (e.g., the CEK evaluation of a
+    validator): the tactics are only applied to its local differences (see `diffEq`), within time budgets. -/
+def largeTermSize : Nat := 20000
+
+/-- `x` with a budget of `budget` thousand heartbeats: `none` on any exception, including the runtime ones (e.g.,
+    running out of the budget, which `try ... catch` does not catch); interruptions are propagated. -/
+def withBudget? (budget : Nat) (x : MetaM α) : MetaM (Option α) :=
+  tryCatchRuntimeEx
+    (some <$> withTheReader Core.Context (fun c => { c with maxHeartbeats := budget * 1000 }) (withCurrHeartbeats x))
+    fun _ => pure none
+
 /-- `ite c x y = ite c' x' y'` (with the classical instances of the interpretation, whose argument depends on
     the condition), given the proofs of the equalities of the arguments (`sub`); similarly for `decide`. -/
 def iteCongr? [Monad m] [MonadLiftT MetaM m] (l r : Expr) (sub : Expr → Expr → m (Option Expr)) : m (Option Expr) := do
@@ -254,10 +266,10 @@ def isNumLit (e : Expr) : Bool :=
   (e.isAppOfArity ``Neg.neg 3 && (e.getArg! 2).isAppOfArity ``OfNat.ofNat 3) ||
   ((e.isAppOfArity ``Int.ofNat 1 || e.isAppOfArity ``Int.negSucc 1) && e.appArg!.isRawNatLit)
 
-/-- `e` with the occurrences of `t` (structurally equal, i.e., pointer equal on the shared terms of the replay; `t` without
-    loose bound variables) replaced by the loose bound variable 0, as `kabstract` without definitional unfolding:
-    `kabstract` checks each subterm with the head of `t` for definitional equality (e.g., two minutes for a rewrite
-    step over the CEK terms of a validator). -/
+/-- `e` with the occurrences of `t` (structurally equal, i.e., pointer equal on the shared terms of the replay; `t`
+    without loose bound variables) replaced by the loose bound variable 0, as `kabstract` without definitional
+    unfolding: `kabstract` checks each subterm with the head of `t` for definitional equality (e.g., two minutes for a
+    rewrite step over the CEK terms of a validator). -/
 def abstractOccurrences (e t : Expr) : MetaM Expr := do
   if t.hasLooseBVars then return ← kabstract e t
   withLocalDeclD `z (← inferType t) fun z =>
@@ -273,10 +285,7 @@ def substProof? (h a a' : Expr) : MetaM (Option Expr) := do
     else return none
   let abst ← abstractOccurrences a t
   if !abst.hasLooseBVars then return none
-  let ok ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
-      withCurrHeartbeats <| withDefault <| isDefEq (abst.instantiate1 k) a'
-    catch _ => pure false
-  if !ok then return none
+  let some true ← withBudget? 5000 (withDefault <| isDefEq (abst.instantiate1 k) a') | return none
   let f := mkLambda `z .default (← inferType t) abst
   return some (← mkExpectedTypeHint (← mkCongrArg f toK) (← mkEq a a'))
 
@@ -284,9 +293,7 @@ def substProof? (h a a' : Expr) : MetaM (Option Expr) := do
 def decideTrue? (p : Expr) : MetaM (Option Expr) := do
   if p.hasFVar || p.hasMVar then return none
   let some inst ← (try some <$> synthInstance (mkApp (mkConst ``Decidable) p) catch _ => pure none) | return none
-  let r ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
-      withCurrHeartbeats <| withDefault <| whnf (mkApp2 (mkConst ``Decidable.decide) p inst)
-    catch _ => return none
+  let some r ← withBudget? 5000 (withDefault <| whnf (mkApp2 (mkConst ``Decidable.decide) p inst)) | return none
   if !r.isConstOf ``Bool.true then return none
   return some (mkApp3 (mkConst ``of_decide_eq_true) p inst (mkApp2 (mkConst ``Eq.refl [levelOne]) (mkConst ``Bool) (mkConst ``Bool.true)))
 
@@ -407,9 +414,10 @@ def refuted (g : Expr) (maxInstances := 64) : MetaM Bool := do
     let mut combos : Array (Array Expr) := #[#[]]
     for d in domains do
       combos := (combos.flatMap fun c => d.map c.push).extract 0 maxInstances
-    -- NOTE: the decision of the body is built once (its instances are synthesized with the variables, e.g., `Int.decLt`),
-    -- then instantiated at the values (the synthesis at each instance took a tenth of the replay of a CEK evaluation);
-    -- per instance with variables of type `Prop` (e.g., the conditions of conditionals, decidable at `True` and `False`)
+    -- NOTE: the decision of the body is built once (its instances are synthesized with the variables, e.g.,
+    -- `Int.decLt`), then instantiated at the values (the synthesis at each instance took a tenth of the replay of a CEK
+    -- evaluation); per instance with variables of type `Prop` (e.g., the conditions of conditionals, decidable at
+    -- `True` and `False`)
     let props ← zs.anyM fun z => return (← inferType z).isProp
     if let some d ← (if props then pure none else decision? body) then
       for c in combos do
@@ -424,8 +432,10 @@ def refuted (g : Expr) (maxInstances := 64) : MetaM Bool := do
     lost, i.e., its result is expected to be closed (e.g., the proof of a closed statement, checked by the caller).
     NOTE: the states are fresh such that the objects of the current ones (e.g., the large terms of a replay) are not
     shared with the task, i.e., marked as multi-threaded (their reference counts would be updated atomically, e.g.,
-    five times slower replays when sharing the state of a replay with tasks). -/
-def runAsync (x : Elab.Term.TermElabM α) : Elab.Term.TermElabM (Task (Except Exception α)) := do
+    five times slower replays when sharing the state of a replay with tasks).
+    The task is interrupted when `cancelTk?` is set (see `Core.checkSystem`). -/
+def runAsync (x : Elab.Term.TermElabM α) (cancelTk? : Option IO.CancelToken := none) :
+    Elab.Term.TermElabM (Task (Except Exception α)) := do
   let tctx ← read
   let mctx := { (← readThe Meta.Context) with lctx := {}, localInstances := #[] }
   -- NOTE: the task gets the environment but not the caches, messages, info trees and traces of the Core state (taken by
@@ -437,17 +447,17 @@ def runAsync (x : Elab.Term.TermElabM α) : Elab.Term.TermElabM (Task (Except Ex
   let act ← try
       Core.wrapAsync (fun (_ : Unit) => do
         let ((a, _), _) ← (x.run tctx {}).run mctx {}
-        return a) none
+        return a) cancelTk?
     finally
       modifyThe Core.State fun s =>
         { s with cache := saved.cache, messages := saved.messages, infoState := saved.infoState,
                  traceState := saved.traceState, snapshotTasks := saved.snapshotTasks }
   EIO.asTask (act ()) (prio := .dedicated)
 
-/-- `e` with the constants of the environment that are not in `base` replaced by their values, e.g., the auxiliary lemmas
-    of the tactics in a task with its own environment (see `Local.runAsync`), such that the proof can be used in the
-    environment `base`. The reserved names (e.g., the splitters and equations of matchers, realized on demand and shared
-    between the environments, see `realizeReservedNames`) are kept. -/
+/-- `e` with the constants of the environment that are not in `base` replaced by their values, e.g., the auxiliary
+    lemmas of the tactics in a task with its own environment (see `Local.runAsync`), such that the proof can be used in
+    the environment `base`. The reserved names (e.g., the splitters and equations of matchers, realized on demand and
+    shared between the environments, see `realizeReservedNames`) are kept. -/
 partial def inlineNewConstants (base : Environment) (e : Expr) : CoreM Expr := do
   let env ← getEnv
   let rec go (e : Expr) : StateT (Std.HashMap Name (List Name × Expr)) CoreM Expr := do
@@ -472,16 +482,25 @@ def realizeReservedNames (e : Expr) : CoreM Unit := do
     let env ← getEnv
     if env.contains c (skipRealize := true) || !isReservedName env c then continue
     let msgs := (← getThe Core.State).messages
-    try executeReservedNameAction c catch _ => pure ()
+    tryCatchRuntimeEx (executeReservedNameAction c) fun _ => pure ()
     modifyThe Core.State fun s => { s with messages := msgs }
 
-/-- The time spent in the tactic portfolios (see `SmtProof.portfolioPar`) and their number of goals, e.g., per step of the
-    replay (environment variable `BLASTER_SMTPROOF_TRACE`). -/
+/-- Return `true` if the proof `p` found by a task with its own environment (see `runAsync` and `inlineNewConstants`) is
+    usable in the current environment, after the realization of the reserved names it uses (e.g., the splitters of
+    matchers, shared between the environments, see `realizeReservedNames`). -/
+def usableProof (p : Expr) : CoreM Bool := do
+  realizeReservedNames p
+  let env ← getEnv
+  return p.getUsedConstants.all (env.contains · (skipRealize := true))
+
+/-- The time spent in the tactic portfolios (see `SmtProof.portfolioPar`) and their number of goals, e.g., per step of
+    the replay (environment variable `BLASTER_SMTPROOF_TRACE`). -/
 initialize portfolioTime : IO.Ref (Nat × Nat) ← IO.mkRef (0, 0)
 
 /-- Option holding the deadline of the portfolio (monotonic time in ms plus one, `0`: none): no tactic is started after
-    it (see `withPortfolioDeadline` and `SmtProof.portfolio`). An option of the context, i.e., local to the tasks of a
-    parallel replay (see `SmtProof.prepass`). -/
+    it, and a running one is interrupted at it (see `withPortfolioDeadline`, `SmtProof.portfolio` and
+    `SmtProof.portfolioParMulti`, whose tasks capture it). An option of the context, i.e., local to the computation
+    run by `withPortfolioDeadline`. -/
 def portfolioDeadlineKey : Name := `blaster.smtproof.portfolioDeadline
 
 /-- The deadline of the portfolio (see `portfolioDeadlineKey`). -/

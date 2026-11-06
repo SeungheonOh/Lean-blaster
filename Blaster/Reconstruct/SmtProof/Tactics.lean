@@ -374,16 +374,22 @@ where
     return some (if arith then "arith" else "other")
   isCtorName (env : Environment) (n : Name) : Bool := (env.find? n).any (·.isCtor)
 
-/-- The tactics `tacs` on goals of the shape of `rule` (see `goalShape`), the most efficient first, i.e., highest number of
-    successes per time unit (with a prior favoring the given order). -/
-def orderTactics (tacs : Array (String × TSyntax `tactic)) (rule : String) : BaseIO (Array (String × TSyntax `tactic)) := do
+/-- The tactics `tacs` on goals of the shape of `rule` (see `goalShape`), the most efficient first, i.e., highest number
+    of successes per time unit (with a prior favoring the given order). -/
+def orderTactics (tacs : Array (String × TSyntax `tactic)) (rule : String) :
+    BaseIO (Array (String × TSyntax `tactic)) := do
   let stats ← tacticStats.get
   let score (n : String) (i : Nat) : Float :=
     let (succ, ms) := stats.getD (rule, n) (0, 0)
     (succ.toFloat + 1.0 / (i.toFloat + 1.0)) / (ms.toFloat + 50.0)
   return (tacs.zipIdx.qsort fun ((n₁, _), i₁) ((n₂, _), i₂) => score n₁ i₁ > score n₂ i₂).map (·.1)
 
-def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
+/-- The first of the tactics `tacs` proving `goal`, attempted one after the other in the order of their success rate per
+    time unit on the goals of the same rule and shape (see `orderTactics`, `rule`), with the proof and the name of the
+    tactic; no tactic is started after the deadline of the portfolio (see `Local.portfolioDeadline`), and a running one
+    is interrupted at it. -/
+def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") :
+    TermElabM (Option (Expr × String)) := do
   let rule := s!"{rule}/{← goalShape goal}"
   let tacs ← orderTactics tacs rule
   for (name, tac) in tacs do
@@ -401,11 +407,11 @@ def portfolio (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := 
     if let some p := r then return some (p, name)
   return none
 
-/-- `portfolio` on several closed goals `jobs` (with their tactics) at once, the attempts being run in parallel, each in a
-    task with fresh states (see `Local.runAsync`): the first proof found (with the index of its goal), the other attempts
-    being interrupted, e.g., the tactics on the local differences of the rewrites of CEK evaluations (a few hundred
-    milliseconds each, after the failures of the others), or the generalizations of a datatype lemma. The proofs are
-    usable in the current environment (see `Local.inlineNewConstants`). -/
+/-- `portfolio` on several closed goals `jobs` (with their tactics) at once, the attempts being run in parallel, each in
+    a task with fresh states (see `Local.runAsync`): the first proof found (with the index of its goal), the other
+    attempts being interrupted, e.g., the tactics on the local differences of the rewrites of CEK evaluations (a few
+    hundred milliseconds each, after the failures of the others), or the generalizations of a datatype lemma. The proofs
+    are usable in the current environment (see `Local.inlineNewConstants`). -/
 def portfolioParMulti (jobs : Array (Expr × Array (String × TSyntax `tactic) × String)) :
     TermElabM (Option (Nat × Expr × String)) := do
   let start ← IO.monoMsNow
@@ -426,10 +432,10 @@ def portfolioParMulti (jobs : Array (Expr × Array (String × TSyntax `tactic) �
   queue := queue.qsort fun (j₁, i₁) (j₂, i₂) => i₁ < i₂ || (i₁ == i₂ && j₁ < j₂)
   let base ← getEnv
   let tk ← IO.CancelToken.new
-  let start (j i : Nat) : TermElabM (Task (Nat × Nat × Nat × Option Expr)) := do
+  let startAttempt (j i : Nat) : TermElabM (Task (Nat × Nat × Nat × Option Expr)) := do
     let goal := jobs[j]!.1
     let tac := ordered[j]![i]!.2
-    let t ← Local.runAsync <| withTheReader Core.Context (fun c => { c with cancelTk? := some tk }) do
+    let t ← Local.runAsync (cancelTk? := some tk) do
       let t0 ← IO.monoMsNow
       let r ← match deadline with
         | some d => withTimeLimit (d - min d t0) (proveWithTactic goal tac)
@@ -439,11 +445,15 @@ def portfolioParMulti (jobs : Array (Expr × Array (String × TSyntax `tactic) �
     return t.map fun r => match r with
       | .ok r => r
       | .error _ => (j, i, 0, none)
+  -- NOTE: no attempt is started after the deadline (it would be interrupted at once)
+  let beforeDeadline : IO Bool := do
+    let some d := deadline | return true
+    return (← IO.monoMsNow) < d
   let mut pending : Array (Task (Nat × Nat × Nat × Option Expr)) := #[]
   let mut next := 0
   while next < queue.size && pending.size < max width 1 do
     let (j, i) := queue[next]!
-    pending := pending.push (← start j i)
+    pending := pending.push (← startAttempt j i)
     next := next + 1
   let mut result := none
   try
@@ -455,19 +465,19 @@ def portfolioParMulti (jobs : Array (Expr × Array (String × TSyntax `tactic) �
         if !(← IO.hasFinished t) then rest := rest.push t; continue
         let (j, i, ms, r?) := t.get
         let name := ordered[j]![i]!.1
+        -- NOTE: a proof is only counted as a success (see `orderTactics`) when it is usable
+        let ok ← if result.isSome then pure r?.isSome else match r? with
+          | some p =>
+              if ← Local.usableProof p then result := some (j, p, name); pure true
+              else pure false
+          | none => pure false
         let key := keys[j]!
         tacticStats.modify fun m =>
-          let (a, b) := m.getD (key, name) (0, 0); m.insert (key, name) (a + (if r?.isSome then 1 else 0), b + ms)
-        if result.isSome then continue
-        let some p := r? | continue
-        -- the realizations of the task (e.g., the splitters of matchers), shared between the environments
-        Local.realizeReservedNames p
-        let env ← getEnv
-        if p.getUsedConstants.all (env.contains · (skipRealize := true)) then result := some (j, p, name)
+          let (a, b) := m.getD (key, name) (0, 0); m.insert (key, name) (a + (if ok then 1 else 0), b + ms)
       -- the next attempts
-      while result.isNone && next < queue.size && rest.size < max width 1 do
+      while result.isNone && next < queue.size && rest.size < max width 1 && (← beforeDeadline) do
         let (j, i) := queue[next]!
-        rest := rest.push (← start j i)
+        rest := rest.push (← startAttempt j i)
         next := next + 1
       pending := rest
   finally
@@ -476,7 +486,8 @@ def portfolioParMulti (jobs : Array (Expr × Array (String × TSyntax `tactic) �
 
 /-- `portfolio` with the tactics attempted in parallel on closed goals (see `portfolioParMulti`); environment variable
     `BLASTER_SMTPROOF_PARPORTFOLIO`: the number of attempts at a time, `0` for `portfolio`. -/
-def portfolioPar (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") : TermElabM (Option (Expr × String)) := do
+def portfolioPar (tacs : Array (String × TSyntax `tactic)) (goal : Expr) (rule := "") :
+    TermElabM (Option (Expr × String)) := do
   let t0 ← IO.monoMsNow
   try
     if tacs.size ≤ 1 || goal.hasFVar || goal.hasMVar || (← IO.getEnv "BLASTER_SMTPROOF_PARPORTFOLIO") == some "0" then

@@ -87,10 +87,11 @@ unsafe def dagSizeLeImpl (e : Expr) (n : Nat) : Bool := unsafeBaseIO do
 @[implemented_by dagSizeLeImpl]
 opaque dagSizeLe (e : Expr) (n : Nat) : Bool
 
-/-- The conjunction of `es` as a balanced tree (e.g., the terms of an array traversed as a whole, with a logarithmic
-    recursion depth). -/
-partial def balancedConj (es : Array Expr) (lo := 0) (hi := es.size) : Expr :=
+/-- A term containing the terms `es` as a balanced tree of `And` applications (not meant to be type correct), such that
+    they are traversed as a whole (e.g., by `dagSizeLe` or `dependsOnSorry`, their shared subterms once) with a
+    logarithmic recursion depth. -/
+partial def balancedBundle (es : Array Expr) (lo := 0) (hi := es.size) : Expr :=
   if hi ≤ lo + 1 then es.getD lo (mkConst ``True)
-  else mkApp2 (mkConst ``And) (balancedConj es lo ((lo + hi) / 2)) (balancedConj es ((lo + hi) / 2) hi)
+  else mkApp2 (mkConst ``And) (balancedBundle es lo ((lo + hi) / 2)) (balancedBundle es ((lo + hi) / 2) hi)
 
 end Blaster.Reconstruct

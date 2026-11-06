@@ -205,14 +205,18 @@ def runBackendCached (backend : Backend) (cmds : Array SExpr) (seeds := 1) (dela
   let (q, runs) ← backendRuns.get
   let runs := if q == query then runs else {}
   if let some r := runs.get? backend.name then return r
-  -- debugging: the proof output read from the file `BLASTER_SMTPROOF_PROOFFILE` instead of a run of the solver (e.g.,
-  -- to replay the same proof again), and the proof output written to the file `BLASTER_SMTPROOF_PROOFDUMP`
-  let r ← if let some f ← IO.getEnv "BLASTER_SMTPROOF_PROOFFILE" then pure (.ok (← IO.FS.readFile f))
+  -- debugging: the proof output of each backend written to the file `BLASTER_SMTPROOF_PROOFDUMP` suffixed with the name
+  -- of the backend (e.g., `proof.z3rec`), and read from the file `BLASTER_SMTPROOF_PROOFFILE` suffixed likewise (when
+  -- it exists) instead of a run of the solver, e.g., to replay the same proof again
+  let proofFile? ← (← IO.getEnv "BLASTER_SMTPROOF_PROOFFILE").filterM fun f =>
+    System.FilePath.pathExists s!"{f}.{backend.name}"
+  let r ← if let some f := proofFile? then pure (.ok (← IO.FS.readFile s!"{f}.{backend.name}"))
     else if seeds ≤ 1 then runBackend backend cmds else
       let seed := querySeed cmds
-      runPortfolio backend ((List.range seeds).toArray.map fun k => if k == 0 then cmds else withSeed cmds (seed + k)) delayMs
+      let queries := (List.range seeds).toArray.map fun k => if k == 0 then cmds else withSeed cmds (seed + k)
+      runPortfolio backend queries delayMs
   if let some f ← IO.getEnv "BLASTER_SMTPROOF_PROOFDUMP" then
-    if let .ok out := r then IO.FS.writeFile f out
+    if let .ok out := r then IO.FS.writeFile s!"{f}.{backend.name}" out
   backendRuns.set (query, runs.insert backend.name r)
   return r
 

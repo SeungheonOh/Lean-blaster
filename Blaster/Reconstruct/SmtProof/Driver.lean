@@ -36,6 +36,18 @@ partial def dataBinders (e : Expr) (k : Array Expr → Expr → TermElabM α) (a
       else withLocalDecl n bi t fun x => dataBinders (b.instantiate1 x) k (acc.push x)
   | _ => k acc e
 
+/-- The kernel checks of the auxiliary theorems of a proof, run in parallel (see `startKernelChecks`). -/
+structure KernelChecks where
+  tasks : Array (Task (Option String)) := #[]
+  /-- set to interrupt the checks (e.g., once one of them failed, or when the proof is rejected otherwise) -/
+  cancelTks : Array IO.CancelToken := #[]
+
+instance : Append KernelChecks where
+  append a b := { tasks := a.tasks ++ b.tasks, cancelTks := a.cancelTks ++ b.cancelTks }
+
+/-- Interrupt the kernel checks `k` (e.g., when the proof is rejected otherwise). -/
+def KernelChecks.cancel (k : KernelChecks) : BaseIO Unit := k.cancelTks.forM (·.set)
+
 structure SmtProofResult where
   proof : Expr
   backend : String
@@ -43,45 +55,52 @@ structure SmtProofResult where
   stats : ReplayStats
   /-- the kernel checks of the auxiliary theorems of the proof run in parallel (see `startKernelChecks`): the proof is
       only accepted once they all succeeded (see `awaitKernelChecks`) -/
-  kernelChecks : Array (Task (Option String)) := #[]
+  kernelChecks : KernelChecks := {}
   /-- the auxiliary theorems of the proof whose checks are started by `startKernelChecks`, with their values: known not
       to depend on `sorryAx` (see `dependsOnSorry`, such that their values are not traversed again) -/
   sorryFree : Array (Name × Expr) := #[]
 
 /-- Start the kernel checks of `decls`, each against the kernel environment given with it (the environment before
-    it, such that a declaration may only use the declarations before it), on `threads` dedicated threads. -/
+    it, such that a declaration may only use the declarations before it), on `threads` dedicated threads. The checks
+    stop at the first error. -/
 def startKernelChecks (decls : Array (Kernel.Environment × Declaration)) (threads : Nat) (opts : Options) :
-    BaseIO (Array (Task (Option String))) := do
+    BaseIO KernelChecks := do
+  if decls.isEmpty then return {}
   let next ← IO.mkRef 0
+  let tk ← IO.CancelToken.new
   -- the checks taking at least 200 ms (environment variable `BLASTER_SMTPROOF_TRACE`)
   let trace ← IO.getEnv "BLASTER_SMTPROOF_TRACE"
   let rec worker (fuel : Nat) : BaseIO (Option String) := do
     match fuel with
     | 0 => return none
     | fuel + 1 =>
+      if ← tk.isSet then return none
       let i ← next.modifyGet fun i => (i, i + 1)
       let some (kenv, decl) := decls[i]? | return none
       let t0 ← IO.monoMsNow
-      let r := kenv.addDeclCore 0 decl none
+      let r := kenv.addDeclCore 0 decl (some tk)
       if let some f := trace then
         let ms := (← IO.monoMsNow) - t0
         if ms ≥ 200 then
-          (do (← IO.FS.Handle.mk f .append).putStrLn s!"  kernel check of auxiliary theorem {i}/{decls.size}: {ms} ms").catchExceptions
-            fun _ => pure ()
+          let msg := s!"  kernel check of auxiliary theorem {i}/{decls.size}: {ms} ms"
+          (do (← IO.FS.Handle.mk f .append).putStrLn msg).catchExceptions fun _ => pure ()
       match r with
       | .ok _ => worker fuel
       | .error ex =>
+          -- NOTE: an interruption (see `KernelChecks.cancel`) is not reported as a failure of the check
+          if ← tk.isSet then return none
+          tk.set
           let msg ← (do return some (← (ex.toMessageData opts).toString)).catchExceptions fun _ => pure (some "?")
           return some s!"kernel check of {decl.getNames}: {msg.getD "?"}"
   let mut tasks := #[]
-  for _ in [:max threads 1] do
+  for _ in [:max (min threads decls.size) 1] do
     tasks := tasks.push (← BaseIO.asTask (prio := .dedicated) (worker decls.size))
-  return tasks
+  return { tasks, cancelTks := #[tk] }
 
-/-- Wait for the kernel checks `tasks` (see `startKernelChecks`): the first error, if any. -/
-def awaitKernelChecks (tasks : Array (Task (Option String))) : BaseIO (Option String) := do
+/-- Wait for the kernel checks `k` (see `startKernelChecks`): the first error, if any. -/
+def awaitKernelChecks (k : KernelChecks) : BaseIO (Option String) := do
   let mut err := none
-  for t in tasks do
+  for t in k.tasks do
     if let some msg ← IO.wait t then
       if err.isNone then err := some msg
   return err
@@ -167,13 +186,14 @@ def polyModes (sortVars : Array Expr) (quantifiedSorts : Bool) : Array Bool :=
   else if sortVars.size == 1 then #[false, true]
   else #[true, false]
 
-/-- The translation of the negation of the goal `body` over the data variables `xs` (with the sort variables `sortVars`):
-    the goal translated (`body` or its optimized form, see below), the environment of the translation and the SMT
-    commands. -/
+/-- The translation of the negation of the goal `body` over the data variables `xs` (with the sort variables
+    `sortVars`): the goal translated (`body` or its optimized form, see below), the environment of the translation and
+    the SMT commands. -/
 def translateNegGoal (xs : Array Expr) (body : Expr) (sortVars : Array Expr) (sOpts : BlasterOptions) :
     TermElabM (Expr × TranslateEnv × Array SExpr) := do
   -- NOTE: commands are only recorded when `dumpSmtLib` is set (nothing is printed)
-  let env := {(default : TranslateEnv) with optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
+  let env := {(default : TranslateEnv) with
+                optEnv.options.solverOptions := { sOpts with onlySmtLib := true, dumpSmtLib := true }}
   let (goalTerm, tenv) ← (do
       -- NOTE: the optimizer populates the caches used by the translation (e.g., the definitions of
       -- recursive functions); `body` being already optimized, `body'` is expected to be `body` (up to
@@ -206,8 +226,7 @@ def translateNegGoal (xs : Array Expr) (body : Expr) (sortVars : Array Expr) (sO
       let (st, goalTerm) ← if reopt then pure (← translateExpr body', body') else
         try pure (← translateExpr body, body) catch ex => do
           set saved
-          let defeq ← try withTheReader Core.Context (fun c => { c with maxHeartbeats := 20000 * 1000 }) <|
-              withCurrHeartbeats <| withDefault <| isDefEq body body' catch _ => pure false
+          let defeq ← (·.getD false) <$> Local.withBudget? 20000 (withDefault <| isDefEq body body')
           if !defeq then throw ex
           pure (← translateExpr body', body')
       assertTerm (notSmt st)
@@ -237,8 +256,8 @@ def backendFor (n : String) (cmds : Array SExpr) (timeout : Nat) :
   let delayMs := ((← IO.getEnv "BLASTER_SMTPROOF_SEED_DELAY").bind String.toNat?).getD (min 10000 (timeout * 250))
   return some (backend, query, pairs, seeds, delayMs)
 
-/-- The backends of the proof replay, tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g., `z3,cvc5`),
-    and their timeout in seconds. -/
+/-- The backends of the proof replay, tried in order (environment variable `BLASTER_SMTPROOF_BACKENDS`, e.g.,
+    `z3,cvc5`), and their timeout in seconds. -/
 def proofBackends (sOpts : BlasterOptions) : IO (List String × Nat) := do
   let names := ((← IO.getEnv "BLASTER_SMTPROOF_BACKENDS").getD "z3,z3rec,z3+").splitOn ","
   let timeout := ((← IO.getEnv "BLASTER_SMTPROOF_TIMEOUT").bind String.toNat?).getD (sOpts.timeout.getD 20)
@@ -275,6 +294,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
   -- NOTE: each tactic attempt has its own heartbeat budget (see `proveWithTactic`)
   withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) do
   dataBinders e fun xs body => do
+  -- interrupts the proofs of the definitional equations started in parallel (see `RecFun.startEqTasks`) on return
+  let eqStop ← IO.CancelToken.new
   try
     -- polymorphic encoding (see `sortVariables`), interpreted by `Poly` when `poly` is set
     let (sortVars, quantifiedSorts) ← sortVariables xs body
@@ -289,12 +310,14 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
     let lctx ← getLCtx
     for (v, idx) in tenv.smtEnv.fvarsCache.toList do
       if lctx.contains v then consts := consts.insert s!"${idx}" (mkFVar v)
-    let baseTbl ← if poly then polyBuildSymTable cmds tenv consts sortVars else buildSymTable cmds tenv consts sortVars[0]?
+    let baseTbl ← if poly then polyBuildSymTable cmds tenv consts sortVars
+      else buildSymTable cmds tenv consts sortVars[0]?
+    -- NOTE: the parallel kernel checks of the auxiliary theorems of the proof (see `startKernelChecks`) are recorded in
+    -- `kernelChecks`, such that the caller can interrupt them when the replay fails afterwards
     let replayWith (backend : Backend) (sproof : Proof) (recPairs : Array RecFun.Pair)
-        (eqTasks : Array (Expr × Task (Except Exception (Option Expr)))) : TermElabM SmtProofResult := do
+        (eqTasks : Array (Expr × Task (Except Exception (Option Expr)))) (kernelChecks : IO.Ref KernelChecks) :
+        TermElabM SmtProofResult := do
       clearLocalCache
-      -- the parallel kernel checks of the auxiliary theorems of the proof (see `startKernelChecks`)
-      let kernelChecks ← IO.mkRef (#[] : Array (Task (Option String)))
       let sorryFree ← IO.mkRef (#[] : Array (Name × Expr))
       let tbl ← addSkolems sproof baseTbl
       -- auxiliary functions and case predicates of recursive functions (Z3)
@@ -323,24 +346,20 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         matchInst := insts.get?, macroOf, polyWorld := poly
         proveLemma := fun stmt => do return (← portfolio macroTacs stmt "macro").map (·.1) }
       let tacCache : IO.Ref (Std.HashMap String (Array (String × TSyntax `tactic))) ← IO.mkRef {}
-      let proveStep (rule : String) (stmt : Expr) : TermElabM (Option (Expr × String)) := do
+      -- the tactics on the statement `stmt` of a step of rule `rule`
+      let tacticsFor (rule : String) (stmt : Expr) : TermElabM (Array (String × TSyntax `tactic)) := do
         -- NOTE: the tactic syntax of each rule is built once per replay
         let tacs ← match (← tacCache.get).get? rule with
           | some t => pure t
           | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
         -- the axioms of the polymorphic encoding (e.g., Z3's `recfun` lemmas on the definitions of `@isList`)
-        let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
-        portfolioPar tacs stmt rule
+        return if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
+      let proveStep (rule : String) (stmt : Expr) : TermElabM (Option (Expr × String)) := do
+        portfolioPar (← tacticsFor rule stmt) stmt rule
       -- several goals attempted in parallel (see `proveClosedFirst`)
       let proveSteps? : Option (Array (String × Expr) → TermElabM (Option (Nat × Expr × String))) :=
         if (← IO.getEnv "BLASTER_SMTPROOF_PARPORTFOLIO") == some "0" then none else some fun gs => do
-          let jobs ← gs.mapM fun (rule, stmt) => do
-            let tacs ← match (← tacCache.get).get? rule with
-              | some t => pure t
-              | none => do let t ← stepTactics rule; tacCache.modify (·.insert rule t); pure t
-            let tacs := if poly && (stmt.find? (·.isConstOf ``Poly.Img)).isSome then tacs ++ polyTac else tacs
-            return (stmt, tacs, rule)
-          portfolioParMulti jobs
+          portfolioParMulti (← gs.mapM fun (rule, stmt) => return (stmt, ← tacticsFor rule stmt, rule))
       -- recursive functions (`z3rec`): definitional equations, proved with the bridge tactics in the empty local
       -- context when closed (see `proveClosed`), and differences of normal forms in their unfoldings
       let recCtx ← RecFun.mkCtx tbl recAux recPairs sproof.defs
@@ -349,13 +368,14 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           if stmt.hasFVar then run else withLCtx {} {} run)
         (fun stmt => do return (← proveClosed { proveDirect := fun _ => pure none, proveStep } "th-lemma" stmt).map (·.1))
         (fun a b => do
-          let largeStep := !(Local.sizeLe a 20000 && Local.sizeLe b 20000)
-          Local.diffEq (localProof { proveDirect := fun _ => pure none, proveStep } "rewrite" largeStep) (← IO.mkRef 6) a b)
+          let largeStep := !(Local.sizeLe a Local.largeTermSize && Local.sizeLe b Local.largeTermSize)
+          let prove := localProof { proveDirect := fun _ => pure none, proveStep } "rewrite" largeStep
+          Local.diffEq prove (← IO.mkRef 6) a b)
         eqTasks
       -- the definitional equations of the functions unfolded by the lemmas of the proof, proved in parallel
       let unfolded := sproof.steps.foldl (init := {}) fun acc s =>
         if s.rule == "th-lemma" && s.attrs[0]? == some (.atom "recfun") then RecFun.appliedSymbols s.concl acc else acc
-      RecFun.startEqTasks recCtx unfolded
+      RecFun.startEqTasks recCtx unfolded (cancelTk? := some eqStop)
       let recCache : IO.Ref (Std.HashMap Expr (Option Expr)) ← IO.mkRef {}
       let pf ← withLocalDeclD `hneg (mkNot body) fun hneg => do
         let cfg : ReplayConfig := {
@@ -363,10 +383,10 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
             if ← traceSlow "asserted: reducible defeq" (withReducible (isDefEq c (mkNot body))) then
               return some (← mkExpectedTypeHint hneg c)
             -- e.g., projections vs. case analyses, casts of literals (with a budget)
-            let defeq (a b : Expr) : TermElabM Bool := do
-              try withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
-                    withCurrHeartbeats <| withDefault <| isDefEq a b
-              catch _ => return false
+            let defeq (a b : Expr) : TermElabM Bool :=
+              tryCatchRuntimeEx (withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 50000 * 1000 }) <|
+                  withCurrHeartbeats <| withDefault <| isDefEq a b)
+                fun _ => return false
             if c.isAppOfArity ``Not 1 then
               if ← traceSlow "asserted: defeq" (defeq c (mkNot body)) then return some (← mkExpectedTypeHint hneg c)
             -- the interpretation of the translation of the negated goal: simultaneous traversal (see `Bridge`)
@@ -413,13 +433,13 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         let t0 ← IO.monoMsNow
         let (sortHints, conflicts) := SortInfer.inferHints cmds sproof
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
-          traceTimed s!"sort inference: {sortHints.size} hints, {conflicts} unification failures, {(← IO.monoMsNow) - t0} ms"
-            (pure ())
-        let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache, sortHints }, cfg, deadline, global,
-                                 openHyps := openHypotheses sproof,
+          traceTimed s!"sort inference: {sortHints.size} hints, {conflicts} unification failures, \
+            {(← IO.monoMsNow) - t0} ms" (pure ())
+        let ctx : ReplayCtx := { proof := sproof, interp := { table := tbl, cache := some cache, sortHints }, cfg,
+                                 deadline, global, openHyps := openHypotheses sproof,
                                  baseLCtx := ← getLCtx, baseInsts := ← getLocalInstances }
-        let (p?, st) ← ((do try prepass; return Except.ok (← replay sproof.root)
-                              catch ex => return Except.error ex) |>.run ctx).run {}
+        let (p?, st) ← ((tryCatchRuntimeEx (do prepass; return Except.ok (← replay sproof.root))
+                              fun ex => return Except.error ex) |>.run ctx).run {}
         let p ← match p? with
           | .ok p => pure p
           | .error ex =>
@@ -433,27 +453,27 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
         -- NOTE: the proofs of the steps are instantiated once (see `replay`), the ones of the global steps as closed
         -- lambda terms over the variables of the goal and the negated goal (see `liftGlobalProofs`), the only free
         -- variables of their proofs as `e` is closed (not the variables of the context of the elaboration)
-        -- NOTE: the proofs of many global steps (environment variable `BLASTER_SMTPROOF_SPLIT`, default 4096; 0: always)
-        -- of large proofs (`BLASTER_SMTPROOF_SPLIT_DAG`, default 5M distinct subterms) are auxiliary theorems over the
-        -- variables of the goal and the negated goal, checked by the kernel one at a time: the kernel's caches (e.g., the
-        -- types inferred for the subterms) are kept for the check of a whole declaration, e.g., beyond 30 GB for the
-        -- 10.1M distinct subterms of the proof of a CEK evaluation of a validator (19,369 global proofs), checked as
-        -- auxiliary theorems in 6.5 minutes without memory increase. The smaller proofs are checked as a whole unless
-        -- their auxiliary theorems are checked in parallel (see `startKernelChecks`): one at a time, the auxiliary
-        -- theorems check the shared subterms of their statements again (e.g., 35 s instead of 25 s for the 2.6M
-        -- distinct subterms of the proof of another validator, at 6.5 GB)
+        -- NOTE: the proofs of many global steps (environment variable `BLASTER_SMTPROOF_SPLIT`, default 4096; 0:
+        -- always) of large proofs (`BLASTER_SMTPROOF_SPLIT_DAG`, default 5M distinct subterms) are auxiliary theorems
+        -- over the variables of the goal and the negated goal, checked by the kernel one at a time: the kernel's caches
+        -- (e.g., the types inferred for the subterms) are kept for the check of a whole declaration, e.g., beyond 30 GB
+        -- for the 10.1M distinct subterms of the proof of a CEK evaluation of a validator (19,369 global proofs),
+        -- checked as auxiliary theorems in 6.5 minutes without memory increase. The smaller proofs are checked as a
+        -- whole unless their auxiliary theorems are checked in parallel (see `startKernelChecks`): one at a time, the
+        -- auxiliary theorems check the shared subterms of their statements again (e.g., 35 s instead of 25 s for the
+        -- 2.6M distinct subterms of the proof of another validator, at 6.5 GB)
         let trace ← IO.getEnv "BLASTER_SMTPROOF_TRACE"
         let splitMin := ((← IO.getEnv "BLASTER_SMTPROOF_SPLIT").bind String.toNat?).getD 4096
         let splitDag := ((← IO.getEnv "BLASTER_SMTPROOF_SPLIT_DAG").bind String.toNat?).getD 5000000
-        -- parallel kernel checks (environment variable `BLASTER_SMTPROOF_PARCHECK`: number of threads, default 8, 0: none)
-        -- of the auxiliary theorems of the proofs with at least `BLASTER_SMTPROOF_PARCHECK_MIN` (default 1024) global
-        -- proofs, e.g., 4 s instead of 26 s (as a whole) for the 6928 global proofs of the CEK evaluation of a minting
-        -- policy, and a third of the memory
+        -- parallel kernel checks (environment variable `BLASTER_SMTPROOF_PARCHECK`: number of threads, default 8, 0:
+        -- none) of the auxiliary theorems of the proofs with at least `BLASTER_SMTPROOF_PARCHECK_MIN` (default 1024)
+        -- global proofs, e.g., 4 s instead of 26 s (as a whole) for the 6928 global proofs of the CEK evaluation of a
+        -- minting policy, and a third of the memory
         let parThreads := ((← IO.getEnv "BLASTER_SMTPROOF_PARCHECK").bind String.toNat?).getD 8
         let parMin := ((← IO.getEnv "BLASTER_SMTPROOF_PARCHECK_MIN").bind String.toNat?).getD 1024
         let parallel := parThreads > 0 && st.globalProofs.size ≥ parMin
         let split := parallel || splitMin == 0 ||
-          (st.globalProofs.size ≥ splitMin && !dagSizeLe (balancedConj (st.globalProofs.map (·.2))) splitDag)
+          (st.globalProofs.size ≥ splitMin && !dagSizeLe (balancedBundle (st.globalProofs.map (·.2))) splitDag)
         let auxCount ← IO.mkRef 0
         let parDecls : IO.Ref (Array (Kernel.Environment × Declaration)) ← IO.mkRef #[]
         let aux? : Option (Nat → Expr → Expr → MetaM Expr) :=
@@ -466,7 +486,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
             if parallel then
               -- NOTE: added without checking, and checked against the environment before it by `startKernelChecks`
               -- (such that it only uses the auxiliary theorems before it)
-              -- NOTE: not traversed by `addDecl` either (`warn.sorry`), the whole proof being traversed by `dependsOnSorry`
+              -- NOTE: not traversed by `addDecl` either (`warn.sorry`), the whole proof being traversed by
+              -- `dependsOnSorry`
               let kenv := (← getEnv).toKernelEnv
               let n ← mkAuxDeclName (kind := `_proof)
               let decl := Declaration.thmDecl { name := n, levelParams := lvls, type := ty, value := v }
@@ -484,27 +505,29 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
                 let k := st.globalSteps.getD i 0
                 let rule := (sproof.steps[k]?.map (·.rule)).getD "?"
                 (← IO.FS.Handle.mk f .append).putStrLn
-                  s!"  auxiliary theorem {← auxCount.get}/{st.globalProofs.size} (step {k} {rule}): {ms} ms, value {(dagStats v).1}, type {(dagStats ty).1}"
+                  s!"  auxiliary theorem {← auxCount.get}/{st.globalProofs.size} (step {k} {rule}): {ms} ms, \
+                    value {(dagStats v).1}, type {(dagStats ty).1}"
             return mkConst n (lvls.map mkLevelParam)
         if trace.isSome then
-          traceTimed s!"{st.globalProofs.size} global proofs (auxiliary theorems: {aux?.isSome}), negated goal of {(dagStats (← inferType hneg)).1} distinct subterms" (pure ())
+          traceTimed s!"{st.globalProofs.size} global proofs (auxiliary theorems: {aux?.isSome}), negated goal of \
+            {(dagStats (← inferType hneg)).1} distinct subterms" (pure ())
         let p ← traceTimed "instantiation" (liftGlobalProofs p st.globalProofs (xs.push hneg) aux?)
         if parallel then
           let decls ← parDecls.get
-          -- NOTE: the values of the auxiliary theorems share subterms (e.g., the interpreted terms of the goal), traversed
-          -- once by a single traversal of all of them
+          -- NOTE: the values of the auxiliary theorems share subterms (e.g., the interpreted terms of the goal),
+          -- traversed once by a single traversal of all of them
           let thms := decls.filterMap fun (_, d) => match d with
             | .thmDecl t => some t
             | _ => none
           let entries := thms.map fun t => (t.name, t.value)
-          let all := balancedConj (thms.map fun t => mkApp2 (mkConst ``And) t.type t.value)
+          let all := balancedBundle (thms.map fun t => mkApp2 (mkConst ``And) t.type t.value)
           if ← traceTimed "sorry check of the auxiliary theorems" (dependsOnSorry all entries) then
             throwError "smt proof: the proof depends on sorryAx"
           sorryFree.modify (· ++ entries)
-          let tasks ← traceTimed s!"parallel kernel checks of {decls.size} auxiliary theorems on {parThreads} threads started"
+          let checks ← traceTimed s!"parallel kernel checks of {decls.size} auxiliary theorems on {parThreads} threads"
             (startKernelChecks decls parThreads (← getOptions))
-          kernelChecks.modify (· ++ tasks)
-        if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome then
+          kernelChecks.modify (· ++ checks)
+        if trace.isSome then
           let (n, d) := dagStats p
           traceTimed s!"proof of {n} distinct subterms, binder depth {d}, metavariables {p.hasMVar}" (pure ())
           -- the cost of the instantiations of the binders by the kernel (environment variable
@@ -512,7 +535,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           if (← IO.getEnv "BLASTER_SMTPROOF_ISTATS").isSome then
             let pf := mkLambda `hneg .default (← inferType hneg) (p.abstract #[hneg])
             let (m, total, hist) := instantiationStats (← mkLambdaFVars xs pf)
-            traceTimed s!"instantiations: {m} subterms with loose bound variables, {total} copies, histogram {hist}" (pure ())
+            traceTimed s!"instantiations: {m} subterms with loose bound variables, {total} copies, \
+              histogram {hist}" (pure ())
         -- NOTE: the negated goal only occurs in the proofs of the asserted formulas (see `abstractFVar`)
         let pf ← traceTimed "abstraction of the negated goal" do
           if p.hasMVar then mkLambdaFVars #[hneg] p
@@ -540,7 +564,8 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
       let some (backend, query, pairs, seeds, delayMs) ← backendFor n cmds timeout | continue
       -- the proofs of the definitional equations of the recursive functions, started before the search of the backend
       let eqTasks ← if pairs.isEmpty then pure #[] else
-        traceTimed "definitional equations started" (try RecFun.preStartEqTasks baseTbl pairs catch _ => pure #[])
+        traceTimed "definitional equations started"
+          (try RecFun.preStartEqTasks baseTbl pairs (cancelTk? := some eqStop) catch _ => pure #[])
       match ← traceTimed s!"backend {backend.name}" (runBackendCached backend query seeds delayMs) with
       | .error msg => errors := errors.push msg
       | .ok out =>
@@ -548,13 +573,19 @@ partial def proveBySmtProof (e : Expr) (sOpts : BlasterOptions) (poly? : Option 
           | .ok p =>
               -- NOTE: the next backends are tried when the replay fails (e.g., `z3rec` after `z3`)
               let s ← saveState
-              try return .ok (← replayWith backend p pairs eqTasks)
-              catch ex =>
+              let kernelChecks ← IO.mkRef ({} : KernelChecks)
+              let r ← tryCatchRuntimeEx (Except.ok <$> replayWith backend p pairs eqTasks kernelChecks) fun ex => do
+                (← kernelChecks.get).cancel
                 s.restore
-                errors := errors.push s!"{backend.name}: {← ex.toMessageData.toString}"
+                return .error s!"{backend.name}: {← ex.toMessageData.toString}"
+              match r with
+              | .ok r => return .ok r
+              | .error msg => errors := errors.push msg
           | .error msg => errors := errors.push s!"{backend.name}: {msg}"
     throwError "no proof: {errors}"
   catch ex =>
     return .error (← ex.toMessageData.toString)
+  finally
+    eqStop.set
 
 end Blaster.Reconstruct.SmtProof

@@ -44,7 +44,8 @@ structure ReplayConfig where
   proveDirect : Expr → TermElabM (Option Expr)
   /-- tactic proving `p₁ → ... → pₙ → c` for a step of the given rule -/
   proveStep : String → Expr → TermElabM (Option (Expr × String))
-  /-- the first of the closed goals proved (with the rules of their tactics, see `proveStep`), e.g., attempted in parallel -/
+  /-- the first of the closed goals proved (with the rules of their tactics, see `proveStep`), e.g., attempted in
+      parallel -/
   proveSteps? : Option (Array (String × Expr) → TermElabM (Option (Nat × Expr × String))) := none
   /-- proof of a lemma of Z3's theory of recursive functions (`th-lemma recfun`), given the interpretation
       of its clause and its number of literals (see `RecFun.lean`) -/
@@ -131,7 +132,8 @@ def stepConcl (i : Nat) : ReplayM Expr := do
   let t0 ← IO.monoMsNow
   -- NOTE: the hints of the constructor applications whose instance the conclusion leaves undetermined (see
   -- `SortInfer`) are applied before the defaults
-  let e ← instantiateMVars (← liftInterp (withSortHints (withReader (fun c => { c with deferTypes := true }) (interpProp c))))
+  let e ← instantiateMVars
+    (← liftInterp (withSortHints (withReader (fun c => { c with deferTypes := true }) (interpProp c))))
   -- NOTE: undetermined type parameters are most likely the sort variable of a polymorphic goal (e.g., `List.nil`
   -- in a goal on `List α`), and otherwise irrelevant (e.g., `Option.none` under a tester)
   let e ← defaultTypes (← fillDefaults e) (← defaultTypeParam)
@@ -483,9 +485,7 @@ def withScope (x : ReplayM α) (inherit := false) (keep : Nat → Expr → Bool 
 
 /-- Definitional equality with a heartbeat budget (default transparency when `unfold`, reducible otherwise). -/
 def defeqBudget (a b : Expr) (budget : Nat) (unfold : Bool) : MetaM Bool := do
-  try withTheReader Core.Context (fun c => { c with maxHeartbeats := budget * 1000 }) <|
-      withCurrHeartbeats <| (if unfold then withDefault else withReducible) <| isDefEq a b
-  catch _ => return false
+  return (← Local.withBudget? budget ((if unfold then withDefault else withReducible) <| isDefEq a b)).getD false
 
 /-- Rules whose steps are propositional reasoning on their atoms. -/
 def propositionalRules : Array String :=
@@ -604,10 +604,10 @@ def cachedLocal (rule : String) (g : Expr) (budget? : Option Nat) (x : TermElabM
 def localProof (cfg : ReplayConfig) (rule : String) (largeStep : Bool) (eq : Expr) : TermElabM (Option Expr) := do
   -- NOTE: the tactics on the local differences of large terms are bounded in time (environment variable
   -- `BLASTER_SMTPROOF_LOCAL_MS`, default 1000 ms, and half of it for the lossless generalization; a tactic running past
-  -- the deadline is interrupted), with `largeStep` (the differences of large steps): on the CEK terms of validators, the
-  -- differences proved take at most a few hundred ms (about 80 ms for the lossless ones), while the ones not proved
-  -- (e.g., Z3's normal forms of nested integer divisions, whose step is then proved otherwise) took up to 17 s each. The
-  -- other differences of large terms are only bounded against runaway attempts, at 120 times the budget (e.g., the
+  -- the deadline is interrupted), with `largeStep` (the differences of large steps): on the CEK terms of validators,
+  -- the differences proved take at most a few hundred ms (about 80 ms for the lossless ones), while the ones not proved
+  -- (e.g., Z3's normal forms of nested integer divisions, whose step is then proved otherwise) took up to 17 s each.
+  -- The other differences of large terms are only bounded against runaway attempts, at 120 times the budget (e.g., the
   -- polynomial normal forms of the steps of nonlinear goals are proved after more than 10 s, while a difference of the
   -- same tests did not terminate), and the ones of small terms are not bounded.
   if Local.sizeLe eq 2000 then return ← localProofCore cfg rule eq none
@@ -643,22 +643,24 @@ where
     | none => pure none
   if let some pp := pp? then return some (mkAppN pp vals)
   -- NOTE: no tactic on a generalization refuted by its small instances (e.g., the common subterms of the two sides
-  -- generalized as the same variable, while their relations make the difference hold)
-  let mut res : Option (Expr × String) := none
-  if !(← Local.refuted g) then
-    res ← cachedLocal rule g (budgets.map (·.1)) (bounded (budgets.map (·.1)) (slowGoal g "local" (proveClosed cfg rule g)))
+  -- generalized as the same variable, while their relations make the difference hold), checked on cache misses only
+  let mut res ← cachedLocal rule g (budgets.map (·.1)) do
+    if ← Local.refuted g then return none
+    bounded (budgets.map (·.1)) (slowGoal g "local" (proveClosed cfg rule g))
   let t2 ← IO.monoMsNow
   -- the generalization without loss of the relations between the generalized subterms (see `Local.commonSubterms`)
   let mut vals := vals
   let mut lossless := ""
-  -- NOTE: not when the tactics ran out of time on the generalization (on CEK evaluations, the lossless generalization of
-  -- such a difference was never proved, e.g., normal forms of nested divisions, while it cost half the budget again)
+  -- NOTE: not when the tactics ran out of time on the generalization (on CEK evaluations, the lossless generalization
+  -- of such a difference was never proved, e.g., normal forms of nested divisions, while it cost half the budget again)
   let timedOut := budgets.any fun (b, _) => t2 - t1 ≥ b
   if res.isNone && !timedOut then
     if let some (g', vals') ← Local.generalizeCommon eq l r (lossless := true) then
-      if g' != g && !(← Local.refuted g') then
+      if g' != g then
         let t3 ← IO.monoMsNow
-        res ← cachedLocal rule g' (budgets.map (·.2)) (bounded (budgets.map (·.2)) (proveClosed cfg rule g'))
+        res ← cachedLocal rule g' (budgets.map (·.2)) do
+          if ← Local.refuted g' then return none
+          bounded (budgets.map (·.2)) (proveClosed cfg rule g')
         vals := vals'
         lossless := s!", lossless: generalization {t3 - t2} ms, tactics {(← IO.monoMsNow) - t3} ms"
         if (← IO.getEnv "BLASTER_SMTPROOF_TRACE").isSome && res.isNone then
@@ -720,10 +722,7 @@ where
 /-- Proof of the literal `l` by evaluation: `True`, `¬ False` and `a = a` up to definitional unfolding (e.g., the
     testers and selectors of the interpretation applied to constructors, reduced by `casesOn`). -/
 def evalLit? (l : Expr) : MetaM (Option Expr) := do
-  let defeq (a b : Expr) : MetaM Bool := do
-    try withTheReader Core.Context (fun c => { c with maxHeartbeats := 5000 * 1000 }) <|
-        withCurrHeartbeats <| withDefault <| isDefEq a b
-    catch _ => return false
+  let defeq (a b : Expr) : MetaM Bool := do return (← Local.withBudget? 5000 (withDefault <| isDefEq a b)).getD false
   if let some a := l.not? then
     if (← whnfD a).isConstOf ``False then return some (← mkExpectedTypeHint (mkLambda `h .default a (.bvar 0)) l)
     return none
@@ -861,7 +860,7 @@ partial def popCount (n : Nat) (acc : Nat := 0) : Nat :=
 
 /-- Implementation of `instantiationStats`. -/
 unsafe def instantiationStatsImpl (e : Expr) : Nat × Nat × Array Nat :=
-  let (_, (m, total, hist)) := (go e).run ({}, 0, Array.replicate 12 0)
+  let (_, (_, total, hist)) := (go e).run ({}, 0, Array.replicate 12 0)
   (hist.foldl (· + ·) 0, total, hist)
 where
   -- NOTE: the closed subterms are traversed too (e.g., the closed lambda terms of `liftGlobalProofs`)
@@ -1089,7 +1088,8 @@ partial def replayCore (i : Nat) : ReplayM Expr := do
       if let some f ← IO.getEnv "BLASTER_SMTPROOF_TRACE" then
         let h ← IO.FS.Handle.mk f .append
         let (tac1, goals1) ← Local.portfolioTime.get
-        h.putStrLn s!"step {i} {step.rule} depth {ctx.depth}: {ms} ms (tactics {tac1 - tac0} ms on {goals1 - goals0} goals); {(toString step.concl).take 200}"
+        h.putStrLn s!"step {i} {step.rule} depth {ctx.depth}: {ms} ms (tactics {tac1 - tac0} ms on \
+          {goals1 - goals0} goals); {(toString step.concl).take 200}"
 
 partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   let ctx ← read
@@ -1104,20 +1104,21 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
         return toString (← ppExpr g)
       let h ← IO.FS.Handle.mk f .append
       h.putStrLn s!"-- step {i} ({step.rule})\nexample : {s} := by\n  sorry\n"
+  -- NOTE: the runtime exceptions (e.g., the maximum recursion depth in a tactic) are failures of the attempt too
   let attempt : ReplayM (Option Expr) := do
-    try some <$> withReader (fun c => { c with stepIdx := i }) (replayRule step concl)
-    catch ex =>
+    tryCatchRuntimeEx (some <$> withReader (fun c => { c with stepIdx := i }) (replayRule step concl)) fun ex => do
       debugLog m!"step {i} ({step.rule}) failed: {ex.toMessageData}"
       return none
   if let some p ← attempt then return p
   -- fallback: unit propagation (e.g., for clauses whose literals are disjunctions)
   if ["unit-resolution", "resolution", "th_resolution"].contains step.rule then
-    try return ← replayRup step concl
-    catch _ => pure ()
+    if let some p ← tryCatchRuntimeEx (some <$> replayRup step concl) fun _ => pure none then return p
   -- fallback: tactics on `premises → conclusion` (e.g., when an explicit construction fails due to casts)
   if !(["asserted", "goal", "hypothesis", "lemma", "proof-bind"].contains step.rule) then
-    try return ← replayByTactic step concl
-    catch ex => debugLog m!"step {i} ({step.rule}) by tactics failed: {ex.toMessageData}"
+    let p? ← tryCatchRuntimeEx (some <$> replayByTactic step concl) fun ex => do
+      debugLog m!"step {i} ({step.rule}) by tactics failed: {ex.toMessageData}"
+      return none
+    if let some p := p? then return p
   -- fallback: direct proof of the conclusion (except for `False`, which amounts to proving the goal
   -- without the proof of the backend)
   if concl.isConstOf ``False then
@@ -1125,7 +1126,7 @@ partial def replayCore' (i : Nat) (step : Step) : ReplayM Expr := do
   -- NOTE: direct proofs are costly; they are attempted a bounded number of times, and for a bounded total time on
   -- large statements (e.g., the steps of a CEK evaluation depending on a failed step: each attempt exhausted the
   -- budgets of the bridge tactics, about 15 s)
-  let large := !Local.sizeLe concl 20000
+  let large := !Local.sizeLe concl Local.largeTermSize
   if !ctx.prepass && (← get).directAttempts < ctx.maxDirect && (!large || (← get).largeDirectMs < 60000) then
     modify fun s => { s with directAttempts := s.directAttempts + 1 }
     let start ← IO.monoMsNow
@@ -1268,8 +1269,8 @@ partial def replayRule (step : Step) (concl : Expr) : ReplayM Expr := do
       let some (nq, inst) := orArgs? concl | throwError "quant-inst: disjunction expected"
       let some q := nq.not? | throwError "quant-inst: negated quantifier expected"
       let pending ← IO.mkRef #[]
-      let ts ← liftInterp (withReader (fun c => { c with pendingHints := some pending }) (step.args.mapM interpInt?)) >>=
-        (·.mapM fun t => liftM (fillDefaults t))
+      let ts ← liftInterp (withReader (fun c => { c with pendingHints := some pending }) (step.args.mapM interpInt?))
+      let ts ← ts.mapM fun t => liftM (fillDefaults t)
       let dflt ← defaultTypeParam
       let r ← withLocalDeclD `h q fun h => do
         let hi ← instantiateWithCoercion h ts
@@ -1534,7 +1535,7 @@ partial def replayDatatype (concl : Expr) : MetaM (Option Expr) := do
     if !r.isAppOf c then return none
     let la := l.getAppArgs
     let ra := r.getAppArgs
-    let some k := (List.range info.numFields).find? fun k =>
+    let some _ := (List.range info.numFields).find? fun k =>
       la[info.numParams + k]! == x && ra[info.numParams + k]! == y | return none
     let injName := c ++ `inj
     if !(← getEnv).contains injName then return none
@@ -1606,7 +1607,7 @@ partial def replayByTactic (step : Step) (concl : Expr) : ReplayM Expr := do
       return p
   -- large statements (e.g., the CEK evaluation of validators): tactics are only applied to their local
   -- differences (see `Local`)
-  let large := !(Local.sizeLe concl 20000)
+  let large := !(Local.sizeLe concl Local.largeTermSize)
   let unfoldable := Local.sizeLe concl 2000
   -- identical sides (e.g., rewrites of Z3 normalizing the n-ary connectives folded by the interpretation)
   if let some (_, a, b) := concl.eq? then
