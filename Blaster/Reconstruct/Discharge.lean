@@ -1602,6 +1602,9 @@ partial def dischargeHoles
   (p : Expr) (holes : Array HoleInfo := #[]) (equivs : Array (Expr × Expr) := #[])
   (fallback : Expr → TermElabM (Option (Expr × String)) := fun _ => pure none) :
   TermElabM (Expr × DischargeStats) := do
+  -- NOTE: `hasHoles` is a native traversal, cheaper than the passes below on proofs without obligations (e.g., 2 s
+  -- for the second pass on the proofs of the `#testOptimize` certificates of MatchToITE.lean, of 340K distinct subterms)
+  if !hasHoles p then return (p, {})
   let stats ← IO.mkRef ({} : DischargeStats)
   let facts ← IO.mkRef (← withProfile "dischargeHoles.equivalences" (proveEquivalences equivs))
   let labelOf (e : Expr) : String :=
@@ -1696,6 +1699,10 @@ partial def dischargeHoles
           -- reductions of the `match` applications of different matchers, discharged by `grind` after the failures of
           -- `simp` and `omega`)
           let first? ← firstTactic? (← preferred.get) label
+          -- NOTE: not `early` (e.g., the replay of an SMT proof) on the equivalences of recursive functions, which need
+          -- induction (e.g., 40 s for Z3 to time out on `powerNat x y = Nat.pow x y`): the last resort of the second
+          -- pass, after the induction with the equivalences proved by the first pass as hypotheses
+          let early := if isRecFunEquivLabel label then fun _ => pure none else early
           let r ← withoutSharedProofs
             (dischargeInContext type (first? := first?) (early := early) (skipCheap := skipCheap))
           let ms := (← IO.monoMsNow) - start
@@ -1715,6 +1722,7 @@ partial def dischargeHoles
           | none => return some e
   let p' ← try firstPass finally stop.set
   reportAttempts
+  if !hasHoles p' then return (p', ← stats.get)
   -- second pass (with proved equivalences as hypotheses), fallback regions and failure reporting
   let fallback (type : Expr) : TermElabM (Option (Expr × String)) := do
     if (← fallbackFailed.get).contains (← obligationKey type) then return none

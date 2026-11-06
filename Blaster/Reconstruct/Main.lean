@@ -202,6 +202,10 @@ def obligationBySmtProof (checked : IO.Ref (Array (Name × Expr))) (task : Recon
     TermElabM (Option (Expr × String)) := do
   let type ← zetaReduce (← instantiateMVars type)
   let fvs ← SmtProof.usedFVars type
+  -- NOTE: not on the obligations without variables, i.e., computations (left to kernel evaluation, see
+  -- `dischargeOneAux`), on which the backend evaluates the functions until its timeout (e.g., 40 s for the constant
+  -- folding of `Nat.log2 (2 ^ 65536)`)
+  if fvs.isEmpty then return none
   let vars : FVarIdSet := fvs.foldl (fun s x => s.insert x.fvarId!) {}
   let mut hyps := #[]
   for d in ← getLCtx do

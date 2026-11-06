@@ -211,7 +211,10 @@ and info trees are restored). The portfolio, in order:
   structural induction on one variable. Nested equivalences are proved bottom-up and reused.
 - **SMT proof replay.** The obligation is closed over the variables it mentions and the hypotheses on them (e.g., the
   conditions under which the optimizer rewrote). It comes before the costly case analyses: on CEK evaluations, the
-  replay proves in less than a second obligations on which the case analyses fail after a minute.
+  replay proves in less than a second obligations on which the case analyses fail after a minute. It is not tried on
+  obligations without variables, which are computations left to kernel evaluation, and it is only the last resort for
+  the equivalences of recursive functions, which need induction: on both, the backends ran until their timeouts (40 s
+  for the constant folding of `Nat.log2 (2 ^ 65536)`, and for `powerNat x y = Nat.pow x y`).
 - **`match cases`.** For an obligation `match ds with alts = rhs`, a case split over the matcher's splitter, where the
   discriminants are replaced by the patterns in `rhs`. Each case is discharged recursively with the portfolio, with the
   pattern equalities and the overlap hypotheses in the local context.
@@ -624,6 +627,11 @@ fourteenth `Governance` theorem (#14 below) took 392 s, and the `MintingPolicy` 
 | speculative parallel discharge of proof obligations (`startDischarges`)  | obligations of `HelloWorld`: 4.6 s → 2 s |
 | proof depth bound 512 instead of 128 (`shareDeepProofs`)                 | 12 s of proof sharing removed            |
 | in `last` mode, replay after two exhausted attempts (3.5)                | `HelloWorld` 83 → 16 s, #14 120 → 36 s   |
+
+On the test suite (wall time per file, with the `#testOptimize` audit of `BLASTER_RECON_STATS`), skipping the replay
+of the obligations without variables and of the equivalences of recursive functions (3.4) brought `NatLog2.lean` from
+44 s to 8.5 s and `Tests/Reconstruct/Basic.lean` from 43 s to 2.5 s, and skipping the passes of `dischargeHoles` on
+proofs without obligations brought `MatchToITE.lean` from 67 s to 59 s.
 
 `orElim` was quadratic in the literals of large clauses (a third of the replay of `MintingPolicy`). The parallel
 tactic tasks run without the replay's state, whose objects would otherwise be marked as multi-threaded; the auxiliary
