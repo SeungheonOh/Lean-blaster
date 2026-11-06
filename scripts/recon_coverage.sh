@@ -13,7 +13,10 @@ OUT=$(realpath -m "${1:-recon_stats.jsonl}")
 JOBS=${2:-4}
 FILTER=${3:-Tests}
 rm -f "$OUT"
-lake build Tests.Utils Tests.Smt.Benchmarks.ValidatorsExamples.PlutusLedgerAPI.VDummy >/dev/null || exit 1
+lake build Blaster:shared Tests.Utils Tests.Smt.Benchmarks.ValidatorsExamples.PlutusLedgerAPI.VDummy >/dev/null || exit 1
+# the native code of Blaster, as with `lake build` and the language server (without it, `lake env lean` interprets
+# Blaster's code, e.g., 30 times slower on the optimizer)
+DYNLIB=$(realpath .lake/build/lib/libBlaster.so)
 # leaf test files only (i.e., files that contain test commands), excluding state machine tests
 FILES=$(grep -rlE "#blaster|#testOptimize|by blaster" "$FILTER" --include=*.lean \
           | grep -v "^Tests/Utils.lean" | grep -v "^Tests/StateMachine" | sort)
@@ -28,5 +31,6 @@ FILES=$(grep -rlE "#blaster|#testOptimize|by blaster" "$FILTER" --include=*.lean
 WATCHDOG=$!
 trap 'kill $WATCHDOG 2>/dev/null' EXIT
 echo "$FILES" | xargs -P "$JOBS" -I{} sh -c \
-  'BLASTER_RECONSTRUCT=1 BLASTER_RECON_STATS="$0" timeout 900 lake env lean "$1" >/dev/null 2>&1 || echo "failed: $1"' "$OUT" {}
+  'BLASTER_RECONSTRUCT=1 BLASTER_RECON_STATS="$0" timeout 900 lake env lean --load-dynlib="$1" "$2" >/dev/null 2>&1 ||
+     echo "failed: $2"' "$OUT" "$DYNLIB" {}
 python3 "$(dirname "$0")/recon_report.py" "$OUT"

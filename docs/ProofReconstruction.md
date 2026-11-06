@@ -646,12 +646,13 @@ fourteenth `Governance` theorem (#14 below) took 392 s, and the `MintingPolicy` 
 | proof depth bound 512 instead of 128 (`shareDeepProofs`)                 | 12 s of proof sharing removed            |
 | in `last` mode, replay after two exhausted attempts (3.5)                | `HelloWorld` 83 → 16 s, #14 120 → 36 s   |
 
-On the test suite (wall time per file, with the `#testOptimize` audit of `BLASTER_RECON_STATS`), skipping the replay
-of the obligations without variables and of the equivalences of recursive functions (3.4) brought `NatLog2.lean` from
-44 s to 8.5 s and `Tests/Reconstruct/Basic.lean` from 43 s to 2.5 s, and skipping the passes of `dischargeHoles` on
-proofs without obligations brought `MatchToITE.lean` from 67 s to 59 s. The subterms containing obligations are
-computed once for the two traversals of `dischargeHoles` (the speculative discharge and the first pass), at about
-8 µs per distinct subterm: `dischargeHoles` on the four goals of `Tests/Reconstruct/DeepProofs.lean` 12.7 s → 7.3 s.
+On the test suite (wall time per file, with the `#testOptimize` audit of `BLASTER_RECON_STATS` and Blaster's code
+interpreted, see Section 9), skipping the replay of the obligations without variables and of the equivalences of
+recursive functions (3.4) brought `NatLog2.lean` from 44 s to 8.5 s and `Tests/Reconstruct/Basic.lean` from 43 s to
+2.5 s, and skipping the passes of `dischargeHoles` on proofs without obligations brought `MatchToITE.lean` from 67 s to
+59 s. The subterms containing obligations are computed once for the two traversals of `dischargeHoles` (the speculative
+discharge and the first pass), at about 8 µs per distinct subterm: `dischargeHoles` on the four goals of
+`Tests/Reconstruct/DeepProofs.lean` 12.7 s → 7.3 s.
 
 The order of the strategies follows profiles of the goals of the test suite, each goal in its own file: the commands
 of a file run concurrently (each `#blaster` command in its own task), so that their times overlap and include the
@@ -789,13 +790,15 @@ proof is not eliminated into data. Other limitations of the replay:
 ./scripts/recon_coverage.sh stats.jsonl 8
 ```
 
-This runs every test file with `BLASTER_RECONSTRUCT=1` and `BLASTER_RECON_STATS=stats.jsonl`, which writes one JSON
-line per reconstruction attempt. With `BLASTER_RECON_STATS` set, each `#testOptimize` case is also audited for a
-kernel-checked proof of `e = optimize(e)`. The audit runs after the test's own check, and it optimizes with a dedicated
-name-generator prefix, so that names created while building proof terms don't clash with those created during
-reconstruction. `scripts/recon_report.py` summarizes the results: success rates per category, discharge methods,
-failure reasons, and proof obligations per rewrite site. The rewrite-site breakdown is the to-do list for further rule
-instrumentation.
+This runs every test file with `BLASTER_RECONSTRUCT=1` and `BLASTER_RECON_STATS=stats.jsonl`, which writes one JSON line
+per reconstruction attempt. The files are run with the native code of Blaster (`--load-dynlib`), as with `lake build`
+and the language server: a plain `lake env lean` interprets Blaster's code, about 30 times slower on the optimizer
+(Lean's own tactics are native in both cases), which matters when timing a test file. With `BLASTER_RECON_STATS` set,
+each `#testOptimize` case is also audited for a kernel-checked proof of `e = optimize(e)`. The audit runs after the
+test's own check, and it optimizes with a dedicated name-generator prefix, so that names created while building proof
+terms don't clash with those created during reconstruction. `scripts/recon_report.py` summarizes the results: success
+rates per category, discharge methods, failure reasons, and proof obligations per rewrite site. The rewrite-site
+breakdown is the to-do list for further rule instrumentation.
 
 The replay-only figure of Section 6.1 runs the test files of `Tests/Smt` and `Tests/FixedIssues` with
 `BLASTER_SMT_PROOF=only` and `BLASTER_SMTPROOF_LOG=<file>`, and counts the logged replay attempts whose `kind` is not
