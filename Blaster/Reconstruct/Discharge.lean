@@ -1532,24 +1532,36 @@ opaque transformScoped (e : Expr) (f : Expr → TermElabM (Option Expr)) (obl? :
 
 /-- Return the local context (and local instances) restricted to the declarations `type` depends on
     (transitively) and to the hypotheses only depending on them (e.g., the equalities of the match context of
-    a proof obligation), or `none` when no declaration is removed.
+    a proof obligation), or `none` when no declaration is removed. The hypotheses on the propositional variables it
+    depends on are relevant too (with their own dependencies), as they are their only meaning (e.g., `p1 ∧ True` and
+    `¬p1 ∨ p2 ∧ p3` for an obligation whose rewrite of `¬p3` to `False` used them).
 -/
 def relevantContext? (type : Expr) : MetaM (Option (LocalContext × LocalInstances)) := do
   let lctx ← getLCtx
+  let isHyp (d : LocalDecl) : MetaM Bool := do
+    return !d.isImplementationDetail && (← try isProp d.type catch _ => pure false)
   let mut keep : FVarIdSet := {}
   let mut todo := (collectFVars {} (← instantiateMVars type)).fvarIds
-  while !todo.isEmpty do
-    let y := todo.back!
-    todo := todo.pop
-    if keep.contains y then continue
-    keep := keep.insert y
-    let some d := lctx.find? y | continue
-    todo := todo ++ (collectFVars {} d.type).fvarIds
-    if let some v := d.value? then todo := todo ++ (collectFVars {} v).fvarIds
+  -- the propositional variables kept so far
+  let mut props : FVarIdSet := {}
+  repeat
+    while !todo.isEmpty do
+      let y := todo.back!
+      todo := todo.pop
+      if keep.contains y then continue
+      keep := keep.insert y
+      let some d := lctx.find? y | continue
+      if d.type.isProp then props := props.insert y
+      todo := todo ++ (collectFVars {} d.type).fvarIds
+      if let some v := d.value? then todo := todo ++ (collectFVars {} v).fvarIds
+    if props.isEmpty then break
+    for d in lctx do
+      if !keep.contains d.fvarId && d.type.hasAnyFVar props.contains && (← isHyp d) then todo := todo.push d.fvarId
+    if todo.isEmpty then break
   let mut removed := false
   for d in lctx do
     if keep.contains d.fvarId then continue
-    if !d.isImplementationDetail && !d.type.hasAnyFVar (!keep.contains ·) && (← try isProp d.type catch _ => pure false) then
+    if !d.type.hasAnyFVar (!keep.contains ·) && (← isHyp d) then
       keep := keep.insert d.fvarId
     else
       removed := true
