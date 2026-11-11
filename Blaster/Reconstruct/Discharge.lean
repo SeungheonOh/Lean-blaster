@@ -1042,6 +1042,15 @@ def isRelevantTactic (name : String) (e : Expr) : Bool :=
   | "bitvectors" => mentions `BitVec
   | _ => true
 
+/-- The tactics of `proveResidual` deciding the theories the optimizer encodes (e.g., the bit vectors as natural
+    numbers, on whose encoding the tactics fail), tried on the goal before its optimization (see
+    `Blaster.Reconstruct.reconstruct`). -/
+def encodedTheoryTactics : Array String := #["bitvectors"]
+
+/-- The cheap tactics of `proveResidual` (decision procedures and case analysis by `split`), tried on the goal before
+    the last replay of a proof of the SMT solver (see `Blaster.Reconstruct.reconstruct`). -/
+def cheapResidualTactics : Array String := #["decide", "simp", "strings", "omega", "bitvectors", "grind", "split"]
+
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
@@ -2140,8 +2149,11 @@ def divModConsts : Array Name :=
     backend SMT solver) using decision procedures available in Lean.
     `hard` (e.g., the replay of a proof of the SMT solver) is tried once, as soon as two attempts exhaust their budget;
     it is not tried otherwise (the caller tries it after the other strategies, see `Blaster.Reconstruct.reconstruct`).
+    The number of attempts that exhausted their budget is stored in `exhausted?` (when given). Only the tactics named
+    in `only?` are tried when it is given.
 -/
-def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure none) :
+def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure none)
+    (exhausted? : Option (IO.Ref Nat) := none) (only? : Option (Array String) := none) :
     TermElabM (Option (Expr × String)) := do
   if !(← isTypeCorrectObligation e) then return none
   let tacs : Array (String × TSyntax `tactic) := #[
@@ -2226,7 +2238,8 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
   -- NOTE: the induction (e.g., on the `Nat` variables) doesn't prove them and takes 0.1 to 0.5 s to fail on each of
   -- them (3.5 s on `Tests/Smt/SmtNat/SmtNatDiv.lean`)
   let idx : Array Nat := Id.run do
-    let all := (List.range tacs.size).toArray.filter fun i => isRelevantTactic tacs[i]!.1 e
+    let all := (List.range tacs.size).toArray.filter fun i =>
+      isRelevantTactic tacs[i]!.1 e && only?.all (·.contains tacs[i]!.1)
     if !e.getUsedConstants.any divModConsts.contains then return all
     let ind := all.filter (tacs[·]!.1 == "induction")
     let lastArith := (all.filter (#["div/mod facts", "nonlinear", "arith simp"].contains tacs[·]!.1)).back?
@@ -2293,6 +2306,7 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
       -- NOTE: not after the first one, as the replay may take longer than the tactics after it (e.g., 28 s instead of
       -- 1.5 s for a case analysis)
       exhausted := exhausted + n
+      if let some r := exhausted? then r.set exhausted
       if !hardTried && exhausted ≥ 2 then
         hardTried := true
         if let some r ← profileAttempt "residual:hard" hard then return some r

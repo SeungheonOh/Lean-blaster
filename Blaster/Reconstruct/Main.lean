@@ -252,6 +252,37 @@ def reconstructRewrite (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermE
     | _ => mkTopHole e optExpr
   finishProof (← IO.mkRef #[]) out goal proof startTime recon.holes recon.recFunEquivs
 
+/-- Prove the goal `goal` (over the local axioms `axioms`) directly with Lean's decision procedures, i.e., without the
+    evidence of the optimizer (e.g., when it is ill-typed, or when only the replay of a proof of the SMT solver proves the
+    residual goal), or with the tactics of `proveResidual` named in `only?` when it is given. -/
+def proveDirect (goal : Expr) (axioms : List Name) (only? : Option (Array String) := none) :
+    TermElabM (Option (Expr × String)) := do
+  let goal ← instantiateMVars goal
+  if goal.hasMVar then return none
+  -- the goals of the `blaster` tactic, over the variables of its local context: closed over them
+  let some (xs, goal) ← closeOverLocals goal | return none
+  if goal.hasFVar then return none
+  let r ← if only?.isSome then proveResidual goal (only? := only?) else (do
+    if let some p ← proveByDefEq goal then return some (p, "rfl")
+    -- NOTE: not over the variables of the tactic's goal, on which kernel evaluation is not bounded by the heartbeats
+    -- (e.g., the `2 ^ 20` cases of `∀ a b : BitVec 10, a + b = b + a`)
+    if xs.isEmpty then
+      if let some p ← proveWithTactic goal (← `(tactic| decide +kernel)) then return some (p, "decide")
+    -- local axioms (e.g., universe polymorphic ones) as lemmas
+    if !axioms.isEmpty then
+      let lemmas ← axioms.toArray.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+      let tacs := #[
+        ← `(tactic| (intros <;> blaster_denorm <;> simp_all [$lemmas,*] <;> done)),
+        ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;>
+                     simp_all [$lemmas,*, List.head!, List.head?, List.headD] <;> done))]
+      for tac in tacs do
+        if let some p ← proveWithTactic goal tac (budget := 4 * dischargeHeartbeats) then
+          return some (p, "local axioms")
+    proveResidual goal : TermElabM _)
+  let some (p, m) := r | return none
+  if (← kernelCheck goal p).isSome then return none
+  return some (mkAppN p xs, m)
+
 /-- Try to reconstruct a proof for `task` given the reconstruction environment `recon`
     obtained after optimization.
 -/
@@ -265,6 +296,13 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
   let mode ← match task.smtProof with
     | some m => pure m
     | none => pure ((← IO.getEnv "BLASTER_SMT_PROOF").getD "last")
+  -- the decision procedures of the theories the optimizer encodes on the goal before its optimization (e.g., the bit
+  -- vectors as natural numbers, on whose encoding the tactics fail after 22 s for
+  -- `(0#5).rotateLeft x.toNat = 0#5 ∧ (0#5).rotateLeft y.toNat = 0#5`, which a case analysis on the bits proves at once)
+  if encodedTheoryTactics.any (isRelevantTactic · task.goal) then
+    if let some (p, m) ← withProfile "proveDirect.theories"
+        (proveDirect task.goal task.axioms (only? := encodedTheoryTactics)) then
+      return ← finish { out with proof? := some p, residual := s!"direct by {m}" }
   -- Evidence for `fullGoal = optExpr`
   let optPf? ← withProfile "alignEnds" <| match task.optPf with
     | .defeq => pure none
@@ -272,36 +310,50 @@ def reconstruct (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutcome :
     | _ => some <$> mkTopHole task.fullGoal task.optExpr
   -- Proof of the residual goal
   profileLog "residualGoal" 0 fun _ => s!"dag={dagSize task.optExpr}"
+  -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`; option `smt-proof`, environment variable
+  -- `BLASTER_SMT_PROOF`): `first` (before the tactic strategies), `last` (after them, or as soon as two of them exhaust
+  -- their budget, see `proveResidual`), `only` (without them, to measure the replay) or `off`
+  let replayed ← IO.mkRef false
+  let replay : TermElabM (Option (Expr × String)) := do
+    if mode == "off" || !task.bySmt then return none
+    replayed.set true
+    bySmtProofReplay checked task "residual" task.optExpr
+  let bySmtProof : TermElabM (Option (Expr × String)) := do
+    let some (p, m) ← replay | return none
+    return some (p, s!"smt residual by {m}")
+  -- the number of tactic attempts on the residual goal that exhausted their budget
+  let exhausted ← IO.mkRef 0
   let (residual, residualMethod) ← withProfile "residual" (info := (·.2)) <| match task.optExpr with
     | .const ``True _ => pure (some (Lean.mkConst ``True.intro), "optimizer")
     | e => do
-        -- replay of a proof of the SMT backend (see `Blaster.Reconstruct.SmtProof`; option `smt-proof`, environment
-        -- variable `BLASTER_SMT_PROOF`): `first` (before the tactic strategies), `last` (after them, or as soon as two
-        -- of them exhaust their budget, see `proveResidual`), `only` (without them, to measure the replay) or `off`
-        let replayed ← IO.mkRef false
-        let replay : TermElabM (Option (Expr × String)) := do
-          if mode == "off" || !task.bySmt then return none
-          replayed.set true
-          bySmtProofReplay checked task "residual" e
-        let bySmtProof : TermElabM (Option (Expr × String)) := do
-          let some (p, m) ← replay | return none
-          return some (p, s!"smt residual by {m}")
         let first? ← if mode == "first" || mode == "only" then bySmtProof else pure none
         match first? with
         | some (p, m) => pure (some p, m)
         | none =>
         if mode == "only" then pure (none, "none") else
-        match ← proveResidual e (hard := if mode == "last" then replay else pure none) with
+        match ← proveResidual e (hard := if mode == "last" then replay else pure none) (exhausted? := exhausted) with
         | some (p, m) => pure (some p, s!"smt residual by {m}")
         | none =>
             -- equivalences between recursive functions established by the optimizer as hypotheses
             let facts ← if recon.recFunEquivs.isEmpty then pure #[] else proveEquivalences recon.recFunEquivs
             match ← dischargeWithFacts e facts with
             | some p => pure (some p, "smt residual by induction+facts")
-            | none =>
-                match ← (if mode == "last" && !(← replayed.get) then bySmtProof else pure none) with
-                | some (p, m) => pure (some p, m)
-                | none => pure (none, "none")
+            | none => pure (none, "none")
+  -- the last resort when the tactics fail on the residual goal: the replay, preceded by the cheap tactics on the goal
+  -- itself (e.g., `simp` proves `A ∩ B = ⋂₀ {A, B}` in 5 ms, while the replay doesn't end) when no tactic exhausted its
+  -- budget on the residual goal (e.g., 15 s of failed direct attempts before the replay proving the nonlinear residual
+  -- of `m * n = 288 → m = 18` in 1.4 s), the whole portfolio on the goal being a fallback (see `reconstructSafe`)
+  if residual.isNone && mode != "only" && (← exhausted.get) == 0 then
+    if let some (p, m) ← withProfile "proveDirect.cheap"
+        (proveDirect task.goal task.axioms (only? := cheapResidualTactics)) then
+      return ← finish { out with proof? := some p, residual := s!"direct by {m}" }
+  let (residual, residualMethod) ← match residual with
+    | some p => pure (some p, residualMethod)
+    | none => do
+        if mode != "last" || (← replayed.get) then pure (none, residualMethod) else
+        match ← withProfile "residual.replay" bySmtProof with
+        | some (p, m) => pure (some p, m)
+        | none => pure (none, residualMethod)
   let out := { out with residual := residualMethod }
   profileLog "components" 0 fun _ =>
     s!"evidence={(optPf?.map dagSize).getD 0} residual={(residual.map dagSize).getD 0}"
@@ -357,34 +409,12 @@ def reconstructSafe (task : ReconTask) (recon : ReconEnv) : TermElabM ReconOutco
   -- fallback: prove the original goal directly with Lean's decision procedures
   let startTime ← IO.monoMsNow
   let s ← saveState
-  let direct ← withProfile "proveDirect" <| tryCatchRuntimeEx (withReconContext (proveDirect task.goal task.axioms)) fun _ => do
-    s.restore
-    return none
+  let direct ← withProfile "proveDirect" <| tryCatchRuntimeEx (withReconContext (proveDirect task.goal task.axioms))
+    fun _ => do s.restore; return none
   match direct with
   | some (p, m) => return { out with proof? := some p, failure := m!"", residual := s!"direct by {m}",
                                      elapsedMs := out.elapsedMs + ((← IO.monoMsNow) - startTime) }
   | none => return out
-where
-  proveDirect (goal : Expr) (axioms : List Name) : TermElabM (Option (Expr × String)) := do
-    let goal ← instantiateMVars goal
-    if goal.hasMVar || goal.hasFVar then return none
-    let r ← (do
-      if let some p ← proveByDefEq goal then return some (p, "rfl")
-      if let some p ← proveWithTactic goal (← `(tactic| decide +kernel)) then return some (p, "decide")
-      -- local axioms (e.g., universe polymorphic ones) as lemmas
-      if !axioms.isEmpty then
-        let lemmas ← axioms.toArray.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
-        let tacs := #[
-          ← `(tactic| (intros <;> blaster_denorm <;> simp_all [$lemmas,*] <;> done)),
-          ← `(tactic| (intros <;> blaster_denorm <;> blaster_cases_vars <;>
-                       simp_all [$lemmas,*, List.head!, List.head?, List.headD] <;> done))]
-        for tac in tacs do
-          if let some p ← proveWithTactic goal tac (budget := 4 * dischargeHeartbeats) then
-            return some (p, "local axioms")
-      proveResidual goal : TermElabM _)
-    let some (p, m) := r | return none
-    if (← kernelCheck goal p).isSome then return none
-    return some (p, m)
 
 /-- Same as `reconstructRewrite` but any exception is reported as a reconstruction failure. -/
 def reconstructRewriteSafe (e optExpr : Expr) (pf : EqPf) (recon : ReconEnv) : TermElabM ReconOutcome := do
