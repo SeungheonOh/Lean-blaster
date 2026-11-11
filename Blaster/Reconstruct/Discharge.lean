@@ -779,7 +779,13 @@ partial def inhabitGoal (depth : Nat) : TacticM Bool := do
   focus do
     unless ← inhabitGoal inhabitDepth do throwError "blaster_inhabit: no element constructed"
 
-@[tactic blasterExists] def evalBlasterExists : Tactic := fun _ => do
+/-- Maximum number of nested existentials whose witnesses are searched (see `proveExists`). -/
+def existsDepth : Nat := 2
+
+mutual
+/-- Prove the existential main goal with a candidate witness (see `witnessCandidates`), its body being closed by
+    `closeExistsBody` (with the existentials nested in it at most `fuel` levels). -/
+partial def proveExists (fuel : Nat) : TacticM Unit := do
   let g ← getMainGoal
   let target ← instantiateMVars (← g.getType)
   let some (_, .lam _ t _ _) := (← whnfR target).app2? ``Exists
@@ -790,9 +796,16 @@ partial def inhabitGoal (depth : Nat) : TacticM Bool := do
     if ← g.withContext (isDefEq d.type t) then vars := vars.push (mkIdent d.userName)
   let candidates ← g.withContext (witnessCandidates t (literalSeeds target) vars 2)
   for c in candidates do
-    if ← closesGoals (evalTactic (← `(tactic| (refine ⟨$c, ?_⟩ <;>
-        (try blaster_unfold_user) <;> first | omega | decide | (simp_all; done) | (simp_all <;> omega))))) then
-      return
+    -- the body and the proof fields of the witness (e.g., `⟨n, ?_⟩` for a subtype)
+    let close : TacticM Unit := do
+      evalTactic (← `(tactic| refine ⟨$c, ?_⟩))
+      for g' in ← getUnsolvedGoals do
+        -- NOTE: a goal may be assigned when closing an earlier one (e.g., a data field determined by a proof field)
+        if ← g'.isAssigned then continue
+        setGoals [g']
+        closeExistsBody fuel
+      setGoals []
+    if ← closesGoals close then return
   -- a witness constructed from the type when it has no candidate witnesses (e.g., the function type `FalseInv → Empty`
   -- with `FalseInv` false)
   if candidates.isEmpty then
@@ -800,6 +813,26 @@ partial def inhabitGoal (depth : Nat) : TacticM Bool := do
         (← `(tactic| (refine ⟨?_, ?_⟩ <;> first | blaster_inhabit | trivial | omega | (simp_all; done))))) then
       return
   throwError "blaster_exists: no witness found"
+
+/-- Close the body of an existential given its witness, with its conjuncts split and the existential ones proved by a
+    witness search (e.g., `∃ n, n ^ 2 = 4 ∧ ∃ m, m ^ 2 = 9`), at most `fuel` levels. -/
+partial def closeExistsBody (fuel : Nat) : TacticM Unit := do
+  if ← closesGoals (evalTactic (← `(tactic| ((try blaster_unfold_user) <;>
+      first | omega | decide | (simp_all; done) | (simp_all <;> omega))))) then return
+  if fuel == 0 then throwError "blaster_exists: body not proved"
+  let t ← whnfR (← instantiateMVars (← getMainTarget))
+  if t.isAppOfArity ``And 2 then
+    evalTactic (← `(tactic| refine ⟨?_, ?_⟩))
+    for g in ← getUnsolvedGoals do
+      setGoals [g]
+      closeExistsBody fuel
+    setGoals []
+  else if t.isAppOfArity ``Exists 2 then
+    proveExists (fuel - 1)
+  else throwError "blaster_exists: body not proved"
+end
+
+@[tactic blasterExists] def evalBlasterExists : Tactic := fun _ => proveExists existsDepth
 
 /-! ## Equivalence of recursive functions
 
