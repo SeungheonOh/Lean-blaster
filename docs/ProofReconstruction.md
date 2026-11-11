@@ -172,7 +172,10 @@ lemmas live in `Reconstruct/Lemmas.lean`.
 Notes on the `match` rules:
 
 - **`matchReduction`.** The discriminants, resolved with the match context, are rewritten with the equalities of the
-  enclosing alternatives; the match then reduces by iota.
+  enclosing alternatives; the match then reduces by iota. The definitional equality check has a bounded recursion
+  depth (`matchReductionMaxRecDepth`): a deeper check leaves the reduction as a proof obligation, instead of
+  overflowing the stack (e.g., on the evaluation of a UPLC program of 4096 nested terms, in a file setting
+  `maxRecDepth` to 1000000). The kernel's check is not used: it was 20 times slower on `Tests/Reconstruct/DeepProofs.lean`.
 - **Match push.** Case of case (`constMatchPropagation?`), a function over a match (`funPropagation?`) and a match
   applied to extra arguments (`normChoiceApplication?`) all rewrite `F[match d with alts]` to
   `match d with (F[·] ∘ alts)`. The proof is a case split over the alternatives of the resulting match, each case
@@ -195,7 +198,7 @@ and info trees are restored). The portfolio, in order:
 |------|----------------------------------------------------------------------------------------------------------|
 | 0    | the tactic that discharged the previous obligation of the same kind (e.g., all the `match` reductions)   |
 | 1    | definitional equality (`rfl`); for closed obligations, `decide +kernel` and `blaster_wf_eval`            |
-| 2    | `simp [*]`, `omega`, `grind`                                                                             |
+| 2    | `simp [*]`, `omega`, bit vectors (`bv_omega`, then bit by bit), `grind`                                  |
 | 3    | cancellation of non-zero divisors (`simp` with `omega` as discharger)                                    |
 | 4    | case analysis: `split`, the conditions of applied `dite`s, cancellation of non-zero factors              |
 | 5    | case analysis on variables of inductive types and their fields, unfolding user definitions and instances |
@@ -206,6 +209,11 @@ and info trees are restored). The portfolio, in order:
 | 10   | case analysis on `match`es with generalized discriminants                                                |
 | 11   | `match cases` over the splitter                                                                          |
 
+- **Relevant context.** An obligation is first discharged in its relevant local context: the declarations it depends
+  on (transitively), the hypotheses on them, and the hypotheses on the propositional variables among them, with their
+  own dependencies, as these hypotheses are the only meaning of the variables (e.g., `p1 ∧ True` and `¬p1 ∨ p2 ∧ p3`
+  for the rewrite of `¬p3` to `False`: without them, the SMT replay of the obligation timed out after 20 s before
+  `simp [*]` proved it in the whole context). The cheap strategies are tried in the whole context last.
 - **Closed computations.** `blaster_wf_eval` evaluates well-founded recursion by unfolding its equation lemmas, since
   the kernel cannot reduce well-founded recursion efficiently.
 - **Induction.** `blaster_funind` uses functional induction following one of the functions of the equation, or
@@ -252,11 +260,11 @@ mode. The tactic strategies:
 
 | strategy            | tactics                                                                                |
 |---------------------|----------------------------------------------------------------------------------------|
-| decision procedures | `decide`, `simp`, `omega`, `grind`                                                     |
+| decision procedures | `decide`, `simp`, `omega`, `grind`; strings and bit vectors (see below)                |
 | instantiation       | seeded (`blaster_inst_hyps`), with structure invariants (`blaster_struct_facts`)       |
 | case analysis       | variables of inductive types (unfolding user definitions), `split`, `match cases`      |
 | recursive functions | unfolding equation lemmas (after `blaster_lit_add`), induction (`blaster_funind`)      |
-| existentials        | witness search (`blaster_exists`), including existentials over types                   |
+| existentials        | witness search (`blaster_exists`), nested existentials, existentials over types        |
 | arithmetic          | `div`/`mod` facts (`blaster_divmod_facts`), nonlinear lemmas                           |
 | empty types         | elements of empty types (`blaster_nomatch`), constructed arguments (`blaster_inhabit`) |
 
@@ -265,6 +273,20 @@ types, are constructed from their types when they have no default element (`blas
 `∀ (f : SomeBig → Empty), False` with `SomeBig.intro (n : Nat) (h : n > 5)`, the term `f ⟨6, _⟩` takes the witness 6
 from the literals of the constructor type. Another example is `fun x => absurd x.inv _ : FalseInv → Empty`, where a
 field of `x` is contradictory.
+
+**Theories.** String equalities are stated on the lists of characters (`simp_all [String.ext_iff]`, e.g., the
+associativity of `++`). Bit vectors are decided by `bv_omega` (linear arithmetic, with the bit vectors encoded by the
+optimizer, e.g., `{ toFin := ⟨(x.1.1 + y.1.1) % 16, _⟩ }`, stated on their values), then bit by bit (`ext`, `simp`,
+`grind`, e.g., rotations). These tactics only run on the goals that mention strings or bit vectors, respectively. The
+optimizer encodes the operations on bit vectors as arithmetic on natural numbers (e.g., the rotations with
+`Nat.bitwise`), on which the tactics fail after seconds and the replay takes minutes: the bit-vector tactics are
+therefore tried first on the goal before its optimization (`encodedTheoryTactics`): e.g., 1 s for
+`(0#5).rotateLeft x.toNat = 0#5 ∧ (0#5).rotateLeft y.toNat = 0#5`, on whose residual the tactics fail for 22 s and
+the replay doesn't end within two minutes.
+
+**Nested existentials.** The witness search splits the body of an existential into its conjuncts and searches the
+witnesses of the existentials among them (two levels), e.g., `∃ n, n ^ 2 = 4 ∧ ∃ n, n ^ 2 = 9`. Before, the residual
+of this goal failed after 44 s (two backends timing out on the replay).
 
 **Racing case analyses.** On residuals with `match` applications, `omega`, `grind` and the case analyses (`split`,
 `match cases`, unfolding with case analysis) are attempted in parallel right after `decide` (`raceTactics`), on the
@@ -285,7 +307,10 @@ their budget (`proveResidual` with `hard`), the attempts of a race counting indi
 residuals of CEK evaluations, every tactic runs out of its budget (7.5 s each, 13 s for the deeper case analysis), so
 waiting for all of them delayed the replay by about 75 s. If every strategy fails, the equivalences between recursive
 functions established by the optimizer are proved and used as facts, and the replay is tried last if it has not been
-tried yet.
+tried yet. When no attempt exhausted its budget, the cheap tactics (the decision procedures and `split`) are tried on
+the goal itself (Section 3.7) before this last replay: e.g., `simp` proves `A ∩ B = ⋂₀ {A, B}` in 5 ms, while the replay
+doesn't end within two minutes. The whole portfolio on the goal comes after the replay: e.g., the replay proves the
+nonlinear residual of `m * n = 288 → m = 18` in 1.4 s, where the whole portfolio fails for 15 s on the goal.
 
 ### 3.6 Kernel check
 
@@ -312,7 +337,12 @@ Only kernel-accepted proofs are reported as reconstructed or used to close tacti
 ### 3.7 Direct fallback
 
 If the steps above fail, the strategies of Section 3.5 are tried on the original goal itself (e.g., `rfl` or
-`decide +kernel` for closed computations), with the local axioms as `simp` lemmas.
+`decide +kernel` for closed computations), with the local axioms as `simp` lemmas (`proveDirect`; see Section 3.5 for
+the cheap tactics tried before the last replay). The goals of the `blaster` tactic are closed over the
+variables of its local context first. This proves the goals whose optimized form is ill-typed (Section 7.2), e.g., a
+proof depending on a condition the optimizer normalized (`h : a 0 = 42` used under the condition `42 = a 0` of
+`match h : a 0 with | 42 => ...`). `decide +kernel` is only tried on goals without variables, as kernel evaluation is
+not bounded by the heartbeats (e.g., the `2 ^ 20` cases of `∀ a b : BitVec 10, a + b = b + a`).
 
 ## 4. SMT proof replay
 
@@ -356,7 +386,10 @@ proofs, but no veriT backend is provided.
    axioms of recursive functions over `Nat` (`∀ x, f x = f_LRec x`) are guarded with `0 ≤ x` (this only weakens the
    query).
 2. **Proof** (`Z3.lean`, `Alethe.lean`, `IR.lean`). Each adapter translates the backend's proof into a DAG of steps:
-   rule, premises, arguments (e.g., quantifier instantiations) and conclusion (clauses as disjunctions).
+   rule, premises, arguments (e.g., quantifier instantiations) and conclusion (clauses as disjunctions). The indices
+   of the rules that are not terms are kept as printed, e.g., the certificates of the nonlinear theory lemmas of Z3 5.3
+   (`(_ th-lemma arith nla (polynomial-refutation ...))`, with empty lists and lists of numbers), whose proofs failed
+   to parse before.
 3. **Interpretation** (`Interp.lean`). SMT terms are interpreted as Lean terms:
    - `Int` arithmetic on Lean `Int`, with casts (`↑n`, `Int.toNat`) where Lean terms of type `Nat` occur (arguments
      and results of Lean functions, constructor fields);
