@@ -134,7 +134,7 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
       -- indexed identifier as a term, e.g., `(_ Char 67)`
       | .atom "_" =>
           let some f := xs[1]? >>= SExpr.atom? | throw s!"ill-formed indexed identifier: {e}"
-          return .iapp f (← (xs.extract 2 xs.size).mapM (ofSExpr env)) #[]
+          return .iapp f ((xs.extract 2 xs.size).map (index env)) #[]
       | .atom f =>
           let args ← (xs.extract 1 xs.size).mapM (ofSExpr env)
           -- a let-bound symbol can't be applied
@@ -142,7 +142,7 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
       | .list hd =>
           let args ← (xs.extract 1 xs.size).mapM (ofSExpr env)
           match hd.toList with
-          | .atom "_" :: .atom f :: idx => return .iapp f (← idx.toArray.mapM (ofSExpr env)) args
+          | .atom "_" :: .atom f :: idx => return .iapp f (idx.toArray.map (index env)) args
           -- β-redex (e.g., after the expansion of named lambdas)
           | [.atom "lambda", .list vs, body] =>
               if vs.size != args.size then throw s!"ill-formed β-redex: {e}"
@@ -154,6 +154,14 @@ partial def STerm.ofSExpr (env : Std.HashMap String STerm := {}) (e : SExpr) : E
           | [.atom "as", .atom f, s] => return .qual f s args
           | _ => throw s!"unsupported application head: {SExpr.list hd}"
       | h => throw s!"unsupported application head: {h}"
+where
+  /-- An index of an indexed identifier: a term (e.g., the instance of `quant-inst`), or kept as printed when it is not
+      one (e.g., the certificates of the nonlinear theory lemmas of Z3, `(_ th-lemma arith nla (polynomial-refutation
+      (variables (0 Int ()) ...) ...))`). -/
+  index (env : Std.HashMap String STerm) (i : SExpr) : STerm :=
+    match ofSExpr env i with
+    | .ok t => t
+    | .error _ => .lit (toString i)
 
 /-- Cache on term object addresses, for traversals of terms with sharing. The terms must be alive while the cache is
     used (e.g., the subterms of a proof): the address of a freed term may be reused by another term (see `TermMemo`). -/
