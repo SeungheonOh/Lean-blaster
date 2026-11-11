@@ -578,6 +578,11 @@ def matchHypEqProof? (a b : Expr) : MetaM (Option Expr) := do
       return some (← mkExpectedTypeHint p (← mkEq a b))
   return none
 
+/-- Maximum recursion depth of the definitional equality check of a match reduction (see `proveMatchReduction`): a
+    deeper check fails, i.e., the reduction is left as a proof obligation, instead of overflowing the stack (e.g., on the
+    evaluation of a UPLC program of 4096 nested terms, with `maxRecDepth` set to 1000000 by the user's file). -/
+def matchReductionMaxRecDepth : Nat := 2048
+
 /-- Given a match application `m := matcher ps motive d₁ ... dₙ alts` and `ds'` the discriminants such that
     each `d'ⱼ` is either `dⱼ` or its value in the match context (see `matchHypEqProof?`), return a proof of
     `m = r` with `r` the alternative to which `matcher ps motive d'₁ ... d'ₙ alts` reduces.
@@ -601,7 +606,11 @@ def proveMatchReduction (m : Expr) (ds' : Array Expr) (r : Expr) : MetaM Expr :=
           | some p => some <$> mkEqTrans p step
     args := args.set! (firstDiscr + j) d'
   let m' := mkAppN f args
-  unless ← withTransparency .default (isDefEq m' r) do throwError "proveMatchReduction: not reducible"
+  let reducible ← tryCatchRuntimeEx
+    (withTheReader Core.Context (fun ctx => { ctx with maxRecDepth := matchReductionMaxRecDepth })
+      (withTransparency .default (isDefEq m' r)))
+    fun _ => pure false
+  unless reducible do throwError "proveMatchReduction: not reducible"
   let refl ← mkExpectedTypeHint (← mkEqRefl m') (← mkEq m' r)
   match pf? with
   | none => return refl
