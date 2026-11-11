@@ -1025,11 +1025,29 @@ def matchGeneralizeTactic : TermElabM (TSyntax `tactic) :=
              (try simp_all [Int.negSucc_eq]) <;> (try norm_cast at *) <;> (try simp_all) <;>
              (try blaster_inst_hyps) <;> first | omega | (subst_vars; simp_all; done) | grind))
 
+/-- Bit vectors: linear arithmetic (`bv_omega`), with the bit vectors encoded by the optimizer (e.g., `x + y` as
+    `{ toFin := ⟨(x.1.1 + y.1.1) % 16, _⟩ }`) stated on their values, or the equalities of bit vectors bit by bit (e.g.,
+    `x.rotateLeft 3 = x.rotateRight 12` for `x : BitVec 15`). -/
+def bitVecTactic : TermElabM (TSyntax `tactic) :=
+  `(tactic| (intros <;> blaster_denorm <;> first
+              | ((try simp only [Fin.ext_iff, BitVec.toNat_eq, BitVec.toNat_ofFin, BitVec.val_toFin] at *) <;> bv_omega)
+              | ((repeat' apply And.intro) <;> ext i hi <;> simp_all <;> grind)))
+
+/-- Return `false` for the tactics specific to a type (e.g., `String` or `BitVec`) on a goal `e` without its
+    constants. NOTE: the native `Expr.find?`, as the goals may be large (e.g., CEK evaluations). -/
+def isRelevantTactic (name : String) (e : Expr) : Bool :=
+  let mentions (ns : Name) := (e.find? fun s => s.constName?.any (·.getRoot == ns)).isSome
+  match name with
+  | "strings" => mentions `String
+  | "bitvectors" => mentions `BitVec
+  | _ => true
+
 /-- The portfolio of tactics used to discharge proof obligations, in order of application. -/
 def dischargeTactics : TermElabM (Array (String × TSyntax `tactic)) := do
   return #[
     ("simp", ← `(tactic| (blaster_denorm <;> simp [*] <;> done))),
     ("omega", ← `(tactic| ((try apply propext) <;> blaster_denorm <;> omega))),
+    ("bitvectors", ← bitVecTactic),
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
     -- cancellation of non-zero divisors (side conditions proved by `omega`)
     ("arith simp", ← `(tactic| (blaster_denorm <;>
@@ -1146,7 +1164,7 @@ def isMatchToDite (env : Environment) (type : Expr) : Bool := Id.run do
 
 /-- The tactics of `dischargeTactics` tried before the case analysis on stuck `match` applications for the
     normalizations of `match` applications to `Blaster.dite'` chains (see `dischargeOneAux`). -/
-def matchToDiteCheapTactics : List String := ["simp", "omega", "grind"]
+def matchToDiteCheapTactics : List String := ["simp", "omega", "bitvectors", "grind"]
 
 /-- Return the first free variable a `match` application of `e` is stuck on. -/
 def findMatchStuckFVar? (e : Expr) : MetaM (Option FVarId) := do
@@ -1249,7 +1267,8 @@ partial def dischargeOneAux (type : Expr) (depth := matchCasesDepth) (first? : O
   -- costly auxiliary lemmas (e.g., splitters), which are not subject to the discharge budget.
   let large ← involvesLargeMatch type
   let tacs ← dischargeTactics
-  let skip (name : String) : Bool := large && name ∈ ["split", "cases", "induction"]
+  let skip (name : String) : Bool :=
+    (large && name ∈ ["split", "cases", "induction"]) || !isRelevantTactic name type
   let first := first?.filter fun i => i < tacs.size && !skip tacs[i]!.1
   -- the normalization of a `match` to a chain of `Blaster.dite'` (`normMatchExpr?`): the case analysis on the variables
   -- the `match` is stuck on, after the cheap tactics but before the costly case analyses of the portfolio (e.g.,
@@ -2128,7 +2147,10 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
   let tacs : Array (String × TSyntax `tactic) := #[
     ("decide", ← `(tactic| decide)),
     ("simp", ← `(tactic| (blaster_denorm <;> simp <;> done))),
+    -- strings as their lists of characters (e.g., the associativity of `String.append`), on the goals with strings
+    ("strings", ← `(tactic| (intros <;> blaster_denorm <;> simp_all [String.ext_iff] <;> done))),
     ("omega", ← `(tactic| (intros <;> blaster_denorm <;> omega))),
+    ("bitvectors", ← bitVecTactic),
     ("grind", ← `(tactic| (blaster_denorm <;> grind))),
     ("seeded instantiation", ← `(tactic| (intros <;> blaster_inst_hyps <;> blaster_denorm <;>
                                            first | omega | grind))),
@@ -2204,7 +2226,7 @@ def proveResidual (e : Expr) (hard : TermElabM (Option (Expr × String)) := pure
   -- NOTE: the induction (e.g., on the `Nat` variables) doesn't prove them and takes 0.1 to 0.5 s to fail on each of
   -- them (3.5 s on `Tests/Smt/SmtNat/SmtNatDiv.lean`)
   let idx : Array Nat := Id.run do
-    let all := (List.range tacs.size).toArray
+    let all := (List.range tacs.size).toArray.filter fun i => isRelevantTactic tacs[i]!.1 e
     if !e.getUsedConstants.any divModConsts.contains then return all
     let ind := all.filter (tacs[·]!.1 == "induction")
     let lastArith := (all.filter (#["div/mod facts", "nonlinear", "arith simp"].contains tacs[·]!.1)).back?
